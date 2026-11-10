@@ -288,6 +288,12 @@ async fn update_record(
         .ok_or_else(|| DnsError::Cloudflare("update record response had no result".to_string()))
 }
 
+/// TTL written on ACME DNS-01 TXT records. A resolver that cached the
+/// previous challenge can keep serving that value for this long after the
+/// authoritative server stopped. The provider-confirm settle is shorter
+/// and must not treat a live stale answer as propagated.
+pub const ACME_TXT_TTL_SECONDS: u32 = 60;
+
 /// Create one immutable ACME TXT record and return its provider identity.
 /// Multiple concurrent challenges for the same hostname intentionally create
 /// distinct records; cleanup must never update or delete a sibling challenge.
@@ -301,8 +307,16 @@ pub async fn create_txt_record(
         return Err(DnsError::OutsideManagedZone(hostname.to_string()));
     }
     let zone_id = resolve_zone_id(client, config).await?;
-    let record =
-        create_record_by_type(client, config, &zone_id, "TXT", hostname, content, 60).await?;
+    let record = create_record_by_type(
+        client,
+        config,
+        &zone_id,
+        "TXT",
+        hostname,
+        content,
+        ACME_TXT_TTL_SECONDS,
+    )
+    .await?;
     Ok(DnsRecordHandle {
         zone_id,
         record_id: record.id,
@@ -350,11 +364,13 @@ pub async fn delete_txt_record(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreatedTxtRead {
     Match,
-    /// Row missing, outside the managed zone, or not this challenge.
+    /// Row missing, a 404 for this record handle, outside the managed zone,
+    /// or not this challenge. A 404 is absence: the handle is gone, so a
+    /// prior confirmation must not survive it.
     Absent,
-    /// Transport, HTTP, parse, or `success: false`. The label is static:
-    /// `transport`, `http`, `rejected`, or `parse`. It never carries a
-    /// token, URL, or response body.
+    /// Transport, non-404 HTTP, parse, or `success: false`. The label is
+    /// static: `transport`, `http`, `rejected`, or `parse`. It never carries
+    /// a token, URL, or response body.
     Unreadable(&'static str),
 }
 
@@ -383,6 +399,9 @@ pub async fn read_created_txt(
         Ok(response) => response,
         Err(_) => return CreatedTxtRead::Unreadable("transport"),
     };
+    if response.status() == StatusCode::NOT_FOUND {
+        return CreatedTxtRead::Absent;
+    }
     if !response.status().is_success() {
         return CreatedTxtRead::Unreadable("http");
     }

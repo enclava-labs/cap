@@ -117,8 +117,9 @@ const MAX_BROKER_RESPONSE_BYTES: usize = 64 * 1024;
 /// broker is still working; that transport timeout is not a typed broker
 /// failure, so it collapses to generic `enclava_init_failed` (cap#345).
 /// 360s covers one window plus the polls and setup, and stays under the
-/// attestation-proxy ready-watch (900s). The provider-confirm settle is
-/// inside the propagation window, not added on top.
+/// attestation-proxy ready-watch (900s). A provider confirmation near the
+/// end of the window may finish its 30s settle up to one settle past that
+/// window; 360s still covers the production 180s window plus that extension.
 const TLS_BROKER_CLIENT_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Farthest a single honored ACME `retry_after` deadline may lie in the
