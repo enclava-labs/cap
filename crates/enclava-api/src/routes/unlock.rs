@@ -226,6 +226,54 @@ fn signable_storage_paths(paths: Option<&[String]>) -> Result<Vec<String>, &'sta
         .collect())
 }
 
+/// A signed unlock-mode redeploy must not change the running workload.
+///
+/// The CLI signs the status object's command, port, and storage paths. A
+/// proxy that rewrites both status reads can still present a different
+/// descriptor at PUT, and `require_same_locked_generation` will not catch
+/// it. Compare those fields to the locked primary before any container
+/// write, using the same normalization the status builder publishes: JSON
+/// argv, port > 0, and [`signable_storage_paths`] (drop `/state`, allow the
+/// empty remainder). A raw equality check against a `/state`-only column
+/// would refuse that honest empty list. Matching fields are not written
+/// back: the stored primary is already the workload that was signed.
+fn signed_workload_matches_locked_primary(
+    primary: &crate::models::AppContainer,
+    signed_command: Option<&str>,
+    signed_port: Option<i32>,
+    signed_paths: Option<&[String]>,
+) -> Result<(), &'static str> {
+    if signed_command.is_none() && signed_port.is_none() && signed_paths.is_none() {
+        return Ok(());
+    }
+    let (Some(signed_command), Some(signed_port), Some(signed_paths)) =
+        (signed_command, signed_port, signed_paths)
+    else {
+        return Err("signed descriptor omitted command, port, or storage paths");
+    };
+    let locked_command = signable_command(primary.command.as_deref())
+        .ok_or("stored primary command is missing or not a JSON argv")?;
+    let signed_argv = signable_command(Some(signed_command))
+        .ok_or("signed descriptor command is missing or not a JSON argv")?;
+    if signed_argv != locked_command {
+        return Err("signed descriptor command does not match the locked primary");
+    }
+    let locked_port = signable_port(primary.port)
+        .ok_or("stored primary omitted port; refusing to assume 8080")?;
+    let Some(normalized_signed_port) = signable_port(Some(signed_port)) else {
+        return Err("signed descriptor port does not match the locked primary");
+    };
+    if normalized_signed_port != locked_port {
+        return Err("signed descriptor port does not match the locked primary");
+    }
+    let locked_paths = signable_storage_paths(primary.storage_paths.as_deref())?;
+    let signed_normalized = signable_storage_paths(Some(signed_paths))?;
+    if signed_normalized != locked_paths {
+        return Err("signed descriptor storage paths do not match the locked primary");
+    }
+    Ok(())
+}
+
 fn signable_image_ref(image_ref: &str, digest: &str) -> bool {
     let Some(repository) = image_ref.strip_suffix(&format!("@{digest}")) else {
         return false;
@@ -1200,6 +1248,17 @@ async fn commit_unlock_mode_transition(
             "app runtime changed while unlock mode transition was validating; retry",
         ));
     }
+    // Reject a rewritten command, port, or mount list before either UPDATE.
+    // Profile and image digest are already bound; these three are the fields
+    // the descriptor write used to copy onto the primary.
+    if let Err(reason) = signed_workload_matches_locked_primary(
+        locked_primary,
+        request.signed_workload_command,
+        request.signed_container_port,
+        request.signed_storage_paths.map(Vec::as_slice),
+    ) {
+        return Err(unlock_transition_conflict(reason));
+    }
 
     // Lock resources too so the apply snapshot is exactly the state accepted
     // by this transaction rather than a later concurrent edit.
@@ -1328,28 +1387,10 @@ async fn commit_unlock_mode_transition(
         return Err(unlock_database_error());
     }
 
-    if request.signed_workload_command.is_some()
-        || request.signed_container_port.is_some()
-        || request.signed_storage_paths.is_some()
-    {
-        let result = sqlx::query(
-            "UPDATE app_containers
-             SET command = COALESCE($1, command),
-                 port = COALESCE($2, port),
-                 storage_paths = COALESCE($3, storage_paths)
-             WHERE app_id = $4 AND is_primary = true",
-        )
-        .bind(request.signed_workload_command)
-        .bind(request.signed_container_port)
-        .bind(request.signed_storage_paths)
-        .bind(locked_app.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| unlock_database_error())?;
-        if result.rows_affected() != 1 {
-            return Err(unlock_database_error());
-        }
-    }
+    // Do not copy the signed descriptor's command, port, or storage paths
+    // onto the primary. Those fields were compared to the locked primary
+    // above; writing them back is how a rewritten status changed the
+    // workload. The apply snapshot below reads the unchanged row.
 
     let updated_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(locked_app.id)
@@ -1864,7 +1905,8 @@ pub async fn update_unlock_mode(
     let primary = observed_containers
         .iter()
         .find(|container| container.is_primary)
-        .ok_or_else(|| unlock_transition_conflict("app has no primary container"))?;
+        .ok_or_else(|| unlock_transition_conflict("app has no primary container"))?
+        .clone();
     let image_digest = primary.image_digest.clone();
     let current_profile = primary
         .workload_security_profile
@@ -1952,6 +1994,16 @@ pub async fn update_unlock_mode(
         signed_storage_paths = Some(crate::deploy::descriptor_storage_paths(
             &artifacts.descriptor,
         ));
+        // Fail before the signing service sees a descriptor that would change
+        // the stored primary. The commit re-checks the locked row.
+        if let Err(reason) = signed_workload_matches_locked_primary(
+            &primary,
+            signed_workload_command.as_deref(),
+            signed_container_port,
+            signed_storage_paths.as_deref(),
+        ) {
+            return Err(unlock_transition_conflict(reason));
+        }
         let attestation = state.attestation.as_ref().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -3160,6 +3212,183 @@ mod tests {
         );
     }
 
+    async fn commit_signed_workload<'a>(
+        pool: &sqlx::PgPool,
+        fixture: &'a UnlockTestFixture,
+        command: Option<&'a str>,
+        port: Option<i32>,
+        paths: Option<&'a Vec<String>>,
+        timestamp: &str,
+        key_byte: u8,
+    ) -> Result<super::CommittedUnlockModeTransition, (StatusCode, Json<serde_json::Value>)> {
+        let signing_key = SigningKey::from_bytes(&[key_byte; 32]);
+        let quote_hash = hex::encode([key_byte; 32]);
+        let receipt = signed_transition_receipt_for_app(
+            fixture.app.id,
+            timestamp,
+            "auto",
+            "password",
+            &quote_hash,
+            &signing_key,
+        );
+        let verified_receipt = verify_transition_receipt(
+            &receipt,
+            &fixture.app,
+            RequestedUnlockMode::Auto,
+            RequestedUnlockMode::Password,
+        )
+        .expect("verify signed-workload receipt");
+        let attestation = transition_attestation_for_domain(
+            fixture.app.tee_domain.as_deref().expect("test TEE domain"),
+            &signing_key,
+            &quote_hash,
+        );
+        let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+        let image_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        commit_unlock_mode_transition(
+            pool,
+            UnlockModeCommitRequest {
+                org_id: fixture.app.org_id,
+                user_id: fixture.user_id,
+                app_name: &fixture.app.name,
+                observed_authority: &fixture.authority,
+                source_deployment_id: fixture.source_deployment_id,
+                requested: RequestedUnlockMode::Password,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id: Uuid::new_v4(),
+                image_digest: Some(image_digest),
+                signed_workload_command: command,
+                signed_container_port: port,
+                signed_storage_paths: paths,
+                signing_artifacts: None,
+                signed_policy_artifact: None,
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
+                log_encryption: None,
+                api_signing_pubkey: "unused-without-signing-artifacts",
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn rewritten_signed_command_is_rejected_before_primary_update() {
+        let pool = database_test_pool().await;
+        let fixture = insert_unlock_test_app(&pool).await;
+        let paths = vec!["/data".to_string()];
+        let result = commit_signed_workload(
+            &pool,
+            &fixture,
+            Some("[\"/bin/rewritten\"]"),
+            Some(8080),
+            Some(&paths),
+            "2026-07-17T11:10:00Z",
+            23,
+        )
+        .await;
+        let (status, body) = result.expect_err("rewritten command must not commit");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.0["error"],
+            "signed descriptor command does not match the locked primary"
+        );
+
+        let persisted_mode: String =
+            sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+                .bind(fixture.app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load mode after rewritten command");
+        assert_eq!(persisted_mode, "auto");
+        let persisted: AppContainer =
+            sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 AND is_primary = true")
+                .bind(fixture.app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load primary after rewritten command");
+        assert_eq!(persisted.command.as_deref(), Some("[\"/bin/old\"]"));
+        assert_eq!(persisted.port, Some(8080));
+        assert_eq!(persisted.storage_paths, Some(vec!["/data".to_string()]));
+        delete_unlock_test_org(&pool, fixture.app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn state_only_primary_accepts_empty_signed_paths_without_rewriting_the_column() {
+        let pool = database_test_pool().await;
+        let mut fixture = insert_unlock_test_app(&pool).await;
+        sqlx::query(
+            "UPDATE app_containers SET storage_paths = $1 WHERE app_id = $2 AND is_primary = true",
+        )
+        .bind(vec!["/state".to_string()])
+        .bind(fixture.app.id)
+        .execute(&pool)
+        .await
+        .expect("set state-only storage paths");
+        let containers: Vec<AppContainer> = sqlx::query_as(
+            "SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC, id",
+        )
+        .bind(fixture.app.id)
+        .fetch_all(&pool)
+        .await
+        .expect("reload state-only containers");
+        let resources: crate::models::AppResources =
+            sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+                .bind(fixture.app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("reload state-only resources");
+        fixture.authority = crate::deploy::ExistingAppAuthoritySnapshot::new(
+            fixture.app.updated_at,
+            containers,
+            resources,
+        );
+        let paths = Vec::<String>::new();
+        let result = commit_signed_workload(
+            &pool,
+            &fixture,
+            Some("[\"/bin/old\"]"),
+            Some(8080),
+            Some(&paths),
+            "2026-07-17T11:20:00Z",
+            24,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "empty signed paths must match a /state-only column, got {result:?}"
+        );
+
+        let persisted_mode: String =
+            sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+                .bind(fixture.app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load mode after empty-path transition");
+        assert_eq!(persisted_mode, "password");
+        let persisted: AppContainer =
+            sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 AND is_primary = true")
+                .bind(fixture.app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load primary after empty-path transition");
+        assert_eq!(persisted.command.as_deref(), Some("[\"/bin/old\"]"));
+        assert_eq!(persisted.port, Some(8080));
+        assert_eq!(
+            persisted.storage_paths,
+            Some(vec!["/state".to_string()]),
+            "matching signed paths must not be written back over the locked primary"
+        );
+        delete_unlock_test_org(&pool, fixture.app.org_id).await;
+    }
+
     #[tokio::test]
     async fn audit_failure_rolls_back_unlock_mode_runtime_receipt_and_deployment() {
         let pool = database_test_pool().await;
@@ -3195,8 +3424,11 @@ mod tests {
         let deploy_id = Uuid::new_v4();
         let image_digest =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let new_command = "[\"/bin/new\"]";
-        let new_storage_paths = vec!["/new-data".to_string()];
+        // The stored primary. A rewritten command is rejected before this
+        // transaction reaches the audit insert, so the rollback fixture has
+        // to present the workload the handler locks.
+        let new_command = "[\"/bin/old\"]";
+        let new_storage_paths = vec!["/data".to_string()];
 
         let suffix = app.id.simple().to_string();
         let function_name = format!("cap_test_block_unlock_audit_{suffix}");
@@ -3240,7 +3472,7 @@ mod tests {
                 deploy_id,
                 image_digest: Some(image_digest),
                 signed_workload_command: Some(new_command),
-                signed_container_port: Some(9090),
+                signed_container_port: Some(8080),
                 signed_storage_paths: Some(&new_storage_paths),
                 signing_artifacts: None,
                 signed_policy_artifact: None,
@@ -4168,6 +4400,87 @@ mod tests {
         assert!(super::reject_omitted_log_recipient(true, Some(&recipient)).is_err());
         assert!(super::reject_omitted_log_recipient(false, Some(&recipient)).is_ok());
         assert!(super::reject_omitted_log_recipient(true, None).is_ok());
+    }
+
+    #[test]
+    fn signed_workload_match_drops_state_and_rejects_a_rewritten_primary() {
+        let primary = crate::models::AppContainer {
+            id: Uuid::nil(),
+            app_id: Uuid::nil(),
+            name: "app".to_string(),
+            image_ref: "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            image_digest: None,
+            port: Some(8080),
+            command: Some("[\"/bin/old\"]".to_string()),
+            storage_paths: Some(vec!["/data".to_string(), "/state".to_string()]),
+            workload_security_profile: None,
+            is_primary: true,
+        };
+        let data = vec!["/data".to_string()];
+        assert!(
+            super::signed_workload_matches_locked_primary(
+                &primary,
+                Some("[\"/bin/old\"]"),
+                Some(8080),
+                Some(&data),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            super::signed_workload_matches_locked_primary(
+                &primary,
+                Some("[\"/bin/rewritten\"]"),
+                Some(8080),
+                Some(&data),
+            )
+            .unwrap_err(),
+            "signed descriptor command does not match the locked primary"
+        );
+        assert_eq!(
+            super::signed_workload_matches_locked_primary(
+                &primary,
+                Some("[\"/bin/old\"]"),
+                Some(9090),
+                Some(&data),
+            )
+            .unwrap_err(),
+            "signed descriptor port does not match the locked primary"
+        );
+        let rewritten = vec!["/other".to_string()];
+        assert_eq!(
+            super::signed_workload_matches_locked_primary(
+                &primary,
+                Some("[\"/bin/old\"]"),
+                Some(8080),
+                Some(&rewritten),
+            )
+            .unwrap_err(),
+            "signed descriptor storage paths do not match the locked primary"
+        );
+        let mut state_only = primary.clone();
+        state_only.storage_paths = Some(vec!["/state".to_string()]);
+        let empty = Vec::<String>::new();
+        assert!(
+            super::signed_workload_matches_locked_primary(
+                &state_only,
+                Some("[\"/bin/old\"]"),
+                Some(8080),
+                Some(&empty),
+            )
+            .is_ok(),
+            "a /state-only column is the honest empty user-path list"
+        );
+        assert!(super::signed_workload_matches_locked_primary(&primary, None, None, None).is_ok());
+        assert_eq!(
+            super::signed_workload_matches_locked_primary(
+                &primary,
+                Some("[\"/bin/old\"]"),
+                None,
+                Some(&data),
+            )
+            .unwrap_err(),
+            "signed descriptor omitted command, port, or storage paths"
+        );
     }
 
     #[test]
