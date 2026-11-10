@@ -106,8 +106,8 @@ pub struct UnlockLockedGeneration {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<UnlockLockedGenerationApp>,
     /// Generation `spec_snapshot.log_encryption`. Null is an explicit
-    /// no-recipient generation. Omitted only on a refused snapshot, which
-    /// the CLI must not sign.
+    /// no-recipient generation. A refused snapshot also serializes null; clients
+    /// must use `acceptable`, not this field, to decide whether to sign.
     pub log_encryption: Option<enclava_engine::types::LogEncryptionConfig>,
 }
 
@@ -135,6 +135,21 @@ fn refused_generation(
         app: None,
         log_encryption: None,
     }
+}
+
+/// An unlock-mode redeploy must not pin the legacy omit-claim render when the
+/// locked generation has a log recipient. A proxy that rewrites that field to
+/// null would otherwise commit encrypted logging off after the wrap is gone.
+fn reject_omitted_log_recipient(
+    omit_log_encryption_claim: bool,
+    log_encryption: Option<&enclava_engine::types::LogEncryptionConfig>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if log_encryption.is_some() && omit_log_encryption_claim {
+        return Err(unlock_transition_conflict(
+            "signed descriptor omitted the locked generation log recipient",
+        ));
+    }
+    Ok(())
 }
 
 /// The predicate `update_unlock_mode` enforces after it has a primary and a
@@ -1388,6 +1403,13 @@ async fn commit_unlock_mode_transition(
         artifacts
             .validate_and_pin_cc_init_data_render(&mut app_spec)
             .map_err(crate::routes::deployments::signing_error_response)?;
+        reject_omitted_log_recipient(
+            app_spec
+                .workload_artifact_binding
+                .as_ref()
+                .is_some_and(|binding| binding.omit_log_encryption_claim),
+            request.log_encryption,
+        )?;
     }
 
     let primary = containers
@@ -1979,6 +2001,13 @@ pub async fn update_unlock_mode(
         artifacts
             .validate_and_pin_cc_init_data_render(&mut app_spec)
             .map_err(crate::routes::deployments::signing_error_response)?;
+        reject_omitted_log_recipient(
+            app_spec
+                .workload_artifact_binding
+                .as_ref()
+                .is_some_and(|binding| binding.omit_log_encryption_claim),
+            log_encryption.as_ref(),
+        )?;
         signed_policy_artifact = Some(signed);
     }
 
@@ -4129,6 +4158,19 @@ mod tests {
     }
 
     #[test]
+    fn omit_claim_pin_is_rejected_when_the_generation_has_a_recipient() {
+        let recipient = enclava_engine::types::LogEncryptionConfig {
+            algorithm: "x25519-hpke-v1".to_string(),
+            key_id: "log-key".to_string(),
+            public_key_base64url: "pubkey".to_string(),
+            public_key_sha256: "hash".to_string(),
+        };
+        assert!(super::reject_omitted_log_recipient(true, Some(&recipient)).is_err());
+        assert!(super::reject_omitted_log_recipient(false, Some(&recipient)).is_ok());
+        assert!(super::reject_omitted_log_recipient(true, None).is_ok());
+    }
+
+    #[test]
     fn locked_generation_is_the_apply_job_row_not_a_healthy_container() {
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut app = test_app();
@@ -4180,6 +4222,19 @@ mod tests {
         );
         assert!(empty.acceptable, "{empty:?}");
         assert_eq!(empty.storage_paths.as_deref(), Some(&[][..]));
+
+        let mut deleting = app.clone();
+        deleting.status = AppStatus::Deleting;
+        let deleting = locked_generation_snapshot(
+            Some(&generation),
+            Some(&primary),
+            Some(&resources),
+            &deleting,
+        );
+        assert_eq!(
+            deleting.refusal.as_deref(),
+            Some("app deletion is in progress")
+        );
 
         let (pending, primary, resources) = generation_fixture(
             "pending",
@@ -4352,9 +4407,11 @@ mod tests {
         // than look acceptable.
         assert_eq!(body.locked_generation.source, LOCKED_GENERATION_SOURCE);
         assert!(!body.locked_generation.acceptable);
+        // The fixture has a generation and a primary, but no signer. That is
+        // not a signable identity, and the refusal must not expose a digest.
         assert_eq!(
             body.locked_generation.refusal.as_deref(),
-            Some("app has no deployment generation")
+            Some("stored app has no signer subject")
         );
         assert!(body.locked_generation.image_digest.is_none());
         assert!(body.locked_generation.port.is_none());

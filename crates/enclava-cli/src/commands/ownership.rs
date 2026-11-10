@@ -848,11 +848,15 @@ fn require_signable_generation(
         .clone()
         .filter(|argv| !argv.is_empty() && argv.iter().all(|arg| !arg.is_empty()))
         .ok_or_else(|| "locked generation omitted command".to_string())?;
-    let storage_paths = generation
-        .storage_paths
-        .clone()
-        .filter(|paths| !paths.is_empty() && paths.iter().all(|path| !path.is_empty()))
-        .ok_or_else(|| "locked generation omitted storage paths".to_string())?;
+    let Some(paths) = generation.storage_paths.clone() else {
+        return Err("locked generation omitted storage paths".into());
+    };
+    if paths.iter().any(|path| path.is_empty()) {
+        return Err("locked generation storage paths contain an empty path".into());
+    }
+    // Match the server: /state is the platform mount, and an empty remainder
+    // is a valid no-extra-mount workload.
+    let storage_paths: Vec<String> = paths.into_iter().filter(|path| path != "/state").collect();
     let resources = generation
         .resources
         .clone()
@@ -1319,6 +1323,15 @@ mod tests {
             .log_encryption = None;
         let dropped = require_signable_generation(&omitted_log, &image).unwrap_err();
         assert!(dropped.contains("log_encryption"), "{dropped}");
+
+        let mut empty_paths = acceptable_status(9090);
+        empty_paths
+            .locked_generation
+            .as_mut()
+            .unwrap()
+            .storage_paths = Some(Vec::new());
+        let empty = require_signable_generation(&empty_paths, &image).unwrap();
+        assert!(empty.app_config.storage.paths.is_empty());
     }
 
     #[test]
