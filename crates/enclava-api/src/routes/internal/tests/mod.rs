@@ -790,6 +790,25 @@ async fn deterministic_config_token_migration_scrubs_legacy_and_enforces_confide
     assert_eq!(null_kind_terminal.2, None);
     assert!(!null_kind_terminal.3.contains(&null_kind_secret));
 
+    // The scrub checks above ran on the 0043/0045 schema. Current replay
+    // code writes capability_config_generation, so apply that column before
+    // exercising it against this isolated schema.
+    let generation_migration = migrations
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("0090_"))
+        })
+        .cloned()
+        .expect("find config-token generation migration");
+    let generation_sql = std::fs::read_to_string(&generation_migration)
+        .expect("read config-token generation migration");
+    sqlx::raw_sql(&generation_sql)
+        .execute(&mut connection)
+        .await
+        .expect("apply config-token generation column before current replay code");
+
     let replay_options = database_url
         .parse::<sqlx::postgres::PgConnectOptions>()
         .expect("parse isolated config-token migration database URL")
@@ -2292,6 +2311,13 @@ async fn app_config_token_route_replays_exactly_and_rejects_name_recreation() {
 
 #[tokio::test]
 async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() {
+    // Debug state for this fixture exceeds the 2MB libtest stack once the
+    // route future is embedded in it. Box the body so that future stays on
+    // the heap while each route call is constructed.
+    Box::pin(generic_deployment_config_token_route_replays_and_rejects_app_rebind_body()).await;
+}
+
+async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind_body() {
     let pool = database_test_pool().await;
     let suffix = Uuid::new_v4().simple().to_string();
     let org_id = Uuid::new_v4();
@@ -2351,13 +2377,13 @@ async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() 
     let key = format!("generic-config-route-{suffix}");
     let headers = config_token_actor_headers(&key, &paas_user_id);
     let call = |state: AppState, headers: HeaderMap| {
-        issue_paas_generic_config_token(
+        Box::pin(issue_paas_generic_config_token(
             internal_test_auth(),
             State(state),
             Path((paas_org_id.clone(), deployment_id)),
             headers,
             Json(serde_json::json!({})),
-        )
+        ))
     };
     let (first_status, Json(first)) = call(state.clone(), headers.clone())
         .await
