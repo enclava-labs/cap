@@ -42,13 +42,23 @@ const RENEW_TIMEOUT_SECONDS: u64 = 10;
 /// fail-closed: the fence is retained and revisited next cycle.
 const RETAINED_NAMESPACE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Worst-case sequential Kubernetes calls for one admitted retained
+/// fence: the initial GET, a pinned DELETE, and a confirmation GET.
+/// Admission cannot know which arm the GET will take, so it reserves
+/// all three. A later wave that only has one probe window left would
+/// otherwise spend it on the GET, then rotate the cursor without
+/// issuing the DELETE (cap#373 review).
+const RETAINED_FENCE_SEQUENCE_CALLS: u32 = 3;
+
 /// Overall budget for one reconciliation pass over expired retained
-/// namespace fences. A fence is started only when a full
-/// [`RETAINED_NAMESPACE_PROBE_TIMEOUT`] still fits before this deadline;
-/// the rest keep their older probe cursor and are resumed next pass
-/// (cap#240). The bound still stops one slow pass from running on without
-/// limit — it no longer does that by handing later fences an expired
-/// timeout.
+/// namespace fences. A fence is started only when
+/// [`RETAINED_FENCE_SEQUENCE_CALLS`] full
+/// [`RETAINED_NAMESPACE_PROBE_TIMEOUT`] windows still fit before this
+/// deadline; the rest keep their older probe cursor and are resumed
+/// next pass (cap#240, cap#373 review). The bound still stops one slow
+/// pass from running on without limit — it no longer does that by
+/// handing later fences an expired timeout, or by admitting a fence
+/// whose follow-ups cannot finish.
 const RETAINED_FENCE_BATCH_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Concurrent retained-fence reconciles per pass: enough parallelism that
@@ -56,14 +66,15 @@ const RETAINED_FENCE_BATCH_DEADLINE: Duration = Duration::from_secs(120);
 const RETAINED_FENCE_RECONCILE_CONCURRENCY: usize = 4;
 
 /// Shared deadline plus the full window one Kubernetes request needs.
-/// A fence is started only when that window still fits before
-/// `batch_deadline` (cap#240). `captured_deadline` is taken after the
-/// cursor stamp, once a full window is confirmed again, and with no
-/// further await before the first GET. Follow-up calls do not reuse that
-/// instant: a GET that consumed most of it would leave the pinned DELETE
-/// and the confirmation GET no time to finish, and a consistently slow
-/// API would never clear the fence (cap#373 review). Each later
-/// Kubernetes call takes its own probe window via
+/// A fence is started only when [`RETAINED_FENCE_SEQUENCE_CALLS`] of
+/// those windows still fit before `batch_deadline` (cap#240, cap#373
+/// review). `captured_deadline` is taken after the cursor stamp, once
+/// that sequence budget is confirmed again, and with no further await
+/// before the first GET. Follow-up calls do not reuse that instant: a
+/// GET that consumed most of it would leave the pinned DELETE and the
+/// confirmation GET no time to finish, and a consistently slow API
+/// would never clear the fence (cap#373 review). Each later Kubernetes
+/// call takes its own probe window via
 /// [`ProbeWindow::follow_up_deadline`], still capped by `batch_deadline`.
 #[derive(Clone, Copy)]
 struct ProbeWindow {
@@ -91,23 +102,45 @@ impl ProbeWindow {
             .min(tokio::time::Instant::now() + self.probe_timeout)
     }
 
-    /// True when a request started now can run for the whole probe timeout
-    /// without crossing the batch deadline.
-    fn has_full_window(&self) -> bool {
-        tokio::time::Instant::now() + self.probe_timeout <= self.batch_deadline
+    /// True when a fence started now can run
+    /// [`RETAINED_FENCE_SEQUENCE_CALLS`] full probe timeouts without
+    /// crossing the batch deadline. One remaining probe window is not
+    /// enough: the GET would consume it and the pinned DELETE would see
+    /// an expired follow-up deadline.
+    fn has_sequence_budget(&self) -> bool {
+        let Some(sequence) = self
+            .probe_timeout
+            .checked_mul(RETAINED_FENCE_SEQUENCE_CALLS)
+        else {
+            return false;
+        };
+        match tokio::time::Instant::now().checked_add(sequence) {
+            Some(end) => end <= self.batch_deadline,
+            None => false,
+        }
     }
 }
 
 /// Upper bound on fences one pass can start when every probe burns a full
 /// `probe_timeout`, at most `concurrency` run at once, and the first wave
-/// starts with the deadline still intact. [`ProbeWindow::has_full_window`]
-/// may start fewer if scheduling delay eats a later wave, and a stamp that
-/// consumes the window is undone rather than counted as a probe (cap#240).
-/// This is not a guaranteed `ceil(n / fair_page)` bound.
+/// starts with the deadline still intact. Admission requires
+/// [`RETAINED_FENCE_SEQUENCE_CALLS`] probe windows, so a wave that burns
+/// one probe may leave the next wave short of a full sequence.
+/// [`ProbeWindow::has_sequence_budget`] may start fewer if scheduling
+/// delay eats a later wave, and a stamp that consumes the sequence is
+/// undone rather than counted as a probe (cap#240). This is not a
+/// guaranteed `ceil(n / fair_page)` bound.
 #[cfg(test)]
 fn retained_fence_fair_page(batch: Duration, probe: Duration, concurrency: usize) -> usize {
     let probe_ms = probe.as_millis().max(1);
-    let waves = usize::try_from(batch.as_millis() / probe_ms).unwrap_or(usize::MAX);
+    let sequence_ms = probe_ms.saturating_mul(u128::from(RETAINED_FENCE_SEQUENCE_CALLS));
+    let batch_ms = batch.as_millis();
+    if batch_ms < sequence_ms {
+        return 0;
+    }
+    // The next wave starts `probe` after the previous one burned its
+    // timeout. It is admitted only while a full sequence still fits.
+    let waves = usize::try_from((batch_ms - sequence_ms) / probe_ms + 1).unwrap_or(usize::MAX);
     concurrency.saturating_mul(waves)
 }
 
@@ -1265,7 +1298,8 @@ pub async fn reconcile_orphaned_deployment_apply_leases(
 /// name — redeploy or app delete — is rejected as `Busy` even after
 /// Kubernetes finishes the deletion.
 ///
-/// For each expired retained fence this pass can give a full probe window,
+/// For each expired retained fence this pass can give a full
+/// reconciliation sequence (GET, pinned DELETE, confirmation),
 /// the Kubernetes API is asked whether the namespace still exists. Fences
 /// the deadline cannot cover keep their older `updated_at` cursor and are
 /// resumed at the head of the next pass (cap#240) — a pass does not ask
@@ -1311,13 +1345,14 @@ pub async fn release_retained_deployment_namespace_fences(
 /// Expired retained namespace fences to probe this pass, oldest probe
 /// cursor first. `updated_at` is that cursor (cap#240): a pass stamps it
 /// only when it actually starts a probe, and restores the previous value
-/// if the stamp itself consumes the remaining window. The stamp claims the
+/// if the stamp itself consumes the remaining sequence. The stamp claims the
 /// selected value with a compare-and-swap and parks it in the future for
 /// the batch budget, so a second replica holding this same snapshot skips
 /// that fence, and a replica that selects afterwards does not see it until
 /// the probe returns or the claim expires (cap#373 review). Fences that are
-/// not started stay older and are resumed next pass. A pass that still has a full window when its first fence is
-/// polled starts that concurrent wave; scheduling delay may start fewer, so
+/// not started stay older and are resumed next pass. A pass that still has
+/// a full reconciliation sequence when its first fence is polled starts
+/// that concurrent wave; scheduling delay may start fewer, so
 /// the bound is not `ceil(n / fair_page)`. `app_delete` fences are selected
 /// alongside the
 /// retained-apply marker (cap#336): the delete path arms the same infinite
@@ -1354,9 +1389,9 @@ async fn select_expired_retained_namespace_fences(
 
 /// Move a fence we are about to probe behind fences this pass will not
 /// start, and hide it from other replicas until the claim expires.
-/// Returns the stamped `updated_at` so a stamp that consumes the probe
-/// window can be undone, and so the caller can drop the claim when the
-/// probe returns. The compare-and-swap stays on the expired retained row
+/// Returns the stamped `updated_at` so a stamp that consumes the
+/// reconciliation sequence can be undone, and so the caller can drop the
+/// claim when the probe returns. The compare-and-swap stays on the expired retained row
 /// and on the `updated_at` this replica selected, so a release, a renew,
 /// or another replica that already claimed this cursor is left alone and
 /// the caller skips the probe. The new cursor is in the future by
@@ -1597,10 +1632,10 @@ async fn release_retained_deployment_namespace_fences_budgeted(
     let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
     // Codex P2 bounded the pass so one slow namespace could not delay every
     // later fence. cap#240: that shared deadline itself starved later fences
-    // when a slow prefix burned it. Start a probe only while a full window
-    // remains, and stamp `updated_at` so the next pass resumes at the fences
-    // this pass did not start. Fast probes still drain the whole set in one
-    // pass — there is no hard page cap.
+    // when a slow prefix burned it. Start a probe only while a full
+    // reconciliation sequence remains, and stamp `updated_at` so the next
+    // pass resumes at the fences this pass did not start. Fast probes still
+    // drain the whole set in one pass — there is no hard page cap.
     let window = ProbeWindow {
         batch_deadline: tokio::time::Instant::now() + batch_budget,
         probe_timeout,
@@ -1630,14 +1665,19 @@ async fn release_retained_deployment_namespace_fences_budgeted(
                     let api = api.clone();
                     let pool = pool.clone();
                     async move {
-                        // cap#240: do not start a probe the shared deadline
-                        // cannot give a full window. Leaving `updated_at`
-                        // untouched is what puts this fence ahead of the
-                        // ones we do start, on the next pass.
-                        if !window.has_full_window() {
+                        // cap#240 / cap#373: do not start a probe the shared
+                        // deadline cannot give a full reconciliation sequence
+                        // (GET, pinned DELETE, confirmation). Leaving
+                        // `updated_at` untouched is what puts this fence ahead
+                        // of the ones we do start, on the next pass. One
+                        // remaining probe window is not that sequence: the
+                        // GET would consume it and the DELETE would see an
+                        // expired follow-up deadline, then the cursor clear
+                        // would rotate a fence that never completed.
+                        if !window.has_sequence_budget() {
                             tracing::debug!(
                                 namespace = %namespace,
-                                "retained-namespace fence deferred; batch deadline cannot give it a full probe window"
+                                "retained-namespace fence deferred; batch deadline cannot cover the reconciliation sequence"
                             );
                             return Ok(false);
                         }
@@ -1660,11 +1700,12 @@ async fn release_retained_deployment_namespace_fences_budgeted(
                         else {
                             return Ok(false);
                         };
-                        // The stamp is an await. If it consumed the window,
-                        // put the cursor back and do not call reconcile —
-                        // an expired timeout_at is not a probe, and a moved
-                        // cursor would send this fence to the back of the queue.
-                        if !window.has_full_window() {
+                        // The stamp is an await. If it consumed the sequence
+                        // budget, put the cursor back and do not call
+                        // reconcile — an expired timeout_at is not a probe,
+                        // and a moved cursor would send this fence to the
+                        // back of the queue.
+                        if !window.has_sequence_budget() {
                             restore_retained_fence_probe_cursor(
                                 &pool,
                                 &namespace,
@@ -1678,7 +1719,7 @@ async fn release_retained_deployment_namespace_fences_budgeted(
                             .await?;
                             tracing::debug!(
                                 namespace = %namespace,
-                                "retained-namespace fence probe cursor restored; stamp consumed the probe window"
+                                "retained-namespace fence probe cursor restored; stamp consumed the reconciliation sequence"
                             );
                             return Ok(false);
                         }
@@ -1899,8 +1940,10 @@ async fn retained_marker_namespace_provenance(
 /// captured deadline applies only to the initial GET. The pinned DELETE,
 /// the absence confirmation, and the foreign-namespace re-check each take
 /// a fresh probe window still capped by the batch deadline, so a slow GET
-/// cannot starve the call that clears the fence (cap#373 review). A
-/// follow-up whose batch deadline has already passed fails closed.
+/// cannot starve the call that clears the fence (cap#373 review).
+/// Admission reserves that full sequence before the first GET, so the
+/// cap is not already expired when the DELETE starts. A follow-up whose
+/// batch deadline has already passed fails closed.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_one_retained_namespace(
     pool: &PgPool,
@@ -4888,16 +4931,18 @@ pub(crate) mod tests {
         use axum::response::IntoResponse;
 
         let probe = Duration::from_secs(2);
-        // One wave per pass. The extra second is slack so the cursor
-        // stamp's Postgres round-trip cannot eat the window the way 20ms
-        // did. batch == probe would defer everyone: a few microseconds
-        // elapse before the first future is polled.
-        let batch = Duration::from_secs(3);
+        // One wave per pass. The sequence is three probe windows (6s);
+        // the extra second is slack so the cursor stamp's Postgres
+        // round-trip cannot eat the budget the way 20ms did. A batch
+        // equal to the sequence would defer everyone: a few microseconds
+        // elapse before the first future is polled. The next wave, one
+        // probe later, no longer holds a full sequence.
+        let batch = Duration::from_secs(7);
         let concurrency = 4usize;
         let page = retained_fence_fair_page(batch, probe, concurrency);
         assert_eq!(
             page, concurrency,
-            "3s / 2s admits exactly one wave of `concurrency`"
+            "7s admits exactly one wave of `concurrency`; the next wave no longer holds a 6s sequence"
         );
         // Two full pages of slow fences ahead of the deleted namespace, so
         // it must survive pass 1 and pass 2 and release on pass 3.
@@ -5157,22 +5202,32 @@ pub(crate) mod tests {
             RETAINED_NAMESPACE_PROBE_TIMEOUT,
             RETAINED_FENCE_RECONCILE_CONCURRENCY,
         );
-        // 120s / 30s = 4 waves × concurrency 4. The last wave still starts
-        // with a full probe window when every earlier probe burns its timeout.
-        assert_eq!(page, 16);
+        // 120s holds two waves of concurrency 4. The second starts after
+        // one full probe and still has a 90s sequence (GET, pinned DELETE,
+        // confirmation). A third wave would not: admitting it with only
+        // one probe left is the cursor-rotation bug.
+        assert_eq!(page, 8);
         let waves = page / RETAINED_FENCE_RECONCILE_CONCURRENCY;
+        assert_eq!(waves, 2);
         let last_start = RETAINED_NAMESPACE_PROBE_TIMEOUT * u32::try_from(waves - 1).unwrap();
-        assert!(last_start + RETAINED_NAMESPACE_PROBE_TIMEOUT <= RETAINED_FENCE_BATCH_DEADLINE);
-        let one_more_wave = RETAINED_NAMESPACE_PROBE_TIMEOUT * u32::try_from(waves).unwrap();
-        assert!(one_more_wave >= RETAINED_FENCE_BATCH_DEADLINE);
+        assert!(
+            last_start + RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS
+                <= RETAINED_FENCE_BATCH_DEADLINE
+        );
+        let next_wave = last_start
+            + RETAINED_NAMESPACE_PROBE_TIMEOUT
+            + RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS;
+        assert!(next_wave > RETAINED_FENCE_BATCH_DEADLINE);
         // A live owned retry is three Kubernetes calls (GET, pinned DELETE,
         // confirmation), each allowed a full probe window capped by the
         // batch. A batch shorter than that reintroduces the never-clears
         // bug even for a fence admitted at the start of the pass. The
-        // remainder is also sqlx's default acquire_timeout (30s); DB work
-        // between those calls has to fit in it.
+        // remainder after that sequence is also sqlx's default
+        // acquire_timeout (30s); DB work between those calls has to fit
+        // in it when the fence is admitted at the start.
         assert!(
-            RETAINED_FENCE_BATCH_DEADLINE >= RETAINED_NAMESPACE_PROBE_TIMEOUT * 3,
+            RETAINED_FENCE_BATCH_DEADLINE
+                >= RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS,
             "the batch must fit a GET, a pinned DELETE, and a confirmation GET"
         );
     }
@@ -5432,7 +5487,7 @@ pub(crate) mod tests {
         let released = release_retained_deployment_namespace_fences_budgeted(
             &pool,
             client.clone(),
-            Duration::from_secs(3),
+            Duration::from_secs(7),
             Duration::from_secs(2),
             1,
         )
@@ -5471,7 +5526,7 @@ pub(crate) mod tests {
         let released = release_retained_deployment_namespace_fences_budgeted(
             &pool,
             client,
-            Duration::from_secs(3),
+            Duration::from_secs(7),
             Duration::from_secs(2),
             1,
         )
@@ -5530,6 +5585,31 @@ pub(crate) mod tests {
         assert!(
             expired.request_deadline() > now,
             "the admitted GET still uses its captured instant; only follow-ups are capped by the batch"
+        );
+    }
+
+    #[test]
+    fn sequence_budget_rejects_a_single_remaining_probe_window() {
+        let probe = Duration::from_secs(30);
+        let one_window = ProbeWindow {
+            batch_deadline: tokio::time::Instant::now() + probe,
+            probe_timeout: probe,
+            captured_deadline: None,
+        };
+        assert!(
+            !one_window.has_sequence_budget(),
+            "one probe window covers the GET only; the DELETE and confirmation would expire"
+        );
+        let admits = ProbeWindow {
+            batch_deadline: tokio::time::Instant::now()
+                + probe * RETAINED_FENCE_SEQUENCE_CALLS
+                + Duration::from_secs(1),
+            probe_timeout: probe,
+            captured_deadline: None,
+        };
+        assert!(
+            admits.has_sequence_budget(),
+            "a batch that still holds the full sequence must admit"
         );
     }
 
@@ -5911,5 +5991,312 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("remove slow-recheck fixture organization");
+    }
+
+    /// cap#373 review: a later wave that still has one probe window must
+    /// not admit a live owned fence. Reconciliation may still need a GET,
+    /// a pinned DELETE, and a confirmation. Admitting it would spend the
+    /// window on the GET, then clear the claim and rotate a fence the
+    /// DELETE never finished. The next pass, which still has the sequence,
+    /// must issue that DELETE and release the fence.
+    #[tokio::test]
+    async fn later_wave_does_not_rotate_an_owned_fence_without_sequence_budget() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let probe = Duration::from_secs(2);
+        let batch = Duration::from_secs(7);
+        let delay = Duration::from_secs(1);
+        let sequence = probe * RETAINED_FENCE_SEQUENCE_CALLS;
+        assert!(batch > sequence, "the first wave must be admissible");
+        assert!(
+            batch - probe < sequence,
+            "after one burned probe the sequence must no longer fit"
+        );
+        assert!(
+            batch - probe >= probe,
+            "sabotage: the old one-window gate would still admit"
+        );
+        assert!(
+            delay * 3 < batch - probe,
+            "sabotage: those three calls would finish in the leftover window"
+        );
+
+        let pool = database_test_pool(2).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let (slow_org, _slow_app, _slow_token, slow_namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        let (victim_org, _victim_app, _victim_token, victim_namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        let victim_generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("load victim fence generation");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET updated_at = clock_timestamp() - interval '2 hours'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&slow_namespace)
+        .execute(&pool)
+        .await
+        .expect("age the slow prefix ahead of the victim");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET updated_at = clock_timestamp() - interval '1 hour'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .execute(&pool)
+        .await
+        .expect("age the victim behind the slow prefix");
+        let victim_cursor_before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT updated_at FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read the victim cursor before the short pass");
+
+        let gets = Arc::new(Mutex::new(Vec::<String>::new()));
+        let deletes = Arc::new(AtomicU32::new(0));
+        let deleted = Arc::new(AtomicBool::new(false));
+        let hang = probe * 5;
+        let app = Router::new().fallback({
+            let gets = Arc::clone(&gets);
+            let deletes = Arc::clone(&deletes);
+            let deleted = Arc::clone(&deleted);
+            let slow_namespace = slow_namespace.clone();
+            let victim_namespace = victim_namespace.clone();
+            move |request: axum::extract::Request| {
+                let gets = Arc::clone(&gets);
+                let deletes = Arc::clone(&deletes);
+                let deleted = Arc::clone(&deleted);
+                let slow_namespace = slow_namespace.clone();
+                let victim_namespace = victim_namespace.clone();
+                async move {
+                    let path = request.uri().path().to_string();
+                    if !path.contains("/namespaces/") {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Namespace",
+                                "metadata": {
+                                    "name": "discovery",
+                                    "uid": "discovery",
+                                    "resourceVersion": "1"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    let name = path.rsplit('/').next().unwrap_or("").to_string();
+                    if name == slow_namespace {
+                        if request.method() == axum::http::Method::GET {
+                            gets.lock().await.push(name);
+                        }
+                        tokio::time::sleep(hang).await;
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "code": 500
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if name != victim_namespace {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "reason": "NotFound",
+                                "code": 404
+                            })),
+                        )
+                            .into_response();
+                    }
+                    tokio::time::sleep(delay).await;
+                    if request.method() == axum::http::Method::DELETE {
+                        deletes.fetch_add(1, Ordering::SeqCst);
+                        deleted.store(true, Ordering::SeqCst);
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Success",
+                                "code": 200
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if request.method() == axum::http::Method::GET {
+                        gets.lock().await.push(name.clone());
+                    }
+                    if deleted.load(Ordering::SeqCst) {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "reason": "NotFound",
+                                "code": 404
+                            })),
+                        )
+                            .into_response();
+                    }
+                    let annotations = std::collections::BTreeMap::from([
+                        (
+                            enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
+                                .to_string(),
+                            victim_generation.to_string(),
+                        ),
+                        (
+                            enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                                .to_string(),
+                            victim_generation.to_string(),
+                        ),
+                    ]);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": {
+                                "name": name,
+                                "uid": "fixture",
+                                "resourceVersion": "1",
+                                "creationTimestamp": "2026-10-01T00:00:00Z",
+                                "annotations": annotations,
+                                "managedFields": [{
+                                    "manager": "enclava-platform",
+                                    "apiVersion": "v1",
+                                    "time": "2026-01-01T00:00:00Z",
+                                    "fieldsType": "FieldsV1",
+                                    "fieldsV1": {
+                                        "f:metadata": {
+                                            "f:annotations": {
+                                                format!(
+                                                    "f:{}",
+                                                    enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                                                ): {}
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sequence-budget mock");
+        let address = listener.local_addr().expect("sequence-budget mock address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sequence-budget mock");
+        });
+        let client = mock_kube_client(&format!("http://{address}"));
+
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            client.clone(),
+            batch,
+            probe,
+            1,
+        )
+        .await
+        .expect("pass that can finish only the slow prefix");
+        let pass1 = gets.lock().await.clone();
+        assert!(
+            pass1.iter().any(|name| name == &slow_namespace),
+            "the prefix must burn its probe so the victim is checked with one window left; gets={pass1:?}"
+        );
+        assert!(
+            !pass1.iter().any(|name| name == &victim_namespace),
+            "the owned fence must not be probed once the sequence no longer fits; gets={pass1:?}"
+        );
+        assert_eq!(released, 0, "the deferred owned fence must stay retained");
+        assert_eq!(
+            deletes.load(Ordering::SeqCst),
+            0,
+            "a deferred fence must not issue the pinned DELETE"
+        );
+        let victim_cursor_after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT updated_at FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read the victim cursor after the short pass");
+        assert_eq!(
+            victim_cursor_before, victim_cursor_after,
+            "deferring the fence must not rotate its cursor"
+        );
+
+        gets.lock().await.clear();
+        let released =
+            release_retained_deployment_namespace_fences_budgeted(&pool, client, batch, probe, 1)
+                .await
+                .expect("pass with a fresh sequence budget");
+        let pass2 = gets.lock().await.clone();
+        assert!(
+            pass2.iter().any(|name| name == &victim_namespace),
+            "the next pass must GET the fence this pass deferred; gets={pass2:?}"
+        );
+        assert!(
+            deletes.load(Ordering::SeqCst) >= 1,
+            "the admitted owned fence must issue the pinned DELETE"
+        );
+        assert_eq!(
+            released, 1,
+            "the owned fence must release once the sequence fits"
+        );
+        let owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT owner_token FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read the owned fence after the full-sequence pass");
+        assert_eq!(owner, None, "the exact owned fence must be cleared");
+
+        server.abort();
+        for namespace in [&slow_namespace, &victim_namespace] {
+            sqlx::query(
+                "DELETE FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("remove sequence-budget fixture fence");
+        }
+        for org in [slow_org, victim_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(&pool)
+                .await
+                .expect("remove sequence-budget fixture organization");
+        }
     }
 }
