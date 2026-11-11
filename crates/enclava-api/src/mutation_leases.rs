@@ -5066,6 +5066,16 @@ pub(crate) mod tests {
         assert!(last_start + RETAINED_NAMESPACE_PROBE_TIMEOUT <= RETAINED_FENCE_BATCH_DEADLINE);
         let one_more_wave = RETAINED_NAMESPACE_PROBE_TIMEOUT * u32::try_from(waves).unwrap();
         assert!(one_more_wave >= RETAINED_FENCE_BATCH_DEADLINE);
+        // A live owned retry is three Kubernetes calls (GET, pinned DELETE,
+        // confirmation), each allowed a full probe window capped by the
+        // batch. A batch shorter than that reintroduces the never-clears
+        // bug even for a fence admitted at the start of the pass. The
+        // remainder is also sqlx's default acquire_timeout (30s); DB work
+        // between those calls has to fit in it.
+        assert!(
+            RETAINED_FENCE_BATCH_DEADLINE >= RETAINED_NAMESPACE_PROBE_TIMEOUT * 3,
+            "the batch must fit a GET, a pinned DELETE, and a confirmation GET"
+        );
     }
 
     /// A healthy pass (every namespace already gone) must still release the
@@ -5364,12 +5374,17 @@ pub(crate) mod tests {
     }
 
     async fn drop_leftover_retained_fence_fixtures(pool: &PgPool) {
+        // Same predicate the reconciler selects, not a name prefix: a
+        // panic leftover under another prefix would be probed and change
+        // an exact `released` count.
         sqlx::query(
             "DELETE FROM external_resource_mutation_leases
               WHERE resource_scope = 'kubernetes_namespace'
-                AND (resource_key LIKE 'retained-kube-%'
-                  OR resource_key LIKE 'delete-fence-%')",
+                AND operation_kind IN ($1, 'app_delete')
+                AND reclaim_after = 'infinity'::timestamptz
+                AND locked_until <= clock_timestamp()",
         )
+        .bind(RETAINED_DEPLOYMENT_NAMESPACE_OPERATION)
         .execute(pool)
         .await
         .expect("drop leftover retained-fence fixtures");
@@ -5389,11 +5404,11 @@ pub(crate) mod tests {
         assert!(delay < probe, "the admitted GET must fit its own window");
         assert!(
             delay > probe - delay,
-            "sabotage: reusing the captured instant would still leave room for the DELETE"
+            "sabotage: the DELETE must be longer than the captured window's remainder"
         );
         assert!(
             delay + delay > probe,
-            "sabotage: one shared follow-up window would still fit DELETE and confirmation"
+            "sabotage: DELETE and confirmation must not fit in one shared follow-up window"
         );
         assert!(
             probe + delay + delay < batch,
