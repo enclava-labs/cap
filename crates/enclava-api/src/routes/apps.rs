@@ -1943,8 +1943,7 @@ pub(crate) async fn delete_app_before(
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
-                    "error": "live workload publication could not be verified; retry deletion",
-                    "abandon_teardown": "skips this check and selects teardown authority without a classified live spec"
+                    "error": "live workload publication could not be verified; retry deletion. abandon_teardown skips this check and selects teardown authority without a classified live spec"
                 })),
             ));
         }

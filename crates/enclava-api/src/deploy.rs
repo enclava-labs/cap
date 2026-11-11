@@ -7303,8 +7303,9 @@ pub(crate) enum PublicationRecoveryDecision {
     AlreadyRecorded,
     /// The live object is not an unstamped generation of this app.
     NotWritten,
-    /// Label and generation name different deployments, or a fenced
-    /// generation disagrees with the label. Do not guess.
+    /// Label and generation name different deployments, a fenced generation
+    /// disagrees with the label, or a manifest hash disagrees with the live
+    /// object. Do not guess.
     Ambiguous,
 }
 
@@ -7546,6 +7547,11 @@ pub(crate) async fn recover_unpublished_workload_spec(
         }
     };
     let Some(sts) = live else {
+        // A missing object is not proof the write landed. `apply_committed_at`
+        // is stored before `apply_statefulset`, so a first create that never
+        // produced a StatefulSet is also a 404. Failing closed here would
+        // wedge supersession of that failure. The crash this issue names
+        // leaves the object in place.
         return Ok(());
     };
     apply_live_publication_recovery(pool, app_id, &live_workload_publication(&sts), mode).await
@@ -7614,10 +7620,14 @@ async fn read_live_statefulset(
 /// Best-effort recovery for every deleting app whose teardown selector
 /// still depends on `workload_spec_published_at`. A single unread namespace
 /// must not fail the global policy pass.
+///
+/// Returns whether a stamp was committed. The stamp and the signed-policy
+/// generation bump are one transaction: a recovered selector must not be
+/// published at a generation Trustee already applied.
 pub(crate) async fn recover_deleting_workload_publications(
     pool: &PgPool,
     client: &kube::Client,
-) -> Result<(), DeployError> {
+) -> Result<bool, DeployError> {
     let apps: Vec<(Uuid, String, String)> = sqlx::query_as(
         "SELECT app.id, app.namespace, app.name
            FROM apps AS app
@@ -7633,25 +7643,110 @@ pub(crate) async fn recover_deleting_workload_publications(
     )
     .fetch_all(pool)
     .await?;
+    let mut pending = Vec::new();
     for (app_id, namespace, name) in apps {
-        if let Err(error) = recover_unpublished_workload_spec(
-            pool,
-            client,
-            app_id,
-            &namespace,
-            &name,
-            PublicationRecoveryMode::BestEffort,
+        match publication_stamp_candidate(pool, client, app_id, &namespace, &name).await {
+            Ok(Some(deployment_id)) => pending.push(deployment_id),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %app_id,
+                    error = %error,
+                    "skipping workload publication recovery for a deleting app"
+                );
+            }
+        }
+    }
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    let mut tx = pool.begin().await?;
+    let mut stamped = false;
+    for deployment_id in pending {
+        let result = sqlx::query(
+            "UPDATE deployments
+                SET workload_spec_published_at = clock_timestamp()
+              WHERE id = $1
+                AND workload_spec_published_at IS NULL",
         )
-        .await
-        {
-            tracing::warn!(
-                %app_id,
-                error = %error,
-                "skipping workload publication recovery for a deleting app"
+        .bind(deployment_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 1 {
+            stamped = true;
+            tracing::info!(
+                %deployment_id,
+                "recovered workload publication from the live StatefulSet"
             );
         }
     }
-    Ok(())
+    if stamped {
+        crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
+            .await
+            .map_err(DeployError::KbsPolicy)?;
+    }
+    tx.commit().await?;
+    Ok(stamped)
+}
+
+/// The deployment a live StatefulSet proves should be stamped, if any.
+/// Does not write. Best-effort: ambiguous or unreadable evidence is None
+/// so one namespace cannot fail the global pass.
+async fn publication_stamp_candidate(
+    pool: &PgPool,
+    client: &kube::Client,
+    app_id: Uuid,
+    namespace: &str,
+    workload_name: &str,
+) -> Result<Option<Uuid>, DeployError> {
+    let rows = load_publication_recovery_rows(pool, app_id).await?;
+    if rows.iter().all(|row| row.published) {
+        return Ok(None);
+    }
+    let live = match tokio::time::timeout(
+        WORKLOAD_PUBLICATION_PROBE_TIMEOUT,
+        read_live_statefulset(client, namespace, workload_name),
+    )
+    .await
+    {
+        Ok(Ok(Some(sts))) => live_workload_publication(&sts),
+        Ok(Ok(None)) => return Ok(None),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %app_id,
+                error = %error,
+                "could not read the live StatefulSet to recover workload publication"
+            );
+            return Ok(None);
+        }
+        Err(elapsed) => {
+            tracing::warn!(
+                %app_id,
+                error = %elapsed,
+                "live StatefulSet publication probe timed out"
+            );
+            return Ok(None);
+        }
+    };
+    let deployments: Vec<_> = rows
+        .iter()
+        .map(PublicationRecoveryRow::deployment)
+        .collect();
+    match decide_workload_publication_recovery(&live, &deployments) {
+        PublicationRecoveryDecision::Stamp(deployment_id) => Ok(Some(deployment_id)),
+        PublicationRecoveryDecision::AlreadyRecorded | PublicationRecoveryDecision::NotWritten => {
+            Ok(None)
+        }
+        PublicationRecoveryDecision::Ambiguous => {
+            tracing::warn!(
+                %app_id,
+                ?live.deployment_id,
+                ?live.mutation_generation,
+                "leaving workload publication unstamped after ambiguous live evidence"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Stamp attempts for `record_workload_spec_published` before the failure is

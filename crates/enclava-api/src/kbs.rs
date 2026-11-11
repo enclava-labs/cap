@@ -2016,13 +2016,25 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         // pass: one unread namespace must not fail every app's reconciliation.
         if !publication_recovered {
             publication_recovered = true;
-            if let Err(error) =
-                crate::deploy::recover_deleting_workload_publications(db, &client).await
-            {
-                tracing::warn!(
-                    error = %error,
-                    "workload publication recovery failed before signed policy selection"
-                );
+            match crate::deploy::recover_deleting_workload_publications(db, &client).await {
+                Ok(true) => {
+                    // The stamp changed the deleting selector. Do not publish
+                    // that body at the generation loaded above — it may
+                    // already be applied, and a same-generation body change
+                    // is rejected. The bump committed with the stamp; reload
+                    // it.
+                    tracing::info!(
+                        "recovered workload publication advanced the signed policy generation"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "workload publication recovery failed before signed policy selection"
+                    );
+                }
             }
         }
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;

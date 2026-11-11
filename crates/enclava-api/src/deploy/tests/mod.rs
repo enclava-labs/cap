@@ -9746,6 +9746,82 @@ async fn recover_unpublished_workload_spec_stamps_the_live_generation() {
 }
 
 #[tokio::test]
+async fn deleting_publication_recovery_bumps_policy_generation_with_the_stamp() {
+    let pool = crate::test_support::database_test_pool().await;
+    let (app, deployment_id, _, _) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+    sqlx::query(
+        "UPDATE apps
+            SET status = 'deleting',
+                workload_teardown_required = true,
+                workload_teardown_completed_at = NULL
+          WHERE id = $1",
+    )
+    .bind(app.id)
+    .execute(&pool)
+    .await
+    .expect("mark deleting teardown");
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'failed',
+                apply_committed_at = clock_timestamp(),
+                manifest_hash = 'written',
+                namespace_fence_generations = ARRAY[4]::bigint[],
+                workload_spec_published_at = NULL
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&pool)
+    .await
+    .expect("open the crash window");
+    let before: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read policy generation");
+
+    let stamped = recover_deleting_workload_publications(
+        &pool,
+        &publication_statefulset_client(deployment_id, false),
+    )
+    .await
+    .expect("recover deleting publication");
+    assert!(stamped);
+    let (published, after): (bool, i64) = sqlx::query_as(
+        "SELECT deployment.workload_spec_published_at IS NOT NULL,
+                reconciliation.desired_generation
+           FROM deployments AS deployment
+           CROSS JOIN kbs_signed_policy_reconciliation AS reconciliation
+          WHERE deployment.id = $1
+            AND reconciliation.singleton",
+    )
+    .bind(deployment_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read stamp and generation");
+    assert!(published, "the live generation must be stamped");
+    assert_eq!(
+        after,
+        before + 1,
+        "the selector change needs a new policy generation"
+    );
+
+    let again = recover_deleting_workload_publications(
+        &pool,
+        &publication_statefulset_client(deployment_id, false),
+    )
+    .await
+    .expect("second recovery is a no-op");
+    assert!(!again, "an already stamped generation must not bump again");
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(app.org_id)
+        .execute(&pool)
+        .await
+        .expect("delete generation-bump fixture");
+}
+
+#[tokio::test]
 async fn recover_unpublished_workload_spec_refuses_an_unreadable_in_flight_write() {
     let pool = crate::test_support::database_test_pool().await;
     let (app, deployment_id, _, _) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
