@@ -644,9 +644,26 @@ impl ApiClient {
     // --- Config ---
 
     pub async fn get_config_token(&self, app_name: &str) -> Result<ConfigTokenResponse, ApiError> {
+        self.post_config_token(&format!("/apps/{app_name}/config-token"))
+            .await
+    }
+
+    /// Mint a token bound to one deployment. Template-deploy refresh must use
+    /// this instead of the app-scoped route, which cannot tell a superseded
+    /// deploy from an operator config write.
+    pub async fn get_deployment_config_token(
+        &self,
+        deployment_id: &str,
+    ) -> Result<ConfigTokenResponse, ApiError> {
+        let deployment_id = path_segment(deployment_id);
+        self.post_config_token(&format!("/deployments/{deployment_id}/config-token"))
+            .await
+    }
+
+    async fn post_config_token(&self, path: &str) -> Result<ConfigTokenResponse, ApiError> {
         let resp = self
             .http
-            .post(self.url(&format!("/apps/{app_name}/config-token")))
+            .post(self.url(path))
             .headers(self.auth_headers()?)
             .send()
             .await?;

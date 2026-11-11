@@ -2242,6 +2242,7 @@ impl TemplateConfigDeliveryState<'_> {
                     let refreshed = refresh_template_config_token_with_retry(
                         self.api,
                         self.instance_name,
+                        self.deployment.deployment_id,
                         key,
                         nested_deadline,
                     )
@@ -2804,15 +2805,22 @@ async fn poll_managed_delivery_status(
 async fn refresh_template_config_token_with_retry(
     api: &ApiClient,
     instance_name: &str,
+    deployment_id: &str,
     key: &str,
     deadline: Option<Instant>,
 ) -> Result<enclava_cli::api_types::ConfigTokenResponse, Box<dyn std::error::Error>> {
     let mut attempt = 0usize;
     loop {
         attempt += 1;
-        // The deadline bounds the in-flight token request too, so a
-        // stalled response cannot run past the phase budget.
-        let token = api.get_config_token(instance_name);
+        // A held deploy must refresh the token bound to that deployment.
+        // The app-scoped route cannot tell this caller from a later deploy.
+        let token = async {
+            if deployment_id.is_empty() || deployment_id == "pending" {
+                api.get_config_token(instance_name).await
+            } else {
+                api.get_deployment_config_token(deployment_id).await
+            }
+        };
         let response = match deadline {
             Some(deadline) => {
                 match tokio::time::timeout(

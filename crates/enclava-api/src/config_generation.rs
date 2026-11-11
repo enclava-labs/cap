@@ -23,12 +23,9 @@ pub async fn deployment_apply_generation(
     .await
 }
 
-/// Newest apply-job generation for the app, including failed jobs.
-///
-/// A failed or expired hold still has a higher identity than the running
-/// workload. Stamping operator tokens with that maximum keeps them able to
-/// write after such a job, and keeps them from being a generation-0 token
-/// that the TEE would reject once any positive generation has written.
+/// Generation an operator (app-scoped) config token may write as: the newest
+/// completed apply job. In-flight and superseded jobs are excluded so a
+/// refresh of an older deploy cannot be upgraded into the replacement.
 pub async fn app_config_write_generation(
     pool: &PgPool,
     app_id: Uuid,
@@ -36,7 +33,8 @@ pub async fn app_config_write_generation(
     sqlx::query_scalar(
         "SELECT MAX(generation)
            FROM deployment_apply_jobs
-          WHERE app_id = $1",
+          WHERE app_id = $1
+            AND state = 'completed'",
     )
     .bind(app_id)
     .fetch_one(pool)
@@ -84,29 +82,34 @@ mod tests {
         .await
         .expect("insert app");
         let mut tx = pool.begin().await.expect("begin generation fixture");
-        for deployment_id in [older, newer] {
+        for (deployment_id, job_state, deploy_status) in [
+            (older, "completed", "healthy"),
+            (newer, "pending", "pending"),
+        ] {
             sqlx::query(
                 "INSERT INTO deployment_apply_jobs (
                      deployment_id, app_id, org_id, source_deployment_id,
                      payload_version, payload, payload_sha256,
                      cleanup_app_on_setup_failure, signed_required, state
                  ) VALUES ($1, $2, $3, $1, 1, '{\"version\":1,\"log_encryption\":null}'::jsonb, $4,
-                           false, false, 'pending')",
+                           false, false, $5)",
             )
             .bind(deployment_id)
             .bind(app_id)
             .bind(org_id)
             .bind(vec![7u8; 32])
+            .bind(job_state)
             .execute(&mut *tx)
             .await
             .expect("insert apply job");
             sqlx::query(
                 "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
-                 VALUES ($1, $2, $3, 'pending'::deploy_status_enum, '{}'::jsonb)",
+                 VALUES ($1, $2, $3, $4::deploy_status_enum, '{}'::jsonb)",
             )
             .bind(deployment_id)
             .bind(org_id)
             .bind(app_id)
+            .bind(deploy_status)
             .execute(&mut *tx)
             .await
             .expect("insert deployment");
@@ -125,7 +128,8 @@ mod tests {
             app_config_write_generation(&pool, app_id)
                 .await
                 .expect("app generation"),
-            Some(newer_generation)
+            Some(older_generation),
+            "an in-flight replacement must not become the app-scoped writer"
         );
         assert_ne!(
             deployment_apply_generation(&pool, older)

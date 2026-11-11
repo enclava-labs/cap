@@ -5696,7 +5696,13 @@ pub async fn issue_paas_generic_config_token(
     let deployment_generation =
         crate::config_generation::deployment_apply_generation(&state.db, deployment_id)
             .await
-            .map_err(|_| db_error())?;
+            .map_err(|_| db_error())?
+            .ok_or_else(|| {
+                json_error(
+                    StatusCode::CONFLICT,
+                    "deployment has no apply generation to bind the config token to",
+                )
+            })?;
     let idempotency = match begin_actor_deterministic_config_token_request(
         &state,
         &headers,
@@ -5704,7 +5710,7 @@ pub async fn issue_paas_generic_config_token(
         &auth,
         &body,
         &binding.binding,
-        deployment_generation,
+        Some(deployment_generation),
     )
     .await?
     {

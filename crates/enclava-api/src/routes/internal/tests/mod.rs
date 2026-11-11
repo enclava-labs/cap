@@ -2314,6 +2314,25 @@ async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() 
     )
     .await;
     insert_config_token_test_app(&pool, org_id, &org_name, app_a, &app_name_a, "a").await;
+    let mut fx = pool
+        .begin()
+        .await
+        .expect("begin generic config-token deployment");
+    sqlx::query(
+        "INSERT INTO deployment_apply_jobs (
+             deployment_id, app_id, org_id, source_deployment_id,
+             payload_version, payload, payload_sha256,
+             cleanup_app_on_setup_failure, signed_required, state
+         ) VALUES ($1, $2, $3, $1, 1, '{\"version\":1,\"log_encryption\":null}'::jsonb, $4,
+                   false, false, 'completed')",
+    )
+    .bind(deployment_id)
+    .bind(app_a)
+    .bind(org_id)
+    .bind(vec![9u8; 32])
+    .execute(&mut *fx)
+    .await
+    .expect("insert generic config-token apply job");
     sqlx::query(
         "INSERT INTO deployments
                  (id, org_id, app_id, trigger, status, spec_snapshot)
@@ -2322,9 +2341,12 @@ async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() 
     .bind(deployment_id)
     .bind(org_id)
     .bind(app_a)
-    .execute(&pool)
+    .execute(&mut *fx)
     .await
     .expect("insert generic config-token deployment");
+    fx.commit()
+        .await
+        .expect("commit generic config-token deployment");
     let state = idempotency_test_state(pool.clone());
     let key = format!("generic-config-route-{suffix}");
     let headers = config_token_actor_headers(&key, &paas_user_id);
@@ -2353,6 +2375,30 @@ async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() 
     // fixture admits no workload, so there is nothing to attest against.
     assert_eq!(first["launch_identities"], serde_json::json!([]));
     assert_eq!(duplicate["launch_identities"], first["launch_identities"]);
+    let stored_generation = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT capability_config_generation
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("stored config generation")
+    .expect("deployment mint stores a generation");
+    let payload = first["token"]
+        .as_str()
+        .expect("token")
+        .split('.')
+        .nth(1)
+        .expect("jwt payload");
+    let claims: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("jwt payload decodes"),
+    )
+    .expect("jwt payload is json");
+    assert_eq!(claims["deployment_generation"], stored_generation);
+    assert_eq!(duplicate["token"], first["token"]);
 
     insert_config_token_test_app(&pool, org_id, &org_name, app_b, &app_name_b, "b").await;
     sqlx::query("DELETE FROM deployments WHERE id = $1")
