@@ -142,13 +142,31 @@ pub fn build_guarded_client(config: &ClientConfig) -> Result<reqwest::Client, Cl
 }
 
 fn build_inner(config: &ClientConfig) -> Result<reqwest::Client, ClientError> {
+    client_builder(config, false)
+        .build()
+        .map_err(ClientError::from)
+}
+
+/// Registry client builder. A proxy resolves destinations remotely and would
+/// also see `Authorization` once tag resolution attaches platform pull
+/// credentials (issue #228), so registry traffic does not use one.
+fn build_registry_inner(config: &ClientConfig) -> Result<reqwest::Client, ClientError> {
+    client_builder(config, true)
+        .build()
+        .map_err(ClientError::from)
+}
+
+fn client_builder(config: &ClientConfig, no_proxy: bool) -> reqwest::ClientBuilder {
     let resolver = Arc::new(GuardedResolver::new(Arc::clone(&config.blocked)));
-    Ok(reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(config.timeout)
-        .dns_resolver(resolver)
-        .build()?)
+        .dns_resolver(resolver);
+    if no_proxy {
+        builder = builder.no_proxy();
+    }
+    builder
 }
 
 /// Parse a URL host as a literal IP if it is one. Brackets are Url's
@@ -251,7 +269,7 @@ impl RegistryClient {
 
     pub fn new(config: ClientConfig, allowlist: AllowList) -> Result<Self, ClientError> {
         Ok(Self {
-            inner: build_inner(&config)?,
+            inner: build_registry_inner(&config)?,
             allowlist,
             blocked: Arc::clone(&config.blocked),
             body_limit: config.body_limit_bytes,
