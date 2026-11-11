@@ -165,10 +165,13 @@ The witness is one static ELF. Before any accept:
    access, EXECUTE included, and denies all of them, plus a network
    denial — the net accesses
    `LANDLOCK_ACCESS_NET_CONNECT_TCP | LANDLOCK_ACCESS_NET_BIND_TCP`
-   handled and denied, and a seccomp filter denying `socket` and
-   `socketpair`. The framing needs no sockets: stdin, stdout, and
-   stderr are already-open pipes. The seccomp half closes what landlock
-   does not mediate (UDP and Unix-domain sockets). Landlock does not
+   handled and denied, and a seccomp filter denying `socket`,
+   `socketpair`, and `io_uring_setup` — io_uring submission-queue
+   operations are not syscalls (`IORING_OP_SOCKET` creates a socket the
+   filter never sees). The framing needs no sockets (stdin, stdout, and
+   stderr are already-open pipes) and no async IO. The seccomp
+   half closes what landlock does not mediate (UDP and Unix-domain
+   sockets). Landlock does not
    revoke fds inherited across fork: the helper file fd is `O_CLOEXEC`,
    but other CAP sockets are not, and the helper must not inherit them.
    Do not apply the sandbox to the CAP process. If any part cannot be
