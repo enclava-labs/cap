@@ -2722,7 +2722,11 @@ mod tests {
             "oci_runtime_spec": {
                 "command": [enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH],
                 "args": ["/usr/local/bin/test"],
-                "env": [],
+                // Must match insert_unlock_test_app's primary name and the
+                // app_resources defaults. commit_unlock_mode_transition
+                // rejects a missing name or limit as 409 before it reaches
+                // customer-authority validation.
+                "env": [{"name": "ENCLAVA_CONTAINER_NAME", "value": "web"}],
                 "ports": [{"container_port": 8080, "protocol": "TCP"}],
                 "mounts": [],
                 "capabilities": {"add": [], "drop": []},
@@ -2733,7 +2737,13 @@ mod tests {
                     "allow_privilege_escalation": false,
                     "privileged": false,
                 },
-                "resources": {"requests": [], "limits": []},
+                "resources": {
+                    "requests": [],
+                    "limits": [
+                        {"name": "cpu", "value": "1"},
+                        {"name": "memory", "value": "1Gi"},
+                    ],
+                },
             },
             "sidecars": {
                 "attestation_proxy_digest": format!("sha256:{}", "11".repeat(32)),
@@ -4086,13 +4096,14 @@ mod tests {
             },
         )
         .await;
-        let (status, _) = result.expect_err("invalid artifact authority rejects transition");
+        let (status, body) = result.expect_err("invalid artifact authority rejects transition");
         assert!(
             matches!(
                 status,
                 StatusCode::BAD_REQUEST | StatusCode::SERVICE_UNAVAILABLE
             ),
-            "invalid signed authority must fail before persistence, got {status}"
+            "invalid signed authority must fail before persistence, got {status} {}",
+            body.0
         );
 
         let persisted_mode: String =
