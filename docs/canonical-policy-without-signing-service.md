@@ -158,22 +158,36 @@ The witness is one static ELF. Before any accept:
    whose text matches the digest and then runs a host genpolicy is not
    this witness.
 5. In the child, after fork and before `execveat`, close every fd
-   except stdin, stdout, and stderr, then apply a landlock (or
-   equivalent) that denies every filesystem open. Landlock does not
+   except stdin, stdout, stderr, and the sealed memfd from step 4 —
+   that memfd is a fourth fd the exec consumes, and closing it makes
+   `execveat` `EBADF` on every run. Then install the sandbox: a
+   landlock (or equivalent) whose handled set covers every filesystem
+   access, EXECUTE included, and denies all of them, plus a network
+   denial — the net accesses
+   `LANDLOCK_ACCESS_NET_CONNECT_TCP | LANDLOCK_ACCESS_NET_BIND_TCP`
+   handled and denied, and a seccomp filter denying `socket` and
+   `socketpair`. The framing needs no sockets: stdin, stdout, and
+   stderr are already-open pipes. The seccomp half closes what landlock
+   does not mediate (UDP and Unix-domain sockets). Landlock does not
    revoke fds inherited across fork: the helper file fd is `O_CLOEXEC`,
    but other CAP sockets are not, and the helper must not inherit them.
-   Do not apply landlock to the CAP process. The helper may use only the
-   already-open stdin, stdout, and stderr. If the restriction cannot be
-   installed, 503 and do not exec. "The helper must not open files" is not a
-   check. The host can change a default template path the helper
-   reads, the digest still matches, and the witness emits the weaker
-   policy the artifact was signed to.
+   Do not apply the sandbox to the CAP process. If any part cannot be
+   installed, 503 and do not exec. If the exec then fails, do not "fix"
+   it by un-handling EXECUTE: `execveat` on the already-open sealed
+   memfd succeeds even when EXECUTE is handled and denied, and
+   un-handling it re-allows executing host path binaries — a quieter
+   version of the path-exec this design forbids. "The helper must not
+   open files" is not a check. The host can change a default template
+   path the helper reads, or steer the helper over the network to fetch
+   template or generator behavior; the digest still matches, and the
+   witness emits the weaker policy the artifact was signed to. Witness
+   output must be a function of stdin and release-signed inputs only.
 6. Stdin framing is `agent-policy-stdin-v1`, not `AgentPolicyRequest`.
    The live `/agent-policy` body does not carry the template. The
    framing is four fields, each a `u64` little-endian length prefix
    followed by exactly that many bytes, in order:
-   `descriptor_canonical_bytes`; the serde encoding of the
-   already-validated `LogEncryptionConfig`, or a zero length when
+   `descriptor_canonical_bytes`; the compact `serde_json` encoding of
+   the already-validated `LogEncryptionConfig`, or a zero length when
    absent (a zero length, not a JSON `null`); `policy_template_text`
    bytes; and `genpolicy_version` bytes. No paths. Any trailing byte
    after the fourth field is a framing error: 503. Two binaries that
@@ -249,7 +263,7 @@ When the client is absent:
 
 | Condition | HTTP |
 | --- | --- |
-| No release loaded, digest empty, digest not 64 lowercase hex, schema not `agent-policy-stdin-v1`, measurement mismatch, helper fails, landlock unavailable, helper pin ≠ `release.genpolicy_version`, or witness hash ≠ `sha256(witness text)` | 503 `canonical policy validation requires the platform signing service`. Log a distinct reason for each cause. The HTTP string stays shared, so a test that asserts only the body cannot tell the causes apart; sabotage tests assert the log reason. Check witness self-consistency before `validate_canonical_agent_policy`. A self-inconsistent witness must not become 400. |
+| No release loaded, digest empty, digest not 64 lowercase hex, schema not `agent-policy-stdin-v1`, measurement mismatch, helper fails, sandbox (landlock or seccomp) unavailable, helper pin ≠ `release.genpolicy_version`, or witness hash ≠ `sha256(witness text)` | 503 `canonical policy validation requires the platform signing service`. Log a distinct reason for each cause. The HTTP string stays shared, so a test that asserts only the body cannot tell the causes apart; sabotage tests assert the log reason. Check witness self-consistency before `validate_canonical_agent_policy`. A self-inconsistent witness must not become 400. That self-check is `validate_canonical_agent_policy`'s first compare today, whose `Mismatch` maps to 400 through `signing_error_response`; on this path extract or duplicate it to run before the shared call and map it to this row's 503, and only the remaining compares go through the shared call. |
 | Witness configured, no `signed_policy_artifact` | 503 `signed_policy_artifact required when the platform signing service is absent`. Do not synthesize an artifact. |
 | Pubkey absent | 503 `platform signing-service pubkey required for signed_policy_artifact verification`. Unchanged. |
 | `validate_signed_artifact` fails (signature, field caps, metadata binds) | Terminal. Existing `signing_error_response` for that error. Do not fall through to `/sign`. |
@@ -388,7 +402,10 @@ those two transactions, after the lane lock and before
 `accept_signed_workload_artifacts`, and only when
 `resolve_signed_policy_artifact` took the absent-service witness
 branch. A service-present resolve carries the live artifact and skips
-it. Rollback and dispatch revalidate a stored artifact via
+it. The transactions learn the branch from the resolve result — a flag
+on what resolve returns — or by re-testing `state.signing_service`,
+which is startup-frozen and equivalent. Do not key it off the artifact
+contents. Rollback and dispatch revalidate a stored artifact via
 `validate_stored_authority` and must not grow a witness dependency.
 
 ## Threats
@@ -403,6 +420,7 @@ it. Rollback and dispatch revalidate a stored artifact via
 | Replay of an artifact whose parsed `signed_at` is before the loaded release `created_at` | 400 `signed_artifact_mismatch`. |
 | Host rewrites a generator digest that is not in `canonical_release_bytes` | Not possible under this design: the digest is in both canonicalizers, or the witness is not configured. |
 | Host swaps the helper inode after the hash read and before exec, rewrites the same inode in that window, or writes the memfd after the seal | Not possible under this design: one buffer is hashed, that same buffer is written to a memfd sealed with `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` before fork, and `execveat` runs it. The fd is never re-read and the memfd is not writable after the seal. The gate tests all three swaps. |
+| Helper is steered over the network to fetch template or generator behavior | Not possible under this design: the sandbox handles and denies TCP connect/bind and seccomp denies `socket`, so witness output is a function of stdin and release-signed inputs only. The gate restriction test attempts a TCP connect and requires failure. |
 | Signing service suppressed to force a weaker path | Empty digest means the same 503 as today. Configured witness means the agent-policy compares above, not a customer-only accept. |
 | Split brain between service and witness | Service present: service wins. Witness is not an accept path. |
 | Witness or release missing | 503. Never fall through to customer checks. |
@@ -457,8 +475,10 @@ No KBS schema change.
    rejected. A landlock (or equivalent) that cannot be installed is 503
    and does not exec. For the restriction test, the unrestricted helper
    must actually attempt to open a named path (the release file, or cwd)
-   and that open must fail under the restriction; identical output alone
-   does not prove the restriction was installed.
+   and attempt a TCP connect; the open and the connect must both fail
+   under the restriction. A connect that returns `ECONNREFUSED` is a
+   pass for the attacker: the packet left the process. Identical output
+   alone does not prove the restriction was installed.
 3. Parity fixture: the same descriptor and log-encryption inputs
    through the live `/agent-policy` client and the measured helper
    produce byte-identical `agent_policy_text`, `agent_policy_sha256`,
