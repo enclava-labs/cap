@@ -545,6 +545,12 @@ pub struct DeploymentContextResponse {
     /// they keep producing claim-less signed renders.
     #[serde(default)]
     pub log_spool_state_bind_supported: bool,
+    /// Engine-contract id of the cc_init_data byte layout the API renders.
+    /// Absent on older APIs. Absence is not skew: failing closed would brick
+    /// this CLI against every platform that has not rolled the field out.
+    /// A present value that differs from the CLI pin is skew.
+    #[serde(default)]
+    pub cc_init_data_contract_version: Option<u32>,
     #[serde(default)]
     pub current_platform_release_id: Option<String>,
     #[serde(default)]
@@ -1264,6 +1270,17 @@ mod tests {
         }))
         .expect("deployment context with the gate field should decode");
         assert!(parsed.log_spool_state_bind_supported);
+        assert!(
+            parsed.cc_init_data_contract_version.is_none(),
+            "an older deployment-context omits the contract and must stay decodable"
+        );
+
+        let parsed: super::DeploymentContextResponse = serde_json::from_value(serde_json::json!({
+            "api_signing_pubkey": "pub",
+            "cc_init_data_contract_version": 1
+        }))
+        .expect("deployment context with the contract field should decode");
+        assert_eq!(parsed.cc_init_data_contract_version, Some(1));
     }
 
     #[test]

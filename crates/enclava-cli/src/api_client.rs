@@ -1080,6 +1080,19 @@ fn compose_api_error(status_code: u16, body: ApiErrorBody) -> (Option<String>, S
             "{message} (a previous instance's teardown is incomplete: ask the platform operator to erase the stale owner seed in KBS and clear the recorded waiver, or choose a different app name)"
         );
     }
+    // Hosted proxy keeps the allowlisted code and drops `detail`
+    // (enclava-paas `sanitize_cap_observation` allowlists
+    // `signed_artifact_mismatch` and collapses only unknown codes to
+    // `cap_operation_rejected`). A bare mismatch after a CLI or platform
+    // upgrade is the engine-contract brick (cap#196): name the pin and the
+    // fix even when the hashes never arrive. Direct CAP clients get `detail`
+    // instead, so this branch must not fire when a diagnostic was forwarded.
+    if code.as_deref() == Some("signed_artifact_mismatch") && !prefixed {
+        let pinned = enclava_engine::manifest::cc_init_data::CC_INIT_DATA_CONTRACT_VERSION;
+        message = format!(
+            "{message} (the hosted proxy omitted the field diagnostic, so this message cannot name which signed field mismatched; this CLI pins cc_init_data contract {pinned}. If this deploy failed after a CLI or platform upgrade, the usual cause is engine-contract skew: upgrade this CLI from a trusted source if the platform was upgraded, or wait for the platform rollout if you upgraded the CLI first)"
+        );
+    }
     if prefixed {
         (code, format!("{label}: {message}"))
     } else {
@@ -1213,6 +1226,38 @@ mod tests {
         assert_eq!(code.as_deref(), Some("stale_owner_seed"));
         assert!(message.starts_with("stale_owner_seed"), "{message}");
         assert!(message.contains("erase the stale owner seed"), "{message}");
+    }
+
+    #[test]
+    fn api_error_message_names_engine_contract_remedy_when_detail_is_stripped() {
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "signed_artifact_mismatch"
+        }))
+        .expect("sanitized mismatch body decodes");
+        let (code, message) = compose_api_error(400, body);
+        assert_eq!(code.as_deref(), Some("signed_artifact_mismatch"));
+        assert!(message.contains("cc_init_data contract"), "{message}");
+        assert!(
+            message.contains("upgrade this CLI from a trusted source"),
+            "{message}"
+        );
+        assert!(
+            message.contains("wait for the platform rollout"),
+            "{message}"
+        );
+
+        let detailed: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "signed_artifact_mismatch",
+            "detail": "expected_cc_init_data_hash mismatch: signed aa, platform rendered bb"
+        }))
+        .expect("direct mismatch body decodes");
+        let (_, message) = compose_api_error(400, detailed);
+        assert!(message.contains("signed aa"), "{message}");
+        assert!(message.contains("platform rendered bb"), "{message}");
+        assert!(
+            !message.contains("hosted proxy omitted"),
+            "a forwarded diagnostic must not be replaced by the stripped-proxy remedy: {message}"
+        );
     }
 
     #[test]
