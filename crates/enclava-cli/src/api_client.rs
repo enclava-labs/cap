@@ -648,9 +648,10 @@ impl ApiClient {
             .await
     }
 
-    /// Mint a token bound to one deployment. Template-deploy refresh must use
-    /// this instead of the app-scoped route, which cannot tell a superseded
-    /// deploy from an operator config write.
+    /// Mint a token bound to one deployment's apply generation. Deploy-time
+    /// writers (`enclava app deploy --set`, held template refresh) must use
+    /// this instead of the app-scoped route, which stamps the app's maximum
+    /// generation and cannot tell a superseded deploy from an operator write.
     pub async fn get_deployment_config_token(
         &self,
         deployment_id: &str,
