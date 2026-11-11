@@ -23,9 +23,11 @@ pub async fn deployment_apply_generation(
     .await
 }
 
-/// Generation an operator (app-scoped) config token may write as: the newest
-/// completed apply job. In-flight and superseded jobs are excluded so a
-/// refresh of an older deploy cannot be upgraded into the replacement.
+/// Newest apply-job generation for the app, including failed and in-flight jobs.
+///
+/// Operator `config set` must still be able to write after a held deploy
+/// advanced the TEE mark and then failed. The stale-CLI race is closed by
+/// the deployment-scoped refresh, not by narrowing this stamp.
 pub async fn app_config_write_generation(
     pool: &PgPool,
     app_id: Uuid,
@@ -33,8 +35,7 @@ pub async fn app_config_write_generation(
     sqlx::query_scalar(
         "SELECT MAX(generation)
            FROM deployment_apply_jobs
-          WHERE app_id = $1
-            AND state = 'completed'",
+          WHERE app_id = $1",
     )
     .bind(app_id)
     .fetch_one(pool)
@@ -128,8 +129,8 @@ mod tests {
             app_config_write_generation(&pool, app_id)
                 .await
                 .expect("app generation"),
-            Some(older_generation),
-            "an in-flight replacement must not become the app-scoped writer"
+            Some(newer_generation),
+            "operator tokens must include a failed or in-flight generation the TEE may already have accepted"
         );
         assert_ne!(
             deployment_apply_generation(&pool, older)

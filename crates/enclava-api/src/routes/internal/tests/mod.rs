@@ -2362,6 +2362,35 @@ async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() 
     let (first_status, Json(first)) = call(state.clone(), headers.clone())
         .await
         .expect("issue first generic config token");
+    let later = Uuid::new_v4();
+    let mut later_tx = pool.begin().await.expect("begin later generation");
+    sqlx::query(
+        "INSERT INTO deployment_apply_jobs (
+             deployment_id, app_id, org_id, source_deployment_id,
+             payload_version, payload, payload_sha256,
+             cleanup_app_on_setup_failure, signed_required, state
+         ) VALUES ($1, $2, $3, $1, 1, '{\"version\":1,\"log_encryption\":null}'::jsonb, $4,
+                   false, false, 'pending')",
+    )
+    .bind(later)
+    .bind(app_a)
+    .bind(org_id)
+    .bind(vec![8u8; 32])
+    .execute(&mut *later_tx)
+    .await
+    .expect("insert later apply job");
+    sqlx::query(
+        "INSERT INTO deployments
+                 (id, org_id, app_id, trigger, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'api', 'pending', '{}'::jsonb)",
+    )
+    .bind(later)
+    .bind(org_id)
+    .bind(app_a)
+    .execute(&mut *later_tx)
+    .await
+    .expect("insert later deployment");
+    later_tx.commit().await.expect("commit later generation");
     let (duplicate_status, Json(duplicate)) = call(state.clone(), headers.clone())
         .await
         .expect("regenerate exact generic config token");
@@ -2399,6 +2428,17 @@ async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() 
     .expect("jwt payload is json");
     assert_eq!(claims["deployment_generation"], stored_generation);
     assert_eq!(duplicate["token"], first["token"]);
+    let later_generation = sqlx::query_scalar::<_, i64>(
+        "SELECT generation FROM deployment_apply_jobs WHERE deployment_id = $1",
+    )
+    .bind(later)
+    .fetch_one(&pool)
+    .await
+    .expect("later generation");
+    assert!(
+        later_generation > stored_generation,
+        "replay must ignore a later apply job"
+    );
 
     insert_config_token_test_app(&pool, org_id, &org_name, app_b, &app_name_b, "b").await;
     sqlx::query("DELETE FROM deployments WHERE id = $1")

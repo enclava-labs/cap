@@ -644,7 +644,7 @@ impl ApiClient {
     // --- Config ---
 
     pub async fn get_config_token(&self, app_name: &str) -> Result<ConfigTokenResponse, ApiError> {
-        self.post_config_token(&format!("/apps/{app_name}/config-token"))
+        self.post_config_token_path(&format!("/apps/{app_name}/config-token"))
             .await
     }
 
@@ -656,11 +656,14 @@ impl ApiClient {
         deployment_id: &str,
     ) -> Result<ConfigTokenResponse, ApiError> {
         let deployment_id = path_segment(deployment_id);
-        self.post_config_token(&format!("/deployments/{deployment_id}/config-token"))
+        self.post_config_token_path(&format!("/deployments/{deployment_id}/config-token"))
             .await
     }
 
-    async fn post_config_token(&self, path: &str) -> Result<ConfigTokenResponse, ApiError> {
+    pub async fn post_config_token_path(
+        &self,
+        path: &str,
+    ) -> Result<ConfigTokenResponse, ApiError> {
         let resp = self
             .http
             .post(self.url(path))
