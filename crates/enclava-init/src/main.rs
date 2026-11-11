@@ -3,6 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -12,6 +13,7 @@ use enclava_init::config::{
     Config, LOG_SPOOL_STORAGE_STATE_BIND, LogEncryptionHandoff, LogEncryptionHandoffFile, Mode,
     VolumeConfig,
 };
+use enclava_init::guest_flush::{self, FlushReason};
 use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
@@ -53,6 +55,11 @@ const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
 const MANAGED_CONFIG_ROOT: &str = ".enclava";
 const MANAGED_CONFIG_DIR: &str = ".enclava/config";
 const MANAGED_CONFIG_DIR_MODE: u32 = 0o750;
+
+/// Set by the SIGTERM/SIGINT handler. The handler itself only calls
+/// `sync(2)` — async-signal-safe — and the stay-alive loop does the
+/// second flush after workload processes exit.
+static TEARDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -140,6 +147,15 @@ fn run_with_stats(stats: &mut init_stats::BootStats) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/enclava-init/config.toml"));
     let cfg = Config::load(&cfg_path).with_context(|| format!("loading {}", cfg_path.display()))?;
+    // Start the teardown flush before anything else runs (round-2 review
+    // suggestion 4): the handler's immediate sync(2) then also covers a
+    // pod deleted mid-bootstrap, and the monitor thread owns the
+    // structured post-sibling flush no matter what the stay-alive loop is
+    // blocked in.
+    start_teardown_flush(vec![
+        PathBuf::from(&cfg.state.mount_path),
+        PathBuf::from(&cfg.tls_state.mount_path),
+    ]);
     record_stage("validating signed config").ok();
     // Read the projected cc_init_data ConfigMap exactly once per boot and use
     // this single byte snapshot for BOTH the ConfigMap transport cross-check
@@ -516,6 +532,9 @@ fn write_ready_file_state(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn stay_alive_forever(cfg: &Config) -> ! {
+    // The teardown flush (handler + monitor thread) is already installed:
+    // run_with_stats starts it as soon as the config names the mounts,
+    // before readiness flips (round-2 review suggestion 4).
     let mut next_tls_check = Instant::now() + TLS_RENEWAL_CHECK_INTERVAL;
     if tls_renewal_check_required(cfg)
         && let Err(err) = spawn_served_tls_readiness_watch(cfg.clone())
@@ -673,8 +692,170 @@ where
 }
 
 fn stay_alive_after_failure() -> ! {
+    // run_with_stats installs the teardown flush as soon as the config
+    // loads. Config load itself can still fail, so cover that path here
+    // with the production default mount points (round-2 review suggestion
+    // 5: they mirror the manifest's `/state` and `/state/tls-state`
+    // mounts, which the engine pins in
+    // crates/enclava-engine/src/manifest/containers.rs). The guard inside
+    // makes the second call a no-op when the config-derived install
+    // already happened.
+    start_teardown_flush(vec![
+        PathBuf::from("/state"),
+        PathBuf::from("/state/tls-state"),
+    ]);
     loop {
         std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+fn teardown_requested() -> bool {
+    TEARDOWN_REQUESTED.load(Ordering::Acquire)
+}
+
+extern "C" fn handle_teardown_signal(_signal: i32) {
+    // Immediate flush. kubelet SIGKILLs this process at the end of the
+    // grace period whether or not the monitor thread has noticed the flag.
+    guest_flush::signal_safe_sync();
+    TEARDOWN_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Guards against a second monitor when the config-derived install and the
+/// failure-path install both run.
+static TEARDOWN_FLUSH_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Install the SIGTERM/SIGINT handler and start the monitor thread that
+/// owns the structured teardown flush.
+///
+/// The teardown work runs on its own thread (round-2 review warning 2):
+/// the stay-alive loop can block for minutes inside a broker TLS renewal
+/// (its HTTP client has a 180s timeout), and the old design only polled
+/// the flag between loop iterations — SIGKILL could arrive before the
+/// post-sibling flush while the workload's shutdown writes were still in
+/// the page cache. The monitor thread is parked until SIGTERM arrives and
+/// then owns the whole wait/flush sequence, exactly like the served-TLS
+/// readiness watch thread already lives apart from the loop.
+fn start_teardown_flush(mounts: Vec<PathBuf>) {
+    if TEARDOWN_FLUSH_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    install_teardown_flush_handler();
+    let spawn_result = std::thread::Builder::new()
+        .name("teardown-flush".to_string())
+        .spawn(move || {
+            while !teardown_requested() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            complete_teardown_flush(&mounts);
+        });
+    if let Err(err) = spawn_result {
+        // The handler's immediate sync(2) is still installed; only the
+        // structured post-sibling pass is lost.
+        tracing::warn!(
+            error = %err,
+            "spawning teardown flush monitor failed; SIGTERM still triggers the immediate sync"
+        );
+    }
+}
+
+fn install_teardown_flush_handler() {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    let action = SigAction::new(
+        SigHandler::Handler(handle_teardown_signal),
+        // No SA_RESTART: a restarted sleep in the monitor's poll loop only
+        // delays the flag check by one slice, and the teardown work itself
+        // no longer runs on the interrupted thread.
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+    for signal in [Signal::SIGTERM, Signal::SIGINT] {
+        // SAFETY: the handler only calls sync(2) and stores an atomic.
+        // Both are async-signal-safe. The disposition is process-wide.
+        if let Err(err) = unsafe { sigaction(signal, &action) } {
+            tracing::warn!(
+                error = %err,
+                signal = ?signal,
+                "failed to install guest filesystem flush handler"
+            );
+        }
+    }
+}
+
+/// Flush the persistent volumes, wait for workload processes to finish
+/// their own SIGTERM handling, then flush again — and keep re-flushing
+/// until shortly before the pod grace deadline while siblings remain.
+/// Exits the process. Runs on the teardown monitor thread.
+fn complete_teardown_flush(mounts: &[PathBuf]) -> ! {
+    let siblings = guest_flush::load_siblings(&started_dir_path(), std::process::id());
+    tracing::info!(
+        siblings = siblings.len(),
+        mounts = ?mounts,
+        "pod teardown: flushing guest filesystems"
+    );
+    let (reports, outcome) = guest_flush::execute_teardown(
+        &guest_flush::TeardownRequest {
+            mounts,
+            siblings: &siblings,
+            initial_wait: guest_flush::SIBLING_EXIT_WAIT,
+            deadline: guest_flush::TEARDOWN_DEADLINE,
+        },
+        |siblings| guest_flush::pending_siblings(Path::new("/proc"), siblings),
+        std::thread::sleep,
+    );
+    for (index, report) in reports.iter().enumerate() {
+        let reason = if index == 0 {
+            FlushReason::OnSignal
+        } else {
+            FlushReason::AfterSiblings
+        };
+        log_flush_report(reason, report);
+    }
+    if outcome.after_sibling_flushes as usize + 1 != reports.len() {
+        tracing::error!(
+            reports = reports.len(),
+            after_sibling_flushes = outcome.after_sibling_flushes,
+            "teardown flush bookkeeping is inconsistent"
+        );
+    }
+    if !outcome.siblings_remaining.is_empty() {
+        tracing::warn!(
+            pids = ?outcome.siblings_remaining,
+            waited_ms = u64::try_from(outcome.waited.as_millis()).unwrap_or(u64::MAX),
+            "guest flush deadline reached with workload processes still running; their writes after the last flush until SIGKILL can still be lost"
+        );
+    }
+    std::process::exit(0);
+}
+
+fn log_flush_report(reason: FlushReason, report: &guest_flush::FlushReport) {
+    for mount in &report.mounts {
+        match &mount.result {
+            Ok(()) => tracing::info!(
+                path = %mount.path.display(),
+                reason = reason.as_str(),
+                "synced guest filesystem"
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => tracing::warn!(
+                path = %mount.path.display(),
+                reason = reason.as_str(),
+                "guest filesystem mount is not present; skipped syncfs"
+            ),
+            Err(err) => tracing::error!(
+                path = %mount.path.display(),
+                reason = reason.as_str(),
+                error = %err,
+                "failed to sync guest filesystem"
+            ),
+        }
+    }
+    if !report.global_sync {
+        tracing::error!(
+            reason = reason.as_str(),
+            "guest page cache flush did not call sync(2)"
+        );
     }
 }
 

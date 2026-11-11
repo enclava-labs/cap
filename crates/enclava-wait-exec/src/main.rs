@@ -133,6 +133,9 @@ fn run(argv: Vec<OsString>) -> Result<(), String> {
     // Without encrypted logging there is no permitted output reader:
     // ReadStreamRequest is denied by the agent policy. Inheriting those pipes
     // eventually blocks a chatty payload (and its recovery path) on write.
+    // This exec replaces us, so we cannot flush after the workload exits.
+    // enclava-init owns that flush: it syncs on SIGTERM and again after this
+    // pid (unchanged by exec) leaves the guest.
     let err = Command::new(&program)
         .args(&args)
         .stdout(Stdio::null())
@@ -482,9 +485,15 @@ fn run_with_encrypted_logs(
         sequence_sidecar,
     );
 
-    let status = child
-        .wait()
-        .map_err(|err| format!("failed to wait for encrypted log child: {err}"))?;
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(err) => {
+            // The child may already have written. Flush before surfacing the
+            // wait error so those pages are not left for VM teardown.
+            flush_guest_page_cache();
+            return Err(format!("failed to wait for encrypted log child: {err}"));
+        }
+    };
     CHILD_PID.store(0, Ordering::Release);
     for result in [stdout_thread.join(), stderr_thread.join()] {
         match result {
@@ -493,7 +502,43 @@ fn run_with_encrypted_logs(
             Err(_) => eprintln!("enclava-wait-exec encrypted log forwarding panicked"),
         }
     }
-    Ok(status.code().unwrap_or(1))
+    // The child has stopped writing. Flush before we exit: enclava-init
+    // may already have synced, and this child's shutdown writes would
+    // otherwise sit in the guest page cache until the VM is destroyed.
+    Ok(exit_code_after_guest_flush(status, flush_guest_page_cache))
+}
+
+/// Flush the shared Kata guest page cache. Process exit does not write it
+/// back, and VM teardown discards it — the same failure as a pod delete
+/// with no guest `sync`.
+fn flush_guest_page_cache() {
+    // SAFETY: sync(2) takes no arguments. It writes every dirty page on
+    // this kernel, including the workload's persistent-home cache.
+    unsafe { nix::libc::sync() };
+    // Dev/test-only observable (same trust class as the other env
+    // overrides: honored exclusively in non-prod-strict builds): append a
+    // line AFTER sync(2) returns so integration tests can prove the
+    // production exit path actually flushed. Best-effort; never affects
+    // the flush itself.
+    if let Some(marker) = flush_proof_path()
+        && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&marker)
+    {
+        let _ = writeln!(file, "synced");
+    }
+}
+
+/// Path of the dev-build flush proof marker (`ENCLAVA_FLUSH_PROOF_FILE`).
+/// Prod-strict binds operational behavior to compiled behavior only, so
+/// the override resolves to `None` there (`env_override`).
+fn flush_proof_path() -> Option<PathBuf> {
+    env_override("ENCLAVA_FLUSH_PROOF_FILE").map(PathBuf::from)
+}
+
+/// The flush runs before the exit code is returned so a caller cannot
+/// observe child completion without having synced.
+fn exit_code_after_guest_flush(status: std::process::ExitStatus, flush: impl FnOnce()) -> i32 {
+    flush();
+    status.code().unwrap_or(1)
 }
 
 fn install_signal_forwarding() -> Result<(), String> {
@@ -1493,6 +1538,18 @@ mod tests {
             .unwrap()
             .as_nanos();
         env::temp_dir().join(format!("enclava-wait-exec-test-{}-{nanos}", process::id()))
+    }
+
+    #[test]
+    fn wrapped_child_exit_flushes_the_guest_page_cache_before_returning() {
+        let status = std::process::Command::new("true").status().unwrap();
+        let mut flushed = false;
+        let code = exit_code_after_guest_flush(status, || flushed = true);
+        assert_eq!(code, 0);
+        assert!(
+            flushed,
+            "child exit must flush the guest page cache before the wrapper returns"
+        );
     }
 
     #[test]
