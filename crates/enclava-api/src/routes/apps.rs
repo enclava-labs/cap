@@ -1911,6 +1911,43 @@ pub(crate) async fn delete_app_before(
     let pre_delete_teardown_required = teardown_required_pre_delete(&mut phase_tx, &phase_app)
         .await
         .map_err(|_| internal_server_error())?;
+    // Recover a generation whose StatefulSet write landed but whose
+    // publication stamp was lost to a crash, before the teardown unit is
+    // projected. `apply_committed_at` is not proof — the live object is.
+    // abandon_teardown is the operator escape when the cluster cannot be read.
+    if let Err(error) = crate::deploy::recover_unpublished_workload_spec(
+        &state.db,
+        &state.kube_client,
+        phase_app.id,
+        &phase_app.namespace,
+        &phase_app.name,
+        crate::deploy::PublicationRecoveryMode::BeforeTeardownSelection,
+    )
+    .await
+    {
+        tracing::warn!(
+            app_id = %phase_app.id,
+            error = %error,
+            abandon_teardown,
+            "could not recover workload publication before teardown selection"
+        );
+        if !abandon_teardown {
+            phase_tx
+                .rollback()
+                .await
+                .map_err(|_| internal_server_error())?;
+            delete_mutation
+                .finish()
+                .await
+                .map_err(|_| internal_server_error())?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "live workload publication could not be verified; retry deletion"
+                })),
+            ));
+        }
+    }
     // Admission control for the teardown policy pin (Codex security finding
     // 4a27950: teardown candidates can exhaust the global KBS policy budget).
     // A teardown-pending workload keeps required, retention-exempt signed

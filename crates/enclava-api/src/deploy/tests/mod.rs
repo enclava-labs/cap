@@ -9487,3 +9487,279 @@ async fn recovery_budget_bounds_stalled_compensation() {
     );
     assert!(started.elapsed() >= PULL_SECRET_CREATE_RECOVERY_BUDGET);
 }
+
+fn publication_row(
+    id: Uuid,
+    fence: &[i64],
+    published: bool,
+    provenance_incomplete: bool,
+) -> PublicationRecoveryDeployment {
+    PublicationRecoveryDeployment {
+        id,
+        manifest_hash: Some("hash-a".to_string()),
+        fence_generations: fence.to_vec(),
+        provenance_incomplete,
+        published,
+    }
+}
+
+#[test]
+fn publication_recovery_stamps_the_live_deployment_id_not_an_entered_apply() {
+    let written = Uuid::new_v4();
+    let entered_only = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: Some(written),
+        mutation_generation: Some(7),
+        manifest_hash: Some("hash-a".to_string()),
+    };
+    let rows = vec![
+        publication_row(entered_only, &[8], false, false),
+        publication_row(written, &[7], false, false),
+    ];
+    assert_eq!(
+        decide_workload_publication_recovery(&live, &rows),
+        PublicationRecoveryDecision::Stamp(written)
+    );
+}
+
+#[test]
+fn publication_recovery_does_not_treat_a_planned_hash_as_a_write() {
+    // The live object still names the previous generation. A later row that
+    // stored the same manifest hash before reaching the StatefulSet is not it.
+    let previous = Uuid::new_v4();
+    let planned = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: Some(previous),
+        mutation_generation: Some(4),
+        manifest_hash: Some("hash-a".to_string()),
+    };
+    let rows = vec![
+        publication_row(previous, &[4], true, false),
+        publication_row(planned, &[], false, false),
+    ];
+    assert_eq!(
+        decide_workload_publication_recovery(&live, &rows),
+        PublicationRecoveryDecision::AlreadyRecorded
+    );
+}
+
+#[test]
+fn publication_recovery_accepts_a_fenced_generation_when_the_label_was_stripped() {
+    let written = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: None,
+        mutation_generation: Some(9),
+        manifest_hash: Some("hash-a".to_string()),
+    };
+    assert_eq!(
+        decide_workload_publication_recovery(
+            &live,
+            &[publication_row(written, &[9], false, false)]
+        ),
+        PublicationRecoveryDecision::Stamp(written)
+    );
+}
+
+#[test]
+fn publication_recovery_covers_a_historical_label_without_fence_provenance() {
+    let historical = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: Some(historical),
+        mutation_generation: Some(3),
+        manifest_hash: None,
+    };
+    let mut row = publication_row(historical, &[], false, true);
+    row.manifest_hash = None;
+    assert_eq!(
+        decide_workload_publication_recovery(&live, &[row]),
+        PublicationRecoveryDecision::Stamp(historical)
+    );
+}
+
+#[test]
+fn publication_recovery_refuses_disagreeing_label_and_generation() {
+    let labeled = Uuid::new_v4();
+    let fenced = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: Some(labeled),
+        mutation_generation: Some(5),
+        manifest_hash: Some("hash-a".to_string()),
+    };
+    let rows = vec![
+        publication_row(labeled, &[4], false, false),
+        publication_row(fenced, &[5], false, false),
+    ];
+    assert_eq!(
+        decide_workload_publication_recovery(&live, &rows),
+        PublicationRecoveryDecision::Ambiguous
+    );
+}
+
+#[test]
+fn live_workload_publication_reads_the_applied_spec_identity() {
+    let deployment_id = Uuid::new_v4();
+    let sts: k8s_openapi::api::apps::v1::StatefulSet = serde_json::from_value(serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": {
+            "name": "app",
+            "namespace": "cap-app",
+            "annotations": {
+                "enclava.dev/cap-provider-mutation-generation": "12",
+                "enclava.dev/manifest-hash": "abc"
+            }
+        },
+        "spec": {
+            "template": {
+                "metadata": {
+                    "labels": { "enclava.dev/deployment-id": deployment_id.to_string() }
+                }
+            }
+        }
+    }))
+    .expect("statefulset publication fixture");
+    assert_eq!(
+        live_workload_publication(&sts),
+        LiveWorkloadPublication {
+            deployment_id: Some(deployment_id),
+            mutation_generation: Some(12),
+            manifest_hash: Some("abc".to_string()),
+        }
+    );
+}
+
+fn publication_statefulset_client(deployment_id: Uuid, fail: bool) -> kube::Client {
+    use axum::http::{Request, Response};
+    use http_body_util::BodyExt;
+    use kube::client::Body;
+    use tower::service_fn;
+
+    kube::Client::new(
+        service_fn(move |request: Request<Body>| async move {
+            let _ = request.into_body().collect().await;
+            if fail {
+                let status = serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "reason": "ServerTimeout",
+                    "message": "timed out",
+                    "code": 500,
+                });
+                return Ok::<_, std::io::Error>(
+                    Response::builder()
+                        .status(500)
+                        .body(Body::from(serde_json::to_vec(&status).unwrap()))
+                        .unwrap(),
+                );
+            }
+            let sts = serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "metadata": {
+                    "name": "queued-app",
+                    "namespace": "cap-queued-app",
+                    "annotations": {
+                        "enclava.dev/cap-provider-mutation-generation": "4",
+                        "enclava.dev/manifest-hash": "written"
+                    }
+                },
+                "spec": {
+                    "replicas": 1,
+                    "template": {
+                        "metadata": {
+                            "labels": { "enclava.dev/deployment-id": deployment_id.to_string() }
+                        }
+                    }
+                }
+            });
+            Ok(Response::builder()
+                .status(200)
+                .body(Body::from(serde_json::to_vec(&sts).unwrap()))
+                .unwrap())
+        }),
+        "default",
+    )
+}
+
+#[tokio::test]
+async fn recover_unpublished_workload_spec_stamps_the_live_generation() {
+    let pool = crate::test_support::database_test_pool().await;
+    let (app, deployment_id, _, _) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'applying',
+                apply_committed_at = clock_timestamp(),
+                manifest_hash = 'written',
+                namespace_fence_generations = ARRAY[4]::bigint[],
+                workload_spec_published_at = NULL
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&pool)
+    .await
+    .expect("mark the crash window");
+
+    recover_unpublished_workload_spec(
+        &pool,
+        &publication_statefulset_client(deployment_id, false),
+        app.id,
+        &app.namespace,
+        &app.name,
+        PublicationRecoveryMode::BeforeSupersession,
+    )
+    .await
+    .expect("recover the written spec");
+    let stamped: bool = sqlx::query_scalar(
+        "SELECT workload_spec_published_at IS NOT NULL FROM deployments WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read recovered stamp");
+    assert!(
+        stamped,
+        "the live deployment id must recover the lost stamp"
+    );
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(app.org_id)
+        .execute(&pool)
+        .await
+        .expect("delete publication recovery fixture");
+}
+
+#[tokio::test]
+async fn recover_unpublished_workload_spec_refuses_an_unreadable_in_flight_write() {
+    let pool = crate::test_support::database_test_pool().await;
+    let (app, deployment_id, _, _) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'applying',
+                apply_committed_at = clock_timestamp(),
+                workload_spec_published_at = NULL
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&pool)
+    .await
+    .expect("mark an in-flight StatefulSet attempt");
+
+    let error = recover_unpublished_workload_spec(
+        &pool,
+        &publication_statefulset_client(deployment_id, true),
+        app.id,
+        &app.namespace,
+        &app.name,
+        PublicationRecoveryMode::BeforeSupersession,
+    )
+    .await
+    .expect_err("an unreadable in-flight write must not be superseded");
+    assert!(matches!(error, DeployError::PublicationUnclassified));
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(app.org_id)
+        .execute(&pool)
+        .await
+        .expect("delete unreadable publication fixture");
+}

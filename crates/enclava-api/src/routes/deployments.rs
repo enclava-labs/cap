@@ -1875,6 +1875,22 @@ async fn deploy_app_candidate(
                 ));
             }
         };
+    crate::deploy::recover_unpublished_workload_spec(
+        &state.db,
+        &state.kube_client,
+        app.id,
+        &app.namespace,
+        &app.name,
+        crate::deploy::PublicationRecoveryMode::BeforeSupersession,
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(app_id = %app.id, error = %error, "refusing supersession until workload publication can be classified");
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "live workload publication could not be verified; retry the deployment",
+        )
+    })?;
     crate::deploy::supersede_incomplete_deployments(&mut tx, app.id)
         .await
         .map_err(|error| match error {

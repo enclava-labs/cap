@@ -1968,6 +1968,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
     // Do not let stray debt opt an unsigned installation into signed mode.
     clear_stray_policy_debts(db).await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
+    let mut publication_recovered = false;
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
         let state = load_signed_policy_reconciliation(db).await?;
         if state.desired_generation == 0 {
@@ -2009,6 +2010,21 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             state.desired_generation + state.selector_bumps_owed + state.withdrawal_bumps_owed;
         let reset_bootstrap = state.configmap_generation == 0 && state.applied_generation == 0;
         let previously_applied = state.applied_generation >= generation;
+        // A crash between StatefulSet apply and the publication stamp leaves
+        // a deleting app's serving generation unpublished. Recover it from
+        // the live object before the selector reads the column. Once per
+        // pass: one unread namespace must not fail every app's reconciliation.
+        if !publication_recovered {
+            publication_recovered = true;
+            if let Err(error) =
+                crate::deploy::recover_deleting_workload_publications(db, &client).await
+            {
+                tracing::warn!(
+                    error = %error,
+                    "workload publication recovery failed before signed policy selection"
+                );
+            }
+        }
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
         // Every signed authority is withheld behind an unreleased
         // customer-config hold: publishing the empty body would flip a
@@ -9193,6 +9209,146 @@ resource_bindings := {
         }
 
         crate::test_support::drop_isolated_database("cap_teardown_queued", pool).await;
+    }
+
+    #[tokio::test]
+    async fn crash_before_publication_stamp_is_recovered_from_the_live_statefulset() {
+        // Generation 6 applied its StatefulSet and died before the stamp.
+        // Generation 7 was superseded in preflight and never wrote one.
+        // Deleting must authorize 6, and must not treat 7's apply entry as a
+        // write just because apply_committed_at is set.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_crash_stamp").await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        mark_test_workload_published(&pool, completed).await;
+        let completed_artifact = insert_test_artifact(&pool, app_id, completed, "11").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            completed,
+            completed,
+            Some((completed, &completed_artifact)),
+        )
+        .await;
+
+        let crashed = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            crashed,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        set_test_setup_state(&pool, crashed, "accepted").await;
+        sqlx::query(
+            "UPDATE deployments
+                SET apply_committed_at = clock_timestamp(),
+                    manifest_hash = 'crashed-spec',
+                    namespace_fence_generations = ARRAY[6]::bigint[]
+              WHERE id = $1",
+        )
+        .bind(crashed)
+        .execute(&pool)
+        .await
+        .expect("record the crash window without a publication stamp");
+        let crashed_artifact = insert_test_artifact(&pool, app_id, crashed, "22").await;
+        insert_failed_apply_job(&pool, org_id, app_id, crashed, &crashed_artifact, 6).await;
+
+        let never_wrote = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            never_wrote,
+            "failed",
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+        set_test_setup_state(&pool, never_wrote, "accepted").await;
+        sqlx::query(
+            "UPDATE deployments
+                SET apply_committed_at = clock_timestamp(),
+                    manifest_hash = 'never-wrote'
+              WHERE id = $1",
+        )
+        .bind(never_wrote)
+        .execute(&pool)
+        .await
+        .expect("mark a later apply that entered the StatefulSet step and did not write it");
+        let never_wrote_artifact = insert_test_artifact(&pool, app_id, never_wrote, "33").await;
+        insert_failed_apply_job(&pool, org_id, app_id, never_wrote, &never_wrote_artifact, 7).await;
+
+        let before = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority before recovery");
+        let before_hashes: HashSet<_> = before
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            !before_hashes.contains(crashed_artifact.metadata.descriptor_core_hash.as_str()),
+            "the lost stamp must be the bug this recovery closes"
+        );
+
+        crate::deploy::apply_live_publication_recovery(
+            &pool,
+            app_id,
+            &crate::deploy::LiveWorkloadPublication {
+                deployment_id: Some(crashed),
+                mutation_generation: Some(6),
+                manifest_hash: Some("crashed-spec".to_string()),
+            },
+            crate::deploy::PublicationRecoveryMode::BeforeTeardownSelection,
+        )
+        .await
+        .expect("recover publication from the live StatefulSet");
+
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority after recovery");
+        let hashes: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            hashes.contains(completed_artifact.metadata.descriptor_core_hash.as_str()),
+            "the last completed workload stays authorized"
+        );
+        assert!(
+            hashes.contains(crashed_artifact.metadata.descriptor_core_hash.as_str()),
+            "the generation still named by the live StatefulSet must be authorized"
+        );
+        assert!(
+            !hashes.contains(never_wrote_artifact.metadata.descriptor_core_hash.as_str()),
+            "entering the StatefulSet step is not a write"
+        );
+        let unit = load_teardown_policy_unit(&pool, app_id)
+            .await
+            .expect("project the teardown unit");
+        let unit_hashes: HashSet<_> = unit
+            .iter()
+            .map(|artifact| artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            unit_hashes.contains(crashed_artifact.metadata.descriptor_core_hash.as_str()),
+            "delete admission must include the recovered artifact"
+        );
+        assert!(!unit_hashes.contains(never_wrote_artifact.metadata.descriptor_core_hash.as_str()));
+
+        crate::test_support::drop_isolated_database("cap_teardown_crash_stamp", pool).await;
     }
 
     #[tokio::test]
