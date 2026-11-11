@@ -715,9 +715,16 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
             enclava_cli::template_deploy_retry::load_template_deploy_attempt(
                 &paths, &scope, "shell"
             ),
-            enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Ready(_)
+            enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Absent
         ),
-        "a 404 for `Shell` must not clear `shell`'s resume file; the platform treats them as different apps"
+        "destroy sends the slug PaaS and template deploy use, so Shell must clear shell's resume file"
+    );
+    assert_eq!(template_resume_instance_name("Shell"), "shell");
+    assert_eq!(template_resume_instance_name(" shell "), "shell");
+    assert_eq!(
+        template_resume_instance_name("Not A Slug"),
+        "Not A Slug",
+        "a name template deploy would reject must not be rewritten onto another app's file"
     );
 }
 

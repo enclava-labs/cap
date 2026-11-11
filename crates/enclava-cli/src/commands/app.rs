@@ -3866,7 +3866,15 @@ pub struct DestroyArgs {
 }
 
 pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let app_name = resolve_app_name(&args.app)?;
+    let requested = resolve_app_name(&args.app)?;
+    // Template deploy lowercases before it locks and saves. PaaS does the
+    // same in `validate_slug` before DELETE, so `Shell` deletes `shell` and
+    // returns success. An exact-match API 404s on `Shell` and leaves `shell`.
+    // Either way the resume file and the lock are under the slug. Send that
+    // slug, and confirm it, so a 404 or a success is about the same app whose
+    // file we clear. A name that is not a slug is sent unchanged and only its
+    // own key is touched.
+    let app_name = template_resume_instance_name(&requested);
     let paths = CliPaths::resolve()?;
     let cli_config = config::load_config(&paths)?;
     let creds = config::load_credentials(&paths)?;
@@ -3900,15 +3908,10 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     let scope =
         crate::commands::template::template_deploy_resume_scope(&api, &creds, &cli_config).await?;
     // Same per-app lock as `template deploy`, held across deletion and resume
-    // cleanup. The lock name is the name the delete request sends. Template
-    // deploy lowercases before it locks, so `shell` and `shell` share the
-    // lock. `Shell` is a different app: the platform compares names exactly,
-    // and locking the lowercased name would let a 404 for `Shell` clear
-    // `shell`'s in-flight request.
-    let resume_name = template_resume_instance_name(&app_name);
+    // cleanup. `app_name` is already the slug that deploy locks, and it is the
+    // name this delete sends.
     let _deploy_lock =
-        enclava_cli::template_deploy_retry::lock_template_deploy(&paths, &scope, &resume_name)
-            .await?;
+        enclava_cli::template_deploy_retry::lock_template_deploy(&paths, &scope, &app_name).await?;
 
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.red} {msg}")?);
@@ -3966,15 +3969,15 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 #[path = "app/tests/mod.rs"]
 pub(crate) mod tests;
 
-/// Name this destroy locks and clears.
+/// Slug template deploy locks and PaaS deletes.
 ///
-/// Template deploy lowercases the instance name, and the platform delete
-/// lookup compares names exactly. A 404 for `Shell` does not mean `shell` is
-/// gone, so the lock and the file use the name the delete request sends.
-/// Clearing the lowercased file after that 404 erases a live app's signed
-/// request.
+/// Both fold the instance name to lowercase before they store or delete.
+/// Destroy must send, lock, and clear that same slug. Clearing it after a
+/// delete of the raw name is wrong: PaaS has already deleted the slug, and
+/// an exact-match API has not. A name that is not a slug was never a
+/// template-deploy key, so it is left unchanged.
 fn template_resume_instance_name(app_name: &str) -> String {
-    app_name.to_string()
+    crate::commands::template::normalize_slug(app_name).unwrap_or_else(|_| app_name.to_string())
 }
 
 /// Drop the local template-deploy resume file after the named app is gone.
