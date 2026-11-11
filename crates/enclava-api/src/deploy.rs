@@ -7393,6 +7393,11 @@ pub async fn apply_deployment_manifests(
     let hash = manifest_hash(&manifests);
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
     set_app_status(&pool, app.id, "creating").await?;
+    // KBS convergence must stay ahead of the namespace arm and every
+    // namespace/edge write below: the job worker releases this attempt's
+    // fences outright when it returns `KbsPolicyError::RolloutTimedOut`
+    // (see `requeue_after_trustee_rollout_timeout`), which is only sound
+    // while no other provider write of this attempt can be in flight.
     if signed_policy_artifact.is_some() {
         if should_reconcile_global_signed_policy_artifacts(true, &app_spec.attestation) {
             // Acceptance already advanced the durable desired generation in

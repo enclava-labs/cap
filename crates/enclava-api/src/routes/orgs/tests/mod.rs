@@ -513,12 +513,15 @@ async fn put_keyring_reports_success_only_after_kbs_publication() {
                 let mut provider = provider.lock().await;
                 provider.healthy = true;
             }
-            // Failed provider calls retain their fence until its reclaim deadline.
+            // A failed provider call retains its fence until the reclaim
+            // deadline only when a write may still be in flight; a failure
+            // before any write already released it (nothing to expire).
             sqlx::query(
                 "UPDATE external_resource_mutation_leases
                 SET locked_until = clock_timestamp() - interval '2 seconds',
                     reclaim_after = clock_timestamp() - interval '1 second'
-              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'
+                AND owner_token IS NOT NULL",
             )
             .execute(&pool)
             .await
@@ -711,7 +714,8 @@ async fn put_keyring_second_owner_replays_current_envelope_without_owning_signer
                 "UPDATE external_resource_mutation_leases
                 SET locked_until = clock_timestamp() - interval '2 seconds',
                     reclaim_after = clock_timestamp() - interval '1 second'
-              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'
+                AND owner_token IS NOT NULL",
             )
             .execute(&pool)
             .await
@@ -743,7 +747,8 @@ async fn put_keyring_second_owner_replays_current_envelope_without_owning_signer
                 "UPDATE external_resource_mutation_leases
                 SET locked_until = clock_timestamp() - interval '2 seconds',
                     reclaim_after = clock_timestamp() - interval '1 second'
-              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'
+                AND owner_token IS NOT NULL",
             )
             .execute(&pool)
             .await
@@ -2151,7 +2156,8 @@ async fn rotate_owner_reports_success_only_after_kbs_publication() {
                 "UPDATE external_resource_mutation_leases
                 SET locked_until = clock_timestamp() - interval '2 seconds',
                     reclaim_after = clock_timestamp() - interval '1 second'
-              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
+              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'
+                AND owner_token IS NOT NULL",
             )
             .execute(&pool)
             .await

@@ -1774,10 +1774,15 @@ async fn teardown_unit_already_published_with_applied(
         .as_ref()
         .and_then(|spec| spec.template.metadata.as_ref())
         .and_then(|metadata| metadata.annotations.as_ref());
-    Ok(
-        annotated_policy_generation(template)? == Some((generation, hash.as_str()))
-            && template.and_then(|a| a.get(POLICY_PUBLICATION_TOKEN_ANNOTATION)) == Some(token),
-    )
+    // The template keeps the generation it was last rolled at: a later
+    // generation with a byte-identical body advances only the ConfigMap (see
+    // `template_serves_publication`), so an older template generation with
+    // this exact hash and publication token is the same serving policy.
+    Ok(matches!(
+        annotated_policy_generation(template)?,
+        Some((template_generation, template_hash))
+            if template_generation <= generation && template_hash == hash
+    ) && template.and_then(|a| a.get(POLICY_PUBLICATION_TOKEN_ANNOTATION)) == Some(token))
 }
 
 pub async fn reconcile_signed_policy_artifacts(
@@ -1823,15 +1828,52 @@ pub async fn reconcile_signed_policy_once(
         vec![crate::mutation_leases::ResourceFence::kbs_policy()],
     )
     .await?;
-    lease
+    reconcile_pending_under_resource_lease(state, lease).await
+}
+
+/// Converge the pending signed policy under an already claimed global
+/// `kbs_policy` lease and release the lease on every outcome that provably
+/// leaves no Kubernetes write of this holder in flight.
+///
+/// The lease+quarantine horizon (540 s) exists for a holder that can no
+/// longer vouch for its own writes: a crashed process, a lost heartbeat
+/// (`guard_provider` cancels the future mid-request), or a mutating request
+/// whose outcome is unknown (`provider_write_may_be_in_flight`). Those keep
+/// the row owned by dropping the lease untouched. Every other failure — a
+/// Trustee rollout that did not become Ready in time, a read error, a
+/// deferred publication — returned only after each write was awaited to a
+/// known outcome, and the next holder re-converges from the ConfigMap
+/// annotations under resourceVersion CAS. Holding the fence there protects
+/// nothing and blocks every deployment on the platform for the quarantine.
+pub(crate) async fn reconcile_pending_under_resource_lease(
+    state: &crate::state::AppState,
+    lease: crate::mutation_leases::ResourceMutationLease,
+) -> Result<(), KbsPolicyReconciliationError> {
+    let outcome = lease
         .guard_provider(reconcile_pending_signed_policy_artifacts(
             &state.db,
             state.kbs_policy.as_ref(),
             &state.kube_client,
         ))
-        .await??;
-    lease.finish().await?;
-    Ok(())
+        .await?;
+    match outcome {
+        Ok(()) => {
+            lease.finish().await?;
+            Ok(())
+        }
+        Err(error) if error.provider_write_may_be_in_flight() => Err(error.into()),
+        Err(error) => {
+            if let Err(release_error) = lease.finish().await {
+                tracing::warn!(
+                    error = %release_error,
+                    error_code = "kbs_policy_lease_finish_failed",
+                    "failed to release the KBS policy fence after a failed reconciliation; \
+                     it stays owned through the reclaim quarantine"
+                );
+            }
+            Err(error.into())
+        }
+    }
 }
 
 /// Call after releasing the org transaction: publication claims the global KBS
@@ -2284,6 +2326,24 @@ async fn converge_signed_policy_configmap(
             .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
             .filter(|token| !token.is_empty())
             .cloned();
+        // A newer generation whose body is byte-identical to the published
+        // one advances only the fence: the generation annotation still moves
+        // forward under the same resourceVersion CAS (so older writers stay
+        // superseded), but the publication token is kept. The token names
+        // the ConfigMap write that last changed what Trustee must serve; a
+        // pod template carrying it already runs this exact body, so
+        // re-minting it would only restart Trustee for nothing.
+        let retained_publication_token = match (existing, existing_publication_token.as_ref()) {
+            (Some((existing_generation, annotated_hash)), Some(token))
+                if !allow_generation_reset
+                    && existing_generation < generation
+                    && annotated_hash == policy_sha256_hex
+                    && current_content_hash == policy_sha256_hex =>
+            {
+                Some(token.clone())
+            }
+            _ => None,
+        };
         match generation_decision(
             existing,
             Some(&current_content_hash),
@@ -2321,9 +2381,11 @@ async fn converge_signed_policy_configmap(
         );
         // Kubernetes assigns the next resourceVersion only after a successful
         // CAS. Binding the publication to the version it replaces yields a
-        // stable token that changes on every CAP policy publication, including
-        // a same-generation repair after a stale legacy overwrite.
-        let publication_token = prior_resource_version;
+        // stable token that changes on every CAP policy publication that
+        // changes (or repairs) the body, including a same-generation repair
+        // after a stale legacy overwrite. resourceVersions only grow, so a
+        // retained token can never collide with a later minted one.
+        let publication_token = retained_publication_token.unwrap_or(prior_resource_version);
         annotations.insert(
             POLICY_PUBLICATION_TOKEN_ANNOTATION.to_string(),
             publication_token.clone(),
@@ -2432,6 +2494,16 @@ async fn converge_trustee_policy_generation(
         {
             decision = GenerationDecision::Replace;
         }
+        if template_serves_publication(
+            existing,
+            existing_publication_token,
+            generation,
+            policy_sha256_hex,
+            publication_token,
+        ) {
+            // Leave the template alone: only confirm the rollout is Ready.
+            decision = GenerationDecision::Current;
+        }
         match decision {
             GenerationDecision::Superseded => return Ok(GenerationDecision::Superseded),
             GenerationDecision::Current => {
@@ -2501,6 +2573,31 @@ async fn converge_trustee_policy_generation(
     Err(KbsPolicyError::PolicyCasExhausted)
 }
 
+/// True when the Trustee pod template was rolled for exactly the publication
+/// the ConfigMap now carries, under an older generation number.
+///
+/// The publication token is minted from the ConfigMap resourceVersion that
+/// the body-changing write replaced and is kept only while the body stays
+/// byte-identical, so `(sha256, token)` identifies one ConfigMap body. A
+/// template is stamped with a token only after that ConfigMap write
+/// succeeded, so its pods started with that body mounted. The template's
+/// lower generation annotation is then merely stale bookkeeping; a
+/// different hash or token (changed body, stale-overwrite repair, crash
+/// before the template patch) never matches and still forces a roll.
+fn template_serves_publication(
+    template: Option<(i64, &str)>,
+    template_publication_token: Option<&str>,
+    desired_generation: i64,
+    desired_hash: &str,
+    desired_publication_token: &str,
+) -> bool {
+    matches!(
+        template,
+        Some((generation, policy_hash))
+            if generation < desired_generation && policy_hash == desired_hash
+    ) && template_publication_token == Some(desired_publication_token)
+}
+
 fn deployment_rollout_is_ready(deployment: &Deployment) -> bool {
     let desired = deployment
         .spec
@@ -2542,19 +2639,29 @@ async fn wait_for_deployment_policy_generation(
             .and_then(|spec| spec.template.metadata.as_ref())
             .and_then(|metadata| metadata.annotations.as_ref());
         let annotated = annotated_policy_generation(template_annotations)?;
-        let decision = generation_decision(
-            annotated,
-            annotated.map(|(_, policy_hash)| policy_hash),
-            desired_generation,
-            desired_hash,
-            allow_generation_reset,
-        )?;
-        if decision == GenerationDecision::Superseded {
-            return Ok(decision);
-        }
         let publication_token = template_annotations
             .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
             .map(String::as_str);
+        let decision = if template_serves_publication(
+            annotated,
+            publication_token,
+            desired_generation,
+            desired_hash,
+            desired_publication_token,
+        ) {
+            GenerationDecision::Current
+        } else {
+            generation_decision(
+                annotated,
+                annotated.map(|(_, policy_hash)| policy_hash),
+                desired_generation,
+                desired_hash,
+                allow_generation_reset,
+            )?
+        };
+        if decision == GenerationDecision::Superseded {
+            return Ok(decision);
+        }
         if decision == GenerationDecision::Current
             && publication_token != Some(desired_publication_token)
         {
@@ -4029,6 +4136,12 @@ resource_bindings := {
         configmap: Option<ConfigMap>,
         deployment: Option<Deployment>,
         next_resource_version: u64,
+        configmap_writes: usize,
+        /// Every Deployment write is a pod-template change, i.e. a Trustee roll.
+        deployment_writes: usize,
+        /// Answer every PUT with a 500, as an API server that may or may not
+        /// have persisted the write.
+        fail_writes: bool,
     }
 
     #[derive(Clone)]
@@ -4095,6 +4208,7 @@ resource_bindings := {
                         }),
                     }),
                     next_resource_version: 2,
+                    ..Default::default()
                 },
             )))
         }
@@ -4132,6 +4246,45 @@ resource_bindings := {
                         } else if method == axum::http::Method::PUT {
                             let mut value: serde_json::Value =
                                 serde_json::from_slice(&body).map_err(std::io::Error::other)?;
+                            // Optimistic concurrency like a real API server: a
+                            // write carrying a stale resourceVersion conflicts.
+                            let live_version = if is_configmap {
+                                state
+                                    .configmap
+                                    .as_ref()
+                                    .and_then(|object| object.metadata.resource_version.clone())
+                            } else {
+                                state
+                                    .deployment
+                                    .as_ref()
+                                    .and_then(|object| object.metadata.resource_version.clone())
+                            };
+                            let stale = value["metadata"]["resourceVersion"].as_str()
+                                != live_version.as_deref();
+                            if state.fail_writes || stale {
+                                let code = if state.fail_writes { 500 } else { 409 };
+                                return Ok::<_, std::io::Error>(
+                                    axum::http::Response::builder()
+                                        .status(code)
+                                        .body(kube::client::Body::from(
+                                            serde_json::to_vec(&serde_json::json!({
+                                                "kind": "Status",
+                                                "apiVersion": "v1",
+                                                "status": "Failure",
+                                                "message": "fake write rejection",
+                                                "reason": if code == 409 { "Conflict" } else { "InternalError" },
+                                                "code": code,
+                                            }))
+                                            .unwrap(),
+                                        ))
+                                        .unwrap(),
+                                );
+                            }
+                            if is_configmap {
+                                state.configmap_writes += 1;
+                            } else if is_deployment {
+                                state.deployment_writes += 1;
+                            }
                             value["metadata"]["resourceVersion"] =
                                 serde_json::json!(resource_version);
                             state.next_resource_version += 1;
@@ -4177,6 +4330,34 @@ resource_bindings := {
             )
         }
 
+        /// (generation, sha256, publication token) annotated on the ConfigMap.
+        async fn configmap_publication(&self) -> (String, String, String) {
+            let state = self.0.lock().await;
+            publication_annotations(
+                state
+                    .configmap
+                    .as_ref()
+                    .and_then(|configmap| configmap.metadata.annotations.as_ref()),
+            )
+        }
+
+        /// (generation, sha256, publication token) on the Trustee pod template.
+        async fn template_publication(&self) -> (String, String, String) {
+            let state = self.0.lock().await;
+            publication_annotations(
+                state
+                    .deployment
+                    .as_ref()
+                    .and_then(|deployment| deployment.spec.as_ref())
+                    .and_then(|spec| spec.template.metadata.as_ref())
+                    .and_then(|metadata| metadata.annotations.as_ref()),
+            )
+        }
+
+        async fn trustee_rolls(&self) -> usize {
+            self.0.lock().await.deployment_writes
+        }
+
         async fn configmap_policy(&self) -> Option<String> {
             self.0
                 .lock()
@@ -4187,6 +4368,385 @@ resource_bindings := {
                 .and_then(|data| data.get("resource-policy"))
                 .cloned()
         }
+    }
+
+    fn publication_annotations(
+        annotations: Option<&BTreeMap<String, String>>,
+    ) -> (String, String, String) {
+        let value = |key: &str| {
+            annotations
+                .and_then(|annotations| annotations.get(key))
+                .cloned()
+                .unwrap_or_default()
+        };
+        (
+            value(POLICY_GENERATION_ANNOTATION),
+            value(POLICY_SHA256_ANNOTATION),
+            value(POLICY_PUBLICATION_TOKEN_ANNOTATION),
+        )
+    }
+
+    fn fake_kbs_config() -> KbsPolicyConfig {
+        KbsPolicyConfig {
+            namespace: "trustee".to_string(),
+            configmap_name: "resource-policy".to_string(),
+            policy_key: "resource-policy".to_string(),
+            deployment_name: "trustee".to_string(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 900 * 1024,
+        }
+    }
+
+    fn policy_sha(policy: &str) -> String {
+        hex::encode(Sha256::digest(policy.as_bytes()))
+    }
+
+    /// The ConfigMap half of one publication, as the reconciler runs it.
+    async fn publish_configmap(
+        fake: &FakeKubeState,
+        generation: i64,
+        policy: &str,
+    ) -> ConfigMapConvergence {
+        let config = fake_kbs_config();
+        let cm_api: Api<ConfigMap> = Api::namespaced(fake.client(), &config.namespace);
+        converge_signed_policy_configmap(
+            &cm_api,
+            &config,
+            generation,
+            policy,
+            &policy_sha(policy),
+            false,
+        )
+        .await
+        .expect("converge ConfigMap")
+    }
+
+    /// One full publication: ConfigMap, then the Trustee pod template.
+    async fn publish(fake: &FakeKubeState, generation: i64, policy: &str) -> GenerationDecision {
+        let token = match publish_configmap(fake, generation, policy).await {
+            ConfigMapConvergence::Current {
+                publication_token, ..
+            }
+            | ConfigMapConvergence::Replaced {
+                publication_token, ..
+            } => publication_token,
+            ConfigMapConvergence::Superseded => return GenerationDecision::Superseded,
+        };
+        converge_trustee_policy_generation(
+            fake.client(),
+            &fake_kbs_config(),
+            generation,
+            &policy_sha(policy),
+            &token,
+            false,
+        )
+        .await
+        .expect("converge Trustee")
+    }
+
+    #[tokio::test]
+    async fn first_publication_stamps_configmap_and_rolls_trustee_once() {
+        // A fresh ConfigMap carries no CAP annotations at all.
+        let fake = FakeKubeState::new();
+        assert_eq!(
+            publish(&fake, 1, "policy-a").await,
+            GenerationDecision::Replace
+        );
+        let sha = policy_sha("policy-a");
+        // The token is the resourceVersion the publication replaced.
+        assert_eq!(
+            fake.configmap_publication().await,
+            ("1".to_string(), sha.clone(), "1".to_string())
+        );
+        assert_eq!(
+            fake.template_publication().await,
+            ("1".to_string(), sha, "1".to_string())
+        );
+        assert_eq!(fake.trustee_rolls().await, 1);
+        assert_eq!(fake.configmap_policy().await.as_deref(), Some("policy-a"));
+    }
+
+    #[tokio::test]
+    async fn identical_policy_at_a_newer_generation_advances_the_fence_without_a_roll() {
+        let fake = FakeKubeState::new();
+        publish(&fake, 1, "policy-a").await;
+        let (_, sha, token) = fake.configmap_publication().await;
+
+        // Production: 11 of 23 publications were byte-identical re-rolls.
+        for generation in 2..=4 {
+            assert_eq!(
+                publish(&fake, generation, "policy-a").await,
+                GenerationDecision::Current,
+                "generation {generation} must only confirm readiness"
+            );
+            // The fence still moves forward on the ConfigMap, under CAS.
+            assert_eq!(
+                fake.configmap_publication().await,
+                (generation.to_string(), sha.clone(), token.clone())
+            );
+            // The reconciler's post-rollout re-read agrees with what it wrote.
+            assert!(matches!(
+                publish_configmap(&fake, generation, "policy-a").await,
+                ConfigMapConvergence::Current { publication_token, .. }
+                    if publication_token == token
+            ));
+        }
+        assert_eq!(fake.trustee_rolls().await, 1, "Trustee must not restart");
+        assert_eq!(
+            fake.template_publication().await,
+            ("1".to_string(), sha, token),
+            "the pod template is left untouched"
+        );
+
+        // The advanced generation fences out a stale writer exactly as a
+        // body-changing publication would have.
+        assert!(matches!(
+            publish_configmap(&fake, 3, "policy-stale").await,
+            ConfigMapConvergence::Superseded
+        ));
+        assert_eq!(fake.configmap_policy().await.as_deref(), Some("policy-a"));
+        assert_eq!(fake.configmap_publication().await.0, "4");
+    }
+
+    #[tokio::test]
+    async fn changed_policy_mints_a_new_token_and_rolls_trustee() {
+        let fake = FakeKubeState::new();
+        publish(&fake, 1, "policy-a").await;
+        let (_, _, first_token) = fake.configmap_publication().await;
+        publish(&fake, 2, "policy-a").await;
+
+        assert_eq!(
+            publish(&fake, 3, "policy-b").await,
+            GenerationDecision::Replace
+        );
+        let (generation, sha, token) = fake.configmap_publication().await;
+        assert_eq!((generation.as_str(), sha), ("3", policy_sha("policy-b")));
+        assert_ne!(token, first_token);
+        assert_eq!(
+            fake.template_publication().await,
+            fake.configmap_publication().await
+        );
+        assert_eq!(fake.trustee_rolls().await, 2);
+    }
+
+    #[tokio::test]
+    async fn stale_writer_with_a_lower_generation_is_rejected() {
+        let fake = FakeKubeState::new();
+        publish(&fake, 5, "policy-current").await;
+        let before = fake.configmap_publication().await;
+
+        assert_eq!(
+            publish(&fake, 4, "policy-stale").await,
+            GenerationDecision::Superseded
+        );
+        // Not even an identical body may move the generation backwards.
+        assert_eq!(
+            publish(&fake, 4, "policy-current").await,
+            GenerationDecision::Superseded
+        );
+        assert_eq!(fake.configmap_publication().await, before);
+        assert_eq!(
+            fake.configmap_policy().await.as_deref(),
+            Some("policy-current")
+        );
+        assert_eq!(fake.trustee_rolls().await, 1);
+
+        // A stale writer cannot bypass the fence at the Trustee step either.
+        let rejected = converge_trustee_policy_generation(
+            fake.client(),
+            &fake_kbs_config(),
+            4,
+            &policy_sha("policy-stale"),
+            "forged-token",
+            false,
+        )
+        .await
+        .expect("stale Trustee convergence");
+        assert_eq!(rejected, GenerationDecision::Superseded);
+        assert_eq!(fake.trustee_rolls().await, 1);
+    }
+
+    #[tokio::test]
+    async fn crash_between_configmap_write_and_trustee_patch_converges_on_the_next_pass() {
+        let fake = FakeKubeState::new();
+        publish(&fake, 1, "policy-a").await;
+
+        // The holder dies after the ConfigMap CAS, before patching Trustee:
+        // the ConfigMap claims policy-b while the pods still run policy-a.
+        assert!(matches!(
+            publish_configmap(&fake, 2, "policy-b").await,
+            ConfigMapConvergence::Replaced { .. }
+        ));
+        assert_eq!(fake.trustee_rolls().await, 1);
+        assert_ne!(
+            fake.template_publication().await,
+            fake.configmap_publication().await
+        );
+
+        // Recovery arrives at a NEWER generation with the same body (every
+        // enqueue bumps it). The generation-only fast path must not mistake
+        // the unrolled template for current.
+        assert_eq!(
+            publish(&fake, 3, "policy-b").await,
+            GenerationDecision::Replace
+        );
+        assert_eq!(fake.trustee_rolls().await, 2);
+        assert_eq!(
+            fake.template_publication().await,
+            fake.configmap_publication().await
+        );
+        assert_eq!(fake.configmap_publication().await.1, policy_sha("policy-b"));
+
+        // Same crash, recovered at the SAME generation.
+        assert!(matches!(
+            publish_configmap(&fake, 4, "policy-c").await,
+            ConfigMapConvergence::Replaced { .. }
+        ));
+        assert_eq!(
+            publish(&fake, 4, "policy-c").await,
+            GenerationDecision::Replace
+        );
+        assert_eq!(fake.trustee_rolls().await, 3);
+        assert_eq!(
+            fake.template_publication().await,
+            fake.configmap_publication().await
+        );
+    }
+
+    #[tokio::test]
+    async fn same_hash_under_a_different_publication_token_still_rolls() {
+        let fake = FakeKubeState::new();
+        publish(&fake, 1, "policy-a").await;
+        let (_, _, first_token) = fake.configmap_publication().await;
+
+        // policy-b reaches only the ConfigMap, then the desired body reverts
+        // to policy-a. The template's hash matches again, but it names a
+        // publication the ConfigMap no longer carries: what the pods mounted
+        // in between is unknown, so Trustee must restart.
+        publish_configmap(&fake, 2, "policy-b").await;
+        assert_eq!(
+            publish(&fake, 3, "policy-a").await,
+            GenerationDecision::Replace
+        );
+        let (generation, sha, token) = fake.configmap_publication().await;
+        assert_eq!((generation.as_str(), sha), ("3", policy_sha("policy-a")));
+        assert_ne!(token, first_token);
+        assert_eq!(fake.trustee_rolls().await, 2);
+        assert_eq!(
+            fake.template_publication().await,
+            fake.configmap_publication().await
+        );
+
+        // A same-generation repair of a body overwritten behind CAP's
+        // annotations also re-mints the token and rolls.
+        {
+            let mut state = fake.0.lock().await;
+            let configmap = state.configmap.as_mut().unwrap();
+            configmap
+                .data
+                .as_mut()
+                .unwrap()
+                .insert("resource-policy".to_string(), "overwritten".to_string());
+        }
+        assert_eq!(
+            publish(&fake, 4, "policy-a").await,
+            GenerationDecision::Replace
+        );
+        assert_ne!(fake.configmap_publication().await.2, token);
+        assert_eq!(fake.configmap_policy().await.as_deref(), Some("policy-a"));
+        assert_eq!(fake.trustee_rolls().await, 3);
+    }
+
+    #[test]
+    fn template_serves_publication_requires_matching_hash_and_token() {
+        let hash = "aa".repeat(32);
+        let other = "bb".repeat(32);
+        let serves = |template: Option<(i64, &str)>, token: Option<&str>| {
+            template_serves_publication(template, token, 5, &hash, "41")
+        };
+        assert!(serves(Some((3, &hash)), Some("41")));
+        assert!(!serves(Some((3, &other)), Some("41")), "changed body");
+        assert!(!serves(Some((3, &hash)), Some("40")), "other publication");
+        assert!(!serves(Some((3, &hash)), None), "pre-token template");
+        assert!(!serves(None, Some("41")), "never published");
+        // Equal and newer generations keep going through generation_decision
+        // (Current / Superseded), never through this shortcut.
+        assert!(!serves(Some((5, &hash)), Some("41")));
+        assert!(!serves(Some((6, &hash)), Some("41")));
+    }
+
+    async fn kbs_fence_claimable(state: &crate::state::AppState) -> bool {
+        match crate::mutation_leases::claim_resources(
+            state,
+            "test_probe",
+            Uuid::new_v4(),
+            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+        )
+        .await
+        {
+            Ok(lease) => {
+                lease.finish().await.expect("release probe lease");
+                true
+            }
+            Err(crate::mutation_leases::MutationLeaseError::Busy) => false,
+            Err(error) => panic!("unexpected claim error: {error}"),
+        }
+    }
+
+    /// Production 2026-11-10 09:47:34Z: a reconcile failed with `Trustee
+    /// deployment rollout timed out` and the next deployment sat for exactly
+    /// 540 s behind the abandoned `kbs_policy` lease. A failure that leaves
+    /// no write in flight must release the fence; an uncertain write must
+    /// keep the quarantine.
+    #[tokio::test]
+    async fn failed_reconcile_releases_the_fence_unless_a_write_may_be_in_flight() {
+        let (_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("kbs_fence_release").await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.kbs_policy = Some(fake_kbs_config());
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 1, configmap_generation = 0,
+                    applied_generation = 0
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("enter signed mode");
+
+        // Read-side failure: the reconciler returns before any write.
+        let fake = FakeKubeState::new();
+        fake.0.lock().await.configmap.as_mut().unwrap().data = None;
+        let error = TEST_KUBE_CLIENT
+            .scope(fake.client(), reconcile_signed_policy_once(&state))
+            .await
+            .expect_err("a ConfigMap without the policy key fails");
+        assert!(matches!(
+            error,
+            KbsPolicyReconciliationError::Policy(KbsPolicyError::MissingPolicyKey(_))
+        ));
+        assert!(
+            kbs_fence_claimable(&state).await,
+            "a failure with no write in flight must not hold the global fence"
+        );
+
+        // A write whose outcome is unknown keeps the reclaim quarantine.
+        let fake = FakeKubeState::new();
+        fake.0.lock().await.fail_writes = true;
+        let error = TEST_KUBE_CLIENT
+            .scope(fake.client(), reconcile_signed_policy_once(&state))
+            .await
+            .expect_err("a rejected write fails");
+        assert!(matches!(
+            &error,
+            KbsPolicyReconciliationError::Policy(policy) if policy.provider_write_may_be_in_flight()
+        ));
+        assert!(
+            !kbs_fence_claimable(&state).await,
+            "an uncertain write must keep the fence owned through quarantine"
+        );
     }
 
     /// #232: a pending generation must cause the reconciler to publish an
@@ -8161,41 +8721,45 @@ resource_bindings := {
             ]))
             .expect("serialize the partial policy body");
 
+        let client_at =
+            |policy: String, deployment_token: &'static str, template_generation: &'static str| {
+                kube::Client::new(
+                    tower::service_fn(move |request: axum::http::Request<kube::client::Body>| {
+                        let hash = hex::encode(Sha256::digest(policy.as_bytes()));
+                        let annotations = serde_json::json!({
+                            (POLICY_GENERATION_ANNOTATION): "7",
+                            (POLICY_SHA256_ANNOTATION): hash,
+                            (POLICY_PUBLICATION_TOKEN_ANNOTATION): "published",
+                        });
+                        let object = if request.uri().path().contains("deployments") {
+                            serde_json::json!({
+                                "apiVersion": "apps/v1", "kind": "Deployment",
+                                "metadata": {"name": "trustee", "namespace": "cap-test"},
+                                "spec": {"template": {"metadata": {"annotations": {
+                                    (POLICY_GENERATION_ANNOTATION): template_generation,
+                                    (POLICY_SHA256_ANNOTATION): hash,
+                                    (POLICY_PUBLICATION_TOKEN_ANNOTATION): deployment_token,
+                                }}}}
+                            })
+                        } else {
+                            serde_json::json!({
+                                "apiVersion": "v1", "kind": "ConfigMap",
+                                "metadata": {"name": "resource-policy", "namespace": "cap-test",
+                                             "resourceVersion": "3", "annotations": annotations},
+                                "data": {"resource-policy.rego": policy}
+                            })
+                        };
+                        async move {
+                            Ok::<_, std::io::Error>(axum::http::Response::new(
+                                kube::client::Body::from(serde_json::to_vec(&object).unwrap()),
+                            ))
+                        }
+                    }),
+                    "default",
+                )
+            };
         let client_for = |policy: String, deployment_token: &'static str| {
-            kube::Client::new(
-                tower::service_fn(move |request: axum::http::Request<kube::client::Body>| {
-                    let hash = hex::encode(Sha256::digest(policy.as_bytes()));
-                    let annotations = serde_json::json!({
-                        (POLICY_GENERATION_ANNOTATION): "7",
-                        (POLICY_SHA256_ANNOTATION): hash,
-                        (POLICY_PUBLICATION_TOKEN_ANNOTATION): "published",
-                    });
-                    let object = if request.uri().path().contains("deployments") {
-                        serde_json::json!({
-                            "apiVersion": "apps/v1", "kind": "Deployment",
-                            "metadata": {"name": "trustee", "namespace": "cap-test"},
-                            "spec": {"template": {"metadata": {"annotations": {
-                                (POLICY_GENERATION_ANNOTATION): "7",
-                                (POLICY_SHA256_ANNOTATION): hash,
-                                (POLICY_PUBLICATION_TOKEN_ANNOTATION): deployment_token,
-                            }}}}
-                        })
-                    } else {
-                        serde_json::json!({
-                            "apiVersion": "v1", "kind": "ConfigMap",
-                            "metadata": {"name": "resource-policy", "namespace": "cap-test",
-                                         "resourceVersion": "3", "annotations": annotations},
-                            "data": {"resource-policy.rego": policy}
-                        })
-                    };
-                    async move {
-                        Ok::<_, std::io::Error>(axum::http::Response::new(
-                            kube::client::Body::from(serde_json::to_vec(&object).unwrap()),
-                        ))
-                    }
-                }),
-                "default",
-            )
+            client_at(policy, deployment_token, "7")
         };
 
         // Exercise the production unit loader too: the publication predicate
@@ -8264,6 +8828,25 @@ resource_bindings := {
         .await
         .expect("check deployment publication token");
         assert!(!covers, "a different Trustee publication must fail closed");
+
+        // A byte-identical policy at a newer generation advances only the
+        // ConfigMap; the template keeps the generation it was rolled at and
+        // is still this publication. A template claiming a NEWER generation
+        // than the applied one is not.
+        for (template_generation, expected) in [("5", true), ("8", false)] {
+            let covers = teardown_unit_already_published_with_applied(
+                &config,
+                client_at(full_body.clone(), "published", template_generation),
+                &unit,
+                applied.clone(),
+            )
+            .await
+            .expect("check template generation");
+            assert_eq!(
+                covers, expected,
+                "template generation {template_generation}"
+            );
+        }
 
         let covers = teardown_unit_already_published_with_applied(
             &config,

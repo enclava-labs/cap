@@ -2340,8 +2340,8 @@ pub(crate) async fn delete_app_before(
         .commit()
         .await
         .map_err(|_| internal_server_error())?;
-    if signed_policy_revocation {
-        delete_mutation
+    if signed_policy_revocation
+        && let Err(error) = delete_mutation
             .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
                 &state.db,
                 state.kbs_policy.as_ref(),
@@ -2349,9 +2349,13 @@ pub(crate) async fn delete_app_before(
             ))
             .await
             .map_err(|_| internal_server_error())?
-            .map_err(|error| {
-                app_delete_failure(deleting_app.id, AppDeleteFailure::KbsPolicy, error)
-            })?;
+    {
+        release_kbs_fence_after_failed_publish(&state, &mut delete_mutation, &error).await;
+        return Err(app_delete_failure(
+            deleting_app.id,
+            AppDeleteFailure::KbsPolicy,
+            error,
+        ));
     }
 
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
@@ -2565,7 +2569,7 @@ pub(crate) async fn delete_app_before(
         .map_err(|error| {
             app_delete_failure(deleting_app.id, AppDeleteFailure::KbsTlsBinding, error)
         })?;
-    delete_mutation
+    if let Err(error) = delete_mutation
         .guard_provider(crate::kbs::reconcile_policy(
             &state.db,
             state.kbs_policy.as_ref(),
@@ -2573,7 +2577,14 @@ pub(crate) async fn delete_app_before(
         ))
         .await
         .map_err(|_| internal_server_error())?
-        .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::KbsPolicy, error))?;
+    {
+        release_kbs_fence_after_failed_publish(&state, &mut delete_mutation, &error).await;
+        return Err(app_delete_failure(
+            deleting_app.id,
+            AppDeleteFailure::KbsPolicy,
+            error,
+        ));
+    }
     // The global KBS policy is durably reconciled; release the shared fence
     // before the final publication transaction so an unrelated app's policy
     // mutation never queues behind this app's remaining row cleanup.
@@ -2667,6 +2678,42 @@ pub(crate) async fn delete_app_before(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A failed delete drops its app mutation lease, which leaves every fence it
+/// claimed owned through the reclaim quarantine. That is right for the app's
+/// own lanes, but the global `kbs_policy` fence would then block every other
+/// deployment on the platform for up to 540 s. Release that one fence when
+/// the KBS failure provably left no write in flight; the app lanes keep
+/// their quarantine. Best effort: a failed release only restores the old
+/// (quarantined) behavior.
+async fn release_kbs_fence_after_failed_publish(
+    state: &AppState,
+    delete_mutation: &mut crate::mutation_leases::AppMutationLease,
+    error: &crate::kbs::KbsPolicyError,
+) {
+    if error.provider_write_may_be_in_flight() {
+        return;
+    }
+    let released: Result<(), crate::mutation_leases::MutationLeaseError> = async {
+        let mut fence_tx = state.db.begin().await?;
+        delete_mutation
+            .release_resource_in_tx(
+                &mut fence_tx,
+                &crate::mutation_leases::ResourceFence::kbs_policy(),
+            )
+            .await?;
+        fence_tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(release_error) = released {
+        tracing::warn!(
+            error = %release_error,
+            error_code = "kbs_policy_lease_finish_failed",
+            "failed to release the KBS policy fence after a failed delete publication"
+        );
+    }
 }
 
 /// Release the KBS fence after a failed publish whose failure provably has

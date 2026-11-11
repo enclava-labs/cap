@@ -37,9 +37,10 @@ use crate::commands::app::{
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
     fail_if_template_deployment_failed, fetch_verified_platform_release, generate_log_key_for_app,
-    reconcile_success_with_deployment_history, tee_supplemental_fields_are_consistent,
-    tee_terminal_diagnostic_probe_due, tee_unlock_state, terminal_bootstrap_failure_message,
-    terminal_diagnostic_budget, terminal_diagnostic_probe_with_budget,
+    reconcile_rollout_with_deployment_history, reconcile_success_with_deployment_history,
+    tee_supplemental_fields_are_consistent, tee_terminal_diagnostic_probe_due, tee_unlock_state,
+    terminal_bootstrap_failure_message, terminal_diagnostic_budget,
+    terminal_diagnostic_probe_with_budget,
 };
 use crate::commands::config::CONFIG_APPLICATION_NOTE;
 use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
@@ -3632,7 +3633,12 @@ async fn wait_for_paas_ssh_command(
             // follow-up): the success must be authorized by a current
             // deployment-state observation, and an inconclusive one keeps
             // the wait running (the enclosing deadline governs).
-            if let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+            //
+            // The stable endpoint outlives a redeploy, so the previous pod
+            // reports it ready too: the observation must also show this
+            // deployment's roll settled, or the wait would end before CAP
+            // applies the new workload.
+            if let SuccessGate::Confirmed = reconcile_rollout_with_deployment_history(
                 api,
                 app_name,
                 deployment_id,
@@ -3645,7 +3651,10 @@ async fn wait_for_paas_ssh_command(
             }
         } else if let Some(response) =
             fetch_direct_ssh_command_response(&response, stable_endpoint, expected_app_url).await?
-            && let SuccessGate::Confirmed = reconcile_success_with_deployment_history(
+            // `/ssh.txt` is unauthenticated and unbound: whichever pod is
+            // behind the app URL answers it. It only counts once the bound
+            // deployment's roll has settled, i.e. the old pod is gone.
+            && let SuccessGate::Confirmed = reconcile_rollout_with_deployment_history(
                 api,
                 app_name,
                 deployment_id,
@@ -3658,11 +3667,27 @@ async fn wait_for_paas_ssh_command(
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    Err(format!(
+    Err(ssh_command_wait_timeout_message(app_name, password_mode, timeout).into())
+}
+
+fn ssh_command_wait_timeout_message(
+    app_name: &str,
+    password_mode: bool,
+    timeout: Duration,
+) -> String {
+    let mut message = format!(
         "stable SSH endpoint for app {app_name} did not become ready within {}; run `enclava template ssh-command --name {app_name} --wait` to continue waiting",
         format_duration(timeout)
-    )
-    .into())
+    );
+    if password_mode {
+        // A password-mode app comes back locked after every roll and no
+        // server-side process unlocks it; the deployment-bound relock stop
+        // above cannot fire on an unbound wait, so say it here too.
+        message.push_str(&format!(
+            "\nIf the app relocked after the update (password mode), run `enclava unlock --app {app_name}` first"
+        ));
+    }
+    message
 }
 
 async fn latest_deployment_id(api: &ApiClient, app_name: &str) -> Result<Option<String>, ApiError> {

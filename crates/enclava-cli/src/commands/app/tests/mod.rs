@@ -3045,6 +3045,110 @@ mod terminal_diagnostics {
     }
 
     #[tokio::test]
+    async fn rollout_gate_rejects_a_deployment_cap_has_not_rolled_yet() {
+        // Production 2026-11-10: a redeploy's stable SSH endpoint answered
+        // ready from the OLD pod in 237 ms, the CLI exited 0, and CAP applied
+        // the StatefulSet 14 s later. An accepted-but-unrolled deployment is
+        // not authority for a readiness signal the previous pod can produce.
+        for status in ["pending", "applying", "watching"] {
+            let address = spawn_history_stub(std::time::Duration::ZERO, move |_| {
+                serde_json::json!([deployment_entry_json("deploy-1", status)])
+            })
+            .await;
+            let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut history = DeploymentHistoryProbe::new();
+            assert_eq!(
+                reconcile_rollout_with_deployment_history(
+                    &api,
+                    "demo",
+                    "deploy-1",
+                    deadline,
+                    &mut history,
+                )
+                .await
+                .expect("an in-flight roll is not an error"),
+                SuccessGate::Inconclusive,
+                "status {status} must keep the readiness wait running"
+            );
+            // The plain gate keeps its meaning for waits that only need to
+            // rule out a failed deployment.
+            assert_eq!(
+                reconcile_success_with_deployment_history(
+                    &api,
+                    "demo",
+                    "deploy-1",
+                    deadline,
+                    &mut history,
+                )
+                .await
+                .expect("non-failed observation"),
+                SuccessGate::Confirmed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rollout_gate_confirms_a_settled_roll_and_reports_a_failed_one() {
+        let address = spawn_history_stub(std::time::Duration::ZERO, |_| {
+            serde_json::json!([deployment_entry_json("deploy-1", "healthy")])
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut history = DeploymentHistoryProbe::new();
+        assert_eq!(
+            reconcile_rollout_with_deployment_history(
+                &api,
+                "demo",
+                "deploy-1",
+                deadline,
+                &mut history
+            )
+            .await
+            .expect("healthy deployment"),
+            SuccessGate::Confirmed
+        );
+        // An unbound wait (no deployment id) keeps its previous behavior.
+        assert_eq!(
+            reconcile_rollout_with_deployment_history(
+                &api,
+                "demo",
+                "pending",
+                deadline,
+                &mut history
+            )
+            .await
+            .expect("unbound wait"),
+            SuccessGate::Confirmed
+        );
+
+        let address = spawn_history_stub(std::time::Duration::ZERO, |_| {
+            serde_json::json!([{
+                "id": "deploy-1",
+                "status": "failed",
+                "error_message": "pod_failed",
+                "image_digest": null,
+                "created_at": "2026-11-10T00:00:00Z",
+                "completed_at": "2026-11-10T00:01:00Z",
+            }])
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let mut history = DeploymentHistoryProbe::new();
+        let error = reconcile_rollout_with_deployment_history(
+            &api,
+            "demo",
+            "deploy-1",
+            deadline,
+            &mut history,
+        )
+        .await
+        .expect_err("a failed deployment stays a terminal error");
+        assert!(error.to_string().contains("deployment deploy-1 failed"));
+    }
+
+    #[tokio::test]
     async fn success_exit_accepts_a_non_failed_observation() {
         // The reconciliation is not a failure trap: an observation showing
         // the deployment is fine passes the exit -- both when it lands

@@ -526,6 +526,11 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
     }
 }
 
+/// Name of the enclava-init sidecar container. The rollout watcher keys its
+/// transient-restart tolerance on it; the value is part of the rendered
+/// (signed) manifest and must not change.
+pub const ENCLAVA_INIT_CONTAINER_NAME: &str = "enclava-init";
+
 /// Build the enclava-init mounter sidecar (Phase 5).
 ///
 /// Performs Argon2id-based unlock or KBS autounlock, opens both LUKS block
@@ -620,7 +625,7 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
         });
     }
     Container {
-        name: "enclava-init".to_string(),
+        name: ENCLAVA_INIT_CONTAINER_NAME.to_string(),
         image: Some(enclava_init_image()),
         command: Some(vec!["/usr/local/bin/enclava-init".to_string()]),
         env: Some(env_vars),
