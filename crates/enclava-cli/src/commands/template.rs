@@ -393,36 +393,28 @@ async fn deploy_with_timings(
     let ctx = build_api_context()?;
     let api = &ctx.api;
     let templates = api.list_templates().await?;
-    let mut template = templates
+    // A removed catalog entry, or one that no longer exposes SSH-key metadata,
+    // must not abort before the resume file is selected. An already accepted
+    // deployment can finish from the signed request. A fresh sign still
+    // requires the live entry, after selection.
+    let catalog = templates
         .iter()
         .find(|template| template.slug == args.template)
-        .ok_or_else(|| format!("template '{}' is not available", args.template))?
-        .clone();
-    if template_key(&template, "DEBIAN_SSH_AUTHORIZED_KEYS").is_none() {
-        return Err(format!(
-            "template '{}' is not a Debian SSH template supported by this CLI",
-            args.template
-        )
-        .into());
-    }
+        .cloned();
 
     let public_keys = read_ssh_public_keys(&args.ssh_public_keys, &args.ssh_public_key_files)?;
     validate_ssh_public_keys(
         &public_keys,
-        template_key(&template, "DEBIAN_SSH_AUTHORIZED_KEYS"),
+        catalog
+            .as_ref()
+            .and_then(|template| template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS")),
     )?;
     let storage_password =
         StoragePasswordInput::from_file_option(args.storage_password_file.as_ref())?;
     let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
     // Authenticate platform authority before keyring registration or app creation.
     fetch_verified_platform_release(api, &ctx.paths).await?;
-    let scope = enclava_cli::template_deploy_retry::template_deploy_scope(
-        ctx.creds.active_org_id.as_deref(),
-        ctx.cli_config.org_id.as_deref(),
-        ctx.creds.active_org_name.as_deref(),
-        ctx.cli_config.org.as_deref(),
-        api.api_base(),
-    );
+    let scope = template_deploy_resume_scope(api, &ctx.creds, &ctx.cli_config).await?;
     // Hold this until the command returns, including completion. Dropping it
     // after the POST lets a second invocation save a new attempt that this
     // command would then stamp completed.
@@ -491,9 +483,14 @@ async fn deploy_with_timings(
         enclava_cli::template_deploy_retry::deployment_listing_for_list_error(&loaded, Some(404))
     };
     let peeked = if enclava_cli::template_deploy_retry::loaded_attempt_is_password(&loaded) {
-        match peek_password_bootstrap_key(api, &ctx.paths, &instance_name).await {
+        let stored_hash = enclava_cli::template_deploy_retry::loaded_bootstrap_pubkey_hash(&loaded);
+        match peek_password_bootstrap_key(api, &ctx.paths, &instance_name, stored_hash).await {
             Ok(peeked) => peeked,
-            Err(error) if template.unlock_mode == "password" => {
+            Err(error)
+                if catalog
+                    .as_ref()
+                    .is_none_or(|template| template.unlock_mode == "password") =>
+            {
                 return Err(format!(
                     "could not compare the password bootstrap key with the stored template deploy request for `{instance_name}`: {error}. The stored request was not sent, and the local bootstrap key was not replaced."
                 )
@@ -516,17 +513,24 @@ async fn deploy_with_timings(
     // The signed blobs cannot: they embed a fresh deploy id and timestamp, so
     // the key is only stable if this run replays the request already signed
     // for the in-flight deployment (cap#292). A password-to-password retry
-    // matches the hash the current seed would derive, without saving that key.
-    // Any other stored request matches the hash it was signed with, so a
-    // catalog unlock-mode change does not reject a live replay.
+    // matches the saved bootstrap key, then the hash the current seed would
+    // derive, without saving that key. Any other stored request matches the
+    // hash it was signed with, so a catalog unlock-mode change does not
+    // reject a live replay. A missing catalog entry is not that change.
     let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
+    let catalog_unlock_mode = enclava_cli::template_deploy_retry::catalog_unlock_mode_for_resume(
+        catalog
+            .as_ref()
+            .map(|template| template.unlock_mode.as_str()),
+        &loaded,
+    );
     let stable = enclava_cli::template_deploy_retry::StableTemplateDeployInputs {
         template_slug: args.template.clone(),
         instance_name: instance_name.clone(),
         config: template_create_config(explicit_stable_endpoint.as_deref()),
         bootstrap_pubkey_hash: enclava_cli::template_deploy_retry::bootstrap_hash_for_resume_match(
             &loaded,
-            &template.unlock_mode,
+            &catalog_unlock_mode,
             peeked.as_ref().map(|peeked| peeked.hash.clone()),
         ),
     };
@@ -537,6 +541,25 @@ async fn deploy_with_timings(
         &deployments,
         now_unix,
     );
+    if matches!(
+        attempt,
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Fresh
+    ) {
+        let Some(template) = catalog.as_ref() else {
+            return Err(format!("template '{}' is not available", args.template).into());
+        };
+        if template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS").is_none() {
+            return Err(format!(
+                "template '{}' is not a Debian SSH template supported by this CLI",
+                args.template
+            )
+            .into());
+        }
+    }
+    // Replay overwrites unlock mode and managed keys from the signed request.
+    // A stub is only reached when the catalog entry is gone and selection
+    // already chose Replay (Fresh returned above).
+    let mut template = catalog.unwrap_or_else(|| resume_catalog_stub(&args.template));
     let expects_password_preflight =
         enclava_cli::template_deploy_retry::attempt_expects_password_preflight(
             &attempt,
@@ -1589,6 +1612,89 @@ async fn ensure_template_app(
     }
 }
 
+/// Catalog stand-in for a replay whose template was removed from `/templates`.
+///
+/// Selection has already chosen Replay. Ownership and managed-config delivery
+/// use the signed descriptor and the stored workflow, which overwrite
+/// `unlock_mode` and `paas_managed_config_keys` before they are read. The
+/// other fields are not used on that path.
+fn resume_catalog_stub(slug: &str) -> HostedTemplate {
+    HostedTemplate {
+        slug: slug.to_string(),
+        name: slug.to_string(),
+        description: String::new(),
+        features: Vec::new(),
+        version: String::new(),
+        image: String::new(),
+        source_provider: None,
+        source_repository: None,
+        signer_subject: None,
+        signer_issuer: None,
+        container_name: "web".to_string(),
+        command: Vec::new(),
+        port: 8080,
+        unlock_mode: "auto".to_string(),
+        health_path: None,
+        health_interval: None,
+        health_timeout: None,
+        resources: enclava_cli::api_types::HostedTemplateResources::default(),
+        storage_paths: Vec::new(),
+        egress_allowlist: Vec::new(),
+        egress_mode: "restricted".to_string(),
+        config_keys: Vec::new(),
+        paas_managed_config_keys: Vec::new(),
+        persistence_path: None,
+        workload_security_profile: None,
+        security_notes: Vec::new(),
+    }
+}
+
+/// Resume-file scope for this command.
+///
+/// Credentials that already name an org keep that scope, so an existing file
+/// still matches. An API-key record with no org metadata is scoped by the
+/// authenticated org and user. Sharing `org:unknown` would let the next key
+/// overwrite the first account's in-flight request.
+pub(crate) async fn template_deploy_resume_scope(
+    api: &ApiClient,
+    creds: &config::Credentials,
+    cli_config: &config::CliConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !enclava_cli::template_deploy_retry::template_deploy_identity_is_empty(
+        creds.active_org_id.as_deref(),
+        cli_config.org_id.as_deref(),
+        creds.active_org_name.as_deref(),
+        cli_config.org.as_deref(),
+    ) {
+        return Ok(enclava_cli::template_deploy_retry::template_deploy_scope(
+            creds.active_org_id.as_deref(),
+            cli_config.org_id.as_deref(),
+            creds.active_org_name.as_deref(),
+            cli_config.org.as_deref(),
+            api.api_base(),
+        ));
+    }
+    let me = api.get_current_user().await.map_err(|err| {
+        format!(
+            "could not resolve the authenticated org for template-deploy resume state, so this API key was not given a shared scope: {err}"
+        )
+    })?;
+    let identity = enclava_cli::template_deploy_retry::AuthenticatedResumeIdentity {
+        org_id: Some(me.active_org.id.as_str()),
+        org_name: Some(me.active_org.name.as_str()),
+        user_id: Some(me.user_id.as_str()),
+    };
+    enclava_cli::template_deploy_retry::template_deploy_scope_for_credentials(
+        creds.active_org_id.as_deref(),
+        cli_config.org_id.as_deref(),
+        creds.active_org_name.as_deref(),
+        cli_config.org.as_deref(),
+        Some(&identity),
+        api.api_base(),
+    )
+    .map_err(|err| err.into())
+}
+
 fn template_create_app_request(
     template: &HostedTemplate,
     instance_name: &str,
@@ -1626,28 +1732,85 @@ struct PeekedBootstrapKey {
     org_name: String,
 }
 
-/// Hash the current recovery seed would derive, without creating a seed,
-/// registering a keyring, or writing the bootstrap key.
+/// Hash the key ownership claim will use, without creating a seed, registering
+/// a keyring, or writing the bootstrap key.
 ///
-/// `None` means there is no seed. That must not be treated as a match against
-/// a stored password hash, and it must not mint a new seed before selection
-/// decides whether the old descriptor will be replayed.
+/// The saved per-app key is preferred when its hash is the one in the signed
+/// request: claim reads that file before it derives from the recovery seed, so
+/// a removed or replaced seed must not hide a key that can still finish the
+/// deploy. A saved key that does not match falls back to the seed, so a
+/// previous overwrite can still be restored. `None` means neither source can
+/// be read. That must not be treated as a match, and it must not mint a new
+/// seed before selection decides whether the old descriptor will be replayed.
 async fn peek_password_bootstrap_key(
     api: &ApiClient,
     paths: &CliPaths,
+    instance_name: &str,
+    stored_hash: Option<&str>,
+) -> Result<Option<PeekedBootstrapKey>, Box<dyn std::error::Error>> {
+    let active = resolve_current_user_org(api).await?;
+    let saved = read_saved_bootstrap_peek(paths, &active.org_name, instance_name)?;
+    let derived = derive_peek_from_seed(paths, active.org_id, &active.org_name, instance_name)?;
+    let source = enclava_cli::template_deploy_retry::password_resume_key_source(
+        saved.as_ref().map(|key| key.hash.as_str()),
+        derived.as_ref().map(|key| key.hash.as_str()),
+        stored_hash,
+    );
+    Ok(match source {
+        Some(enclava_cli::template_deploy_retry::PasswordResumeKeySource::Saved) => saved,
+        Some(enclava_cli::template_deploy_retry::PasswordResumeKeySource::Derived) => derived,
+        None => None,
+    })
+}
+
+fn read_saved_bootstrap_peek(
+    paths: &CliPaths,
+    org_name: &str,
+    instance_name: &str,
+) -> Result<Option<PeekedBootstrapKey>, Box<dyn std::error::Error>> {
+    let key_path = paths.bootstrap_key_path(org_name, instance_name);
+    if !key_path.exists() {
+        return Ok(None);
+    }
+    let private_key_hex = std::fs::read_to_string(&key_path)?;
+    let private_key_bytes: [u8; 32] = hex::decode(private_key_hex.trim())?
+        .try_into()
+        .map_err(|_| "bootstrap key must be 32 bytes (64 hex chars)")?;
+    Ok(Some(peeked_from_seed(
+        org_name,
+        private_key_bytes,
+        private_key_hex.trim(),
+    )))
+}
+
+fn derive_peek_from_seed(
+    paths: &CliPaths,
+    org_id: uuid::Uuid,
+    org_name: &str,
     instance_name: &str,
 ) -> Result<Option<PeekedBootstrapKey>, Box<dyn std::error::Error>> {
     let Some(seed) = keys::load_recovery_seed(paths)? else {
         return Ok(None);
     };
-    let active = resolve_current_user_org(api).await?;
-    let app_seed = keys::derive_app_bootstrap_seed(active.org_id, instance_name, &seed)?;
+    let app_seed = keys::derive_app_bootstrap_seed(org_id, instance_name, &seed)?;
+    Ok(Some(peeked_from_seed(
+        org_name,
+        app_seed,
+        &hex::encode(app_seed),
+    )))
+}
+
+fn peeked_from_seed(
+    org_name: &str,
+    app_seed: [u8; 32],
+    private_key_hex: &str,
+) -> PeekedBootstrapKey {
     let signing_key = SigningKey::from_bytes(&app_seed);
-    Ok(Some(PeekedBootstrapKey {
+    PeekedBootstrapKey {
         hash: hex::encode(Sha256::digest(signing_key.verifying_key().to_bytes())),
-        private_key_hex: hex::encode(app_seed),
-        org_name: active.org_name,
-    }))
+        private_key_hex: private_key_hex.to_string(),
+        org_name: org_name.to_string(),
+    }
 }
 
 async fn derive_template_bootstrap_key(

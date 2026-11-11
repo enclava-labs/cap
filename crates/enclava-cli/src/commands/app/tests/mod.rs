@@ -677,7 +677,7 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
         },
     )
     .unwrap();
-    forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, origin, "shell").unwrap();
+    forget_destroyed_app_template_deploy(&paths, &scope, "shell").unwrap();
     assert!(matches!(
         enclava_cli::template_deploy_retry::load_template_deploy_attempt(&paths, &scope, "shell"),
         enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Absent
@@ -694,7 +694,7 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
         "destroying against one API base path must not clear another path's resume file"
     );
     // A second destroy of an already-cleared name is not an error.
-    forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, origin, "shell").unwrap();
+    forget_destroyed_app_template_deploy(&paths, &scope, "shell").unwrap();
     enclava_cli::template_deploy_retry::save_template_deploy_attempt(
         &paths,
         &scope,
@@ -709,15 +709,15 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
         },
     )
     .unwrap();
-    forget_destroyed_app_template_deploy(&paths, &cli_config, &creds, origin, "Shell").unwrap();
+    forget_destroyed_app_template_deploy(&paths, &scope, "Shell").unwrap();
     assert!(
         matches!(
             enclava_cli::template_deploy_retry::load_template_deploy_attempt(
                 &paths, &scope, "shell"
             ),
-            enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Absent
+            enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Ready(_)
         ),
-        "destroy must clear the resume file under the lowercased template-deploy name"
+        "a 404 for `Shell` must not clear `shell`'s resume file; the platform treats them as different apps"
     );
 }
 

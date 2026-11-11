@@ -185,9 +185,13 @@ impl StoredTemplateDeployAttempt {
 
 /// Exclusive lock covering load/list/sign/save/POST for one app. Dropping it
 /// releases the lock, including on process death.
+///
+/// A path-based scope also holds the origin-keyed lock an older CLI still
+/// takes, so that CLI cannot write the file this process is migrating.
 #[must_use = "dropping the guard releases the template deploy lock"]
 pub struct TemplateDeployLock {
     _guard: crate::fslock::FileLockGuard,
+    _legacy: Option<crate::fslock::FileLockGuard>,
 }
 
 /// Scope the on-disk attempt so two orgs, two API hosts, or two base paths
@@ -225,6 +229,113 @@ pub fn template_deploy_scope(
     // always part of it too: a switch must not reuse the previous org's resume
     // file just because the credential id is stale.
     format!("org:{org_id}\nselected:{selected}\norigin:{api_base}")
+}
+
+fn nonempty_scope_part(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// True when [`template_deploy_scope`] would use the shared `org:unknown` /
+/// `selected:-` fallback. An API key with no saved org must not take that
+/// path: every such key would share one resume file.
+pub fn template_deploy_identity_is_empty(
+    active_org_id: Option<&str>,
+    config_org_id: Option<&str>,
+    active_org_name: Option<&str>,
+    selected_org: Option<&str>,
+) -> bool {
+    nonempty_scope_part(active_org_id)
+        .or(nonempty_scope_part(config_org_id))
+        .is_none()
+        && nonempty_scope_part(selected_org)
+            .or(nonempty_scope_part(active_org_name))
+            .is_none()
+}
+
+/// Org and user from `GET /users/me`, used only when the credential record
+/// has no org id and no selected org name.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthenticatedResumeIdentity<'a> {
+    pub org_id: Option<&'a str>,
+    pub org_name: Option<&'a str>,
+    pub user_id: Option<&'a str>,
+}
+
+/// Resume scope for a deploy or destroy.
+///
+/// A credential that already has an org id or a selected org keeps today's
+/// scope, so files written before this lookup still match. An API-key record
+/// with every identity field empty must take the authenticated org and user
+/// instead of `org:unknown`. Two keys on one machine otherwise overwrite
+/// each other's in-flight request for the same app name. A missing
+/// authenticated org or user is an error, not a shared directory.
+pub fn template_deploy_scope_for_credentials(
+    active_org_id: Option<&str>,
+    config_org_id: Option<&str>,
+    active_org_name: Option<&str>,
+    selected_org: Option<&str>,
+    authenticated: Option<&AuthenticatedResumeIdentity<'_>>,
+    api_base: &str,
+) -> Result<String, &'static str> {
+    if !template_deploy_identity_is_empty(
+        active_org_id,
+        config_org_id,
+        active_org_name,
+        selected_org,
+    ) {
+        return Ok(template_deploy_scope(
+            active_org_id,
+            config_org_id,
+            active_org_name,
+            selected_org,
+            api_base,
+        ));
+    }
+    let Some(authenticated) = authenticated else {
+        return Err(
+            "authenticated identity is required when credentials have no org; refusing to share template-deploy resume state across API keys",
+        );
+    };
+    let Some(org_id) = nonempty_scope_part(authenticated.org_id) else {
+        return Err(
+            "authenticated identity has no org id; refusing to share template-deploy resume state across API keys",
+        );
+    };
+    let Some(user_id) = nonempty_scope_part(authenticated.user_id) else {
+        return Err(
+            "authenticated identity has no user id; refusing to share template-deploy resume state across API keys",
+        );
+    };
+    let selected = nonempty_scope_part(authenticated.org_name).unwrap_or("-");
+    // `user:` is only on this fallback. Session credentials already carry an
+    // org id, and adding a user line to those scopes would hide their files.
+    Ok(format!(
+        "org:{org_id}\nuser:{user_id}\nselected:{selected}\norigin:{api_base}"
+    ))
+}
+
+/// Origin-keyed scope an older CLI wrote before the API base path was part
+/// of the key. `None` when this scope is already origin-keyed.
+///
+/// A path-based API and this legacy scope must be locked together. The older
+/// CLI still locks and writes the origin-keyed file, and a retry that cannot
+/// see that file signs a second deployment.
+pub fn legacy_origin_scope(scope: &str) -> Option<String> {
+    let (prefix, api_base) = scope.rsplit_once("\norigin:")?;
+    let origin = origin_of_api_base(api_base)?;
+    if origin == api_base {
+        return None;
+    }
+    Some(format!("{prefix}\norigin:{origin}"))
+}
+
+/// Same canonical origin [`crate::api_client::ApiClient::origin`] stored
+/// before the base path was included. Derived from the already-normalized
+/// base so `https://example.com/v1` maps back to `https://example.com`.
+fn origin_of_api_base(api_base: &str) -> Option<String> {
+    let url = reqwest::Url::parse(api_base).ok()?;
+    url.host()?;
+    Some(url.origin().ascii_serialization())
 }
 
 pub fn unix_now() -> u64 {
@@ -302,13 +413,16 @@ pub fn loaded_attempt_is_password(loaded: &LoadedTemplateDeployAttempt) -> bool 
 /// A catalog unlock-mode change must not reject a live replay: match the hash
 /// the request was signed with, and let the replay branch restore that mode.
 /// Password-to-password is different. That hash is derived from the local
-/// recovery seed. Substituting the stored hash would replay a descriptor
-/// after the seed rotated, while ownership claim uses the newly derived key.
+/// recovery seed or read from the saved per-app bootstrap key. Substituting
+/// the stored hash would replay a descriptor after the seed rotated, while
+/// ownership claim uses the newly derived key.
 ///
-/// `current_password_hash` is that derivation, computed without writing the
-/// bootstrap key. Pass it only when the catalog is password mode. `None`
-/// means it was not derived. A password stored request then does not match,
-/// so a missing or rotated seed cannot resume a descriptor it cannot claim.
+/// `current_password_hash` is that comparison hash, computed without writing
+/// the bootstrap key. Pass it only when the catalog is password mode, or when
+/// the catalog entry is gone and the stored request is itself password (see
+/// [`catalog_unlock_mode_for_resume`]). `None` means it was not derived. A
+/// password stored request then does not match, so a missing key cannot
+/// resume a descriptor it cannot claim.
 pub fn bootstrap_hash_for_resume_match(
     loaded: &LoadedTemplateDeployAttempt,
     catalog_unlock_mode: &str,
@@ -322,6 +436,70 @@ pub fn bootstrap_hash_for_resume_match(
     } else {
         stored.bootstrap_pubkey_hash.clone()
     }
+}
+
+/// Unlock mode to use when matching a stored request.
+///
+/// A live catalog entry wins, including a password-to-auto change that must
+/// keep the hash the request was signed with. A missing catalog entry is not
+/// that change: a stored password request still has to be compared against
+/// the saved or derived bootstrap key, or a removed template would replay a
+/// descriptor this machine can no longer claim. An absent catalog and a
+/// non-password stored request match the stored hash.
+pub fn catalog_unlock_mode_for_resume(
+    catalog_unlock_mode: Option<&str>,
+    loaded: &LoadedTemplateDeployAttempt,
+) -> String {
+    if let Some(mode) = nonempty_scope_part(catalog_unlock_mode) {
+        return mode.to_string();
+    }
+    if loaded_attempt_is_password(loaded) {
+        "password".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Bootstrap hash stored with this attempt, if the file could be read.
+pub fn loaded_bootstrap_pubkey_hash(loaded: &LoadedTemplateDeployAttempt) -> Option<&str> {
+    match loaded {
+        LoadedTemplateDeployAttempt::Ready(stored) => stored.bootstrap_pubkey_hash.as_deref(),
+        _ => None,
+    }
+}
+
+/// Which local key to hash when deciding whether a password replay can still
+/// be claimed.
+///
+/// Ownership claim reads the per-app bootstrap key before it derives one from
+/// the recovery seed. A seed that was removed or replaced must not hide that
+/// saved key: if its hash is the one in the signed request, the replay is
+/// still completable. A saved key that does not match falls back to the seed,
+/// so a previous overwrite can still be restored when the seed derives the
+/// signed hash. Neither match refuses the replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordResumeKeySource {
+    Saved,
+    Derived,
+}
+
+pub fn password_resume_key_source(
+    saved_hash: Option<&str>,
+    derived_hash: Option<&str>,
+    stored_hash: Option<&str>,
+) -> Option<PasswordResumeKeySource> {
+    let saved_matches = saved_hash.is_some_and(|hash| stored_hash == Some(hash));
+    if saved_matches {
+        return Some(PasswordResumeKeySource::Saved);
+    }
+    let derived_matches = derived_hash.is_some_and(|hash| stored_hash == Some(hash));
+    if derived_matches || (saved_hash.is_none() && derived_hash.is_some()) {
+        return Some(PasswordResumeKeySource::Derived);
+    }
+    if saved_hash.is_some() {
+        return Some(PasswordResumeKeySource::Saved);
+    }
+    None
 }
 
 /// Whether this attempt must satisfy password-mode gates.
@@ -813,10 +991,21 @@ pub fn try_acquire_template_deploy_lock(
     instance_name: &str,
 ) -> Result<Option<TemplateDeployLock>, String> {
     paths.ensure_dirs().map_err(|err| err.to_string())?;
-    let path = lock_path(paths, scope, instance_name);
-    crate::fslock::try_acquire_file_lock(&path)
-        .map(|guard| guard.map(|guard| TemplateDeployLock { _guard: guard }))
-        .map_err(|err| lock_error(instance_name, &err))
+    let Some(guard) = try_lock_scope(paths, scope, instance_name)? else {
+        return Ok(None);
+    };
+    let legacy = match lock_legacy_scope(paths, scope, instance_name, false)? {
+        LegacyLock::None => None,
+        LegacyLock::Held(legacy) => Some(legacy),
+        LegacyLock::Busy => {
+            drop(guard);
+            return Ok(None);
+        }
+    };
+    Ok(Some(TemplateDeployLock {
+        _guard: guard,
+        _legacy: legacy,
+    }))
 }
 
 pub fn acquire_template_deploy_lock(
@@ -825,10 +1014,23 @@ pub fn acquire_template_deploy_lock(
     instance_name: &str,
 ) -> Result<TemplateDeployLock, String> {
     paths.ensure_dirs().map_err(|err| err.to_string())?;
-    let path = lock_path(paths, scope, instance_name);
-    crate::fslock::acquire_file_lock(&path)
-        .map(|guard| TemplateDeployLock { _guard: guard })
-        .map_err(|err| lock_error(instance_name, &err))
+    let guard = acquire_lock_scope(paths, scope, instance_name)?;
+    let legacy = match lock_legacy_scope(paths, scope, instance_name, true)? {
+        LegacyLock::Held(legacy) => Some(legacy),
+        LegacyLock::None => None,
+        LegacyLock::Busy => {
+            return Err(lock_error(
+                instance_name,
+                &std::io::Error::other(
+                    "legacy template deploy lock was busy during a blocking acquire",
+                ),
+            ));
+        }
+    };
+    Ok(TemplateDeployLock {
+        _guard: guard,
+        _legacy: legacy,
+    })
 }
 
 /// Block until this app's template-deploy lock is free, without stalling the
@@ -867,6 +1069,51 @@ pub async fn lock_template_deploy(
 
 fn lock_error(instance_name: &str, err: &std::io::Error) -> String {
     format!("could not lock template deploy state for `{instance_name}`: {err}")
+}
+
+enum LegacyLock {
+    None,
+    Held(crate::fslock::FileLockGuard),
+    Busy,
+}
+
+fn try_lock_scope(
+    paths: &CliPaths,
+    scope: &str,
+    instance_name: &str,
+) -> Result<Option<crate::fslock::FileLockGuard>, String> {
+    crate::fslock::try_acquire_file_lock(&lock_path(paths, scope, instance_name))
+        .map_err(|err| lock_error(instance_name, &err))
+}
+
+fn acquire_lock_scope(
+    paths: &CliPaths,
+    scope: &str,
+    instance_name: &str,
+) -> Result<crate::fslock::FileLockGuard, String> {
+    crate::fslock::acquire_file_lock(&lock_path(paths, scope, instance_name))
+        .map_err(|err| lock_error(instance_name, &err))
+}
+
+/// Lock the origin-keyed path an older CLI still uses. Current scope is
+/// always taken first, then this one, so two new CLIs cannot deadlock. An
+/// older CLI holds only the legacy lock.
+fn lock_legacy_scope(
+    paths: &CliPaths,
+    scope: &str,
+    instance_name: &str,
+    blocking: bool,
+) -> Result<LegacyLock, String> {
+    let Some(legacy) = legacy_origin_scope(scope) else {
+        return Ok(LegacyLock::None);
+    };
+    if blocking {
+        return acquire_lock_scope(paths, &legacy, instance_name).map(LegacyLock::Held);
+    }
+    match try_lock_scope(paths, &legacy, instance_name)? {
+        Some(guard) => Ok(LegacyLock::Held(guard)),
+        None => Ok(LegacyLock::Busy),
+    }
 }
 
 pub fn save_template_deploy_attempt(
@@ -942,6 +1189,50 @@ pub fn load_template_deploy_attempt(
     scope: &str,
     instance_name: &str,
 ) -> LoadedTemplateDeployAttempt {
+    match read_attempt_file(paths, scope, instance_name) {
+        LoadedTemplateDeployAttempt::Absent => {
+            adopt_legacy_origin_attempt(paths, scope, instance_name)
+        }
+        other => other,
+    }
+}
+
+/// Move an origin-keyed file into this path-based scope without changing the
+/// signed request. Called only when the path-keyed file is absent, and only
+/// while the caller holds both locks (see [`TemplateDeployLock`]).
+///
+/// The pre-upgrade file is shared by every path on that origin. The first
+/// path that resumes adopts it. Two paths cannot be told apart after the
+/// fact; leaving the file invisible would sign a second deployment instead.
+fn adopt_legacy_origin_attempt(
+    paths: &CliPaths,
+    scope: &str,
+    instance_name: &str,
+) -> LoadedTemplateDeployAttempt {
+    let Some(legacy) = legacy_origin_scope(scope) else {
+        return LoadedTemplateDeployAttempt::Absent;
+    };
+    match read_attempt_file(paths, &legacy, instance_name) {
+        LoadedTemplateDeployAttempt::Absent => LoadedTemplateDeployAttempt::Absent,
+        // An unreadable origin file is not "no request". Signing fresh could
+        // race the deployment the older CLI saved.
+        LoadedTemplateDeployAttempt::Unreadable => LoadedTemplateDeployAttempt::Unreadable,
+        LoadedTemplateDeployAttempt::Ready(mut stored) => {
+            stored.scope = scope.to_string();
+            if write_stored(paths, &stored).is_err() {
+                return LoadedTemplateDeployAttempt::Unreadable;
+            }
+            let _ = std::fs::remove_file(attempt_path(paths, &legacy, instance_name));
+            LoadedTemplateDeployAttempt::Ready(stored)
+        }
+    }
+}
+
+fn read_attempt_file(
+    paths: &CliPaths,
+    scope: &str,
+    instance_name: &str,
+) -> LoadedTemplateDeployAttempt {
     let path = attempt_path(paths, scope, instance_name);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -969,6 +1260,21 @@ pub fn clear_template_deploy_attempt(
     scope: &str,
     instance_name: &str,
 ) -> Result<(), String> {
+    let current = remove_attempt_file(paths, scope, instance_name);
+    // A destroy that only clears the path-keyed file leaves the pre-upgrade
+    // file for the next resume to adopt, which replays a destroyed app.
+    // Every path on this origin shared that one file, so clearing it is
+    // fail-closed: better to drop an ambiguous pre-upgrade request than to
+    // replay it after the app is gone.
+    let legacy = match legacy_origin_scope(scope) {
+        Some(legacy) => remove_attempt_file(paths, &legacy, instance_name),
+        None => Ok(()),
+    };
+    current?;
+    legacy
+}
+
+fn remove_attempt_file(paths: &CliPaths, scope: &str, instance_name: &str) -> Result<(), String> {
     let path = attempt_path(paths, scope, instance_name);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
@@ -2070,5 +2376,314 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    fn path_scope() -> String {
+        template_deploy_scope(
+            Some("org-1"),
+            None,
+            None,
+            Some("beta"),
+            "https://api.example/v1",
+        )
+    }
+
+    fn origin_scope() -> String {
+        template_deploy_scope(
+            Some("org-1"),
+            None,
+            None,
+            Some("beta"),
+            "https://api.example",
+        )
+    }
+
+    #[test]
+    fn path_scope_adopts_an_origin_keyed_file_without_changing_signed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+        let legacy = origin_scope();
+        let current = path_scope();
+        assert_eq!(
+            legacy_origin_scope(&current).as_deref(),
+            Some(legacy.as_str())
+        );
+        assert!(legacy_origin_scope(&legacy).is_none());
+        let stable = stable();
+        let request = request_from(&stable, "descriptor-legacy");
+        save_template_deploy_attempt(
+            &paths,
+            &legacy,
+            "app-uuid",
+            "deploy-legacy",
+            &request,
+            &record(),
+        )
+        .unwrap();
+        let LoadedTemplateDeployAttempt::Ready(stored) =
+            load_template_deploy_attempt(&paths, &current, "shell")
+        else {
+            panic!("a path-scoped retry must adopt the origin-keyed request");
+        };
+        assert_eq!(stored.deploy_id, "deploy-legacy");
+        assert_eq!(stored.customer_descriptor_blob, "descriptor-legacy");
+        assert_eq!(stored.org_keyring_blob, "keyring-a");
+        assert_eq!(stored.signed_policy_artifact, "policy-a");
+        assert_eq!(
+            idempotency_key_for_request(&stored.clone().into_request()),
+            idempotency_key_for_request(&request),
+            "adopting the file must not change the idempotency key"
+        );
+        assert!(
+            matches!(
+                load_template_deploy_attempt(&paths, &legacy, "shell"),
+                LoadedTemplateDeployAttempt::Absent
+            ),
+            "the origin-keyed file is moved, not copied"
+        );
+        let other_path = template_deploy_scope(
+            Some("org-1"),
+            None,
+            None,
+            Some("beta"),
+            "https://api.example/v2",
+        );
+        assert!(
+            matches!(
+                load_template_deploy_attempt(&paths, &other_path, "shell"),
+                LoadedTemplateDeployAttempt::Absent
+            ),
+            "once adopted, the other base path must not see the origin file"
+        );
+    }
+
+    #[test]
+    fn path_scope_does_not_replace_an_existing_path_keyed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+        let stable = stable();
+        let request = request_from(&stable, "descriptor-a");
+        save_template_deploy_attempt(
+            &paths,
+            &origin_scope(),
+            "app-uuid",
+            "deploy-old",
+            &request,
+            &record(),
+        )
+        .unwrap();
+        save_template_deploy_attempt(
+            &paths,
+            &path_scope(),
+            "app-uuid",
+            "deploy-new",
+            &request,
+            &record(),
+        )
+        .unwrap();
+        let LoadedTemplateDeployAttempt::Ready(stored) =
+            load_template_deploy_attempt(&paths, &path_scope(), "shell")
+        else {
+            panic!("the path-keyed file is authoritative when it exists");
+        };
+        assert_eq!(stored.deploy_id, "deploy-new");
+        assert!(matches!(
+            load_template_deploy_attempt(&paths, &origin_scope(), "shell"),
+            LoadedTemplateDeployAttempt::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn unreadable_origin_file_is_not_treated_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+        let legacy = origin_scope();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(attempt_path(&paths, &legacy, "shell"), b"not-json").unwrap();
+        assert!(
+            matches!(
+                load_template_deploy_attempt(&paths, &path_scope(), "shell"),
+                LoadedTemplateDeployAttempt::Unreadable
+            ),
+            "a corrupt origin-keyed file must not look like permission to sign fresh"
+        );
+    }
+
+    #[test]
+    fn clear_removes_the_origin_keyed_file_for_a_path_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+        let stable = stable();
+        let request = request_from(&stable, "descriptor-a");
+        let other = template_deploy_scope(
+            Some("org-1"),
+            None,
+            None,
+            Some("beta"),
+            "https://api.example/v2",
+        );
+        save_template_deploy_attempt(
+            &paths,
+            &origin_scope(),
+            "app-uuid",
+            "deploy-old",
+            &request,
+            &record(),
+        )
+        .unwrap();
+        save_template_deploy_attempt(&paths, &other, "app-uuid", "deploy-v2", &request, &record())
+            .unwrap();
+        clear_template_deploy_attempt(&paths, &path_scope(), "shell").unwrap();
+        assert!(matches!(
+            load_template_deploy_attempt(&paths, &origin_scope(), "shell"),
+            LoadedTemplateDeployAttempt::Absent
+        ));
+        assert!(
+            matches!(
+                load_template_deploy_attempt(&paths, &other, "shell"),
+                LoadedTemplateDeployAttempt::Ready(_)
+            ),
+            "clearing one base path must not remove another path's own file"
+        );
+    }
+
+    #[test]
+    fn path_scope_lock_also_holds_the_origin_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+        let held = acquire_template_deploy_lock(&paths, &path_scope(), "shell").unwrap();
+        assert!(
+            try_acquire_template_deploy_lock(&paths, &origin_scope(), "shell")
+                .unwrap()
+                .is_none(),
+            "an older CLI locking the origin must wait while the path scope is held"
+        );
+        drop(held);
+        assert!(
+            try_acquire_template_deploy_lock(&paths, &origin_scope(), "shell")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn api_key_identity_does_not_share_the_unknown_scope() {
+        let alpha = AuthenticatedResumeIdentity {
+            org_id: Some("org-a"),
+            org_name: Some("alpha"),
+            user_id: Some("user-a"),
+        };
+        let beta = AuthenticatedResumeIdentity {
+            org_id: Some("org-a"),
+            org_name: Some("alpha"),
+            user_id: Some("user-b"),
+        };
+        let scope_a = template_deploy_scope_for_credentials(
+            None,
+            None,
+            None,
+            None,
+            Some(&alpha),
+            "https://api.example",
+        )
+        .unwrap();
+        let scope_b = template_deploy_scope_for_credentials(
+            None,
+            None,
+            None,
+            None,
+            Some(&beta),
+            "https://api.example",
+        )
+        .unwrap();
+        assert_ne!(scope_a, scope_b, "two users must not share a resume file");
+        assert!(!scope_a.contains("unknown"));
+        assert_eq!(
+            template_deploy_scope_for_credentials(
+                Some("org-1"),
+                None,
+                None,
+                Some("beta"),
+                Some(&alpha),
+                "https://api.example"
+            )
+            .unwrap(),
+            template_deploy_scope(
+                Some("org-1"),
+                None,
+                None,
+                Some("beta"),
+                "https://api.example"
+            ),
+            "a saved org id must keep the existing scope so its resume file still matches"
+        );
+        assert!(
+            template_deploy_scope_for_credentials(
+                None,
+                None,
+                None,
+                None,
+                None,
+                "https://api.example"
+            )
+            .is_err(),
+            "missing identity must not fall back to the shared unknown scope"
+        );
+    }
+
+    #[test]
+    fn missing_catalog_still_compares_a_password_bootstrap_key() {
+        let stable = stable();
+        let loaded = LoadedTemplateDeployAttempt::Ready(Box::new(stored(&stable, "deploy-1")));
+        assert_eq!(
+            catalog_unlock_mode_for_resume(None, &loaded),
+            "password",
+            "a removed catalog entry must not skip the password-key comparison"
+        );
+        assert_eq!(
+            catalog_unlock_mode_for_resume(Some("auto"), &loaded),
+            "auto",
+            "a live catalog mode change still wins"
+        );
+        let mut auto = stored(&stable, "deploy-1");
+        auto.bootstrap_pubkey_hash = None;
+        auto.workflow = Some(StoredTemplateWorkflow {
+            unlock_mode: "auto".to_string(),
+            paas_managed_config_keys: Vec::new(),
+        });
+        assert_eq!(
+            catalog_unlock_mode_for_resume(
+                None,
+                &LoadedTemplateDeployAttempt::Ready(Box::new(auto))
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn password_replay_hashes_the_saved_key_before_the_recovery_seed() {
+        let stored = "ab".repeat(32);
+        let saved = stored.clone();
+        let replaced_seed = "ff".repeat(32);
+        assert_eq!(
+            password_resume_key_source(Some(&saved), None, Some(&stored)),
+            Some(PasswordResumeKeySource::Saved),
+            "a removed recovery seed must not hide the saved bootstrap key"
+        );
+        assert_eq!(
+            password_resume_key_source(Some(&saved), Some(&replaced_seed), Some(&stored)),
+            Some(PasswordResumeKeySource::Saved),
+            "a replaced seed must not win over the saved key that still matches"
+        );
+        assert_eq!(
+            password_resume_key_source(Some(&replaced_seed), Some(&saved), Some(&stored)),
+            Some(PasswordResumeKeySource::Derived),
+            "a saved key that does not match falls back to the seed that does"
+        );
+        assert_eq!(
+            password_resume_key_source(None, Some(&saved), Some(&stored)),
+            Some(PasswordResumeKeySource::Derived)
+        );
+        assert_eq!(password_resume_key_source(None, None, Some(&stored)), None);
     }
 }
