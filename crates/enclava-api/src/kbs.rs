@@ -1161,8 +1161,11 @@ async fn load_signed_policy_candidates_for(
                         --   * the deployment named in
                         --     teardown_live_deployment_pins, when that
                         --     generation published a StatefulSet. Delete
-                        --     records the controller-owned ordinal-0 pod's
-                        --     enclava.dev/deployment-id there before admission.
+                        --     observes the controller-owned ordinal-0 pod's
+                        --     enclava.dev/deployment-id before admission and
+                        --     commits that pin only after the budget check,
+                        --     in the same transaction as the generation bump.
+                        --     A refusal retains the stored pin.
                         --     That label is the applying operation id
                         --     (job.deployment_id), not artifact_deployment_id:
                         --     rollback keeps the source artifact and mints a
