@@ -1291,8 +1291,10 @@ pub async fn reconcile_orphaned_deployment_apply_leases(
 /// generation/expiry/no-remaining-resource guard the documented operator
 /// path uses, and only when a live app row still owns the namespace name,
 /// under that app's deployment-lane advisory lock (the same first lock
-/// `claim`/`finish` take). Multiple API replicas may run this concurrently —
-/// the CAS makes the release exactly-once and harmless to race.
+/// `claim`/`finish` take). Multiple API replicas may run this concurrently.
+/// The release CAS makes a clear exactly-once. The probe-cursor stamp also
+/// compare-and-swaps the `updated_at` that replica selected, so two replicas
+/// that loaded the same oldest-first snapshot do not both probe that prefix.
 pub async fn release_retained_deployment_namespace_fences(
     pool: &PgPool,
     client: &kube::Client,
@@ -1307,11 +1309,14 @@ pub async fn release_retained_deployment_namespace_fences(
 /// Expired retained namespace fences to probe this pass, oldest probe
 /// cursor first. `updated_at` is that cursor (cap#240): a pass stamps it
 /// only when it actually starts a probe, and restores the previous value
-/// if the stamp itself consumes the remaining window. Fences that are not
-/// started stay older and are resumed next pass. A pass that still has a
-/// full window when its first fence is polled starts that concurrent wave;
-/// scheduling delay may start fewer, so the bound is not
-/// `ceil(n / fair_page)`. `app_delete` fences are selected alongside the
+/// if the stamp itself consumes the remaining window. The stamp claims the
+/// selected value with a compare-and-swap, so a second replica holding this
+/// same snapshot skips that fence and continues to the next unclaimed one
+/// (cap#373 review). Fences that are not started stay older and are resumed
+/// next pass. A pass that still has a full window when its first fence is
+/// polled starts that concurrent wave; scheduling delay may start fewer, so
+/// the bound is not `ceil(n / fair_page)`. `app_delete` fences are selected
+/// alongside the
 /// retained-apply marker (cap#336): the delete path arms the same infinite
 /// fence before its namespace DELETE and a provider error strands it
 /// identically.
@@ -1346,9 +1351,12 @@ async fn select_expired_retained_namespace_fences(
 /// Move a fence we are about to probe behind fences this pass will not
 /// start. Returns the stamped `updated_at` so a stamp that consumes the
 /// probe window can be undone. The compare-and-swap stays on the expired
-/// retained row, so a release or renew that already won is left alone and
-/// the caller skips the probe. `locked_until` is not touched: the settle
-/// margin that bounds a foreign namespace reads it.
+/// retained row and on the `updated_at` this replica selected, so a
+/// release, a renew, or another replica that already claimed this cursor
+/// is left alone and the caller skips the probe. Two replicas that
+/// snapshotted the same oldest-first page therefore do not both issue the
+/// Kubernetes GET/DELETE for that prefix (cap#373 review). `locked_until`
+/// is not touched: the settle margin that bounds a foreign namespace reads it.
 async fn stamp_retained_fence_probe(
     pool: &PgPool,
     namespace: &str,
@@ -1356,6 +1364,7 @@ async fn stamp_retained_fence_probe(
     generation: i64,
     operation_id: Uuid,
     operation_kind: &str,
+    previous_updated_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MutationLeaseError> {
     Ok(sqlx::query_scalar(
         "UPDATE external_resource_mutation_leases
@@ -1368,6 +1377,7 @@ async fn stamp_retained_fence_probe(
             AND operation_kind = $5
             AND reclaim_after = 'infinity'::timestamptz
             AND locked_until <= clock_timestamp()
+            AND updated_at = $6
         RETURNING updated_at",
     )
     .bind(namespace)
@@ -1375,6 +1385,7 @@ async fn stamp_retained_fence_probe(
     .bind(generation)
     .bind(operation_id)
     .bind(operation_kind)
+    .bind(previous_updated_at)
     .fetch_optional(pool)
     .await?)
 }
@@ -1571,6 +1582,10 @@ async fn release_retained_deployment_namespace_fences_budgeted(
                             );
                             return Ok(false);
                         }
+                        // Claim the cursor this replica selected. A peer that
+                        // loaded the same snapshot loses this CAS and skips;
+                        // the stream then pulls a later fence instead of
+                        // repeating this prefix.
                         let Some(stamped_updated_at) = stamp_retained_fence_probe(
                             &pool,
                             &namespace,
@@ -1578,6 +1593,7 @@ async fn release_retained_deployment_namespace_fences_budgeted(
                             generation,
                             operation_id,
                             &operation_kind,
+                            previous_updated_at,
                         )
                         .await?
                         else {
@@ -5137,6 +5153,135 @@ pub(crate) mod tests {
                 .await
                 .expect("remove fast-pass fixture organization");
         }
+    }
+
+    /// cap#373 review: two replicas that selected the same oldest-first
+    /// cursor must not both stamp it. The update compare-and-swaps that
+    /// `updated_at`; the loser skips the probe. Restoring the winner's
+    /// stamp puts the cursor back, so a replica that did not probe can
+    /// claim it on a later pass.
+    #[tokio::test]
+    async fn retained_fence_probe_cursor_is_claimed_once_per_selected_updated_at() {
+        let pool = database_test_pool(2).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let (org, _app, _token, namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET updated_at = clock_timestamp() - interval '1 hour'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("age the fixture cursor so a won stamp must move it");
+        let selected = select_expired_retained_namespace_fences(&pool)
+            .await
+            .expect("select expired retained fences");
+        let (
+            owner_token,
+            selected_namespace,
+            operation_id,
+            generation,
+            operation_kind,
+            previous_updated_at,
+        ) = selected
+            .into_iter()
+            .find(|row| row.1 == namespace)
+            .expect("fixture fence is selected");
+        assert_eq!(selected_namespace, namespace);
+
+        let (first, second) = tokio::join!(
+            stamp_retained_fence_probe(
+                &pool,
+                &namespace,
+                owner_token,
+                generation,
+                operation_id,
+                &operation_kind,
+                previous_updated_at,
+            ),
+            stamp_retained_fence_probe(
+                &pool,
+                &namespace,
+                owner_token,
+                generation,
+                operation_id,
+                &operation_kind,
+                previous_updated_at,
+            ),
+        );
+        let first = first.expect("first claim");
+        let second = second.expect("second claim");
+        let wins = [first, second].into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(
+            wins.len(),
+            1,
+            "two replicas holding the same selected cursor must not both claim it"
+        );
+        let stamped = wins[0];
+        assert_ne!(
+            stamped, previous_updated_at,
+            "a won claim must move the probe cursor"
+        );
+        let third = stamp_retained_fence_probe(
+            &pool,
+            &namespace,
+            owner_token,
+            generation,
+            operation_id,
+            &operation_kind,
+            previous_updated_at,
+        )
+        .await
+        .expect("third claim");
+        assert!(
+            third.is_none(),
+            "a later replica still holding the pre-claim cursor must not stamp over the winner"
+        );
+
+        restore_retained_fence_probe_cursor(
+            &pool,
+            &namespace,
+            owner_token,
+            generation,
+            operation_id,
+            &operation_kind,
+            previous_updated_at,
+            stamped,
+        )
+        .await
+        .expect("restore cursor");
+        let after_restore = stamp_retained_fence_probe(
+            &pool,
+            &namespace,
+            owner_token,
+            generation,
+            operation_id,
+            &operation_kind,
+            previous_updated_at,
+        )
+        .await
+        .expect("claim after restore");
+        assert!(
+            after_restore.is_some(),
+            "restoring the cursor must make the unprobed fence claimable again"
+        );
+
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("remove claim-fixture fence");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("remove claim-fixture organization");
     }
 
     #[test]
