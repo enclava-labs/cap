@@ -50,16 +50,31 @@ const RETAINED_NAMESPACE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// issuing the DELETE (cap#373 review).
 const RETAINED_FENCE_SEQUENCE_CALLS: u32 = 3;
 
+/// Work that sits outside a timed-out probe before the next wave is
+/// polled. The GET timeout starts after the cursor stamp, and
+/// `buffer_unordered` pulls the next fence only after that task clears
+/// its claim. A batch equal to one probe plus one sequence therefore
+/// rejects the second wave with nearly a full sequence left — the
+/// timeout fires at or after the probe, not before it (cap#373 review).
+/// Shorter than one probe, so it does not buy a third wave. A round
+/// trip slower than this fails closed and leaves the fence at the head
+/// of the next pass.
+const RETAINED_FENCE_WAVE_SLACK: Duration = Duration::from_secs(5);
+
 /// Overall budget for one reconciliation pass over expired retained
-/// namespace fences. A fence is started only when
-/// [`RETAINED_FENCE_SEQUENCE_CALLS`] full
-/// [`RETAINED_NAMESPACE_PROBE_TIMEOUT`] windows still fit before this
-/// deadline; the rest keep their older probe cursor and are resumed
-/// next pass (cap#240, cap#373 review). The bound still stops one slow
-/// pass from running on without limit — it no longer does that by
-/// handing later fences an expired timeout, or by admitting a fence
-/// whose follow-ups cannot finish.
-const RETAINED_FENCE_BATCH_DEADLINE: Duration = Duration::from_secs(120);
+/// namespace fences: one probe (when the second wave is polled), plus
+/// [`RETAINED_FENCE_SEQUENCE_CALLS`] probe windows for that wave, plus
+/// [`RETAINED_FENCE_WAVE_SLACK`]. A fence is started only when that
+/// sequence still fits; the rest keep their older probe cursor and are
+/// resumed next pass (cap#240, cap#373 review). The bound still stops
+/// one slow pass from running on without limit — it no longer does that
+/// by handing later fences an expired timeout, by admitting a fence
+/// whose follow-ups cannot finish, or by skipping a wave that a full
+/// probe timeout left nearly a sequence.
+const RETAINED_FENCE_BATCH_DEADLINE: Duration = Duration::from_secs(
+    RETAINED_NAMESPACE_PROBE_TIMEOUT.as_secs() * (RETAINED_FENCE_SEQUENCE_CALLS as u64 + 1)
+        + RETAINED_FENCE_WAVE_SLACK.as_secs(),
+);
 
 /// Concurrent retained-fence reconciles per pass: enough parallelism that
 /// slow entries overlap, small enough not to monopolize the API pool.
@@ -124,12 +139,15 @@ impl ProbeWindow {
 /// Upper bound on fences one pass can start when every probe burns a full
 /// `probe_timeout`, at most `concurrency` run at once, and the first wave
 /// starts with the deadline still intact. Admission requires
-/// [`RETAINED_FENCE_SEQUENCE_CALLS`] probe windows, so a wave that burns
-/// one probe may leave the next wave short of a full sequence.
-/// [`ProbeWindow::has_sequence_budget`] may start fewer if scheduling
-/// delay eats a later wave, and a stamp that consumes the sequence is
-/// undone rather than counted as a probe (cap#240). This is not a
-/// guaranteed `ceil(n / fair_page)` bound.
+/// [`RETAINED_FENCE_SEQUENCE_CALLS`] probe windows. The next wave is
+/// polled after that timeout plus the stamp and the claim clear, so a
+/// batch equal to one probe plus one sequence counts a second wave here
+/// and then skips it (cap#373 review). [`RETAINED_FENCE_WAVE_SLACK`] is
+/// what makes the counted wave actually start.
+/// [`ProbeWindow::has_sequence_budget`] may start fewer if that overrun
+/// exceeds the slack, and a stamp that consumes the sequence is undone
+/// rather than counted as a probe (cap#240). This is not a guaranteed
+/// `ceil(n / fair_page)` bound.
 #[cfg(test)]
 fn retained_fence_fair_page(batch: Duration, probe: Duration, concurrency: usize) -> usize {
     let probe_ms = probe.as_millis().max(1);
@@ -5202,22 +5220,38 @@ pub(crate) mod tests {
             RETAINED_NAMESPACE_PROBE_TIMEOUT,
             RETAINED_FENCE_RECONCILE_CONCURRENCY,
         );
-        // 120s holds two waves of concurrency 4. The second starts after
-        // one full probe and still has a 90s sequence (GET, pinned DELETE,
-        // confirmation). A third wave would not: admitting it with only
-        // one probe left is the cursor-rotation bug.
+        // Two waves of concurrency 4. The second is polled after one full
+        // probe plus stamp and claim-clear, and still has a 90s sequence
+        // (GET, pinned DELETE, confirmation). Exact equality (probe +
+        // sequence) counts that wave and then skips it: the timeout fires
+        // at or after the probe. A third wave must not fit.
         assert_eq!(page, 8);
         let waves = page / RETAINED_FENCE_RECONCILE_CONCURRENCY;
         assert_eq!(waves, 2);
-        let last_start = RETAINED_NAMESPACE_PROBE_TIMEOUT * u32::try_from(waves - 1).unwrap();
-        assert!(
-            last_start + RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS
-                <= RETAINED_FENCE_BATCH_DEADLINE
+        assert_eq!(
+            RETAINED_FENCE_BATCH_DEADLINE,
+            RETAINED_NAMESPACE_PROBE_TIMEOUT * (RETAINED_FENCE_SEQUENCE_CALLS + 1)
+                + RETAINED_FENCE_WAVE_SLACK,
+            "production must be probe + sequence + slack, not the 120s equality that skips the second wave"
         );
-        let next_wave = last_start
-            + RETAINED_NAMESPACE_PROBE_TIMEOUT
-            + RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS;
-        assert!(next_wave > RETAINED_FENCE_BATCH_DEADLINE);
+        assert!(
+            RETAINED_FENCE_WAVE_SLACK < RETAINED_NAMESPACE_PROBE_TIMEOUT,
+            "wave slack must not be large enough for fair_page to count a third wave"
+        );
+        let second_wave = RETAINED_NAMESPACE_PROBE_TIMEOUT;
+        assert!(
+            second_wave
+                + RETAINED_FENCE_WAVE_SLACK
+                + RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS
+                <= RETAINED_FENCE_BATCH_DEADLINE,
+            "the second wave, polled after the timeout plus slack, must still hold a full sequence"
+        );
+        let third_wave = RETAINED_NAMESPACE_PROBE_TIMEOUT * 2;
+        assert!(
+            third_wave + RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS
+                > RETAINED_FENCE_BATCH_DEADLINE,
+            "a third wave must not fit; admitting it with one probe left rotates an unfinished fence"
+        );
         // A live owned retry is three Kubernetes calls (GET, pinned DELETE,
         // confirmation), each allowed a full probe window capped by the
         // batch. A batch shorter than that reintroduces the never-clears
@@ -5225,10 +5259,11 @@ pub(crate) mod tests {
         // remainder after that sequence is also sqlx's default
         // acquire_timeout (30s); DB work between those calls has to fit
         // in it when the fence is admitted at the start.
+        let remainder = RETAINED_FENCE_BATCH_DEADLINE
+            - RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS;
         assert!(
-            RETAINED_FENCE_BATCH_DEADLINE
-                >= RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS,
-            "the batch must fit a GET, a pinned DELETE, and a confirmation GET"
+            remainder >= Duration::from_secs(30),
+            "DB work between the three calls has to fit in sqlx's default acquire_timeout when the fence is admitted at the start"
         );
     }
 
@@ -5610,6 +5645,43 @@ pub(crate) mod tests {
         assert!(
             admits.has_sequence_budget(),
             "a batch that still holds the full sequence must admit"
+        );
+    }
+
+    /// cap#373 review: `<=` still admits a wave polled at the exact probe
+    /// instant. A timeout fires at or after that instant, and the next
+    /// wave is polled only after the claim clear, so a batch equal to
+    /// probe + sequence rejects it. Wave slack must still admit that
+    /// overrun, and must not keep admitting once the overrun exceeds it.
+    #[tokio::test(start_paused = true)]
+    async fn wave_slack_admits_the_second_wave_past_the_probe_instant() {
+        let probe = RETAINED_NAMESPACE_PROBE_TIMEOUT;
+        let sequence = probe * RETAINED_FENCE_SEQUENCE_CALLS;
+        let start = tokio::time::Instant::now();
+        let tight = ProbeWindow {
+            batch_deadline: start + probe + sequence,
+            probe_timeout: probe,
+            captured_deadline: None,
+        };
+        let with_slack = ProbeWindow {
+            batch_deadline: start + probe + sequence + RETAINED_FENCE_WAVE_SLACK,
+            probe_timeout: probe,
+            captured_deadline: None,
+        };
+        assert!(tight.has_sequence_budget());
+        tokio::time::advance(probe + Duration::from_millis(1)).await;
+        assert!(
+            !tight.has_sequence_budget(),
+            "probe + sequence rejects the wave polled after the timeout fires"
+        );
+        assert!(
+            with_slack.has_sequence_budget(),
+            "wave slack must still admit the wave a full probe timeout left nearly a sequence"
+        );
+        tokio::time::advance(RETAINED_FENCE_WAVE_SLACK).await;
+        assert!(
+            !with_slack.has_sequence_budget(),
+            "slack is a bound; an overrun past it must defer the fence instead of starting a short sequence"
         );
     }
 
@@ -6297,6 +6369,217 @@ pub(crate) mod tests {
                 .execute(&pool)
                 .await
                 .expect("remove sequence-budget fixture organization");
+        }
+    }
+
+    /// cap#373 review: four GETs that burn a full probe timeout must not
+    /// skip the next wave. That wave is polled only after the stamp and
+    /// the claim clear, so a batch equal to probe + sequence rejects an
+    /// already-absent namespace with nearly a full sequence left. The
+    /// production formula (probe + sequence + wave slack) must GET it and
+    /// release it in this pass.
+    #[tokio::test]
+    async fn slow_probe_wave_still_releases_the_absent_namespace_behind_it() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let probe = Duration::from_secs(2);
+        let batch = probe * (RETAINED_FENCE_SEQUENCE_CALLS + 1) + RETAINED_FENCE_WAVE_SLACK;
+        let concurrency = RETAINED_FENCE_RECONCILE_CONCURRENCY;
+        assert!(
+            batch > probe + probe * RETAINED_FENCE_SEQUENCE_CALLS,
+            "without wave slack the second wave is the skip this test locks"
+        );
+
+        let pool = database_test_pool(8).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let mut slow_namespaces = Vec::with_capacity(concurrency);
+        let mut orgs = Vec::with_capacity(concurrency + 1);
+        for _ in 0..concurrency {
+            let (org, _app, _token, namespace) =
+                stage_retained_namespace_fixture(&pool, Vec::new()).await;
+            slow_namespaces.push(namespace);
+            orgs.push(org);
+        }
+        let (victim_org, _app, _token, victim_namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        orgs.push(victim_org);
+        for namespace in &slow_namespaces {
+            sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                    SET updated_at = clock_timestamp() - interval '2 hours'
+                  WHERE resource_scope = 'kubernetes_namespace'
+                    AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("age slow-prefix cursor ahead of the absent namespace");
+        }
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET updated_at = clock_timestamp() - interval '1 hour'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .execute(&pool)
+        .await
+        .expect("age the absent namespace behind the slow prefix");
+
+        let gets = Arc::new(Mutex::new(Vec::<(String, tokio::time::Instant)>::new()));
+        let hang = probe * 5;
+        let app = Router::new().fallback({
+            let gets = Arc::clone(&gets);
+            let slow_namespaces = slow_namespaces.clone();
+            let victim_namespace = victim_namespace.clone();
+            move |request: axum::extract::Request| {
+                let gets = Arc::clone(&gets);
+                let slow_namespaces = slow_namespaces.clone();
+                let victim_namespace = victim_namespace.clone();
+                async move {
+                    let path = request.uri().path().to_string();
+                    if !path.contains("/namespaces/") {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Namespace",
+                                "metadata": {
+                                    "name": "discovery",
+                                    "uid": "discovery",
+                                    "resourceVersion": "1"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    let name = path.rsplit('/').next().unwrap_or("").to_string();
+                    if request.method() == axum::http::Method::GET
+                        && (slow_namespaces.iter().any(|namespace| namespace == &name)
+                            || name == victim_namespace)
+                    {
+                        gets.lock()
+                            .await
+                            .push((name.clone(), tokio::time::Instant::now()));
+                    }
+                    if name == victim_namespace {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "reason": "NotFound",
+                                "code": 404
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if slow_namespaces.iter().any(|namespace| namespace == &name) {
+                        tokio::time::sleep(hang).await;
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "code": 500
+                            })),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "reason": "NotFound",
+                            "code": 404
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow-wave mock API");
+        let address = listener.local_addr().expect("slow-wave mock address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve slow-wave mock API");
+        });
+        let client = mock_kube_client(&format!("http://{address}"));
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            client,
+            batch,
+            probe,
+            concurrency,
+        )
+        .await
+        .expect("pass with wave slack");
+        let seen = gets.lock().await.clone();
+        let slow_first = seen
+            .iter()
+            .filter(|(name, _)| slow_namespaces.iter().any(|namespace| namespace == name))
+            .map(|(_, at)| *at)
+            .min();
+        let victim_at = seen
+            .iter()
+            .find(|(name, _)| name == &victim_namespace)
+            .map(|(_, at)| *at);
+        assert!(
+            slow_first.is_some(),
+            "the slow prefix must be probed; gets={seen:?}"
+        );
+        let victim_at =
+            victim_at.expect("the absent namespace behind the slow wave must be probed");
+        assert!(
+            victim_at > slow_first.unwrap() + probe / 2,
+            "the absent namespace must start after the slow wave, not inside it; gets={seen:?}"
+        );
+        assert_eq!(
+            released, 1,
+            "the absent namespace must release in this pass, not wait for the next repair sleep"
+        );
+        let victim_released: bool = sqlx::query_scalar(
+            "SELECT owner_token IS NULL
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read the absent fence after the second wave");
+        assert!(
+            victim_released,
+            "the second-wave GET must have observed 404 and cleared that fence"
+        );
+
+        server.abort();
+        for namespace in slow_namespaces
+            .iter()
+            .chain(std::iter::once(&victim_namespace))
+        {
+            sqlx::query(
+                "DELETE FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("remove slow-wave fixture fence");
+        }
+        for org in orgs {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(&pool)
+                .await
+                .expect("remove slow-wave fixture organization");
         }
     }
 }
