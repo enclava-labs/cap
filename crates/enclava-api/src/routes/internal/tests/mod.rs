@@ -181,6 +181,7 @@ async fn begin_test_config_token_receipt(
         ConfigTokenIdempotencyOptions {
             binding: Some(binding),
             legacy_request_hash: None,
+            deployment_generation: None,
         },
     )
     .await
@@ -447,6 +448,7 @@ async fn migration_terminalizes_only_stale_legacy_reservations_without_data_leak
                     NULL::smallint AS capability_receipt_version,
                     NULL::uuid AS capability_resource_id,
                     NULL::text AS capability_instance_id,
+                    NULL::bigint AS capability_config_generation,
                     false AS known_not_applied,
                     completed_at, created_at, updated_at,
                     clock_timestamp() AS database_now
@@ -490,6 +492,7 @@ async fn migration_terminalizes_only_stale_legacy_reservations_without_data_leak
                     NULL::smallint AS capability_receipt_version,
                     NULL::uuid AS capability_resource_id,
                     NULL::text AS capability_instance_id,
+                    NULL::bigint AS capability_config_generation,
                     false AS known_not_applied,
                     completed_at, created_at, updated_at,
                     clock_timestamp() AS database_now
@@ -807,6 +810,7 @@ async fn deterministic_config_token_migration_scrubs_legacy_and_enforces_confide
             &legacy_auth,
             &legacy_body,
             &binding,
+            None,
         )
         .await
         .expect("replay migrated null-kind config-token terminal"),
@@ -822,6 +826,7 @@ async fn deterministic_config_token_migration_scrubs_legacy_and_enforces_confide
         &legacy_auth,
         &legacy_body,
         &binding,
+        None,
     )
     .await
     .err()
@@ -2523,6 +2528,7 @@ async fn deleted_and_rebound_config_token_routes_do_not_extend_or_mask_expiry() 
             &auth,
             &body,
             &app_binding,
+            None,
         )
         .await
         .expect("reserve incomplete app receipt"),
@@ -2535,6 +2541,7 @@ async fn deleted_and_rebound_config_token_routes_do_not_extend_or_mask_expiry() 
             &auth,
             &body,
             &deployment_binding,
+            None,
         )
         .await
         .expect("reserve incomplete deployment receipt"),
@@ -2833,6 +2840,7 @@ async fn deleted_legacy_config_token_routes_preserve_extended_terminal_proof() {
                         reservation_token, operation_id, lease_expires_at,
                         recovery_kind, capability_receipt_version,
                         capability_resource_id, capability_instance_id,
+                        capability_config_generation,
                         known_not_applied,
                         completed_at, created_at, updated_at,
                         clock_timestamp() AS database_now
@@ -2936,6 +2944,7 @@ async fn legacy_completed_config_token_sanitizer_preserves_extended_lease_proof(
                     reservation_token, operation_id, lease_expires_at,
                     recovery_kind, capability_receipt_version,
                     capability_resource_id, capability_instance_id,
+                    capability_config_generation,
                     known_not_applied,
                     completed_at, created_at, updated_at,
                     clock_timestamp() AS database_now
@@ -3004,7 +3013,7 @@ async fn legacy_config_token_receipt_uses_conservative_lease_proof() {
     let headers = idempotency_headers(&key);
     let (status, proof) = expect_idempotency_replay(
         begin_actor_deterministic_config_token_request(
-            &state, &headers, &path, &auth, &body, &binding,
+            &state, &headers, &path, &auth, &body, &binding, None,
         )
         .await
         .expect("terminalize legacy config-token lease"),

@@ -51,6 +51,7 @@ struct IdempotencyRow {
     capability_receipt_version: Option<i16>,
     capability_resource_id: Option<Uuid>,
     capability_instance_id: Option<String>,
+    capability_config_generation: Option<i64>,
     known_not_applied: bool,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -126,6 +127,7 @@ struct ConfigTokenReceipt {
     instance_id: String,
     issued_at: chrono::DateTime<chrono::Utc>,
     expires_at: chrono::DateTime<chrono::Utc>,
+    deployment_generation: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,6 +142,7 @@ impl ConfigTokenReceipt {
         created_at: chrono::DateTime<chrono::Utc>,
         receipt_version: i16,
         binding: ConfigTokenResourceBinding,
+        deployment_generation: Option<i64>,
     ) -> Self {
         let issued_at = chrono::DateTime::from_timestamp(created_at.timestamp(), 0)
             .expect("PostgreSQL timestamptz has a representable whole-second value");
@@ -151,6 +154,7 @@ impl ConfigTokenReceipt {
             issued_at,
             expires_at: issued_at
                 + chrono::Duration::seconds(crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS),
+            deployment_generation,
         }
     }
 
@@ -161,6 +165,7 @@ impl ConfigTokenReceipt {
             jti: format!("cap-config-receipt-v1-{}", self.operation_id),
             resource_id: self.resource_id,
             instance_id: self.instance_id.clone(),
+            deployment_generation: self.deployment_generation,
         }
     }
 }
@@ -1274,6 +1279,7 @@ async fn begin_idempotent_request_with_recovery(
 struct ConfigTokenIdempotencyOptions<'a> {
     binding: Option<&'a ConfigTokenResourceBinding>,
     legacy_request_hash: Option<&'a [u8]>,
+    deployment_generation: Option<i64>,
 }
 
 fn config_token_receipt_from_row(
@@ -1288,6 +1294,7 @@ fn config_token_receipt_from_row(
             resource_id: row.capability_resource_id.ok_or_else(db_error)?,
             instance_id: row.capability_instance_id.clone().ok_or_else(db_error)?,
         },
+        row.capability_config_generation,
     ))
 }
 
@@ -1361,12 +1368,13 @@ async fn begin_idempotent_request_with_recovery_and_binding(
              idempotency_key, method, path, request_hash,
              reservation_token, operation_id, lease_expires_at,
              recovery_kind, attempt_count, capability_receipt_version,
-             capability_resource_id, capability_instance_id
+             capability_resource_id, capability_instance_id,
+             capability_config_generation
          )
          VALUES (
              $1, $2, $3, $4, $5, $6,
              clock_timestamp() + ($7::bigint * interval '1 second'),
-             $8, 1, $9, $10, $11
+             $8, 1, $9, $10, $11, $12
          )
          ON CONFLICT (idempotency_key) DO NOTHING
          RETURNING created_at",
@@ -1382,6 +1390,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
     .bind(config_token_binding.map(|_| crate::auth::jwt::CONFIG_TOKEN_RECEIPT_VERSION))
     .bind(config_token_binding.map(|binding| binding.resource_id))
     .bind(config_token_binding.map(|binding| binding.instance_id.as_str()))
+    .bind(options.deployment_generation)
     .fetch_optional(&state.db)
     .await
     .map_err(|_| db_error())?;
@@ -1396,6 +1405,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                     config_token_binding
                         .expect("config-token recovery requires a binding")
                         .clone(),
+                    options.deployment_generation,
                 )
             });
         return Ok(IdempotencyBegin::Execute(IdempotencyLease::new(
@@ -1418,6 +1428,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                 reservation_token, operation_id, lease_expires_at,
                 recovery_kind, capability_receipt_version,
                 capability_resource_id, capability_instance_id,
+                capability_config_generation,
                 known_not_applied,
                 completed_at, created_at, updated_at,
                 clock_timestamp() AS database_now
@@ -1721,6 +1732,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                                 .clone()
                                 .expect("config-token instance was validated"),
                         },
+                        row.capability_config_generation,
                     )
                 }),
         },
@@ -1789,6 +1801,7 @@ async fn begin_membership_idempotent_request_in_tx(
                 reservation_token, operation_id, lease_expires_at,
                 recovery_kind, capability_receipt_version,
                 capability_resource_id, capability_instance_id,
+                capability_config_generation,
                 known_not_applied,
                 completed_at, created_at, updated_at,
                 clock_timestamp() AS database_now
@@ -3267,6 +3280,7 @@ async fn begin_actor_deterministic_config_token_request(
     auth: &AuthContext,
     body: &serde_json::Value,
     binding: &ConfigTokenResourceBinding,
+    deployment_generation: Option<i64>,
 ) -> Result<IdempotencyBegin, InternalRouteError> {
     let key = idempotency_key(headers)?;
     let hash = deterministic_config_token_request_hash(auth, body, binding)?;
@@ -3281,6 +3295,7 @@ async fn begin_actor_deterministic_config_token_request(
         ConfigTokenIdempotencyOptions {
             binding: Some(binding),
             legacy_request_hash: Some(&legacy_hash),
+            deployment_generation,
         },
     )
     .await
@@ -3323,6 +3338,7 @@ async fn preflight_existing_config_token_request(
                 reservation_token, operation_id, lease_expires_at,
                 recovery_kind, capability_receipt_version,
                 capability_resource_id, capability_instance_id,
+                capability_config_generation,
                 known_not_applied,
                 completed_at, created_at, updated_at,
                 clock_timestamp() AS database_now
@@ -5247,6 +5263,12 @@ pub async fn issue_paas_config_token(
     if !binding.live_resource {
         return Err(idempotency_in_progress_error());
     }
+    let deployment_generation = crate::config_generation::app_config_write_generation(
+        &state.db,
+        binding.binding.resource_id,
+    )
+    .await
+    .map_err(|_| db_error())?;
     let idempotency = match begin_actor_deterministic_config_token_request(
         &state,
         &headers,
@@ -5254,6 +5276,7 @@ pub async fn issue_paas_config_token(
         &auth,
         &body,
         &binding.binding,
+        deployment_generation,
     )
     .await?
     {
@@ -5670,6 +5693,10 @@ pub async fn issue_paas_generic_config_token(
     if !binding.live_resource {
         return Err(idempotency_in_progress_error());
     }
+    let deployment_generation =
+        crate::config_generation::deployment_apply_generation(&state.db, deployment_id)
+            .await
+            .map_err(|_| db_error())?;
     let idempotency = match begin_actor_deterministic_config_token_request(
         &state,
         &headers,
@@ -5677,6 +5704,7 @@ pub async fn issue_paas_generic_config_token(
         &auth,
         &body,
         &binding.binding,
+        deployment_generation,
     )
     .await?
     {
