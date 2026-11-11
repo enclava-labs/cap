@@ -1049,6 +1049,13 @@ async fn commit_unlock_mode_transition(
                 })),
             )
         })?;
+    } else if !cfg!(test) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "live workload publication could not be verified; retry"
+            })),
+        ));
     }
     crate::deploy::supersede_incomplete_deployments(&mut tx, locked_app.id)
         .await

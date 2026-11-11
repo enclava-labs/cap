@@ -1943,10 +1943,15 @@ pub(crate) async fn delete_app_before(
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
-                    "error": "live workload publication could not be verified; retry deletion"
+                    "error": "live workload publication could not be verified; retry deletion",
+                    "abandon_teardown": "skips this check and selects teardown authority without a classified live spec"
                 })),
             ));
         }
+        tracing::warn!(
+            app_id = %phase_app.id,
+            "abandon_teardown is selecting teardown authority without a classified live spec"
+        );
     }
     // Admission control for the teardown policy pin (Codex security finding
     // 4a27950: teardown candidates can exhaust the global KBS policy budget).

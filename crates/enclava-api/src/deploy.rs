@@ -6055,7 +6055,7 @@ impl DeployError {
             // Not persisted on the apply job: recovery refuses the caller
             // before supersession, so this code never has to satisfy the
             // last_error_code CHECK.
-            Self::PublicationUnclassified => "workload_publication_unrecoverable",
+            Self::PublicationUnclassified => "workload_publication_unclassified",
         }
     }
 }
@@ -7414,7 +7414,10 @@ pub(crate) fn decide_workload_publication_recovery(
         return PublicationRecoveryDecision::NotWritten;
     };
     if hashes_disagree(live, generation) {
-        return PublicationRecoveryDecision::NotWritten;
+        // Same tradeoff as the label path: a hash mismatch means the object
+        // was not classified, not that it is someone else's spec. Callers
+        // must retry rather than supersede or select teardown without a stamp.
+        return PublicationRecoveryDecision::Ambiguous;
     }
     if generation.published {
         PublicationRecoveryDecision::AlreadyRecorded
@@ -7499,6 +7502,13 @@ pub(crate) async fn recover_unpublished_workload_spec(
     if rows.iter().all(|row| row.published) {
         return Ok(());
     }
+    // Acceptance does not need a cluster read to heal an already-terminal
+    // row. Delete admission and the deleting reconciler own that. Holding
+    // the deployment lane for a GET on every historical failure would not
+    // close the in-flight crash window.
+    if mode == PublicationRecoveryMode::BeforeSupersession && !recovery_must_classify(&rows, mode) {
+        return Ok(());
+    }
     let live = match tokio::time::timeout(
         WORKLOAD_PUBLICATION_PROBE_TIMEOUT,
         read_live_statefulset(client, namespace, workload_name),
@@ -7575,6 +7585,10 @@ pub(crate) async fn apply_live_publication_recovery(
                 "live StatefulSet publication evidence is ambiguous"
             );
             if mode == PublicationRecoveryMode::BestEffort {
+                tracing::warn!(
+                    %app_id,
+                    "leaving workload publication unstamped after ambiguous live evidence"
+                );
                 Ok(())
             } else {
                 Err(DeployError::PublicationUnclassified)

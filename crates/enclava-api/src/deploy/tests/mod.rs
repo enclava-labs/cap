@@ -9561,6 +9561,22 @@ fn publication_recovery_accepts_a_fenced_generation_when_the_label_was_stripped(
 }
 
 #[test]
+fn publication_recovery_refuses_a_stripped_label_when_the_manifest_hash_disagrees() {
+    let written = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: None,
+        mutation_generation: Some(9),
+        manifest_hash: Some("live-hash".to_string()),
+    };
+    let mut row = publication_row(written, &[9], false, false);
+    row.manifest_hash = Some("row-hash".to_string());
+    assert_eq!(
+        decide_workload_publication_recovery(&live, &[row]),
+        PublicationRecoveryDecision::Ambiguous
+    );
+}
+
+#[test]
 fn publication_recovery_covers_a_historical_label_without_fence_provenance() {
     let historical = Uuid::new_v4();
     let live = LiveWorkloadPublication {
