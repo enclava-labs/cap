@@ -1292,9 +1292,11 @@ pub async fn reconcile_orphaned_deployment_apply_leases(
 /// path uses, and only when a live app row still owns the namespace name,
 /// under that app's deployment-lane advisory lock (the same first lock
 /// `claim`/`finish` take). Multiple API replicas may run this concurrently.
-/// The release CAS makes a clear exactly-once. The probe-cursor stamp also
-/// compare-and-swaps the `updated_at` that replica selected, so two replicas
-/// that loaded the same oldest-first snapshot do not both probe that prefix.
+/// The release CAS makes a clear exactly-once. The probe-cursor stamp
+/// compare-and-swaps the `updated_at` that replica selected and parks the
+/// claim in the future for the batch budget, so two replicas that loaded
+/// the same snapshot do not both probe that prefix, and a replica that
+/// selects later does not re-probe an in-flight fence.
 pub async fn release_retained_deployment_namespace_fences(
     pool: &PgPool,
     client: &kube::Client,
@@ -1310,10 +1312,11 @@ pub async fn release_retained_deployment_namespace_fences(
 /// cursor first. `updated_at` is that cursor (cap#240): a pass stamps it
 /// only when it actually starts a probe, and restores the previous value
 /// if the stamp itself consumes the remaining window. The stamp claims the
-/// selected value with a compare-and-swap, so a second replica holding this
-/// same snapshot skips that fence and continues to the next unclaimed one
-/// (cap#373 review). Fences that are not started stay older and are resumed
-/// next pass. A pass that still has a full window when its first fence is
+/// selected value with a compare-and-swap and parks it in the future for
+/// the batch budget, so a second replica holding this same snapshot skips
+/// that fence, and a replica that selects afterwards does not see it until
+/// the probe returns or the claim expires (cap#373 review). Fences that are
+/// not started stay older and are resumed next pass. A pass that still has a full window when its first fence is
 /// polled starts that concurrent wave; scheduling delay may start fewer, so
 /// the bound is not `ceil(n / fair_page)`. `app_delete` fences are selected
 /// alongside the
@@ -1341,6 +1344,7 @@ async fn select_expired_retained_namespace_fences(
             AND resource.operation_kind IN ($1, 'app_delete')
             AND resource.reclaim_after = 'infinity'::timestamptz
             AND resource.locked_until <= clock_timestamp()
+            AND resource.updated_at <= clock_timestamp()
           ORDER BY resource.updated_at ASC, resource.resource_key ASC",
     )
     .bind(RETAINED_DEPLOYMENT_NAMESPACE_OPERATION)
@@ -1349,14 +1353,18 @@ async fn select_expired_retained_namespace_fences(
 }
 
 /// Move a fence we are about to probe behind fences this pass will not
-/// start. Returns the stamped `updated_at` so a stamp that consumes the
-/// probe window can be undone. The compare-and-swap stays on the expired
-/// retained row and on the `updated_at` this replica selected, so a
-/// release, a renew, or another replica that already claimed this cursor
-/// is left alone and the caller skips the probe. Two replicas that
-/// snapshotted the same oldest-first page therefore do not both issue the
-/// Kubernetes GET/DELETE for that prefix (cap#373 review). `locked_until`
+/// start, and hide it from other replicas until the claim expires.
+/// Returns the stamped `updated_at` so a stamp that consumes the probe
+/// window can be undone, and so the caller can drop the claim when the
+/// probe returns. The compare-and-swap stays on the expired retained row
+/// and on the `updated_at` this replica selected, so a release, a renew,
+/// or another replica that already claimed this cursor is left alone and
+/// the caller skips the probe. The new cursor is in the future by
+/// `claim_secs` (the batch budget). Selection ignores a future cursor, so
+/// a replica that loads its snapshot after this stamp does not re-probe
+/// the fence while the claim is in flight (cap#373 review). `locked_until`
 /// is not touched: the settle margin that bounds a foreign namespace reads it.
+#[allow(clippy::too_many_arguments)]
 async fn stamp_retained_fence_probe(
     pool: &PgPool,
     namespace: &str,
@@ -1365,10 +1373,12 @@ async fn stamp_retained_fence_probe(
     operation_id: Uuid,
     operation_kind: &str,
     previous_updated_at: chrono::DateTime<chrono::Utc>,
+    claim_secs: i64,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MutationLeaseError> {
     Ok(sqlx::query_scalar(
         "UPDATE external_resource_mutation_leases
             SET updated_at = clock_timestamp()
+                    + ($7::bigint * interval '1 second')
           WHERE resource_scope = 'kubernetes_namespace'
             AND resource_key = $1
             AND owner_token = $2
@@ -1378,6 +1388,7 @@ async fn stamp_retained_fence_probe(
             AND reclaim_after = 'infinity'::timestamptz
             AND locked_until <= clock_timestamp()
             AND updated_at = $6
+            AND updated_at <= clock_timestamp()
         RETURNING updated_at",
     )
     .bind(namespace)
@@ -1386,6 +1397,7 @@ async fn stamp_retained_fence_probe(
     .bind(operation_id)
     .bind(operation_kind)
     .bind(previous_updated_at)
+    .bind(claim_secs)
     .fetch_optional(pool)
     .await?)
 }
@@ -1425,6 +1437,44 @@ async fn restore_retained_fence_probe_cursor(
     .bind(operation_kind)
     .bind(stamped_updated_at)
     .bind(previous_updated_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Drop an in-flight probe claim so the fence is selectable again and
+/// sorts behind fences this pass did not start. Only the future cursor
+/// this pass stamped is moved, so a peer that claimed the row after the
+/// claim expired is left alone. A zero-row update means the fence was
+/// released; the release already wrote its own `updated_at`.
+#[allow(clippy::too_many_arguments)]
+async fn clear_retained_fence_probe_claim(
+    pool: &PgPool,
+    namespace: &str,
+    owner_token: Uuid,
+    generation: i64,
+    operation_id: Uuid,
+    operation_kind: &str,
+    stamped_updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), MutationLeaseError> {
+    sqlx::query(
+        "UPDATE external_resource_mutation_leases
+            SET updated_at = clock_timestamp()
+          WHERE resource_scope = 'kubernetes_namespace'
+            AND resource_key = $1
+            AND owner_token = $2
+            AND generation = $3
+            AND operation_id = $4
+            AND operation_kind = $5
+            AND reclaim_after = 'infinity'::timestamptz
+            AND updated_at = $6",
+    )
+    .bind(namespace)
+    .bind(owner_token)
+    .bind(generation)
+    .bind(operation_id)
+    .bind(operation_kind)
+    .bind(stamped_updated_at)
     .execute(pool)
     .await?;
     Ok(())
@@ -1556,6 +1606,12 @@ async fn release_retained_deployment_namespace_fences_budgeted(
         probe_timeout,
         captured_deadline: None,
     };
+    // A claim lasts the whole batch budget, measured from the stamp. A
+    // probe cannot outlive the pass, and the pass cannot outlive a claim
+    // taken after the pass started. Selection ignores that future cursor.
+    // The claim is cleared when the probe returns; a crash leaves it until
+    // this interval elapses. `locked_until` is not the claim.
+    let claim_secs = i64::try_from(batch_budget.as_secs()).unwrap_or(i64::MAX);
     let results = {
         use futures::StreamExt as _;
         futures::stream::iter(retained)
@@ -1582,10 +1638,11 @@ async fn release_retained_deployment_namespace_fences_budgeted(
                             );
                             return Ok(false);
                         }
-                        // Claim the cursor this replica selected. A peer that
-                        // loaded the same snapshot loses this CAS and skips;
-                        // the stream then pulls a later fence instead of
-                        // repeating this prefix.
+                        // Claim the cursor this replica selected. The stamp
+                        // is in the future, so a peer that selects after it
+                        // does not see this fence. A peer that already
+                        // loaded the same snapshot loses the CAS and skips;
+                        // the stream then pulls a later fence.
                         let Some(stamped_updated_at) = stamp_retained_fence_probe(
                             &pool,
                             &namespace,
@@ -1594,6 +1651,7 @@ async fn release_retained_deployment_namespace_fences_budgeted(
                             operation_id,
                             &operation_kind,
                             previous_updated_at,
+                            claim_secs,
                         )
                         .await?
                         else {
@@ -1629,17 +1687,39 @@ async fn release_retained_deployment_namespace_fences_budgeted(
                             ),
                             ..window
                         };
-                        reconcile_one_retained_namespace(
+                        let outcome = reconcile_one_retained_namespace(
                             &pool,
                             &api,
                             owner_token,
-                            namespace,
+                            namespace.clone(),
                             operation_id,
                             generation,
                             &operation_kind,
                             window,
                         )
+                        .await;
+                        // Drop the in-flight claim so a retained fence is
+                        // eligible next pass, behind fences this pass did
+                        // not start. A release already cleared the owner
+                        // and matches zero rows.
+                        if let Err(error) = clear_retained_fence_probe_claim(
+                            &pool,
+                            &namespace,
+                            owner_token,
+                            generation,
+                            operation_id,
+                            &operation_kind,
+                            stamped_updated_at,
+                        )
                         .await
+                        {
+                            tracing::warn!(
+                                namespace = %namespace,
+                                error = %error,
+                                "retained-namespace fence probe claim could not be cleared; cursor stays hidden until it expires"
+                            );
+                        }
+                        outcome
                     }
                 },
             )
@@ -5201,6 +5281,7 @@ pub(crate) mod tests {
                 operation_id,
                 &operation_kind,
                 previous_updated_at,
+                120,
             ),
             stamp_retained_fence_probe(
                 &pool,
@@ -5210,6 +5291,7 @@ pub(crate) mod tests {
                 operation_id,
                 &operation_kind,
                 previous_updated_at,
+                120,
             ),
         );
         let first = first.expect("first claim");
@@ -5225,6 +5307,13 @@ pub(crate) mod tests {
             stamped, previous_updated_at,
             "a won claim must move the probe cursor"
         );
+        let hidden = select_expired_retained_namespace_fences(&pool)
+            .await
+            .expect("select while the claim is in flight");
+        assert!(
+            hidden.iter().all(|row| row.1 != namespace),
+            "a replica that selects after the stamp must not see the in-flight fence"
+        );
         let third = stamp_retained_fence_probe(
             &pool,
             &namespace,
@@ -5233,6 +5322,7 @@ pub(crate) mod tests {
             operation_id,
             &operation_kind,
             previous_updated_at,
+            120,
         )
         .await
         .expect("third claim");
@@ -5261,6 +5351,7 @@ pub(crate) mod tests {
             operation_id,
             &operation_kind,
             previous_updated_at,
+            120,
         )
         .await
         .expect("claim after restore");
@@ -5282,6 +5373,126 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("remove claim-fixture organization");
+    }
+
+    /// cap#373 review: a replica that starts after another has stamped must
+    /// not GET that fence. The claim parks `updated_at` in the future;
+    /// selection ignores it. Clearing the claim makes the next pass probe
+    /// and release an absent namespace. `locked_until` is not the claim.
+    #[tokio::test]
+    async fn later_pass_does_not_reprobe_an_in_flight_retained_fence_claim() {
+        let pool = database_test_pool(2).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let (org, _app, _token, namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET updated_at = clock_timestamp() - interval '1 hour'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("age the fixture cursor");
+        let (
+            owner_token,
+            _selected_namespace,
+            operation_id,
+            generation,
+            operation_kind,
+            previous_updated_at,
+        ) = select_expired_retained_namespace_fences(&pool)
+            .await
+            .expect("select expired retained fences")
+            .into_iter()
+            .find(|row| row.1 == namespace)
+            .expect("fixture fence is selected");
+        let stamped = stamp_retained_fence_probe(
+            &pool,
+            &namespace,
+            owner_token,
+            generation,
+            operation_id,
+            &operation_kind,
+            previous_updated_at,
+            120,
+        )
+        .await
+        .expect("claim")
+        .expect("the selected cursor is claimable");
+
+        let (server_url, mode, server) =
+            mock_namespace_api_server(None, Arc::new(std::sync::atomic::AtomicI64::new(0))).await;
+        mode.store(MOCK_NS_ABSENT, std::sync::atomic::Ordering::SeqCst);
+        let client = mock_kube_client(&server_url);
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            client.clone(),
+            Duration::from_secs(3),
+            Duration::from_secs(2),
+            1,
+        )
+        .await
+        .expect("pass while the claim is held");
+        assert_eq!(
+            released, 0,
+            "a later pass must not probe a cursor another replica still holds"
+        );
+        let still_owned: bool = sqlx::query_scalar(
+            "SELECT owner_token IS NOT NULL
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("owner during the in-flight claim");
+        assert!(
+            still_owned,
+            "skipping the in-flight fence must not release it"
+        );
+
+        clear_retained_fence_probe_claim(
+            &pool,
+            &namespace,
+            owner_token,
+            generation,
+            operation_id,
+            &operation_kind,
+            stamped,
+        )
+        .await
+        .expect("clear the claim");
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            client,
+            Duration::from_secs(3),
+            Duration::from_secs(2),
+            1,
+        )
+        .await
+        .expect("pass after the claim is cleared");
+        assert_eq!(
+            released, 1,
+            "clearing the claim must let the next pass probe and release the absent namespace"
+        );
+
+        server.abort();
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("remove in-flight-claim fixture fence");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("remove in-flight-claim fixture organization");
     }
 
     #[test]
