@@ -1872,11 +1872,15 @@ pub(crate) async fn delete_app_before(
         .ok_or_else(internal_server_error)?;
 
     // Name the owned ordinal-0 pod before admission when an intermediate
-    // publication exists (#235). The read is not a provider mutation: the
-    // deleting phase below is still the first durable external-effect
-    // boundary. A failure here releases the lease without flipping status.
-    // abandon_teardown must stay reachable when the cluster cannot be read,
-    // and a retry whose teardown already completed must not depend on it.
+    // publication exists (#235). The read is not a provider mutation, and the
+    // pin is not written here: a deleting retry already contributes the stored
+    // pin to the selector. Replacing it before admission would change that
+    // selector with no generation bump, and the budget check would treat the
+    // replacement as already required. The decision is committed with the
+    // deleting phase below. A failure here releases the lease without flipping
+    // status or the pin. abandon_teardown must stay reachable when the cluster
+    // cannot be read, and a retry whose teardown already completed must not
+    // depend on it.
     let pin_applies = if app.status == AppStatus::Deleting {
         let (required, completed): (bool, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
             "SELECT workload_teardown_required, workload_teardown_completed_at
@@ -1899,9 +1903,8 @@ pub(crate) async fn delete_app_before(
         .await
         .map_err(|_| internal_server_error())?
     };
-    if !abandon_teardown
-        && pin_applies
-        && let Err(error) = crate::kbs::refresh_teardown_live_deployment_pin(
+    let pin_decision = if !abandon_teardown && pin_applies {
+        match crate::kbs::observe_teardown_live_deployment_pin(
             &state.db,
             &state.kube_client,
             app.id,
@@ -1909,13 +1912,19 @@ pub(crate) async fn delete_app_before(
             &app.name,
         )
         .await
-    {
-        delete_mutation
-            .finish()
-            .await
-            .map_err(|_| internal_server_error())?;
-        return Err(teardown_live_pod_failure(app.id, error));
-    }
+        {
+            Ok(decision) => Some(decision),
+            Err(error) => {
+                delete_mutation
+                    .finish()
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                return Err(teardown_live_pod_failure(app.id, error));
+            }
+        }
+    } else {
+        None
+    };
 
     // Persist the durable deleting phase and whether confidential teardown is
     // required before any external call. Retries must reuse that decision
@@ -1995,9 +2004,11 @@ pub(crate) async fn delete_app_before(
     // policy authority for as long as it can still be serving, and the byte
     // budget fail-closes the whole reconciliation when the required set
     // overflows — stacked deletions would then wedge every app's policy
-    // convergence. Refuse the delete here, under the global kbs_policy fence,
-    // after the live-pod pin has been recorded and before the app is marked
-    // deleting, when this app's teardown unit no longer fits.
+    // convergence. Refuse the delete here, under the global kbs_policy fence, after the
+    // live pod has been observed and before the app is marked deleting, when
+    // this app's teardown unit no longer fits. The observed pin is projected
+    // against the stored one and is not written until the generation bump
+    // below; a refusal leaves the previous pin selected.
     // Nothing is dropped from the policy to make a delete fit. `abandon_teardown`
     // proceeds anyway: its deletion completes in this flow (the pin stays
     // transient), and the operator override must remain reachable to unwind a
@@ -2026,10 +2037,17 @@ pub(crate) async fn delete_app_before(
             pre_delete_teardown_required
         };
         if pin_will_apply {
-            let fits = crate::kbs::teardown_unit_fits_signed_policy_budget(
+            let proposal = match pin_decision {
+                Some(decision) => {
+                    crate::kbs::TeardownPinProposal::Replace(decision.deployment_id())
+                }
+                None => crate::kbs::TeardownPinProposal::Stored,
+            };
+            let fits = crate::kbs::teardown_unit_fits_signed_policy_budget_proposing(
                 &state.db,
                 state.kbs_policy.as_ref(),
                 phase_app.id,
+                proposal,
             )
             .await
             .map_err(|_| internal_server_error())?;
@@ -2112,6 +2130,17 @@ pub(crate) async fn delete_app_before(
         pre_delete_teardown_required
     };
     let publish_enqueued = if publication_needed {
+        // Same transaction as the generation bump. A refusal or rollback above
+        // never reaches this write, so the previous pin stays selected.
+        if let Some(decision) = pin_decision {
+            crate::kbs::commit_teardown_live_pin(
+                &mut phase_tx,
+                phase_app.id,
+                decision.deployment_id(),
+            )
+            .await
+            .map_err(|_| internal_server_error())?;
+        }
         crate::kbs::enqueue_signed_policy_revocation_if_active(&mut phase_tx)
             .await
             .map_err(|_| internal_server_error())?

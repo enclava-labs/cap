@@ -1499,6 +1499,19 @@ async fn load_teardown_policy_unit(
     db: &PgPool,
     app_id: Uuid,
 ) -> Result<Vec<crate::signing_service::SignedPolicyArtifact>, KbsPolicyError> {
+    load_teardown_policy_unit_proposing(db, app_id, TeardownPinProposal::Stored).await
+}
+
+async fn load_teardown_policy_unit_proposing(
+    db: &PgPool,
+    app_id: Uuid,
+    proposed_pin: TeardownPinProposal,
+) -> Result<Vec<crate::signing_service::SignedPolicyArtifact>, KbsPolicyError> {
+    let replace_pin = matches!(proposed_pin, TeardownPinProposal::Replace(_));
+    let replacement_pin = match proposed_pin {
+        TeardownPinProposal::Replace(deployment_id) => deployment_id,
+        TeardownPinProposal::Stored => None,
+    };
     let rows: Vec<serde_json::Value> = sqlx::query_scalar(
         r#"
         WITH ranked_job_operations AS (
@@ -1544,10 +1557,20 @@ async fn load_teardown_policy_unit(
             UNION
             SELECT artifact_deployment_id, artifact_descriptor_core_hash
               FROM ranked_job_operations
-              JOIN teardown_live_deployment_pins AS pin
-                ON pin.app_id = $1
-               AND pin.deployment_id = ranked_job_operations.deployment_id
              WHERE workload_spec_published_at IS NOT NULL
+               AND CASE
+                     -- $2 replaces the committed pin. NULL means clear: the
+                     -- comparison is unknown and this arm admits nothing.
+                     -- Otherwise the stored row is the pin, including when
+                     -- $3 is ignored.
+                     WHEN $2::bool THEN ranked_job_operations.deployment_id = $3::uuid
+                     ELSE EXISTS (
+                         SELECT 1
+                           FROM teardown_live_deployment_pins AS pin
+                          WHERE pin.app_id = $1
+                            AND pin.deployment_id = ranked_job_operations.deployment_id
+                     )
+                   END
         ),
         job_unit AS (
             SELECT artifact.descriptor_core_hash, artifact.signed_policy_artifact
@@ -1623,6 +1646,8 @@ async fn load_teardown_policy_unit(
         "#,
     )
     .bind(app_id)
+    .bind(replace_pin)
+    .bind(replacement_pin)
     .fetch_all(db)
     .await?;
     rows.into_iter()
@@ -1709,15 +1734,57 @@ async fn app_has_intermediate_publications(db: &PgPool, app_id: Uuid) -> Result<
     .await
 }
 
+/// Observed pin for this delete. Not durable until admission commits it with
+/// the generation bump. `Clear` is "no pin", not "leave the stored row".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeardownPinDecision {
+    Clear,
+    Pin(Uuid),
+}
+
+impl TeardownPinDecision {
+    pub(crate) fn deployment_id(self) -> Option<Uuid> {
+        match self {
+            Self::Clear => None,
+            Self::Pin(id) => Some(id),
+        }
+    }
+}
+
+/// Which pin a teardown-unit projection should admit.
+///
+/// `Stored` is the committed row. `Replace` is the pin this delete will commit
+/// if admission succeeds, and must be projected separately: writing it first
+/// makes the deleting selector treat the replacement as already required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeardownPinProposal {
+    Stored,
+    Replace(Option<Uuid>),
+}
+
+#[cfg(test)]
 async fn replace_teardown_live_pin(
     db: &PgPool,
     app_id: Uuid,
     deployment_id: Option<Uuid>,
 ) -> Result<(), sqlx::Error> {
     let mut tx = db.begin().await?;
+    commit_teardown_live_pin(&mut tx, app_id, deployment_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Replace the pin inside the caller's transaction. Delete commits this with
+/// the generation bump so a rejected or crashed retry cannot change the
+/// deleting selector without a publication.
+pub(crate) async fn commit_teardown_live_pin(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    deployment_id: Option<Uuid>,
+) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM teardown_live_deployment_pins WHERE app_id = $1")
         .bind(app_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     if let Some(deployment_id) = deployment_id {
         sqlx::query(
@@ -1726,10 +1793,9 @@ async fn replace_teardown_live_pin(
         )
         .bind(app_id)
         .bind(deployment_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -1816,33 +1882,29 @@ pub(crate) async fn observe_owned_ordinal_pod(
     }
 }
 
-/// Record the owned ordinal-0 pod before teardown admission, but only when an
-/// intermediate publication exists. No intermediates means the two-arm set
-/// already covers every pod the StatefulSet can still be serving, and a kube
-/// read is unnecessary. A stale pin is cleared in that case so it cannot
-/// inflate the unit. When intermediates exist, an unnameable pod refuses the
-/// delete instead of publishing a policy that might miss the pod the Service
-/// will hit.
-pub(crate) async fn refresh_teardown_live_deployment_pin(
+/// Observe the pin delete should commit, without writing it.
+///
+/// No intermediates means the two-arm set already covers every pod the
+/// StatefulSet can still be serving, so the decision is `Clear` and a kube
+/// read is unnecessary. When intermediates exist, an unnameable pod refuses
+/// the delete instead of publishing a policy that might miss the pod the
+/// Service will hit. The stored pin is left untouched: a deleting retry
+/// already contributes that row to the selector, and replacing it before
+/// admission changes required authority with no generation bump. Callers
+/// commit the decision in the same transaction as the generation bump.
+pub(crate) async fn observe_teardown_live_deployment_pin(
     db: &PgPool,
     client: &kube::Client,
     app_id: Uuid,
     namespace: &str,
     app_name: &str,
-) -> Result<(), TeardownLivePodError> {
+) -> Result<TeardownPinDecision, TeardownLivePodError> {
     if !app_has_intermediate_publications(db, app_id).await? {
-        replace_teardown_live_pin(db, app_id, None).await?;
-        return Ok(());
+        return Ok(TeardownPinDecision::Clear);
     }
     match observe_owned_ordinal_pod(client, namespace, app_name).await? {
-        OwnedPodIdentity::Named(deployment_id) => {
-            replace_teardown_live_pin(db, app_id, Some(deployment_id)).await?;
-            Ok(())
-        }
-        OwnedPodIdentity::Absent => {
-            replace_teardown_live_pin(db, app_id, None).await?;
-            Ok(())
-        }
+        OwnedPodIdentity::Named(deployment_id) => Ok(TeardownPinDecision::Pin(deployment_id)),
+        OwnedPodIdentity::Absent => Ok(TeardownPinDecision::Clear),
         OwnedPodIdentity::Unnamed => Err(TeardownLivePodError::Unnamed),
     }
 }
@@ -1857,21 +1919,31 @@ async fn teardown_unit_covers_operation(
     app_id: Uuid,
     operation_id: Uuid,
 ) -> Result<bool, KbsPolicyError> {
-    let artifact_hash: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT artifact_descriptor_core_hash
+    let row: Option<(Option<Uuid>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT artifact_deployment_id, artifact_descriptor_core_hash
            FROM deployment_apply_jobs
           WHERE app_id = $1
-            AND deployment_id = $2
-            AND artifact_deployment_id IS NOT NULL
-            AND artifact_descriptor_core_hash IS NOT NULL",
+            AND deployment_id = $2",
     )
     .bind(app_id)
     .bind(operation_id)
     .fetch_optional(db)
     .await?;
-    let Some(artifact_hash) = artifact_hash else {
+    // No such operation: the label is not a job we can authorize. Fail closed.
+    // Both artifact columns null is a valid unsigned apply (customer-signed
+    // deploys are optional). There is no signed-policy artifact to admit, so
+    // coverage does not apply — reporting Uncovered would 502 the delete
+    // forever once an intermediate publication exists. A half-set row violates
+    // the insert invariant (MATCH FULL) and fails closed.
+    let Some((artifact_deployment_id, artifact_hash)) = row else {
         return Ok(false);
     };
+    let Some(artifact_hash) = artifact_hash else {
+        return Ok(artifact_deployment_id.is_none());
+    };
+    if artifact_deployment_id.is_none() {
+        return Ok(false);
+    }
     let expected = hex::encode(artifact_hash);
     let unit = load_teardown_policy_unit(db, app_id).await?;
     Ok(unit.iter().any(|artifact| {
@@ -1959,6 +2031,29 @@ pub async fn teardown_unit_fits_signed_policy_budget(
     config: Option<&KbsPolicyConfig>,
     app_id: Uuid,
 ) -> Result<bool, KbsPolicyError> {
+    teardown_unit_fits_signed_policy_budget_proposing(
+        db,
+        config,
+        app_id,
+        TeardownPinProposal::Stored,
+    )
+    .await
+}
+
+/// Like [`teardown_unit_fits_signed_policy_budget`], projecting `proposed_pin`
+/// instead of the committed row.
+///
+/// Delete observes the live pod before admission and must not write that pin
+/// until the generation bump commits. Passing the observation here keeps the
+/// committed pin in `current` (what reconciliation already requires) and the
+/// observation in `projected`. Writing first folds the replacement into
+/// `current`, so a larger pin looks non-growing and a 409 leaves it selected.
+pub(crate) async fn teardown_unit_fits_signed_policy_budget_proposing(
+    db: &PgPool,
+    config: Option<&KbsPolicyConfig>,
+    app_id: Uuid,
+    proposed_pin: TeardownPinProposal,
+) -> Result<bool, KbsPolicyError> {
     let Some(config) = config else {
         return Ok(true);
     };
@@ -1987,7 +2082,7 @@ pub async fn teardown_unit_fits_signed_policy_budget(
         }
         current.push(candidate.artifact);
     }
-    projected.extend(load_teardown_policy_unit(db, app_id).await?);
+    projected.extend(load_teardown_policy_unit_proposing(db, app_id, proposed_pin).await?);
     let projected = dedup_signed_policy_artifacts_by_hash(projected);
     let projected_len = signed_policy_artifact_policy_body(&projected)?.len();
     if projected_len <= config.signed_policy_max_bytes {
@@ -4793,7 +4888,42 @@ resource_bindings := {
         deployment_id: Uuid,
         hash_byte: &str,
     ) -> crate::signing_service::SignedPolicyArtifact {
-        insert_test_artifact_signed_by(pool, app_id, deployment_id, hash_byte, "bb").await
+        insert_sized_test_artifact(pool, app_id, deployment_id, hash_byte, 16).await
+    }
+
+    async fn insert_sized_test_artifact(
+        pool: &PgPool,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        hash_byte: &str,
+        payload_bytes: usize,
+    ) -> crate::signing_service::SignedPolicyArtifact {
+        let mut artifact = test_signed_policy_artifact(hash_byte, payload_bytes);
+        artifact.metadata.descriptor_core_hash =
+            unique_test_descriptor_hash(hash_byte, deployment_id);
+        artifact.metadata.app_id = app_id.to_string();
+        artifact.metadata.deploy_id = deployment_id.to_string();
+        artifact.metadata.descriptor_signing_pubkey = "bb".repeat(32);
+        let descriptor_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key',
+                       '{}'::jsonb, $5, $6)",
+        )
+        .bind(&descriptor_hash)
+        .bind(app_id)
+        .bind(deployment_id)
+        .bind(vec![1u8; 64])
+        .bind(vec![2u8; 64])
+        .bind(serde_json::to_value(&artifact).unwrap())
+        .execute(pool)
+        .await
+        .expect("insert sized KBS test artifact");
+        artifact
     }
 
     /// Like insert_test_artifact, but lets each fixture pick its descriptor
@@ -9799,6 +9929,269 @@ resource_bindings := {
         );
 
         crate::test_support::drop_isolated_database("cap_teardown_rollback_pin", pool).await;
+    }
+
+    /// A deleting retry must measure a replacement pin against the stored pin.
+    /// Writing the replacement first makes the selector treat it as already
+    /// required, so a larger pin looks non-growing and a 409 would leave the
+    /// over-budget set selected.
+    #[tokio::test]
+    async fn pin_replacement_growth_is_measured_against_the_stored_pin() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_pin_growth").await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        let completed_artifact = insert_test_artifact(&pool, app_id, completed, "11").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            completed,
+            completed,
+            Some((completed, &completed_artifact)),
+        )
+        .await;
+
+        let stored_pin = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, stored_pin, "failed", now).await;
+        set_test_setup_state(&pool, stored_pin, "accepted").await;
+        mark_test_workload_published(&pool, stored_pin).await;
+        let stored_artifact = insert_test_artifact(&pool, app_id, stored_pin, "22").await;
+        insert_failed_apply_job(&pool, org_id, app_id, stored_pin, &stored_artifact, 6).await;
+
+        let replacement = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, replacement, "failed", now).await;
+        set_test_setup_state(&pool, replacement, "accepted").await;
+        mark_test_workload_published(&pool, replacement).await;
+        let replacement_artifact =
+            insert_sized_test_artifact(&pool, app_id, replacement, "66", 2048).await;
+        insert_failed_apply_job(&pool, org_id, app_id, replacement, &replacement_artifact, 7).await;
+
+        let newest = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            newest,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        set_test_setup_state(&pool, newest, "accepted").await;
+        mark_test_workload_published(&pool, newest).await;
+        let newest_artifact = insert_test_artifact(&pool, app_id, newest, "33").await;
+        insert_failed_apply_job(&pool, org_id, app_id, newest, &newest_artifact, 8).await;
+
+        replace_teardown_live_pin(&pool, app_id, Some(stored_pin))
+            .await
+            .expect("commit the stored pin");
+        let stored_hashes = candidate_hashes(&pool).await;
+        assert!(stored_hashes.contains(&stored_artifact.metadata.descriptor_core_hash));
+        assert!(
+            !stored_hashes.contains(&replacement_artifact.metadata.descriptor_core_hash),
+            "the replacement must not be required until it is the committed pin"
+        );
+        let stored_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(
+                load_teardown_policy_unit(&pool, app_id)
+                    .await
+                    .expect("load stored unit"),
+            ))
+            .expect("serialize stored unit")
+            .len();
+        let proposed_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(
+                load_teardown_policy_unit_proposing(
+                    &pool,
+                    app_id,
+                    TeardownPinProposal::Replace(Some(replacement)),
+                )
+                .await
+                .expect("load proposed unit"),
+            ))
+            .expect("serialize proposed unit")
+            .len();
+        assert!(
+            proposed_len > stored_len,
+            "fixture must grow the unit: stored {stored_len}, proposed {proposed_len}"
+        );
+
+        let fits = teardown_unit_fits_signed_policy_budget_proposing(
+            &pool,
+            Some(&teardown_budget_config(stored_len)),
+            app_id,
+            TeardownPinProposal::Replace(Some(replacement)),
+        )
+        .await
+        .expect("admit against the stored pin");
+        assert!(
+            !fits,
+            "a larger replacement pin must be refused while the stored pin is still selected"
+        );
+        let unchanged: Uuid = sqlx::query_scalar(
+            "SELECT deployment_id FROM teardown_live_deployment_pins WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("stored pin row");
+        assert_eq!(
+            unchanged, stored_pin,
+            "admission must not commit the replacement pin"
+        );
+
+        // The same bytes admit once the replacement is already the committed
+        // pin: both sides of the comparison include it, so it looks non-growing.
+        replace_teardown_live_pin(&pool, app_id, Some(replacement))
+            .await
+            .expect("commit the replacement, as the old handler did before admission");
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(stored_len)),
+            app_id,
+        )
+        .await
+        .expect("admission after the replacement was committed");
+        assert!(
+            fits,
+            "committing the replacement before admission hides the growth; the handler must not"
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_pin_growth", pool).await;
+    }
+
+    /// An unsigned apply has no signed artifact to authorize. Once intermediate
+    /// publications exist, treating a null hash as Uncovered 502s deletion forever.
+    #[tokio::test]
+    async fn unsigned_operation_does_not_need_signed_policy_coverage() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_unsigned_cover").await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_teardown_pending_app(&pool).await;
+
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        insert_test_job(&pool, org_id, app_id, completed, completed, None).await;
+        mark_test_workload_published(&pool, completed).await;
+
+        let intermediate = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, intermediate, "failed", now).await;
+        mark_test_workload_published(&pool, intermediate).await;
+        insert_unsigned_failed_job(&pool, org_id, app_id, intermediate, 6).await;
+
+        let newest = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            newest,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        mark_test_workload_published(&pool, newest).await;
+        insert_unsigned_failed_job(&pool, org_id, app_id, newest, 7).await;
+
+        assert!(
+            app_has_intermediate_publications(&pool, app_id)
+                .await
+                .expect("probe unsigned intermediates"),
+            "the fixture must be the case the coverage probe actually reaches"
+        );
+        assert!(
+            teardown_unit_covers_operation(&pool, app_id, intermediate)
+                .await
+                .expect("coverage for unsigned intermediate"),
+            "an unsigned operation has no signed artifact to authorize"
+        );
+        assert!(
+            teardown_unit_covers_operation(&pool, app_id, newest)
+                .await
+                .expect("coverage for unsigned newest publication")
+        );
+        assert!(
+            !teardown_unit_covers_operation(&pool, app_id, Uuid::new_v4())
+                .await
+                .expect("unknown operation stays uncovered")
+        );
+
+        let signed = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            signed,
+            "failed",
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+        let signed_artifact = insert_test_artifact(&pool, app_id, signed, "77").await;
+        insert_failed_apply_job(&pool, org_id, app_id, signed, &signed_artifact, 8).await;
+        assert!(
+            !teardown_unit_covers_operation(&pool, app_id, signed)
+                .await
+                .expect("coverage for a signed operation outside the unit"),
+            "a signed operation whose artifact is not in the unit must still fail closed"
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_unsigned_cover", pool).await;
+    }
+
+    async fn insert_unsigned_failed_job(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        payload_byte: u8,
+    ) {
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, last_error_code
+             ) VALUES ($1, $2, $3, $1, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $4, false, false, NULL, NULL, NULL, 'failed',
+                       'deployment_apply_failed')",
+        )
+        .bind(deployment_id)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![payload_byte; 32])
+        .execute(pool)
+        .await
+        .expect("insert unsigned failed apply job");
+    }
+
+    #[tokio::test]
+    async fn teardown_pin_commit_rolls_back_with_its_transaction() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_pin_rollback").await;
+        let (_org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        let stored = Uuid::new_v4();
+        replace_teardown_live_pin(&pool, app_id, Some(stored))
+            .await
+            .expect("commit stored pin");
+        let mut tx = pool.begin().await.expect("begin pin transaction");
+        commit_teardown_live_pin(&mut tx, app_id, Some(Uuid::new_v4()))
+            .await
+            .expect("stage replacement pin");
+        tx.rollback().await.expect("roll back replacement pin");
+        let kept: Uuid = sqlx::query_scalar(
+            "SELECT deployment_id FROM teardown_live_deployment_pins WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("stored pin survives rollback");
+        assert_eq!(kept, stored);
+        crate::test_support::drop_isolated_database("cap_teardown_pin_rollback", pool).await;
     }
 
     #[tokio::test]
