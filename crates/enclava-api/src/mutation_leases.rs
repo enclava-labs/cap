@@ -59,9 +59,12 @@ const RETAINED_FENCE_RECONCILE_CONCURRENCY: usize = 4;
 /// A fence is started only when that window still fits before
 /// `batch_deadline` (cap#240). `captured_deadline` is taken after the
 /// cursor stamp, once a full window is confirmed again, and with no
-/// further await before the first GET. Later requests in that entry reuse
-/// it and fail closed if it has passed — they do not recompute a fresh
-/// deadline after another await.
+/// further await before the first GET. Follow-up calls do not reuse that
+/// instant: a GET that consumed most of it would leave the pinned DELETE
+/// and the confirmation GET no time to finish, and a consistently slow
+/// API would never clear the fence (cap#373 review). Each later
+/// Kubernetes call takes its own probe window via
+/// [`ProbeWindow::follow_up_deadline`], still capped by `batch_deadline`.
 #[derive(Clone, Copy)]
 struct ProbeWindow {
     batch_deadline: tokio::time::Instant,
@@ -70,11 +73,22 @@ struct ProbeWindow {
 }
 
 impl ProbeWindow {
+    /// Deadline for the admitted probe. The captured instant is used when
+    /// set, so the first GET cannot start on a timeout an await after the
+    /// window check already expired.
     fn request_deadline(&self) -> tokio::time::Instant {
-        self.captured_deadline.unwrap_or_else(|| {
-            self.batch_deadline
-                .min(tokio::time::Instant::now() + self.probe_timeout)
-        })
+        self.captured_deadline
+            .unwrap_or_else(|| self.follow_up_deadline())
+    }
+
+    /// Fresh deadline for a Kubernetes call after the admitted GET (pinned
+    /// DELETE, absence confirmation, foreign-namespace bounding re-check).
+    /// Independent of [`Self::captured_deadline`]. Capped by the shared
+    /// batch deadline, so a call whose batch instant has already passed
+    /// fails closed instead of extending the pass.
+    fn follow_up_deadline(&self) -> tokio::time::Instant {
+        self.batch_deadline
+            .min(tokio::time::Instant::now() + self.probe_timeout)
     }
 
     /// True when a request started now can run for the whole probe timeout
@@ -1422,7 +1436,7 @@ async fn retry_retained_namespace_delete(
     window: ProbeWindow,
 ) -> bool {
     match tokio::time::timeout_at(
-        window.request_deadline(),
+        window.follow_up_deadline(),
         api.delete(
             namespace,
             &kube::api::DeleteParams {
@@ -1457,10 +1471,12 @@ async fn retry_retained_namespace_delete(
             return false;
         }
     }
-    // The delete was accepted. Confirm absence within the probe budget;
-    // a still-live object (Terminating under finalizers) retains the fence
-    // and converges via the deletionTimestamp path on the next cycle.
-    match tokio::time::timeout_at(window.request_deadline(), api.get_opt(namespace)).await {
+    // The delete was accepted. Confirm absence on a fresh probe window,
+    // not whatever the DELETE left of its own — a slow accept must not
+    // starve the 404 check. A still-live object (Terminating under
+    // finalizers) retains the fence and converges via the
+    // deletionTimestamp path on the next cycle.
+    match tokio::time::timeout_at(window.follow_up_deadline(), api.get_opt(namespace)).await {
         Ok(Ok(None)) => true,
         Ok(Ok(Some(_))) => {
             tracing::info!(
@@ -1590,6 +1606,7 @@ async fn release_retained_deployment_namespace_fences_budgeted(
                             return Ok(false);
                         }
                         // No await between this capture and the first GET.
+                        // Follow-ups do not reuse it; see follow_up_deadline.
                         let window = ProbeWindow {
                             captured_deadline: Some(
                                 tokio::time::Instant::now() + window.probe_timeout,
@@ -1710,7 +1727,7 @@ async fn bound_stranded_foreign_namespace_fence(
     // retained and the deleting/absence arms converge on their own safe
     // resolutions. GET errors and timeouts roll back too (fail closed).
     let still_live_and_not_deleting = match tokio::time::timeout_at(
-        window.request_deadline(),
+        window.follow_up_deadline(),
         api.get_opt(namespace),
     )
     .await
@@ -1779,11 +1796,12 @@ async fn retained_marker_namespace_provenance(
 /// kind — [`RETAINED_DEPLOYMENT_NAMESPACE_OPERATION`] or `app_delete`; only
 /// the retained marker authorizes the live-namespace retry/bounding arms
 /// below, while an `app_delete` fence releases on the observed 404 alone
-/// (cap#336). `window` caps every Kubernetes request in this entry. Its
-/// captured deadline is taken when the probe is started and reused for the
-/// pinned DELETE and the absence confirmation; a later call that would
-/// start after that instant fails closed and retains the fence. It is not
-/// recomputed after another await.
+/// (cap#336). `window` caps every Kubernetes request in this entry. The
+/// captured deadline applies only to the initial GET. The pinned DELETE,
+/// the absence confirmation, and the foreign-namespace re-check each take
+/// a fresh probe window still capped by the batch deadline, so a slow GET
+/// cannot starve the call that clears the fence (cap#373 review). A
+/// follow-up whose batch deadline has already passed fails closed.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_one_retained_namespace(
     pool: &PgPool,
@@ -5109,5 +5127,415 @@ pub(crate) mod tests {
                 .await
                 .expect("remove fast-pass fixture organization");
         }
+    }
+
+    #[test]
+    fn follow_up_deadline_ignores_a_nearly_spent_captured_instant() {
+        let now = tokio::time::Instant::now();
+        let window = ProbeWindow {
+            batch_deadline: now + Duration::from_secs(90),
+            probe_timeout: Duration::from_secs(30),
+            captured_deadline: Some(now + Duration::from_millis(200)),
+        };
+        assert_eq!(
+            window.request_deadline(),
+            window.captured_deadline.unwrap(),
+            "the admitted GET keeps the captured instant"
+        );
+        let follow = window.follow_up_deadline();
+        assert!(
+            follow > now + Duration::from_secs(20),
+            "a follow-up must not inherit a nearly spent GET deadline"
+        );
+        assert!(follow <= window.batch_deadline);
+
+        let expired = ProbeWindow {
+            batch_deadline: now - Duration::from_secs(1),
+            probe_timeout: Duration::from_secs(30),
+            captured_deadline: Some(now + Duration::from_secs(30)),
+        };
+        assert!(
+            expired.follow_up_deadline() <= now,
+            "a passed batch deadline fail-closes the follow-up even while the captured GET window is still open"
+        );
+        assert!(
+            expired.request_deadline() > now,
+            "the admitted GET still uses its captured instant; only follow-ups are capped by the batch"
+        );
+    }
+
+    /// A batch deadline that has already passed must not let the pinned
+    /// DELETE run out the captured GET window. The server hangs; reusing
+    /// the captured instant would wait it out.
+    #[tokio::test]
+    async fn passed_batch_deadline_does_not_wait_out_the_captured_get_window() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let app = Router::new().fallback(|_request: axum::extract::Request| async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            StatusCode::OK.into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hung-delete mock");
+        let address = listener.local_addr().expect("hung-delete mock address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve hung-delete mock");
+        });
+        let api = kube::Api::all(mock_kube_client(&format!("http://{address}")));
+        let window = ProbeWindow {
+            batch_deadline: tokio::time::Instant::now() - Duration::from_millis(10),
+            probe_timeout: Duration::from_secs(30),
+            captured_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(30)),
+        };
+        let started = tokio::time::Instant::now();
+        let finished = tokio::time::timeout(
+            Duration::from_secs(5),
+            retry_retained_namespace_delete(&api, "ns", "uid".to_string(), "1".to_string(), window),
+        )
+        .await;
+        assert!(
+            matches!(finished, Ok(false)),
+            "a passed batch deadline must fail the DELETE closed without using the captured GET window; got {finished:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "fail-closed must return before the captured window, not after the server answers"
+        );
+        server.abort();
+    }
+
+    /// Namespace API that delays only `/namespaces/` calls. Other paths
+    /// answer immediately so client discovery cannot consume the probe
+    /// window. `owned_generation: Some` serves the ledgered CAP-created
+    /// shape; `None` serves a live foreign namespace. A DELETE flips later
+    /// GETs to 404 after the same delay, so the confirmation probe is slow
+    /// too.
+    async fn delayed_namespace_server(
+        owned_generation: Option<i64>,
+        delay: Duration,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::atomic::AtomicU32>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let gets = Arc::new(AtomicU32::new(0));
+        let deletes = Arc::new(AtomicU32::new(0));
+        let deleted = Arc::new(AtomicBool::new(false));
+        let gets_state = Arc::clone(&gets);
+        let deletes_state = Arc::clone(&deletes);
+        let deleted_state = Arc::clone(&deleted);
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
+            let gets = Arc::clone(&gets_state);
+            let deletes = Arc::clone(&deletes_state);
+            let deleted = Arc::clone(&deleted_state);
+            async move {
+                let path = request.uri().path().to_string();
+                let namespace_call = path.contains("/namespaces/");
+                if !namespace_call {
+                    // Discovery and other client chatter must not consume
+                    // the probe window. Same instant shape the other mocks
+                    // return for every path.
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": {
+                                "name": "discovery",
+                                "uid": "discovery",
+                                "resourceVersion": "1"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                tokio::time::sleep(delay).await;
+                let name = path.rsplit('/').next().unwrap_or("ns").to_string();
+                if request.method() == axum::http::Method::DELETE {
+                    deletes.fetch_add(1, Ordering::SeqCst);
+                    deleted.store(true, Ordering::SeqCst);
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Success",
+                            "code": 200
+                        })),
+                    )
+                        .into_response();
+                }
+                gets.fetch_add(1, Ordering::SeqCst);
+                if deleted.load(Ordering::SeqCst) {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Failure",
+                            "reason": "NotFound",
+                            "message": "namespaces \"ns\" not found",
+                            "code": 404
+                        })),
+                    )
+                        .into_response();
+                }
+                let Some(generation) = owned_generation else {
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": {
+                                "name": name,
+                                "uid": "foreign",
+                                "resourceVersion": "1"
+                            }
+                        })),
+                    )
+                        .into_response();
+                };
+                let annotations = std::collections::BTreeMap::from([
+                    (
+                        enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
+                            .to_string(),
+                        generation.to_string(),
+                    ),
+                    (
+                        enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                            .to_string(),
+                        generation.to_string(),
+                    ),
+                ]);
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": {
+                            "name": name,
+                            "uid": "fixture",
+                            "resourceVersion": "1",
+                            "creationTimestamp": "2026-10-01T00:00:00Z",
+                            "annotations": annotations,
+                            "managedFields": [{
+                                "manager": "enclava-platform",
+                                "apiVersion": "v1",
+                                "time": "2026-01-01T00:00:00Z",
+                                "fieldsType": "FieldsV1",
+                                "fieldsV1": {
+                                    "f:metadata": {
+                                        "f:annotations": {
+                                            format!(
+                                                "f:{}",
+                                                enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                                            ): {}
+                                        }
+                                    }
+                                }
+                            }]
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed-namespace mock");
+        let address = listener
+            .local_addr()
+            .expect("delayed-namespace mock address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve delayed-namespace mock");
+        });
+        (format!("http://{address}"), gets, deletes, server)
+    }
+
+    async fn drop_leftover_retained_fence_fixtures(pool: &PgPool) {
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND (resource_key LIKE 'retained-kube-%'
+                  OR resource_key LIKE 'delete-fence-%')",
+        )
+        .execute(pool)
+        .await
+        .expect("drop leftover retained-fence fixtures");
+    }
+
+    /// cap#373 review: a GET that consumes most of the admitted probe
+    /// window must not starve the pinned DELETE or the confirmation GET.
+    /// `delay` is longer than the remainder of that window, and two
+    /// follow-ups cannot share one fresh probe window either — each call
+    /// needs its own. The batch still has room, so the cap is not what
+    /// would fail this pass.
+    #[tokio::test]
+    async fn slow_owned_namespace_get_still_completes_the_pinned_delete() {
+        let probe = Duration::from_secs(3);
+        let batch = Duration::from_secs(20);
+        let delay = Duration::from_secs(2);
+        assert!(delay < probe, "the admitted GET must fit its own window");
+        assert!(
+            delay > probe - delay,
+            "sabotage: reusing the captured instant would still leave room for the DELETE"
+        );
+        assert!(
+            delay + delay > probe,
+            "sabotage: one shared follow-up window would still fit DELETE and confirmation"
+        );
+        assert!(
+            probe + delay + delay < batch,
+            "the batch cap must not be what fails this pass"
+        );
+
+        let pool = database_test_pool(2).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let (org, _app, _token, namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("load retained fence generation");
+        let (url, gets, deletes, server) = delayed_namespace_server(Some(generation), delay).await;
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            mock_kube_client(&url),
+            batch,
+            probe,
+            1,
+        )
+        .await
+        .expect("reconcile a slow owned namespace");
+        assert_eq!(
+            released, 1,
+            "a slow GET must not starve the pinned DELETE or the confirmation GET"
+        );
+        assert!(
+            deletes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the pinned DELETE must have been accepted"
+        );
+        assert!(
+            gets.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the admission GET and the confirmation GET must both have completed"
+        );
+        let owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT owner_token FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read the owned fence after the slow delete");
+        assert_eq!(owner, None, "the exact fence must be cleared");
+        server.abort();
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("remove slow-delete fixture fence");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("remove slow-delete fixture organization");
+    }
+
+    /// Same shared-window bug on the foreign-namespace bounding re-check:
+    /// a slow admission GET must not time out the re-check that commits
+    /// the bound. The marker has already settled.
+    #[tokio::test]
+    async fn slow_foreign_namespace_get_still_bounds_on_its_own_recheck_window() {
+        let probe = Duration::from_secs(3);
+        let batch = Duration::from_secs(20);
+        let delay = Duration::from_secs(2);
+        assert!(delay < probe);
+        assert!(delay > probe - delay);
+
+        let pool = database_test_pool(2).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let (org, _app, _token, namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '10 minutes'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("age the foreign marker past the settle margin");
+        let (url, gets, deletes, server) = delayed_namespace_server(None, delay).await;
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            mock_kube_client(&url),
+            batch,
+            probe,
+            1,
+        )
+        .await
+        .expect("reconcile a slow foreign namespace");
+        assert_eq!(
+            released, 1,
+            "a slow admission GET must not time out the bounding re-check"
+        );
+        assert_eq!(
+            deletes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a foreign namespace must be bounded, not deleted"
+        );
+        assert!(
+            gets.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the admission GET and the bounding re-check must both have completed"
+        );
+        let (infinite, is_future): (bool, bool) = sqlx::query_as(
+            "SELECT reclaim_after = 'infinity'::timestamptz,
+                    reclaim_after > clock_timestamp()
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("load the bounded marker");
+        assert!(!infinite, "a settled foreign marker must not stay infinite");
+        assert!(
+            is_future,
+            "the bound must be a fresh quarantine, not already past"
+        );
+        server.abort();
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("remove slow-recheck fixture fence");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("remove slow-recheck fixture organization");
     }
 }
