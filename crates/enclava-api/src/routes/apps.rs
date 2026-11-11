@@ -173,7 +173,9 @@ enum AppDeleteFailure {
     KbsTlsBinding,
     KbsPolicy,
     KbsPolicyBudget,
-    TeardownLivePod,
+    TeardownLivePodUnavailable,
+    TeardownLivePodUnnamed,
+    TeardownLivePodUncovered,
 }
 
 impl AppDeleteFailure {
@@ -193,7 +195,9 @@ impl AppDeleteFailure {
             Self::KbsTlsBinding => "app_delete_kbs_tls_binding_failed",
             Self::KbsPolicy => "app_delete_kbs_policy_failed",
             Self::KbsPolicyBudget => "app_delete_kbs_policy_budget_exceeded",
-            Self::TeardownLivePod => "app_delete_teardown_live_pod_unresolved",
+            Self::TeardownLivePodUnavailable => "app_delete_teardown_live_pod_unavailable",
+            Self::TeardownLivePodUnnamed => "app_delete_teardown_live_pod_unnamed",
+            Self::TeardownLivePodUncovered => "app_delete_teardown_live_pod_uncovered",
         }
     }
 
@@ -212,7 +216,9 @@ impl AppDeleteFailure {
             | Self::KbsOwnerBinding
             | Self::KbsTlsBinding
             | Self::KbsPolicy
-            | Self::TeardownLivePod => StatusCode::BAD_GATEWAY,
+            | Self::TeardownLivePodUnavailable
+            | Self::TeardownLivePodUnnamed
+            | Self::TeardownLivePodUncovered => StatusCode::BAD_GATEWAY,
         }
     }
 }
@@ -237,17 +243,23 @@ fn teardown_live_pod_failure(
     app_id: Uuid,
     error: crate::kbs::TeardownLivePodError,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match error {
-        crate::kbs::TeardownLivePodError::Db(_) => internal_server_error(),
-        other => {
-            tracing::warn!(
-                app_id = %app_id,
-                error = %other,
-                "teardown live pod could not be named or was not in the published unit"
-            );
-            app_delete_failure(app_id, AppDeleteFailure::TeardownLivePod, other)
+    let failure = match error {
+        crate::kbs::TeardownLivePodError::Db(_) | crate::kbs::TeardownLivePodError::Projection => {
+            return internal_server_error();
         }
-    }
+        crate::kbs::TeardownLivePodError::KubernetesUnavailable => {
+            AppDeleteFailure::TeardownLivePodUnavailable
+        }
+        crate::kbs::TeardownLivePodError::Unnamed => AppDeleteFailure::TeardownLivePodUnnamed,
+        crate::kbs::TeardownLivePodError::Uncovered => AppDeleteFailure::TeardownLivePodUncovered,
+    };
+    tracing::warn!(
+        app_id = %app_id,
+        error = %error,
+        code = failure.code(),
+        "teardown live pod could not be named or its artifact is not in the published unit"
+    );
+    app_delete_failure(app_id, failure, error)
 }
 
 fn app_delete_dns_failure(
@@ -1983,8 +1995,9 @@ pub(crate) async fn delete_app_before(
     // policy authority for as long as it can still be serving, and the byte
     // budget fail-closes the whole reconciliation when the required set
     // overflows — stacked deletions would then wedge every app's policy
-    // convergence. Refuse the delete here, under the global kbs_policy fence
-    // and before the pin exists, when this app's teardown unit no longer fits.
+    // convergence. Refuse the delete here, under the global kbs_policy fence,
+    // after the live-pod pin has been recorded and before the app is marked
+    // deleting, when this app's teardown unit no longer fits.
     // Nothing is dropped from the policy to make a delete fit. `abandon_teardown`
     // proceeds anyway: its deletion completes in this flow (the pin stays
     // transient), and the operator override must remain reachable to unwind a
