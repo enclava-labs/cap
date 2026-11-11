@@ -176,9 +176,16 @@ pub(crate) async fn mark_compensation_resolved(
     Ok(())
 }
 
-async fn note_compensation_retry(pool: &PgPool, id: i64, code: &str) -> Result<(), sqlx::Error> {
+async fn note_compensation_retry(
+    pool: &PgPool,
+    id: i64,
+    attempt_count: i32,
+    code: &str,
+) -> Result<(), sqlx::Error> {
     // Bounded backoff, never a terminal give-up: eventual clearance requires
     // the row to stay until the UID is confirmed absent, deleted, or replaced.
+    // The attempt_count fence is the claim. A replica whose lease lapsed must
+    // not shorten the next_attempt_at a later claim just published.
     sqlx::query(
         "UPDATE unresolved_post_create_compensations
             SET last_error = $2,
@@ -188,19 +195,36 @@ async fn note_compensation_retry(pool: &PgPool, id: i64, code: &str) -> Result<(
                         interval '5 seconds' * power(2, LEAST(attempt_count, 7))
                     )
           WHERE id = $1
+            AND attempt_count = $3
             AND resolved_at IS NULL",
     )
     .bind(id)
     .bind(code)
+    .bind(attempt_count)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// A full reconcile pass can spend one timeout on the GET, one on the DELETE,
-/// and one per confirmation read. The claim lease must cover that so a second
-/// replica cannot issue another delete while the first pass is still confirming.
-const CLAIM_LEASE: &str = "180 seconds";
+/// Slack past one row's Kubernetes budget for the resolve or retry write.
+const CLAIM_LEASE_SLACK: Duration = Duration::from_secs(30);
+
+/// Lease for the row about to run, not for the rest of the batch. A slow
+/// pass spends a timeout on the owning GET, the DELETE, the 409 re-read, and
+/// the retry DELETE, then one interval plus one timeout per confirmation
+/// read. Claiming that budget for every row up front lets a later row become
+/// due again while this pass is still on an earlier one.
+fn claim_lease(limits: CompensationReconcileLimits) -> Duration {
+    let requests = 4 + limits.confirm_attempts as u32;
+    limits.request_timeout * requests
+        + limits.confirm_interval * (limits.confirm_attempts as u32)
+        + CLAIM_LEASE_SLACK
+}
+
+fn claim_lease_secs(limits: CompensationReconcileLimits) -> i64 {
+    let millis = claim_lease(limits).as_millis();
+    i64::try_from(millis.div_ceil(1000)).unwrap_or(i64::MAX)
+}
 
 #[derive(Debug, sqlx::FromRow)]
 struct CompensationRow {
@@ -210,16 +234,17 @@ struct CompensationRow {
     name: String,
     uid: String,
     mutation_generation: i64,
+    attempt_count: i32,
 }
 
-/// Claim a bounded batch of due rows. The CTE `FOR UPDATE SKIP LOCKED` shape
-/// is the one `deployment_jobs` uses: the lock is taken on the candidate
-/// select, then the update publishes the lease. This write touches only this
-/// table.
-async fn claim_due_compensations(
+/// Claim the next due row. The CTE `FOR UPDATE SKIP LOCKED` shape is the one
+/// `deployment_jobs` uses: the lock is taken on the candidate select, then
+/// the update publishes the lease. One row, not the batch — the lease covers
+/// only the work this call is about to do. This write touches only this table.
+async fn claim_next_due_compensation(
     pool: &PgPool,
-    batch: i64,
-) -> Result<Vec<CompensationRow>, sqlx::Error> {
+    lease_secs: i64,
+) -> Result<Option<CompensationRow>, sqlx::Error> {
     sqlx::query_as(
         "WITH candidate AS (
              SELECT id
@@ -227,21 +252,51 @@ async fn claim_due_compensations(
               WHERE resolved_at IS NULL
                 AND next_attempt_at <= clock_timestamp()
               ORDER BY next_attempt_at
-              LIMIT $1
+              LIMIT 1
                 FOR UPDATE SKIP LOCKED
          )
          UPDATE unresolved_post_create_compensations AS row
             SET attempt_count = row.attempt_count + 1,
-                next_attempt_at = clock_timestamp() + $2::interval
+                next_attempt_at = clock_timestamp() + make_interval(secs => $1::bigint)
            FROM candidate
           WHERE row.id = candidate.id
          RETURNING row.id, row.kind, row.namespace, row.name, row.uid,
-                   row.mutation_generation",
+                   row.mutation_generation, row.attempt_count",
     )
-    .bind(batch)
-    .bind(CLAIM_LEASE)
-    .fetch_all(pool)
+    .bind(lease_secs)
+    .fetch_optional(pool)
     .await
+}
+
+/// Extend the claim immediately before a pinned DELETE. A pass that no longer
+/// holds an unexpired claim must not delete, and must not publish a new lease
+/// over a replica that has already taken the row.
+async fn renew_claim_for_delete(pool: &PgPool, row: &CompensationRow, lease_secs: i64) -> bool {
+    match sqlx::query(
+        "UPDATE unresolved_post_create_compensations
+            SET next_attempt_at = clock_timestamp() + make_interval(secs => $3::bigint)
+          WHERE id = $1
+            AND attempt_count = $2
+            AND resolved_at IS NULL
+            AND next_attempt_at > clock_timestamp()",
+    )
+    .bind(row.id)
+    .bind(row.attempt_count)
+    .bind(lease_secs)
+    .execute(pool)
+    .await
+    {
+        Ok(result) => result.rows_affected() == 1,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                id = row.id,
+                error_code = "compensation_claim_renew_failed",
+                "could not renew a compensation claim; not deleting"
+            );
+            false
+        }
+    }
 }
 
 fn compensation_api_resource(kind: &str) -> Option<kube::api::ApiResource> {
@@ -326,18 +381,22 @@ async fn read_live(
     }
 }
 
-/// One reconcile pass. Returns the number of rows still unresolved after the
-/// pass (claimed rows that were not resolved). A claim-query failure returns
-/// `Err` and issues no Kubernetes request.
+/// One reconcile pass. Returns how many claimed rows stayed unresolved. A
+/// claim-query failure returns `Err`. The first claim runs before any
+/// Kubernetes request; a later claim failure leaves earlier rows as written.
 pub(crate) async fn reconcile_unresolved_post_create_compensations(
     pool: &PgPool,
     client: &Client,
     limits: CompensationReconcileLimits,
 ) -> Result<usize, sqlx::Error> {
-    let rows = claim_due_compensations(pool, limits.batch).await?;
+    let lease_secs = claim_lease_secs(limits);
+    let batch = usize::try_from(limits.batch).unwrap_or(0);
     let mut unresolved = 0usize;
-    for row in rows {
-        if !reconcile_one(pool, client, &row, limits).await {
+    for _ in 0..batch {
+        let Some(row) = claim_next_due_compensation(pool, lease_secs).await? else {
+            break;
+        };
+        if !reconcile_one(pool, client, &row, limits, lease_secs).await {
             unresolved += 1;
         }
     }
@@ -345,15 +404,17 @@ pub(crate) async fn reconcile_unresolved_post_create_compensations(
 }
 
 /// `true` when the row was resolved. Kubernetes errors and write failures
-/// leave it unresolved. Never deletes a UID other than `row.uid`.
+/// leave it unresolved. Never deletes a UID other than `row.uid`, and never
+/// deletes after this pass has lost the claim.
 async fn reconcile_one(
     pool: &PgPool,
     client: &Client,
     row: &CompensationRow,
     limits: CompensationReconcileLimits,
+    lease_secs: i64,
 ) -> bool {
     if row.uid.is_empty() || row.name.is_empty() {
-        return leave_unresolved(pool, row.id, "unpinned_identity").await;
+        return leave_unresolved(pool, row, "unpinned_identity").await;
     }
     let Some(resource) = compensation_api_resource(&row.kind) else {
         tracing::error!(
@@ -362,13 +423,13 @@ async fn reconcile_one(
             error_code = "compensation_unknown_kind",
             "refusing to address an unmapped kind; the row stays unresolved"
         );
-        return leave_unresolved(pool, row.id, "unknown_kind").await;
+        return leave_unresolved(pool, row, "unknown_kind").await;
     };
     let api: Api<DynamicObject> = if row.kind == "Namespace" {
         Api::all_with(client.clone(), &resource)
     } else {
         let Some(namespace) = row.namespace.as_deref() else {
-            return leave_unresolved(pool, row.id, "missing_namespace").await;
+            return leave_unresolved(pool, row, "missing_namespace").await;
         };
         Api::namespaced_with(client.clone(), namespace, &resource)
     };
@@ -402,8 +463,11 @@ async fn reconcile_one(
             );
             resolve_or_keep(pool, row, "later_generation").await
         }
-        LiveView::Unreadable(code) => leave_unresolved(pool, row.id, code).await,
+        LiveView::Unreadable(code) => leave_unresolved(pool, row, code).await,
         LiveView::Owned(owned) => {
+            if !renew_claim_for_delete(pool, row, lease_secs).await {
+                return false;
+            }
             match issue_pinned_delete(
                 &api,
                 &row.name,
@@ -415,9 +479,11 @@ async fn reconcile_one(
             {
                 DeleteOutcome::Absent => resolve_or_keep(pool, row, "absent").await,
                 DeleteOutcome::Accepted => confirm_pinned_delete(pool, &api, row, limits).await,
-                DeleteOutcome::Conflict => reclassify_after_conflict(pool, &api, row, limits).await,
-                DeleteOutcome::Rejected => leave_unresolved(pool, row.id, "delete_rejected").await,
-                DeleteOutcome::Ambiguous(code) => leave_unresolved(pool, row.id, code).await,
+                DeleteOutcome::Conflict => {
+                    reclassify_after_conflict(pool, &api, row, limits, lease_secs).await
+                }
+                DeleteOutcome::Rejected => leave_unresolved(pool, row, "delete_rejected").await,
+                DeleteOutcome::Ambiguous(code) => leave_unresolved(pool, row, code).await,
             }
         }
     }
@@ -473,6 +539,7 @@ async fn reclassify_after_conflict(
     api: &Api<DynamicObject>,
     row: &CompensationRow,
     limits: CompensationReconcileLimits,
+    lease_secs: i64,
 ) -> bool {
     match read_live(
         api,
@@ -486,8 +553,11 @@ async fn reclassify_after_conflict(
         LiveView::Absent => resolve_or_keep(pool, row, "absent").await,
         LiveView::DifferentUid => resolve_or_keep(pool, row, "stale_replacement").await,
         LiveView::LaterGeneration => resolve_or_keep(pool, row, "later_generation").await,
-        LiveView::Unreadable(code) => leave_unresolved(pool, row.id, code).await,
+        LiveView::Unreadable(code) => leave_unresolved(pool, row, code).await,
         LiveView::Owned(owned) => {
+            if !renew_claim_for_delete(pool, row, lease_secs).await {
+                return false;
+            }
             match issue_pinned_delete(
                 api,
                 &row.name,
@@ -500,10 +570,10 @@ async fn reclassify_after_conflict(
                 DeleteOutcome::Absent => resolve_or_keep(pool, row, "absent").await,
                 DeleteOutcome::Accepted => confirm_pinned_delete(pool, api, row, limits).await,
                 DeleteOutcome::Conflict => {
-                    leave_unresolved(pool, row.id, "precondition_rejected").await
+                    leave_unresolved(pool, row, "precondition_rejected").await
                 }
-                DeleteOutcome::Rejected => leave_unresolved(pool, row.id, "delete_rejected").await,
-                DeleteOutcome::Ambiguous(code) => leave_unresolved(pool, row.id, code).await,
+                DeleteOutcome::Rejected => leave_unresolved(pool, row, "delete_rejected").await,
+                DeleteOutcome::Ambiguous(code) => leave_unresolved(pool, row, code).await,
             }
         }
     }
@@ -534,17 +604,18 @@ async fn confirm_pinned_delete(
                 return resolve_or_keep(pool, row, "later_generation").await;
             }
             LiveView::Owned(_) => continue,
-            LiveView::Unreadable(code) => return leave_unresolved(pool, row.id, code).await,
+            LiveView::Unreadable(code) => return leave_unresolved(pool, row, code).await,
         }
     }
     // Still the same UID (finalizer, or the delete was accepted but not
     // observed). Leave the row. The next pass retries the pinned delete.
-    leave_unresolved(pool, row.id, "finalizer").await
+    leave_unresolved(pool, row, "finalizer").await
 }
 
 async fn resolve_or_keep(pool: &PgPool, row: &CompensationRow, reason: &str) -> bool {
-    match mark_compensation_resolved(pool, &row.uid, reason).await {
-        Ok(()) => true,
+    match mark_held_compensation_resolved(pool, row.id, row.attempt_count, reason).await {
+        Ok(true) => true,
+        Ok(false) => false,
         Err(error) => {
             tracing::error!(
                 error = %error,
@@ -557,11 +628,35 @@ async fn resolve_or_keep(pool: &PgPool, row: &CompensationRow, reason: &str) -> 
     }
 }
 
-async fn leave_unresolved(pool: &PgPool, id: i64, code: &str) -> bool {
-    if let Err(error) = note_compensation_retry(pool, id, code).await {
+/// Resolve only the claim this pass holds. A newer claim owns the outcome.
+async fn mark_held_compensation_resolved(
+    pool: &PgPool,
+    id: i64,
+    attempt_count: i32,
+    reason: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE unresolved_post_create_compensations
+            SET resolved_at = clock_timestamp(),
+                resolve_reason = $3,
+                last_error = NULL
+          WHERE id = $1
+            AND attempt_count = $2
+            AND resolved_at IS NULL",
+    )
+    .bind(id)
+    .bind(attempt_count)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+async fn leave_unresolved(pool: &PgPool, row: &CompensationRow, code: &str) -> bool {
+    if let Err(error) = note_compensation_retry(pool, row.id, row.attempt_count, code).await {
         tracing::error!(
             error = %error,
-            id,
+            id = row.id,
             error_code = "compensation_retry_unpersisted",
             "could not record a compensation retry; the row stays due"
         );
@@ -1118,5 +1213,217 @@ mod tests {
             .unwrap();
         let (resolve, _) = reason(&pool, uid).await;
         assert_eq!(resolve.as_deref(), Some("absent"));
+    }
+
+    #[test]
+    fn claim_lease_covers_one_slow_row_and_not_the_batch() {
+        let limits = CompensationReconcileLimits::production();
+        let one_row = limits.request_timeout * 4
+            + (limits.request_timeout + limits.confirm_interval)
+                * u32::try_from(limits.confirm_attempts).unwrap();
+        let lease = claim_lease(limits);
+        assert!(
+            lease >= one_row,
+            "lease {lease:?} does not cover one slow row {one_row:?}"
+        );
+        assert!(
+            lease < one_row * u32::try_from(limits.batch).unwrap(),
+            "lease {lease:?} is sized for the batch, not one row"
+        );
+        // The previous fixed 180s lease did not cover the 409 re-read path.
+        assert!(one_row > Duration::from_secs(180));
+    }
+
+    async fn insert_named(pool: &PgPool, name: &str, uid: &str) {
+        sqlx::query(
+            "INSERT INTO unresolved_post_create_compensations
+                (app_id, deployment_id, kind, namespace, name, uid, mutation_generation,
+                 next_attempt_at)
+             VALUES ($1, $2, 'Secret', 'tenant-ns', $3, $4, 7, clock_timestamp())",
+        )
+        .bind(Uuid::nil())
+        .bind(Uuid::nil())
+        .bind(name)
+        .bind(uid)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn later_due_row_is_not_leased_until_this_pass_reaches_it() {
+        let (_guard, _cleanup, pool) = isolated().await;
+        insert_named(&pool, "pull-a", "uid-claim-a").await;
+        insert_named(&pool, "pull-b", "uid-claim-b").await;
+        sqlx::query(
+            "UPDATE unresolved_post_create_compensations
+                SET next_attempt_at = clock_timestamp() - interval '2 seconds'
+              WHERE uid = 'uid-claim-a'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE unresolved_post_create_compensations
+                SET next_attempt_at = clock_timestamp() - interval '1 second'
+              WHERE uid = 'uid-claim-b'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let snapshot = Arc::new(Mutex::new(None));
+        let snapshot_for_client = Arc::clone(&snapshot);
+        let pool_for_client = pool.clone();
+        let kube = Client::new(
+            service_fn(move |request: Request<kube::client::Body>| {
+                let snapshot = Arc::clone(&snapshot_for_client);
+                let pool = pool_for_client.clone();
+                async move {
+                    let path = request.uri().path().to_string();
+                    if path.contains("pull-a") && snapshot.lock().expect("snapshot").is_none() {
+                        let this_leased: bool = sqlx::query_scalar(
+                            "SELECT attempt_count = 1
+                                AND next_attempt_at > clock_timestamp()
+                               FROM unresolved_post_create_compensations
+                              WHERE uid = 'uid-claim-a'",
+                        )
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                        let other_leased: bool = sqlx::query_scalar(
+                            "SELECT attempt_count > 0
+                               FROM unresolved_post_create_compensations
+                              WHERE uid = 'uid-claim-b'",
+                        )
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                        *snapshot.lock().expect("snapshot") = Some((this_leased, other_leased));
+                    }
+                    Ok::<_, std::io::Error>(status(StatusCode::NOT_FOUND))
+                }
+            }),
+            "default",
+        );
+        reconcile_unresolved_post_create_compensations(&pool, &kube, limits())
+            .await
+            .unwrap();
+        let (this_leased, other_leased) = snapshot.lock().unwrap().expect("first get observed");
+        assert!(
+            this_leased,
+            "the row being read must already hold its lease"
+        );
+        assert!(
+            !other_leased,
+            "a later due row must not be leased before this pass reaches it"
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_claim_does_not_delete_or_overwrite_the_new_lease() {
+        let (_guard, _cleanup, pool) = isolated().await;
+        let uid = "post-uid-stolen";
+        insert_restart_row(&pool, uid).await;
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deleted_for_client = Arc::clone(&deleted);
+        let pool_for_client = pool.clone();
+        let kube = Client::new(
+            service_fn(move |request: Request<kube::client::Body>| {
+                let pool = pool_for_client.clone();
+                let deleted = Arc::clone(&deleted_for_client);
+                async move {
+                    if request.method() == Method::DELETE {
+                        deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return Ok(status(StatusCode::OK));
+                    }
+                    sqlx::query(
+                        "UPDATE unresolved_post_create_compensations
+                            SET attempt_count = attempt_count + 1,
+                                next_attempt_at = clock_timestamp() + interval '1 hour'
+                          WHERE uid = 'post-uid-stolen'",
+                    )
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    let object = json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": {
+                            "name": "pull-secret",
+                            "namespace": "tenant-ns",
+                            "uid": "post-uid-stolen",
+                            "resourceVersion": "3"
+                        }
+                    });
+                    Ok::<_, std::io::Error>(json_response(StatusCode::OK, &object))
+                }
+            }),
+            "default",
+        );
+        let unresolved = reconcile_unresolved_post_create_compensations(&pool, &kube, limits())
+            .await
+            .unwrap();
+        assert_eq!(unresolved, 1);
+        assert!(
+            !deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "a pass that lost its claim must not delete"
+        );
+        let (attempt_count, held_for_an_hour, last_error): (i32, bool, Option<String>) =
+            sqlx::query_as(
+                "SELECT attempt_count,
+                        next_attempt_at > clock_timestamp() + interval '30 minutes',
+                        last_error
+                   FROM unresolved_post_create_compensations
+                  WHERE uid = $1",
+            )
+            .bind(uid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attempt_count, 2, "the later claim must survive");
+        assert!(
+            held_for_an_hour,
+            "a stale retry must not shorten the newer lease"
+        );
+        assert!(last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_retry_does_not_overwrite_a_newer_claim() {
+        let (_guard, _cleanup, pool) = isolated().await;
+        let uid = "post-uid-stale-retry";
+        insert_restart_row(&pool, uid).await;
+        let claimed = claim_next_due_compensation(&pool, 60)
+            .await
+            .unwrap()
+            .expect("due row");
+        sqlx::query(
+            "UPDATE unresolved_post_create_compensations
+                SET attempt_count = attempt_count + 1,
+                    next_attempt_at = clock_timestamp() + interval '1 hour'
+              WHERE id = $1",
+        )
+        .bind(claimed.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        note_compensation_retry(&pool, claimed.id, claimed.attempt_count, "finalizer")
+            .await
+            .unwrap();
+        let (attempt_count, held_for_an_hour, last_error): (i32, bool, Option<String>) =
+            sqlx::query_as(
+                "SELECT attempt_count,
+                        next_attempt_at > clock_timestamp() + interval '30 minutes',
+                        last_error
+                   FROM unresolved_post_create_compensations
+                  WHERE id = $1",
+            )
+            .bind(claimed.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attempt_count, claimed.attempt_count + 1);
+        assert!(held_for_an_hour);
+        assert!(last_error.is_none());
     }
 }
