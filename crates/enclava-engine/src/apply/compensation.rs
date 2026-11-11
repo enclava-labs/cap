@@ -39,6 +39,15 @@ pub trait UnresolvedCompensationSink: Send + Sync {
         &'a self,
         uid: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// A fresh read showed this UID is no longer the failed create. `reason`
+    /// is `later_generation` or `stale_replacement`. Idempotent. A failed
+    /// write leaves the row due and must not cause another delete.
+    fn resolve_refused<'a>(
+        &'a self,
+        uid: &'a str,
+        reason: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
 #[cfg(test)]
@@ -88,6 +97,17 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
             Box::pin(async move {
                 self.events.lock().expect("events").push("clear");
+                Ok(())
+            })
+        }
+
+        fn resolve_refused<'a>(
+            &'a self,
+            _uid: &'a str,
+            _reason: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.events.lock().expect("events").push("resolve_refused");
                 Ok(())
             })
         }

@@ -179,6 +179,16 @@ pub(super) async fn compensate_created_object<K>(
                         return;
                     }
                     CompensationRefresh::Refused(code) => {
+                        // Resolve from this fresh read. Leaving the row due
+                        // makes the reconciler re-observe an annotation a
+                        // webhook can strip, and then delete the UID.
+                        resolve_refused_compensation(
+                            engine,
+                            &uid,
+                            refused_resolve_reason(code),
+                            deadline,
+                        )
+                        .await;
                         note_unpersisted(persisted, &record);
                         tracing::error!(
                             kind = kind::<K>(),
@@ -242,18 +252,26 @@ pub(super) async fn compensate_created_object<K>(
                 return;
             }
             Ok(Some(live)) => {
-                // A same-named replacement has a different UID. Do not keep
-                // polling it as if it were the object we created, and do not
-                // delete it. The recorded UID remains for the reconciler,
-                // which will observe the mismatch and refuse the delete.
-                if live.meta().uid.as_deref() != Some(uid.as_str()) {
+                // A replacement UID or a newer generation is no longer the
+                // failed create. Resolve that from this read. Leaving the row
+                // due makes the reconciler re-check a strippable annotation.
+                if let CompensationRefresh::Refused(code) =
+                    classify_compensation_refresh(&live, &uid, generation)
+                {
+                    resolve_refused_compensation(
+                        engine,
+                        &uid,
+                        refused_resolve_reason(code),
+                        deadline,
+                    )
+                    .await;
                     note_unpersisted(persisted, &record);
                     tracing::error!(
                         kind = kind::<K>(),
                         name,
                         uid = %uid,
-                        error_code = "compensation_delete_unresolved",
-                        "name is now a different UID; refusing to treat the replacement as the compensated object"
+                        error_code = code,
+                        "live object is no longer the failed create; refusing to treat it as the compensated object"
                     );
                     return;
                 }
@@ -426,6 +444,60 @@ async fn persist_unresolved_compensation(
         }
     }
     false
+}
+
+fn refused_resolve_reason(code: &str) -> &'static str {
+    if code == "compensation_uid_mismatch" {
+        "stale_replacement"
+    } else {
+        "later_generation"
+    }
+}
+
+/// Best-effort clear after a fresh read showed this UID is no longer the
+/// failed create. A failed write leaves the row due. Never a reason to issue
+/// another delete.
+async fn resolve_refused_compensation(
+    engine: &ApplyEngine,
+    uid: &str,
+    reason: &'static str,
+    deadline: tokio::time::Instant,
+) {
+    let Some(sink) = engine.compensation_sink() else {
+        return;
+    };
+    if tokio::time::Instant::now() >= deadline {
+        tracing::warn!(
+            uid,
+            reason,
+            error_code = "compensation_resolve_unpersisted",
+            "compensation target was refused but the deadline elapsed before the row could be resolved"
+        );
+        return;
+    }
+    let per_request = tokio::time::Instant::now() + COMPENSATE_REQUEST_TIMEOUT;
+    match tokio::time::timeout_at(deadline.min(per_request), sink.resolve_refused(uid, reason))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(
+                uid,
+                reason,
+                error = %error,
+                error_code = "compensation_resolve_unpersisted",
+                "could not record that the compensation target is no longer the failed create"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                uid,
+                reason,
+                error_code = "compensation_resolve_timeout",
+                "resolving a refused compensation exceeded the compensation budget"
+            );
+        }
+    }
 }
 
 /// Best-effort clear after the object is confirmed absent. A failed or

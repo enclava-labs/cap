@@ -111,11 +111,38 @@ impl UnresolvedCompensationSink for DbCompensationSink {
                 })
         })
     }
+
+    fn resolve_refused<'a>(
+        &'a self,
+        uid: &'a str,
+        reason: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            if reason != "later_generation" && reason != "stale_replacement" {
+                return Err("invalid_resolve_reason".to_string());
+            }
+            mark_compensation_resolved(&self.pool, uid, reason)
+                .await
+                .map_err(|error| {
+                    tracing::error!(
+                        error = %error,
+                        uid,
+                        reason,
+                        error_code = "compensation_resolve_unpersisted",
+                        "could not record that a compensation target was no longer the failed create"
+                    );
+                    "resolve_failed".to_string()
+                })
+        })
+    }
 }
 
 /// Durably record a POST-returned UID. Idempotent on UID. A previously
-/// resolved row for the same UID is reopened: the object was observed again
-/// and the obligation is not finished. Does not write any other table.
+/// resolved row is reopened only when the obligation can recur. A
+/// `later_generation` or `stale_replacement` resolution must stay resolved:
+/// a second POST cannot return that UID, and reopening it would let the
+/// reconciler delete an object a later apply adopted. Does not write any
+/// other table.
 pub(crate) async fn persist_unresolved_compensation(
     pool: &PgPool,
     app_id: Uuid,
@@ -142,7 +169,11 @@ pub(crate) async fn persist_unresolved_compensation(
             resolve_reason = NULL,
             last_error = NULL,
             next_attempt_at = clock_timestamp()
-         WHERE unresolved_post_create_compensations.resolved_at IS NOT NULL",
+         WHERE unresolved_post_create_compensations.resolved_at IS NOT NULL
+           AND unresolved_post_create_compensations.resolve_reason
+               IS DISTINCT FROM 'later_generation'
+           AND unresolved_post_create_compensations.resolve_reason
+               IS DISTINCT FROM 'stale_replacement'",
     )
     .bind(app_id)
     .bind(deployment_id)
@@ -264,6 +295,67 @@ async fn claim_next_due_compensation(
                    row.mutation_generation, row.attempt_count",
     )
     .bind(lease_secs)
+    .fetch_optional(pool)
+    .await
+}
+
+/// A missing or non-newer annotation is not proof this UID is still the
+/// failed create. The namespace fence generation advances on every later
+/// apply, and a webhook can strip the annotation. Deleting then can remove a
+/// live namespace, including tenant volumes. Leave the row. Absence is the
+/// fail-closed clearance, not a delete.
+async fn later_fence_blocks_delete(pool: &PgPool, row: &CompensationRow) -> bool {
+    let Some(namespace) = compensation_namespace(row) else {
+        return false;
+    };
+    match namespace_fence_generation(pool, namespace).await {
+        Ok(Some(generation)) if generation > row.mutation_generation => {
+            tracing::info!(
+                kind = %row.kind,
+                name = %row.name,
+                uid = %row.uid,
+                recorded_generation = row.mutation_generation,
+                fence_generation = generation,
+                "namespace fence moved and the live annotation is not newer; refusing the compensating delete"
+            );
+            leave_unresolved(pool, row, "fence_generation_advanced").await;
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                uid = %row.uid,
+                error_code = "compensation_fence_unreadable",
+                "could not read the namespace fence; not deleting"
+            );
+            leave_unresolved(pool, row, "fence_unreadable").await;
+            true
+        }
+    }
+}
+
+fn compensation_namespace(row: &CompensationRow) -> Option<&str> {
+    if row.kind == "Namespace" {
+        Some(row.name.as_str()).filter(|name| !name.is_empty())
+    } else {
+        row.namespace
+            .as_deref()
+            .filter(|namespace| !namespace.is_empty())
+    }
+}
+
+async fn namespace_fence_generation(
+    pool: &PgPool,
+    namespace: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT generation
+           FROM external_resource_mutation_leases
+          WHERE resource_scope = 'kubernetes_namespace'
+            AND resource_key = $1",
+    )
+    .bind(namespace)
     .fetch_optional(pool)
     .await
 }
@@ -465,6 +557,9 @@ async fn reconcile_one(
         }
         LiveView::Unreadable(code) => leave_unresolved(pool, row, code).await,
         LiveView::Owned(owned) => {
+            if later_fence_blocks_delete(pool, row).await {
+                return false;
+            }
             if !renew_claim_for_delete(pool, row, lease_secs).await {
                 return false;
             }
@@ -555,6 +650,9 @@ async fn reclassify_after_conflict(
         LiveView::LaterGeneration => resolve_or_keep(pool, row, "later_generation").await,
         LiveView::Unreadable(code) => leave_unresolved(pool, row, code).await,
         LiveView::Owned(owned) => {
+            if later_fence_blocks_delete(pool, row).await {
+                return false;
+            }
             if !renew_claim_for_delete(pool, row, lease_secs).await {
                 return false;
             }
@@ -1425,5 +1523,77 @@ mod tests {
         assert_eq!(attempt_count, claimed.attempt_count + 1);
         assert!(held_for_an_hour);
         assert!(last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn newer_namespace_fence_with_a_stripped_annotation_is_not_deleted() {
+        let (_guard, _cleanup, pool) = isolated().await;
+        let uid = "post-uid-fence-stripped";
+        sqlx::query(
+            "INSERT INTO unresolved_post_create_compensations
+                (app_id, deployment_id, kind, namespace, name, uid, mutation_generation)
+             VALUES ($1, $2, 'Namespace', NULL, 'tenant-ns', $3, 7)",
+        )
+        .bind(Uuid::nil())
+        .bind(Uuid::nil())
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO external_resource_mutation_leases
+                (resource_scope, resource_key, generation)
+             VALUES ('kubernetes_namespace', 'tenant-ns', 8)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = cluster(Some(uid), json!({}), DeleteMode::Gone);
+        let unresolved = reconcile_unresolved_post_create_compensations(
+            &pool,
+            &client(Arc::clone(&state)),
+            limits(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unresolved, 1);
+        assert!(
+            state.lock().unwrap().deletes.is_empty(),
+            "a newer namespace fence with a stripped annotation must not be deleted"
+        );
+        let (resolve, last_error) = reason(&pool, uid).await;
+        assert!(resolve.is_none());
+        assert_eq!(last_error.as_deref(), Some("fence_generation_advanced"));
+    }
+
+    #[tokio::test]
+    async fn persist_does_not_reopen_a_later_generation_refusal() {
+        let (_guard, _cleanup, pool) = isolated().await;
+        let uid = "post-uid-reopen-refused";
+        sqlx::query(
+            "INSERT INTO unresolved_post_create_compensations
+                (app_id, deployment_id, kind, namespace, name, uid, mutation_generation,
+                 resolved_at, resolve_reason)
+             VALUES ($1, $2, 'Namespace', NULL, 'tenant-ns', $3, 7,
+                     clock_timestamp(), 'later_generation')",
+        )
+        .bind(Uuid::nil())
+        .bind(Uuid::nil())
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let record = UnresolvedCompensationRecord {
+            kind: "Namespace".to_string(),
+            namespace: None,
+            name: "tenant-ns".to_string(),
+            uid: uid.to_string(),
+            mutation_generation: 9,
+        };
+        persist_unresolved_compensation(&pool, Uuid::nil(), Uuid::nil(), &record)
+            .await
+            .unwrap();
+        let (resolve, _) = reason(&pool, uid).await;
+        assert_eq!(resolve.as_deref(), Some("later_generation"));
     }
 }
