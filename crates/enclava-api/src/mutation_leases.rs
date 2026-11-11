@@ -1606,11 +1606,14 @@ async fn release_retained_deployment_namespace_fences_budgeted(
         probe_timeout,
         captured_deadline: None,
     };
-    // A claim lasts the whole batch budget, measured from the stamp. A
-    // probe cannot outlive the pass, and the pass cannot outlive a claim
-    // taken after the pass started. Selection ignores that future cursor.
-    // The claim is cleared when the probe returns; a crash leaves it until
-    // this interval elapses. `locked_until` is not the claim.
+    // A claim lasts the batch budget, measured from the stamp on the
+    // Postgres clock. Selection ignores that future cursor. Kubernetes
+    // calls are capped by the batch deadline, but the release transaction
+    // can still be waiting on the deployment-lane lock after the claim
+    // expires; a peer may then start a duplicate probe. The release
+    // compare-and-swap still makes the clear exactly-once. The claim is
+    // cleared when the probe returns; a crash leaves it until this
+    // interval elapses. `locked_until` is not the claim.
     let claim_secs = i64::try_from(batch_budget.as_secs()).unwrap_or(i64::MAX);
     let results = {
         use futures::StreamExt as _;
