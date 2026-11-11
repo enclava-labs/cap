@@ -75,6 +75,16 @@ pub(crate) async fn fetch_verified_platform_release(
             PlatformRelease::load_verified(api.origin())?
         }
     };
+    // cap#196: refuse to sign against a platform whose cc_init_data byte
+    // contract this CLI does not pin. Absence (older platform, or the hosted
+    // fallback that omits the field) is compatible — failing closed would
+    // brick every new CLI until the API rolls out. The hosted proxy forwards
+    // this JSON raw (`cli_deployment_context` returns the CAP body unchanged),
+    // so a published skew reaches hosted signers without a PaaS schema change.
+    enclava_engine::manifest::cc_init_data::require_compatible_cc_init_data_contract(
+        deployment_context.cc_init_data_contract_version,
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
     Ok((deployment_context, release))
 }
 
@@ -329,6 +339,13 @@ pub(crate) fn confidential_app_for_cc_hash(
         workload_security_profile,
         log_encryption,
     } = params;
+    // cap#196: every producer of expected_cc_init_data_hash must refuse a
+    // published engine-contract skew before hashing. Sibling of the check in
+    // fetch_verified_platform_release, for callers that already hold a context.
+    enclava_engine::manifest::cc_init_data::require_compatible_cc_init_data_contract(
+        deployment_context.cc_init_data_contract_version,
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
     // Trust-anchor parity (the seal-claim rule): the anchors are rendered
     // into cc_init_data from the platform's installed value, so install
     // the API's published value — absence included, the deployment context

@@ -708,7 +708,10 @@ impl DeploymentSigningArtifacts {
         let expected = hex::encode(self.descriptor.expected_cc_init_data_hash);
         if expected != actual_hash_hex {
             return Err(SigningServiceError::Mismatch(
-                "expected_cc_init_data_hash".into(),
+                enclava_engine::manifest::cc_init_data::cc_init_data_hash_mismatch_detail(
+                    &expected,
+                    actual_hash_hex,
+                ),
             ));
         }
         Ok(())
@@ -1900,27 +1903,28 @@ fn pin_matching_cc_init_data_render(
         binding.legacy_collapsed_trustee_key = false;
         binding.omit_log_spool_bind_claim = false;
     }
+    let (_, rendered_hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
+    let hashes = enclava_engine::manifest::cc_init_data::cc_init_data_hash_mismatch_detail(
+        expected_hash_hex,
+        &rendered_hash,
+    );
     if claim_bearing_spool_match {
-        return Err(SigningServiceError::Mismatch(
+        return Err(SigningServiceError::Mismatch(format!(
             "expected_cc_init_data_hash (artifact was signed over a \
              log_spool_storage claim-bearing render but this API deployment \
              does not declare the log_spool_storage state-bind capability; \
              re-sign the artifact after the init rollout ships an \
-             enclava-init that understands the claim)"
-                .into(),
-        ));
+             enclava-init that understands the claim). {hashes}"
+        )));
     }
     if seal_required {
-        return Err(SigningServiceError::Mismatch(
+        return Err(SigningServiceError::Mismatch(format!(
             "expected_cc_init_data_hash (artifact predates the luks2_header_seal \
              claim while the active signed platform release requires sealing; \
-             re-sign the artifact against the current release)"
-                .into(),
-        ));
+             re-sign the artifact against the current release). {hashes}"
+        )));
     }
-    Err(SigningServiceError::Mismatch(
-        "expected_cc_init_data_hash".into(),
-    ))
+    Err(SigningServiceError::Mismatch(hashes))
 }
 
 #[derive(Debug, sqlx::FromRow)]

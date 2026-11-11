@@ -240,7 +240,34 @@ pub(crate) fn signing_error_response(
         }
     };
 
-    (status, Json(serde_json::json!({"error": code})))
+    // Field diagnostics are server-authored (a field name, or a hash-mismatch
+    // sentence over public cc_init_data measurements). Direct clients surface
+    // `detail`; the hosted proxy drops it, so the CLI also carries a remedy
+    // for the bare `signed_artifact_mismatch` code.
+    let detail = match &error {
+        SigningServiceError::Mismatch(field) => Some(bounded_signing_detail(field)),
+        _ => None,
+    };
+    let mut body = serde_json::json!({"error": code});
+    if let Some(detail) = detail {
+        body["detail"] = serde_json::json!(detail);
+    }
+    (status, Json(body))
+}
+
+fn bounded_signing_detail(field: &str) -> String {
+    // Spool/seal diagnostics append the hash sentence. 1024 covers both
+    // 64-byte hashes plus the remedy without truncating the actionable part.
+    const MAX: usize = 1024;
+    let field = field.trim();
+    if field.len() <= MAX {
+        return field.to_string();
+    }
+    let mut end = MAX;
+    while !field.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &field[..end])
 }
 
 pub(crate) fn customer_signed_deploy_required(
@@ -2113,6 +2140,23 @@ pub use rollback::rollback;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_mismatch_response_keeps_the_allowlisted_code_and_the_diagnostic() {
+        let (status, body) =
+            signing_error_response(crate::signing_service::SigningServiceError::Mismatch(
+                enclava_engine::manifest::cc_init_data::cc_init_data_hash_mismatch_detail(
+                    "aa", "bb",
+                ),
+            ));
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let body = body.0;
+        assert_eq!(body["error"], "signed_artifact_mismatch");
+        let detail = body["detail"].as_str().expect("detail");
+        assert!(detail.contains("signed aa"), "{detail}");
+        assert!(detail.contains("platform rendered bb"), "{detail}");
+        assert!(detail.contains("cc_init_data contract"), "{detail}");
+    }
 
     #[test]
     fn deploy_resources_without_tls_storage_serializes_legacy_form() {

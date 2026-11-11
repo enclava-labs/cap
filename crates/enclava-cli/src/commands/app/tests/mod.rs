@@ -157,6 +157,7 @@ fn test_deployment_context() -> DeploymentContextResponse {
         current_platform_release_id: None,
         platform_release_envelope: None,
         log_spool_state_bind_supported: false,
+        cc_init_data_contract_version: None,
     }
 }
 
@@ -226,6 +227,7 @@ fn deployment_context_platform_release_is_verified_and_selected() {
         current_platform_release_id: Some(expected_release_id.clone()),
         platform_release_envelope: Some(envelope),
         log_spool_state_bind_supported: false,
+        cc_init_data_contract_version: None,
     };
 
     let release =
@@ -252,6 +254,7 @@ fn deployment_context_platform_release_tampering_fails_closed() {
         current_platform_release_id: Some(envelope.payload.platform_release_version.clone()),
         platform_release_envelope: Some(envelope),
         log_spool_state_bind_supported: false,
+        cc_init_data_contract_version: None,
     };
 
     let err =
@@ -264,6 +267,57 @@ fn deployment_context_platform_release_tampering_fails_closed() {
     assert!(
         err.contains("invalid platform_release_envelope"),
         "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn cc_hash_refuses_published_engine_contract_skew_with_a_named_remedy() {
+    let mut context = test_deployment_context();
+    context.cc_init_data_contract_version = Some(cc_init_data::CC_INIT_DATA_CONTRACT_VERSION + 1);
+    let err = confidential_app_for_cc_hash(
+        &test_app_response(),
+        &test_app_config(),
+        ConfidentialAppForCcHash {
+            image: enclava_common::image::ImageRef::parse(
+                "ghcr.io/acme/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            )
+            .unwrap(),
+            deployment_id: uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap(),
+            release: &test_release(),
+            workload_artifact_binding: WorkloadArtifactBinding {
+                descriptor_core_hash: [1; 32],
+                descriptor_signing_pubkey: [2; 32],
+                org_keyring_fingerprint: [3; 32],
+                omit_log_encryption_claim: false,
+                legacy_collapsed_trustee_key: false,
+                omit_luks2_header_seal_claim: false,
+                omit_log_spool_bind_claim: false,
+            },
+            generated_agent_policy: GeneratedAgentPolicy {
+                policy_text: "package agent_policy\n".to_string(),
+                policy_sha256: Sha256::digest(b"package agent_policy\n").into(),
+                genpolicy_version_pin: "test-genpolicy".to_string(),
+            },
+            deployment_context: context,
+            unlock_mode: "password",
+            tenant_id: "org".to_string(),
+            tenant_instance_identity_hash: [4; 32],
+            bootstrap_owner_pubkey_hash: "33".repeat(32),
+            workload_security_profile: WorkloadSecurityProfile::Restricted,
+            log_encryption: None,
+        },
+    )
+    .expect_err("a published contract ahead of this CLI must refuse before hashing");
+    let err = err.to_string();
+    assert!(err.contains("engine-contract skew"), "{err}");
+    assert!(err.contains("this CLI is older than the platform"), "{err}");
+    assert!(
+        err.contains("upgrade this CLI from a trusted source"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&cc_init_data::CC_INIT_DATA_CONTRACT_VERSION.to_string()),
+        "{err}"
     );
 }
 
@@ -294,7 +348,12 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
                     policy_sha256: Sha256::digest(b"package agent_policy\n").into(),
                     genpolicy_version_pin: "test-genpolicy".to_string(),
                 },
-                deployment_context: test_deployment_context(),
+                deployment_context: {
+                    let mut context = test_deployment_context();
+                    context.cc_init_data_contract_version =
+                        Some(cc_init_data::CC_INIT_DATA_CONTRACT_VERSION);
+                    context
+                },
                 unlock_mode: "password",
                 tenant_id: "org".to_string(),
                 tenant_instance_identity_hash: [4; 32],
@@ -341,6 +400,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
         current_platform_release_id: None,
         platform_release_envelope: None,
         log_spool_state_bind_supported: false,
+        cc_init_data_contract_version: None,
     };
 
     let app = confidential_app_for_cc_hash(

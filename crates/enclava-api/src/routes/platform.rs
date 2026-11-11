@@ -23,6 +23,10 @@ pub struct DeploymentContextResponse {
     /// tells signers to render claim-less cc_init_data. Deployment-context
     /// JSON tolerates unknown fields, so older CLIs ignore it.
     pub log_spool_state_bind_supported: bool,
+    /// Engine-contract id of the cc_init_data byte layout this API renders.
+    /// Older CLIs ignore the field. A CLI that pins a different id must
+    /// refuse to sign instead of deploying into a sanitized hash rejection.
+    pub cc_init_data_contract_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_platform_release_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,6 +54,8 @@ pub(crate) fn deployment_context_response(state: &AppState) -> DeploymentContext
             enclava_engine::manifest::cc_init_data::tls_certificate_trust_anchors_pem(),
         log_spool_state_bind_supported:
             enclava_engine::manifest::cc_init_data::log_spool_bind_supported(),
+        cc_init_data_contract_version:
+            enclava_engine::manifest::cc_init_data::CC_INIT_DATA_CONTRACT_VERSION,
         current_platform_release_id: state
             .platform_release_envelope
             .as_ref()
@@ -103,6 +109,11 @@ mod tests {
             response.log_spool_state_bind_supported,
             enclava_engine::manifest::cc_init_data::log_spool_bind_supported(),
             "the deployment-context gate must mirror the API's installed claim"
+        );
+        assert_eq!(
+            response.cc_init_data_contract_version,
+            enclava_engine::manifest::cc_init_data::CC_INIT_DATA_CONTRACT_VERSION,
+            "signers pin the contract this API actually renders"
         );
     }
 
