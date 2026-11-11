@@ -173,6 +173,7 @@ enum AppDeleteFailure {
     KbsTlsBinding,
     KbsPolicy,
     KbsPolicyBudget,
+    TeardownLivePod,
 }
 
 impl AppDeleteFailure {
@@ -192,6 +193,7 @@ impl AppDeleteFailure {
             Self::KbsTlsBinding => "app_delete_kbs_tls_binding_failed",
             Self::KbsPolicy => "app_delete_kbs_policy_failed",
             Self::KbsPolicyBudget => "app_delete_kbs_policy_budget_exceeded",
+            Self::TeardownLivePod => "app_delete_teardown_live_pod_unresolved",
         }
     }
 
@@ -209,7 +211,8 @@ impl AppDeleteFailure {
             | Self::Namespace
             | Self::KbsOwnerBinding
             | Self::KbsTlsBinding
-            | Self::KbsPolicy => StatusCode::BAD_GATEWAY,
+            | Self::KbsPolicy
+            | Self::TeardownLivePod => StatusCode::BAD_GATEWAY,
         }
     }
 }
@@ -228,6 +231,23 @@ fn app_delete_failure<T>(
         "app deletion step failed"
     );
     (status, Json(serde_json::json!({"error": code})))
+}
+
+fn teardown_live_pod_failure(
+    app_id: Uuid,
+    error: crate::kbs::TeardownLivePodError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        crate::kbs::TeardownLivePodError::Db(_) => internal_server_error(),
+        other => {
+            tracing::warn!(
+                app_id = %app_id,
+                error = %other,
+                "teardown live pod could not be named or was not in the published unit"
+            );
+            app_delete_failure(app_id, AppDeleteFailure::TeardownLivePod, other)
+        }
+    }
 }
 
 fn app_delete_dns_failure(
@@ -1839,6 +1859,52 @@ pub(crate) async fn delete_app_before(
         ))
         .ok_or_else(internal_server_error)?;
 
+    // Name the owned ordinal-0 pod before admission when an intermediate
+    // publication exists (#235). The read is not a provider mutation: the
+    // deleting phase below is still the first durable external-effect
+    // boundary. A failure here releases the lease without flipping status.
+    // abandon_teardown must stay reachable when the cluster cannot be read,
+    // and a retry whose teardown already completed must not depend on it.
+    let pin_applies = if app.status == AppStatus::Deleting {
+        let (required, completed): (bool, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+            "SELECT workload_teardown_required, workload_teardown_completed_at
+               FROM apps WHERE id = $1",
+        )
+        .bind(app.id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| internal_server_error())?;
+        required && completed.is_none()
+    } else if requires_workload_teardown(app.status) {
+        true
+    } else {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM deployments WHERE app_id = $1)
+             OR EXISTS(SELECT 1 FROM kbs_owner_bindings WHERE app_id = $1)",
+        )
+        .bind(app.id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| internal_server_error())?
+    };
+    if !abandon_teardown
+        && pin_applies
+        && let Err(error) = crate::kbs::refresh_teardown_live_deployment_pin(
+            &state.db,
+            &state.kube_client,
+            app.id,
+            &app.namespace,
+            &app.name,
+        )
+        .await
+    {
+        delete_mutation
+            .finish()
+            .await
+            .map_err(|_| internal_server_error())?;
+        return Err(teardown_live_pod_failure(app.id, error));
+    }
+
     // Persist the durable deleting phase and whether confidential teardown is
     // required before any external call. Retries must reuse that decision
     // instead of inferring it from status='deleting', which every in-flight
@@ -2170,6 +2236,26 @@ pub(crate) async fn delete_app_before(
         }
     } else {
         None
+    };
+    let teardown = if teardown.is_none()
+        && teardown_required
+        && teardown_completed_at.is_none()
+        && !abandon_teardown
+    {
+        match crate::kbs::named_live_pod_is_authorized(
+            &state.db,
+            &state.kube_client,
+            deleting_app.id,
+            &deleting_app.namespace,
+            &deleting_app.name,
+        )
+        .await
+        {
+            Ok(()) => teardown,
+            Err(error) => Some(teardown_live_pod_failure(deleting_app.id, error)),
+        }
+    } else {
+        teardown
     };
     let teardown = match teardown {
         Some(failure) => Err(failure),
