@@ -98,6 +98,10 @@ pattern, not a JSON-only additive field:
   equals the one string this binary implements,
   `agent-policy-stdin-v1`. Any other string, including empty, is
   invalid. CAP must not feed a framing the signed schema does not name.
+  The equality check lives in both crates' `validate_release_payload`:
+  a bad release already refuses startup, so the per-request 503 row
+  below is a backstop, not the check that runs. The CLI load is the
+  other verifier of these bytes.
 - `policy_template_text` is already in those signed bytes. That is the
   template the witness may use. Do not add a second unsigned template
   path.
@@ -121,44 +125,76 @@ The witness is one static ELF. Before any accept:
    key did not sign. Signature failure stays terminal; do not fall
    through to `/sign`.
 2. Open `<release-generator-dir>/<digest>` with `O_NOFOLLOW | O_CLOEXEC`.
-   `release-generator-dir` is a startup directory, not a per-request
-   input, and the leaf is the 64-hex digest, not the id. `fstat` that
-   fd. Reject anything that is not a regular file. Do not follow a
-   symlink. Other files in the directory are irrelevant; do not reject
-   the witness because a previous digest's file is still there.
-3. Read that fd to EOF and hash those bytes. Compare to the signed
-   digest. Mismatch or a short read is 503. Do not hash a path and
-   then exec the path: the host can replace the inode between those
-   steps, and a test that tampers the file before the hash does not
-   see that swap.
-4. Execute those same bytes, not a path. Copy them to a memfd and
-   `fexecve` that fd, or the equivalent that does not resolve a path
-   again. Empty argv. Cleared environment. No interpreter: reject a
-   non-ELF, a script, and any ELF with a `PT_INTERP` (dynamically
-   linked helper or shebang). The dynamic loader and libc are not in
-   the digest. A wrapper whose text matches the digest and then runs
-   a host genpolicy is not this witness.
-5. In the child, after fork and before `fexecve`, apply a landlock
-   (or equivalent) that denies every filesystem open. Do not apply it
-   to the CAP process. The helper may use only the already-open
-   stdin, stdout, and stderr. If that restriction cannot be installed,
-   503 and do not exec. "The helper must not open files" is not a
+   `release-generator-dir` is captured as an absolute path at startup,
+   not a per-request input, and the leaf is the 64-hex digest, not the
+   id. `O_NOFOLLOW` protects only the leaf; intermediate components are
+   not covered, so a relative path plus a later `chdir` is not part of
+   the measurement and must not become one. `fstat` that fd. Reject
+   anything that is not a regular file. Do not follow a symlink. Other
+   files in the directory are irrelevant; do not reject the witness
+   because a previous digest's file is still there.
+3. Read that fd into exactly one buffer, hashing incrementally, and 503
+   above a fixed read cap so a swapped multi-gigabyte file cannot OOM
+   CAP before the compare. Compare the final hash to the signed digest.
+   Mismatch or a short read is 503. That buffer is the only copy of the
+   bytes: step 4 writes exactly it. The fd is not `lseek`ed or read
+   again. Do not hash a path and then exec the path: the host can
+   replace the inode between those steps. Do not hash the fd and then
+   re-read the fd either: a `pwrite` to the same inode after the hash
+   read changes what a re-read returns, and a test that only replaces
+   the inode does not see that swap.
+4. Execute those same bytes, not a path and not bytes re-read from the
+   fd. Write the hashed buffer from step 3 to a memfd — that one buffer,
+   no `lseek` and no second read of the helper fd — then seal the memfd
+   with `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` before the fork.
+   Until the seal, `/proc/<pid>/fd/<memfd>` is a writable path to the
+   bytes that will run. Exec with `execveat(memfd, "", ..., AT_EMPTY_PATH)`,
+   not a libc `fexecve` that opens `/proc/self/fd/N`: landlock in the
+   child can deny that `open`, and its `/proc` fallback would turn every
+   run into a 503. Fail-closed is not an implementation of this witness.
+   Empty argv. Cleared environment. No interpreter: reject a non-ELF, a
+   script, and any ELF with a `PT_INTERP` (dynamically linked helper or
+   shebang). The dynamic loader and libc are not in the digest. A wrapper
+   whose text matches the digest and then runs a host genpolicy is not
+   this witness.
+5. In the child, after fork and before `execveat`, close every fd
+   except stdin, stdout, and stderr, then apply a landlock (or
+   equivalent) that denies every filesystem open. Landlock does not
+   revoke fds inherited across fork: the helper file fd is `O_CLOEXEC`,
+   but other CAP sockets are not, and the helper must not inherit them.
+   Do not apply landlock to the CAP process. The helper may use only the
+   already-open stdin, stdout, and stderr. If the restriction cannot be
+   installed, 503 and do not exec. "The helper must not open files" is not a
    check. The host can change a default template path the helper
    reads, the digest still matches, and the witness emits the weaker
    policy the artifact was signed to.
 6. Stdin framing is `agent-policy-stdin-v1`, not `AgentPolicyRequest`.
    The live `/agent-policy` body does not carry the template. The
-   framing is length-prefixed canonical fields, in order: descriptor
-   canonical bytes, the validated `log_encryption` JSON or a zero
-   length if absent, `policy_template_text` bytes, and
-   `genpolicy_version` bytes. No paths.
+   framing is four fields, each a `u64` little-endian length prefix
+   followed by exactly that many bytes, in order:
+   `descriptor_canonical_bytes`; the serde encoding of the
+   already-validated `LogEncryptionConfig`, or a zero length when
+   absent (a zero length, not a JSON `null`); `policy_template_text`
+   bytes; and `genpolicy_version` bytes. No paths. Any trailing byte
+   after the fourth field is a framing error: 503. Two binaries that
+   both claim this schema string must feed identical bytes; the string
+   binds this layout, and gate item 3's parity fixture proves it.
 7. Bound the helper the way the signing-service client is bounded:
    wall time 120 seconds (`DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS`),
-   stdout capped at the existing agent-policy field cap, and a CPU
-   rlimit no larger than that wall time. Exceeding any of them is a
+   a CPU rlimit no larger than that wall time, and stdout capped at a
+   size that can carry one field-legal response.
+   `MAX_POLICY_TEXT_BYTES` (`signing_service.rs`) caps the JSON-escaped
+   `agent_policy_text` field of `AgentPolicyResponse`, not the response
+   envelope; a 160 KiB stdout cap would reject a field-legal response
+   the signing service itself returns. Cap stdout at
+   `MAX_POLICY_TEXT_BYTES` plus a fixed envelope allowance, and 503
+   before parsing anything above the cap. Exceeding any bound is a
    broken witness: 503, kill the child, do not accept.
 
-Output is an `AgentPolicyResponse` parsed from that capped stdout.
+Output is one `signing_service::AgentPolicyResponse` parsed from that
+capped stdout. Stdout carries only that JSON; every diagnostic goes to
+stderr. A helper that logs to stdout is a broken witness, not a noisy
+one.
 Acceptance then calls `validate_canonical_agent_policy` only after the
 witness self-checks below. CAP never holds the signing-service private
 key and never calls `/sign` on this path.
@@ -177,8 +213,9 @@ Rejected alternatives:
 - An in-process function whose digest is not compared to bytes this
   process will execute.
 - Hash the path, then `execve` that path. The host replaces the inode
-  between the hash read and exec. Execute the hashed bytes
-  (`fexecve` of a memfd), not the path.
+  between the hash read and exec. Execute the hashed bytes (the sealed
+  memfd via `execveat(AT_EMPTY_PATH)`), not the path, and not bytes
+  re-read from the fd after the hash.
 
 ## Acceptance rules
 
@@ -186,6 +223,11 @@ When the signing-service client is present, it remains the only
 acceptance source. The witness is not consulted. A disagreement between
 a live service response and a local witness is an operator alarm in
 parity tests, never a reason to accept the witness output instead.
+None of the `signed_at` checks in Stale and replay run when the client
+is present: they are witness-branch checks. `signed_at` is not parsed
+today, and a zero-skew future bound against `clock_timestamp()` would
+reject an artifact the service just signed whenever the service clock
+runs ahead of Postgres. #263 requires preserving that behavior.
 
 The release envelope is loaded once at startup and is not re-read under
 the signing-authority lane. Repeating the agent-policy text compare
@@ -248,9 +290,12 @@ Existing metadata binds stay and are not optional: `app_id`,
 or cross-release artifact already fails those compares.
 
 `PolicyMetadata.signed_at` is a `String`. The signature covers those
-raw bytes. It is not parsed today. Parse both `signed_at` and
-`release.created_at` with `DateTime::parse_from_rfc3339` and fail
-closed on any unparseable value. A string compare is not acceptable:
+raw bytes. It is not parsed today. On the witness branch only, parse
+both `signed_at` and `release.created_at` with
+`DateTime::parse_from_rfc3339` and fail closed on any unparseable
+value. Do not add the parse to the live path: an unparseable
+`signed_at` there is covered by the signature over the raw bytes and
+must not become a new rejection. A string compare is not acceptable:
 unpadded dates and offsets would still verify under the signature.
 
 The freshness window is new. It is not the owner-rotation directive
@@ -259,13 +304,25 @@ different functions. Putting both in `resolve_signed_policy_artifact`
 is wrong: that function runs before either acceptance transaction, and
 a `Utc::now()` sample there is not the post-lock clock.
 
-- `created_at` floor: in `resolve_signed_policy_artifact`, because the
-  release envelope is immutable for the process. Parsed
+Both checks are witness-branch checks. They run only on the
+absent-service path — after `state.signing_service` has been found
+absent, never before. `resolve_signed_policy_artifact`,
+`deploy_app_candidate`, and `commit_unlock_mode_transition` all run for
+the live `/agent-policy` path today. Coding the checks where that path
+also executes would parse `signed_at` (it is not parsed today) and
+reject artifacts the signing service just signed.
+
+- `created_at` floor: only in the absent-service branch of
+  `resolve_signed_policy_artifact`, after the pubkey check and instead
+  of the current 503 — not before `state.signing_service` is tested.
+  The release envelope is immutable for the process. Parsed
   `release.created_at <= signed_at`. This is not
   `enforce_release_not_older_than_bundled`. That check rejects
   envelopes older than the compiled baseline. The artifact claims
   `platform_release_version`, not `created_at`.
-- Future bound: after `lock_org_signing_authority_lane` and before
+- Future bound: only when that absent-service branch produced the
+  artifact — skip it for a service-present resolve. After
+  `lock_org_signing_authority_lane` and before
   `accept_signed_workload_artifacts`, on that transaction's
   `clock_timestamp()`, in both acceptance transactions:
   `deploy_app_candidate` (the `begin` in `routes/deployments.rs`) and
@@ -328,9 +385,11 @@ The witness path must return into that same caller. It must not enqueue
 from `resolve_signed_policy_artifact`, and it must not open its own
 transaction. The `signed_at` future bound is the one check added inside
 those two transactions, after the lane lock and before
-`accept_signed_workload_artifacts`. Rollback and dispatch revalidate a
-stored artifact via `validate_stored_authority` and must not grow a
-witness dependency.
+`accept_signed_workload_artifacts`, and only when
+`resolve_signed_policy_artifact` took the absent-service witness
+branch. A service-present resolve carries the live artifact and skips
+it. Rollback and dispatch revalidate a stored artifact via
+`validate_stored_authority` and must not grow a witness dependency.
 
 ## Threats
 
@@ -343,7 +402,7 @@ witness dependency.
 | Replay onto another app, deploy, descriptor, or release | Existing metadata binds reject. |
 | Replay of an artifact whose parsed `signed_at` is before the loaded release `created_at` | 400 `signed_artifact_mismatch`. |
 | Host rewrites a generator digest that is not in `canonical_release_bytes` | Not possible under this design: the digest is in both canonicalizers, or the witness is not configured. |
-| Host swaps the helper inode after the hash read and before exec | Not possible under this design: the hashed fd bytes are what `fexecve` runs. A path `execve` after a separate hash is rejected by the gate. |
+| Host swaps the helper inode after the hash read and before exec, rewrites the same inode in that window, or writes the memfd after the seal | Not possible under this design: one buffer is hashed, that same buffer is written to a memfd sealed with `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` before fork, and `execveat` runs it. The fd is never re-read and the memfd is not writable after the seal. The gate tests all three swaps. |
 | Signing service suppressed to force a weaker path | Empty digest means the same 503 as today. Configured witness means the agent-policy compares above, not a customer-only accept. |
 | Split brain between service and witness | Service present: service wins. Witness is not an accept path. |
 | Witness or release missing | 503. Never fall through to customer checks. |
@@ -386,14 +445,20 @@ No KBS schema change.
    A cross-crate fixture shows the signed bytes match. A tampered
    digest fails envelope verification. A pre-field envelope still
    deserializes (`serde(default)`) and still verifies.
-2. Executed bytes, not a path. Open with `O_NOFOLLOW`, hash the fd,
-   `fexecve` those same bytes from a memfd. A test that replaces the
-   inode after the hash read and before exec still runs the hashed
-   bytes, or fails closed. A test that tampers the file only before
-   the hash is not sufficient. A `PT_INTERP` ELF and a script are
-   rejected. A landlock (or equivalent) that cannot be installed is
-   503 and does not exec. A gate test mutates a file that is not the
-   hashed bytes and not stdin and requires identical helper output.
+2. Executed bytes, not a path. Open with `O_NOFOLLOW`, hash one buffer,
+   write that buffer to a memfd sealed with
+   `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` before fork, and
+   `execveat` it with `AT_EMPTY_PATH`. Three swaps are tested and must
+   either run the hashed bytes or fail closed: replacing the inode after
+   the hash read and before exec (that test alone is not sufficient), a
+   `pwrite` to the same inode between the hash read and exec, and a
+   write to the memfd after the seal. A test that tampers the file only
+   before the hash sees none of them. A `PT_INTERP` ELF and a script are
+   rejected. A landlock (or equivalent) that cannot be installed is 503
+   and does not exec. For the restriction test, the unrestricted helper
+   must actually attempt to open a named path (the release file, or cwd)
+   and that open must fail under the restriction; identical output alone
+   does not prove the restriction was installed.
 3. Parity fixture: the same descriptor and log-encryption inputs
    through the live `/agent-policy` client and the measured helper
    produce byte-identical `agent_policy_text`, `agent_policy_sha256`,
@@ -408,7 +473,11 @@ No KBS schema change.
    customer-key signature, trustee-key signature. A deploy-only future
    bound test is not enough. Signature failure does not fall through.
    Each 503 cause is distinguishable in logs even though the HTTP
-   string is shared.
+   string is shared. The same table is pinned in the other direction:
+   a service-present deploy whose `signed_at` is slightly ahead of the
+   post-lock `clock_timestamp()` stays 200. That test is what keeps the
+   new checks off the live path; a witness-only suite passes with the
+   signing-service path broken.
 5. Isolated DB test: valid artifact, service absent, witness present,
    release loaded. The acceptance transaction persists the artifact and
    increments `desired_generation` together; aborting the transaction
