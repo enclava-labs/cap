@@ -289,6 +289,13 @@ const CLEANUP_RETRY_INTERVAL_SQL: &str = "30 seconds";
 const APPLY_RETRY_BASE_SECS: i64 = 5;
 /// Base retry interval (seconds) for nonterminal rollout observations.
 const ROLLOUT_OBSERVATION_RETRY_BASE_SECS: i64 = 30;
+/// Ceiling (seconds) for the nonterminal observation retry above. Both
+/// nonterminal observation reasons (password owner wait and a bounded slice
+/// elapsing with rollout budget remaining) wait on external progress that can
+/// finish right after a requeue, so unlike contention the cadence stays near
+/// the base: an owner unlock must reach status within about a minute instead
+/// of waiting out an exponential delay. The 24 h grace still bounds the loop.
+const ROLLOUT_OBSERVATION_RETRY_MAX_SECS: i64 = 60;
 /// Retry backoff grows exponentially with the job's attempt count so a job
 /// that keeps requeueing without reaching a terminal observation releases
 /// its apply worker instead of pinning one of the bounded worker slots at a
@@ -4123,7 +4130,7 @@ async fn publish_rollout_outcome_with_mutation(
     .bind(job.deployment_id)
     .bind(job.lock_token)
     .bind(APPLY_RETRY_BACKOFF_SHIFT_CAP)
-    .bind(APPLY_RETRY_BACKOFF_CEILING_SECS)
+    .bind(ROLLOUT_OBSERVATION_RETRY_MAX_SECS)
     .bind(exhausted)
     .bind(DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE)
     .execute(&mut *tx)
@@ -7832,6 +7839,108 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete aged observation fixture");
+    }
+
+    #[tokio::test]
+    async fn owner_wait_observation_requeue_caps_backoff_at_sixty_seconds() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let manifest_hash = "capped-observation-manifest";
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = $2,
+                    observing_since = clock_timestamp(),
+                    rollout_timeout_millis = 600000
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(manifest_hash)
+        .execute(&pool)
+        .await
+        .expect("stage watching anchor");
+
+        // A first observation attempt keeps the 30 s base delay.
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim first observation")
+            .expect("first observation exists");
+        publish_rollout_outcome(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect("publish first nonterminal observation");
+        let fresh_delay_secs: i64 = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (next_attempt_at - clock_timestamp()))::bigint
+               FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load first observation delay");
+        assert!(
+            (29..=30).contains(&fresh_delay_secs),
+            "first observation must keep the 30 s base delay, got {fresh_delay_secs}"
+        );
+
+        // The owner can unlock right after any attempt; a repeatedly
+        // requeued owner wait must not drift past a minute or CAP's status
+        // stays stale long after the TEE unlocked (2026-11-12: +480 s).
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("reclaim aged observation")
+            .expect("aged observation exists");
+        sqlx::query("UPDATE deployment_apply_jobs SET attempts = 20 WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("age observation attempts");
+        publish_rollout_outcome(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect("publish aged nonterminal observation");
+        let aged_delay_secs: i64 = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (next_attempt_at - clock_timestamp()))::bigint
+               FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load aged observation delay");
+        assert!(
+            (59..=60).contains(&aged_delay_secs),
+            "aged observation must cap at 60 s, got {aged_delay_secs}"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete capped observation fixture");
     }
 
     #[tokio::test]
