@@ -37,9 +37,10 @@ use crate::commands::app::{
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
     fail_if_template_deployment_failed, fetch_verified_platform_release, generate_log_key_for_app,
-    reconcile_success_with_deployment_history, tee_supplemental_fields_are_consistent,
-    tee_terminal_diagnostic_probe_due, tee_unlock_state, terminal_bootstrap_failure_message,
-    terminal_diagnostic_budget, terminal_diagnostic_probe_with_budget,
+    reconcile_success_with_deployment_history, resolve_current_user_org,
+    tee_supplemental_fields_are_consistent, tee_terminal_diagnostic_probe_due, tee_unlock_state,
+    terminal_bootstrap_failure_message, terminal_diagnostic_budget,
+    terminal_diagnostic_probe_with_budget,
 };
 use crate::commands::config::CONFIG_APPLICATION_NOTE;
 use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
@@ -392,51 +393,42 @@ async fn deploy_with_timings(
     let ctx = build_api_context()?;
     let api = &ctx.api;
     let templates = api.list_templates().await?;
-    let template = templates
+    // A removed catalog entry, or one that no longer exposes SSH-key metadata,
+    // must not abort before the resume file is selected. An already accepted
+    // deployment can finish from the signed request. A fresh sign still
+    // requires the live entry, after selection.
+    let catalog = templates
         .iter()
         .find(|template| template.slug == args.template)
-        .ok_or_else(|| format!("template '{}' is not available", args.template))?;
-    if template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS").is_none() {
-        return Err(format!(
-            "template '{}' is not a Debian SSH template supported by this CLI",
-            args.template
-        )
-        .into());
-    }
+        .cloned();
 
     let public_keys = read_ssh_public_keys(&args.ssh_public_keys, &args.ssh_public_key_files)?;
     validate_ssh_public_keys(
         &public_keys,
-        template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS"),
+        catalog
+            .as_ref()
+            .and_then(|template| template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS")),
     )?;
     let storage_password =
         StoragePasswordInput::from_file_option(args.storage_password_file.as_ref())?;
-    if template.unlock_mode == "password" {
-        storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
-        // Pre-mutation claim-session gate (same rationale as the deploy
-        // path). The post-submit flow auto-claims only while ownership is
-        // unclaimed (the bootstrap wait skips claimed apps); unresolved
-        // ownership fails closed the same way, since password templates
-        // auto-claim on first boot.
-        let preflight_ownership = api
-            .get_unlock_status(&instance_name)
-            .await
-            .ok()
-            .and_then(|status| status.ownership_state);
-        if deploy_preflight_needs_claim(true, preflight_ownership.as_deref(), "creating") {
-            crate::commands::ownership::ensure_claim_session_now(storage_password.is_from_file())?;
-        }
-    }
+    let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
     // Authenticate platform authority before keyring registration or app creation.
     fetch_verified_platform_release(api, &ctx.paths).await?;
-    let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
-    // Password-mode template deploys auto-claim on first boot; refuse the no-store
-    // sink mode before creating anything, while the run can still stop without
-    // side effects. (The authoritative pre-claim gate in the ownership module
-    // re-checks this before the auto-claim fires.)
-    if capture == MnemonicCapture::Skip && template.unlock_mode == "password" {
-        crate::commands::ownership::validate_recovery_mnemonic_sink_mode(capture)?;
-    }
+    let scope = template_deploy_resume_scope(api, &ctx.creds, &ctx.cli_config).await?;
+    // Hold this until the command returns, including completion. Dropping it
+    // after the POST lets a second invocation save a new attempt that this
+    // command would then stamp completed.
+    let _deploy_lock = enclava_cli::template_deploy_retry::lock_template_deploy(
+        &ctx.paths,
+        &scope,
+        &instance_name,
+    )
+    .await?;
+    let loaded = enclava_cli::template_deploy_retry::load_template_deploy_attempt(
+        &ctx.paths,
+        &scope,
+        &instance_name,
+    );
     let pb = if args.json || args.timings {
         ProgressBar::hidden()
     } else {
@@ -451,88 +443,347 @@ async fn deploy_with_timings(
     // password and one-time recovery-mnemonic terminal prompts.
     pb.set_message("Preparing template app...");
 
-    let bootstrap_pubkey_hash =
-        template_bootstrap_pubkey_hash(api, &ctx.paths, template, &instance_name).await?;
-    let app = ensure_template_app(
-        api,
-        template,
-        &instance_name,
-        bootstrap_pubkey_hash.as_deref(),
-    )
-    .await?;
-    let prepared_log_key = prepare_template_log_key(
-        api,
-        &ctx.paths,
-        &instance_name,
-        args.log_key.as_deref(),
-        args.generate_log_key.as_deref(),
-        args.log_private_key_file.clone(),
-        &pb,
-    )
-    .await?;
-    pb.set_position(1);
-    pb.set_message("Signing deployment descriptor...");
-
-    let app_config = template_app_config(template, &instance_name);
-    let workload_security_profile = template_workload_security_profile(template)?;
-    let signed_blobs = build_signed_deploy_blobs(SignedDeployBlobParams {
-        api,
-        paths: &ctx.paths,
-        cli_config: &ctx.cli_config,
-        creds: &ctx.creds,
-        app: &app,
-        app_config: &app_config,
-        image: &template.image,
-        target_unlock_mode: Some(template.unlock_mode.as_str()),
-        workload_security_profile,
-    })
-    .await?;
-    verify_signed_template_log_key(
-        prepared_log_key.as_ref(),
-        signed_blobs.log_encryption.as_ref(),
-    )?;
-    // Locally trusted deployment identity, captured before the signed blobs
-    // are moved into the template instance request.
-    let trusted_deployment = signed_blobs.deployment.clone();
+    // Select before any catalog password work. Deriving a bootstrap key
+    // registers a keyring, requires a recovery seed, and overwrites the local
+    // key. An in-flight auto deploy must resume without that, and a rotated
+    // seed must not be written before we know the old descriptor will not be
+    // replayed.
+    let existing_app = match api.get_app(&instance_name).await {
+        Ok(app) => Some(app),
+        Err(ApiError::Api { status: 404, .. }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let deployments = if existing_app.is_some() {
+        match api.list_deployments(&instance_name).await {
+            Ok(entries) => enclava_cli::template_deploy_retry::DeploymentListing::Listed(
+                entries
+                    .into_iter()
+                    .map(
+                        |entry| enclava_cli::template_deploy_retry::ObservedTemplateDeployment {
+                            id: entry.id,
+                            status: entry.status,
+                            reconciled_status: entry.reconciled_status,
+                        },
+                    )
+                    .collect(),
+            ),
+            Err(ApiError::Api { status, .. }) => {
+                enclava_cli::template_deploy_retry::deployment_listing_for_list_error(
+                    &loaded,
+                    Some(status),
+                )
+            }
+            Err(_) => {
+                enclava_cli::template_deploy_retry::deployment_listing_for_list_error(&loaded, None)
+            }
+        }
+    } else {
+        // The name is gone. A 404 is not an empty history of a live app when
+        // a resume file exists; the selector already treats that as unavailable.
+        enclava_cli::template_deploy_retry::deployment_listing_for_list_error(&loaded, Some(404))
+    };
+    let peeked = if enclava_cli::template_deploy_retry::loaded_attempt_is_password(&loaded) {
+        let stored_hash = enclava_cli::template_deploy_retry::loaded_bootstrap_pubkey_hash(&loaded);
+        match peek_password_bootstrap_key(api, &ctx.paths, &instance_name, stored_hash).await {
+            Ok(peeked) => peeked,
+            Err(error)
+                if catalog
+                    .as_ref()
+                    .is_none_or(|template| template.unlock_mode == "password") =>
+            {
+                return Err(format!(
+                    "could not compare the password bootstrap key with the stored template deploy request for `{instance_name}`: {error}. The stored request was not sent, and the local bootstrap key was not replaced."
+                )
+                .into());
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let now_unix = enclava_cli::template_deploy_retry::unix_now();
+    let current_app = match &existing_app {
+        Some(app) => enclava_cli::template_deploy_retry::CurrentTemplateApp {
+            id: app.id.clone(),
+            created_at_unix: template_app_created_at_unix(&app.created_at),
+        },
+        None => enclava_cli::template_deploy_retry::current_app_when_name_is_absent(now_unix),
+    };
+    // The hold budget is normalized so a retry *can* keep one idempotency key.
+    // The signed blobs cannot: they embed a fresh deploy id and timestamp, so
+    // the key is only stable if this run replays the request already signed
+    // for the in-flight deployment (cap#292). A password-to-password retry
+    // matches the saved bootstrap key, then the hash the current seed would
+    // derive, without saving that key. Any other stored request matches the
+    // hash it was signed with, so a catalog unlock-mode change does not
+    // reject a live replay. A missing catalog entry is not that change.
+    let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
+    let catalog_unlock_mode = enclava_cli::template_deploy_retry::catalog_unlock_mode_for_resume(
+        catalog
+            .as_ref()
+            .map(|template| template.unlock_mode.as_str()),
+        &loaded,
+    );
+    let stable = enclava_cli::template_deploy_retry::StableTemplateDeployInputs {
+        template_slug: args.template.clone(),
+        instance_name: instance_name.clone(),
+        config: template_create_config(explicit_stable_endpoint.as_deref()),
+        bootstrap_pubkey_hash: enclava_cli::template_deploy_retry::bootstrap_hash_for_resume_match(
+            &loaded,
+            &catalog_unlock_mode,
+            peeked.as_ref().map(|peeked| peeked.hash.clone()),
+        ),
+    };
+    let attempt = enclava_cli::template_deploy_retry::select_template_deploy_attempt(
+        loaded,
+        &stable,
+        &current_app,
+        &deployments,
+        now_unix,
+    );
+    if matches!(
+        attempt,
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Fresh
+    ) {
+        let Some(template) = catalog.as_ref() else {
+            return Err(format!("template '{}' is not available", args.template).into());
+        };
+        if template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS").is_none() {
+            return Err(format!(
+                "template '{}' is not a Debian SSH template supported by this CLI",
+                args.template
+            )
+            .into());
+        }
+    }
+    // Replay overwrites unlock mode and managed keys from the signed request.
+    // A stub is only reached when the catalog entry is gone and selection
+    // already chose Replay (Fresh returned above).
+    let mut template = catalog.unwrap_or_else(|| resume_catalog_stub(&args.template));
+    let expects_password_preflight =
+        enclava_cli::template_deploy_retry::attempt_expects_password_preflight(
+            &attempt,
+            &template.unlock_mode,
+        );
+    let output_log_key: Option<OutputLogKey>;
+    let mut resume_unlock_mode: Option<String> = None;
+    let mut resume_managed_keys: Option<Vec<String>> = None;
+    let (trusted_deployment, request) = match attempt {
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Refuse(message) => {
+            return Err(message.into());
+        }
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Replay {
+            request,
+            deploy_id,
+            workflow,
+            log_key,
+        } => {
+            let request = *request;
+            pb.set_position(1);
+            pb.set_message("Resuming in-flight template deployment...");
+            let trusted = trusted_deployment_for_resumed_request(&request, &deploy_id)?;
+            let blob = request.customer_descriptor_blob.as_deref().ok_or(
+                "stored template deploy request is missing its signed descriptor; destroy the app before deploying again",
+            )?;
+            let signed_unlock =
+                enclava_cli::descriptor::unlock_mode_from_descriptor_blob(blob).map_err(|err| {
+                    format!(
+                        "stored template deploy request could not be read ({err}); destroy the app before deploying again"
+                    )
+                })?;
+            if signed_unlock == "password" || expects_password_preflight {
+                // Replay is confirmed. Restore the key the descriptor was
+                // signed with when this seed still derives it, so a previous
+                // overwrite cannot make ownership claim use a different key.
+                // Do not write a key that does not match the descriptor.
+                if signed_unlock == "password"
+                    && let Some(peeked) = peeked.as_ref()
+                    && request.bootstrap_pubkey_hash.as_deref() == Some(peeked.hash.as_str())
+                {
+                    config::save_bootstrap_key(
+                        &ctx.paths,
+                        &peeked.org_name,
+                        &instance_name,
+                        &peeked.private_key_hex,
+                    )?;
+                }
+                ensure_password_mode_preflight(api, &instance_name, &storage_password, capture)
+                    .await?;
+            }
+            // The signed descriptor is what the platform accepted. Catalog
+            // `unlock_mode` fetched on this retry must not skip the ownership
+            // claim or switch password-mode config delivery.
+            resume_unlock_mode = Some(signed_unlock);
+            resume_managed_keys = workflow.map(|stored| stored.paas_managed_config_keys);
+            output_log_key = log_key.map(|key| OutputLogKey {
+                key_id: key.key_id,
+                private_key_file: key.private_key_file.map(PathBuf::from),
+            });
+            (trusted, request)
+        }
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Fresh => {
+            // Gates follow this fresh sign, not a finished password file.
+            // Preflight runs before the key write and before app creation.
+            if expects_password_preflight {
+                ensure_password_mode_preflight(api, &instance_name, &storage_password, capture)
+                    .await?;
+            }
+            let app = match existing_app {
+                Some(app) => app,
+                None => {
+                    fresh_app_after_absence(
+                        api,
+                        &ctx.paths,
+                        &template,
+                        &instance_name,
+                        &scope,
+                        &stable,
+                    )
+                    .await?
+                }
+            };
+            // The app's history was selected as Fresh. Saving the bootstrap
+            // key now cannot overwrite the key of a descriptor we are about
+            // to replay.
+            let catalog_bootstrap_pubkey_hash =
+                template_bootstrap_pubkey_hash(api, &ctx.paths, &template, &instance_name).await?;
+            let prepared_log_key = prepare_template_log_key(
+                api,
+                &ctx.paths,
+                &instance_name,
+                args.log_key.as_deref(),
+                args.generate_log_key.as_deref(),
+                args.log_private_key_file.clone(),
+                &pb,
+            )
+            .await?;
+            pb.set_position(1);
+            pb.set_message("Signing deployment descriptor...");
+            let app_config = template_app_config(&template, &instance_name);
+            let workload_security_profile = template_workload_security_profile(&template)?;
+            let signed_blobs = build_signed_deploy_blobs(SignedDeployBlobParams {
+                api,
+                paths: &ctx.paths,
+                cli_config: &ctx.cli_config,
+                creds: &ctx.creds,
+                app: &app,
+                app_config: &app_config,
+                image: &template.image,
+                target_unlock_mode: Some(template.unlock_mode.as_str()),
+                workload_security_profile,
+            })
+            .await?;
+            verify_signed_template_log_key(
+                prepared_log_key.as_ref(),
+                signed_blobs.log_encryption.as_ref(),
+            )?;
+            // Locally trusted deployment identity, captured before the signed
+            // blobs are moved into the template instance request.
+            let trusted_deployment = signed_blobs.deployment.clone();
+            let request = CreateTemplateInstanceRequest {
+                template_slug: stable.template_slug.clone(),
+                instance_name: stable.instance_name.clone(),
+                config: stable.config.clone(),
+                bootstrap_pubkey_hash: catalog_bootstrap_pubkey_hash.clone(),
+                customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
+                org_keyring_blob: Some(signed_blobs.org_keyring_blob),
+                signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
+                customer_config_roll_hold_seconds: Some(roll_hold_seconds),
+            };
+            // Persist before the POST so a client death during the request
+            // retries the same bytes instead of signing a second deployment.
+            enclava_cli::template_deploy_retry::save_template_deploy_attempt(
+                &ctx.paths,
+                &scope,
+                &app.id,
+                &trusted_deployment.deploy_id,
+                &request,
+                &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
+                    unlock_mode: template.unlock_mode.clone(),
+                    paas_managed_config_keys: template.paas_managed_config_keys.clone(),
+                    log_key_id: prepared_log_key
+                        .as_ref()
+                        .map(|prepared| prepared.config.key_id.clone()),
+                    log_private_key_file: prepared_log_key.as_ref().and_then(|prepared| {
+                        prepared
+                            .private_key_file
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().into_owned())
+                    }),
+                },
+            )
+            .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+            output_log_key = prepared_log_key.map(|prepared| OutputLogKey {
+                key_id: prepared.config.key_id,
+                private_key_file: prepared.private_key_file,
+            });
+            (trusted_deployment, request)
+        }
+    };
     pb.set_position(2);
     pb.set_message("Creating template instance...");
 
-    // Always request the normalized hold so the idempotency key stays stable
-    // across a first-deploy retry: this run may have created the app above,
-    // so gating the request on the app existing would change the key on the
-    // retry. CAP applies the hold only when a live workload is being
-    // replaced and reports that in the response.
-    let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
     // CAP arms the hold when it accepts the request below. The deadline
     // anchor starts here, not at deploy_started, so preflight time above
     // (discovery, app creation, key preparation, signing) does not consume
     // the hold. The server-quoted remainder is anchored at this instant:
     // CAP measured it after the request was sent, so anchoring at send can
-    // only shorten the window, never extend it.
+    // only shorten the window, never extend it. A replayed response carries
+    // the original remaining time, so this anchor does not extend that hold.
     let hold_armed_at = Instant::now();
+    let sent_hold_seconds = request
+        .customer_config_roll_hold_seconds
+        .unwrap_or(roll_hold_seconds);
     let response = match timings
         .run(
             DeployPhase::DeployRequest,
-            api.create_template_instance(&CreateTemplateInstanceRequest {
-                template_slug: args.template.clone(),
-                instance_name: instance_name.clone(),
-                config: template_create_config(explicit_stable_endpoint.as_deref()),
-                bootstrap_pubkey_hash: bootstrap_pubkey_hash.clone(),
-                customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
-                org_keyring_blob: Some(signed_blobs.org_keyring_blob),
-                signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
-                customer_config_roll_hold_seconds: Some(roll_hold_seconds),
-            }),
+            api.create_template_instance(&request),
         )
         .await
     {
-        Ok(response) => response,
-        Err(error) => return Err(template_instance_create_api_error(error)),
+        Ok(response) => {
+            // Record acceptance separately from CLI completion. A later
+            // history outage must not treat "config delivery did not finish"
+            // as "this key was never sent".
+            enclava_cli::template_deploy_retry::mark_template_deploy_attempt_posted(
+                &ctx.paths,
+                &scope,
+                &instance_name,
+            )
+            .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+            response
+        }
+        Err(error) => {
+            // A completed rejection is stored server-side under this key for
+            // the replay window. Drop the local copy so the next attempt can
+            // sign a new key once the deployment is no longer in flight.
+            if enclava_cli::template_deploy_retry::template_instance_rejection_retires_attempt(
+                &error,
+            ) && let Err(clear_error) =
+                enclava_cli::template_deploy_retry::clear_template_deploy_attempt(
+                    &ctx.paths,
+                    &scope,
+                    &instance_name,
+                )
+            {
+                return Err(format!(
+                    "{error}; also failed to discard the stored template deploy request, so the next retry may replay this rejection: {clear_error}"
+                )
+                .into());
+            }
+            return Err(template_instance_create_api_error(error));
+        }
     };
     let stable_endpoint = stored_stable_endpoint_from_template_instance_response(
         &response,
         explicit_stable_endpoint.as_deref(),
     )?;
+    if let Some(mode) = resume_unlock_mode {
+        template.unlock_mode = mode;
+    }
+    if let Some(keys) = resume_managed_keys {
+        template.paas_managed_config_keys = keys;
+    }
     let customer_config_hold = response.customer_config_hold;
     let customer_config_hold_remaining_ms = response.customer_config_hold_remaining_ms;
     // cap#220 review: a missing `cap_deployment_id` must not become a
@@ -562,7 +813,7 @@ async fn deploy_with_timings(
                 customer_config_hold_remaining_ms,
                 response.customer_config_hold_until.as_deref(),
                 hold_armed_at,
-                roll_hold_seconds,
+                sent_hold_seconds,
             )
         })
         .transpose()?;
@@ -815,12 +1066,10 @@ async fn deploy_with_timings(
             stable_endpoint: Some(stable_endpoint.as_str()),
             ssh_command: ssh_command.as_deref(),
             ssh_endpoint: ssh_endpoint.as_deref(),
-            log_key_id: prepared_log_key
+            log_key_id: output_log_key.as_ref().map(|key| key.key_id.as_str()),
+            log_private_key_file: output_log_key
                 .as_ref()
-                .map(|prepared| prepared.config.key_id.as_str()),
-            log_private_key_file: prepared_log_key
-                .as_ref()
-                .and_then(|prepared| prepared.private_key_file.as_deref()),
+                .and_then(|key| key.private_key_file.as_deref()),
             json: args.json,
         })?
     );
@@ -830,7 +1079,19 @@ async fn deploy_with_timings(
             format_duration(deploy_started.elapsed())
         );
     }
+    enclava_cli::template_deploy_retry::mark_template_deploy_attempt_completed(
+        &ctx.paths,
+        &scope,
+        &instance_name,
+        &trusted_deployment.deploy_id,
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
     Ok(())
+}
+
+struct OutputLogKey {
+    key_id: String,
+    private_key_file: Option<PathBuf>,
 }
 
 struct PreparedTemplateLogKey {
@@ -1179,6 +1440,127 @@ fn customer_config_roll_hold_seconds(ssh_timeout_seconds: u64) -> u32 {
     u32::try_from(budget).unwrap_or(u32::MAX)
 }
 
+/// Password-mode gates that must run before a password deploy mutates remote
+/// state. A replay of a non-password signed request does not call this: the
+/// catalog's current unlock mode is not the mode that request was signed for.
+async fn ensure_password_mode_preflight(
+    api: &ApiClient,
+    instance_name: &str,
+    storage_password: &StoragePasswordInput,
+    capture: MnemonicCapture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
+    // Pre-mutation claim-session gate (same rationale as the deploy path).
+    // The post-submit flow auto-claims only while ownership is unclaimed;
+    // unresolved ownership fails closed the same way, since password templates
+    // auto-claim on first boot.
+    let preflight_ownership = api
+        .get_unlock_status(instance_name)
+        .await
+        .ok()
+        .and_then(|status| status.ownership_state);
+    if deploy_preflight_needs_claim(true, preflight_ownership.as_deref(), "creating") {
+        crate::commands::ownership::ensure_claim_session_now(storage_password.is_from_file())?;
+    }
+    // Password-mode template deploys auto-claim on first boot; refuse the
+    // no-store sink mode before creating anything. The ownership module
+    // re-checks this before the auto-claim fires.
+    if capture == MnemonicCapture::Skip {
+        crate::commands::ownership::validate_recovery_mnemonic_sink_mode(capture)?;
+    }
+    Ok(())
+}
+
+fn template_app_created_at_unix(created_at: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(created_at.trim())
+        .ok()
+        .and_then(|parsed| u64::try_from(parsed.timestamp()).ok())
+}
+
+/// The name was absent when selection returned Fresh. Create it, then select
+/// again: a 409 can return an app that appeared in between, and signing
+/// against that history without looking would start a second deployment.
+///
+/// Password bootstrap state is not written here. The caller saves the key
+/// only after this returns, which is only when the second selection is Fresh.
+async fn fresh_app_after_absence(
+    api: &ApiClient,
+    paths: &CliPaths,
+    template: &HostedTemplate,
+    instance_name: &str,
+    scope: &str,
+    stable: &enclava_cli::template_deploy_retry::StableTemplateDeployInputs,
+) -> Result<AppResponse, Box<dyn std::error::Error>> {
+    let app = match api.get_app(instance_name).await {
+        Ok(app) => app,
+        Err(ApiError::Api { status: 404, .. }) => {
+            // Still gone. A password create needs the hash, but the key file
+            // stays untouched until the caller knows this sign is fresh.
+            let hash = if template.unlock_mode == "password" {
+                Some(
+                    derive_template_bootstrap_key(api, paths, instance_name)
+                        .await?
+                        .hash,
+                )
+            } else {
+                None
+            };
+            ensure_template_app(api, template, instance_name, hash.as_deref()).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let loaded = enclava_cli::template_deploy_retry::load_template_deploy_attempt(
+        paths,
+        scope,
+        instance_name,
+    );
+    let deployments = match api.list_deployments(instance_name).await {
+        Ok(entries) => enclava_cli::template_deploy_retry::DeploymentListing::Listed(
+            entries
+                .into_iter()
+                .map(
+                    |entry| enclava_cli::template_deploy_retry::ObservedTemplateDeployment {
+                        id: entry.id,
+                        status: entry.status,
+                        reconciled_status: entry.reconciled_status,
+                    },
+                )
+                .collect(),
+        ),
+        Err(ApiError::Api { status, .. }) => {
+            enclava_cli::template_deploy_retry::deployment_listing_for_list_error(
+                &loaded,
+                Some(status),
+            )
+        }
+        Err(_) => {
+            enclava_cli::template_deploy_retry::deployment_listing_for_list_error(&loaded, None)
+        }
+    };
+    let again = enclava_cli::template_deploy_retry::select_template_deploy_attempt(
+        loaded,
+        stable,
+        &enclava_cli::template_deploy_retry::CurrentTemplateApp {
+            id: app.id.clone(),
+            created_at_unix: template_app_created_at_unix(&app.created_at),
+        },
+        &deployments,
+        enclava_cli::template_deploy_retry::unix_now(),
+    );
+    match again {
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Fresh => Ok(app),
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Refuse(message) => {
+            Err(message.into())
+        }
+        enclava_cli::template_deploy_retry::TemplateDeployAttempt::Replay { .. } => Err(
+            format!(
+                "the app `{instance_name}` appeared while this deploy was starting and already has a deployment to resume. A new deployment was not started, and the local bootstrap key was not replaced. Retry this command to resume it."
+            )
+            .into(),
+        ),
+    }
+}
+
 async fn ensure_template_app(
     api: &ApiClient,
     template: &HostedTemplate,
@@ -1215,10 +1597,12 @@ async fn ensure_template_app(
                     status,
                     code,
                     message,
+                    idempotency_disposition,
                 } => ApiError::Api {
                     status,
                     code,
                     message: format!("{message} (earlier create attempt: {error})"),
+                    idempotency_disposition,
                 }
                 .into(),
                 other => format!("{other} (earlier create attempt: {error})").into(),
@@ -1226,6 +1610,89 @@ async fn ensure_template_app(
         },
         Err(error) => Err(error.into()),
     }
+}
+
+/// Catalog stand-in for a replay whose template was removed from `/templates`.
+///
+/// Selection has already chosen Replay. Ownership and managed-config delivery
+/// use the signed descriptor and the stored workflow, which overwrite
+/// `unlock_mode` and `paas_managed_config_keys` before they are read. The
+/// other fields are not used on that path.
+fn resume_catalog_stub(slug: &str) -> HostedTemplate {
+    HostedTemplate {
+        slug: slug.to_string(),
+        name: slug.to_string(),
+        description: String::new(),
+        features: Vec::new(),
+        version: String::new(),
+        image: String::new(),
+        source_provider: None,
+        source_repository: None,
+        signer_subject: None,
+        signer_issuer: None,
+        container_name: "web".to_string(),
+        command: Vec::new(),
+        port: 8080,
+        unlock_mode: "auto".to_string(),
+        health_path: None,
+        health_interval: None,
+        health_timeout: None,
+        resources: enclava_cli::api_types::HostedTemplateResources::default(),
+        storage_paths: Vec::new(),
+        egress_allowlist: Vec::new(),
+        egress_mode: "restricted".to_string(),
+        config_keys: Vec::new(),
+        paas_managed_config_keys: Vec::new(),
+        persistence_path: None,
+        workload_security_profile: None,
+        security_notes: Vec::new(),
+    }
+}
+
+/// Resume-file scope for this command.
+///
+/// Credentials that already name an org keep that scope, so an existing file
+/// still matches. An API-key record with no org metadata is scoped by the
+/// authenticated org and user. Sharing `org:unknown` would let the next key
+/// overwrite the first account's in-flight request.
+pub(crate) async fn template_deploy_resume_scope(
+    api: &ApiClient,
+    creds: &config::Credentials,
+    cli_config: &config::CliConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !enclava_cli::template_deploy_retry::template_deploy_identity_is_empty(
+        creds.active_org_id.as_deref(),
+        cli_config.org_id.as_deref(),
+        creds.active_org_name.as_deref(),
+        cli_config.org.as_deref(),
+    ) {
+        return Ok(enclava_cli::template_deploy_retry::template_deploy_scope(
+            creds.active_org_id.as_deref(),
+            cli_config.org_id.as_deref(),
+            creds.active_org_name.as_deref(),
+            cli_config.org.as_deref(),
+            api.api_base(),
+        ));
+    }
+    let me = api.get_current_user().await.map_err(|err| {
+        format!(
+            "could not resolve the authenticated org for template-deploy resume state, so this API key was not given a shared scope: {err}"
+        )
+    })?;
+    let identity = enclava_cli::template_deploy_retry::AuthenticatedResumeIdentity {
+        org_id: Some(me.active_org.id.as_str()),
+        org_name: Some(me.active_org.name.as_str()),
+        user_id: Some(me.user_id.as_str()),
+    };
+    enclava_cli::template_deploy_retry::template_deploy_scope_for_credentials(
+        creds.active_org_id.as_deref(),
+        cli_config.org_id.as_deref(),
+        creds.active_org_name.as_deref(),
+        cli_config.org.as_deref(),
+        Some(&identity),
+        api.api_base(),
+    )
+    .map_err(|err| err.into())
 }
 
 fn template_create_app_request(
@@ -1259,6 +1726,109 @@ fn template_create_app_request(
     })
 }
 
+struct PeekedBootstrapKey {
+    hash: String,
+    private_key_hex: String,
+    org_name: String,
+}
+
+/// Hash the key ownership claim will use, without creating a seed, registering
+/// a keyring, or writing the bootstrap key.
+///
+/// The saved per-app key is preferred when its hash is the one in the signed
+/// request: claim reads that file before it derives from the recovery seed, so
+/// a removed or replaced seed must not hide a key that can still finish the
+/// deploy. A saved key that does not match falls back to the seed, so a
+/// previous overwrite can still be restored. `None` means neither source can
+/// be read. That must not be treated as a match, and it must not mint a new
+/// seed before selection decides whether the old descriptor will be replayed.
+async fn peek_password_bootstrap_key(
+    api: &ApiClient,
+    paths: &CliPaths,
+    instance_name: &str,
+    stored_hash: Option<&str>,
+) -> Result<Option<PeekedBootstrapKey>, Box<dyn std::error::Error>> {
+    let active = resolve_current_user_org(api).await?;
+    let saved = read_saved_bootstrap_peek(paths, &active.org_name, instance_name)?;
+    let derived = derive_peek_from_seed(paths, active.org_id, &active.org_name, instance_name)?;
+    let source = enclava_cli::template_deploy_retry::password_resume_key_source(
+        saved.as_ref().map(|key| key.hash.as_str()),
+        derived.as_ref().map(|key| key.hash.as_str()),
+        stored_hash,
+    );
+    Ok(match source {
+        Some(enclava_cli::template_deploy_retry::PasswordResumeKeySource::Saved) => saved,
+        Some(enclava_cli::template_deploy_retry::PasswordResumeKeySource::Derived) => derived,
+        None => None,
+    })
+}
+
+fn read_saved_bootstrap_peek(
+    paths: &CliPaths,
+    org_name: &str,
+    instance_name: &str,
+) -> Result<Option<PeekedBootstrapKey>, Box<dyn std::error::Error>> {
+    let key_path = paths.bootstrap_key_path(org_name, instance_name);
+    if !key_path.exists() {
+        return Ok(None);
+    }
+    let private_key_hex = std::fs::read_to_string(&key_path)?;
+    let private_key_bytes: [u8; 32] = hex::decode(private_key_hex.trim())?
+        .try_into()
+        .map_err(|_| "bootstrap key must be 32 bytes (64 hex chars)")?;
+    Ok(Some(peeked_from_seed(
+        org_name,
+        private_key_bytes,
+        private_key_hex.trim(),
+    )))
+}
+
+fn derive_peek_from_seed(
+    paths: &CliPaths,
+    org_id: uuid::Uuid,
+    org_name: &str,
+    instance_name: &str,
+) -> Result<Option<PeekedBootstrapKey>, Box<dyn std::error::Error>> {
+    let Some(seed) = keys::load_recovery_seed(paths)? else {
+        return Ok(None);
+    };
+    let app_seed = keys::derive_app_bootstrap_seed(org_id, instance_name, &seed)?;
+    Ok(Some(peeked_from_seed(
+        org_name,
+        app_seed,
+        &hex::encode(app_seed),
+    )))
+}
+
+fn peeked_from_seed(
+    org_name: &str,
+    app_seed: [u8; 32],
+    private_key_hex: &str,
+) -> PeekedBootstrapKey {
+    let signing_key = SigningKey::from_bytes(&app_seed);
+    PeekedBootstrapKey {
+        hash: hex::encode(Sha256::digest(signing_key.verifying_key().to_bytes())),
+        private_key_hex: private_key_hex.to_string(),
+        org_name: org_name.to_string(),
+    }
+}
+
+async fn derive_template_bootstrap_key(
+    api: &ApiClient,
+    paths: &CliPaths,
+    instance_name: &str,
+) -> Result<PeekedBootstrapKey, Box<dyn std::error::Error>> {
+    let (org_id, org_name, _) = ensure_manual_deploy_keyring(api, paths, false).await?;
+    let seed = keys::load_or_create_recovery_seed(paths)?;
+    let app_seed = keys::derive_app_bootstrap_seed(org_id, instance_name, &seed)?;
+    let signing_key = SigningKey::from_bytes(&app_seed);
+    Ok(PeekedBootstrapKey {
+        hash: hex::encode(Sha256::digest(signing_key.verifying_key().to_bytes())),
+        private_key_hex: hex::encode(app_seed),
+        org_name,
+    })
+}
+
 async fn template_bootstrap_pubkey_hash(
     api: &ApiClient,
     paths: &CliPaths,
@@ -1268,13 +1838,14 @@ async fn template_bootstrap_pubkey_hash(
     if template.unlock_mode != "password" {
         return Ok(None);
     }
-    let (org_id, org_name, _) = ensure_manual_deploy_keyring(api, paths, false).await?;
-    let seed = keys::load_or_create_recovery_seed(paths)?;
-    let app_seed = keys::derive_app_bootstrap_seed(org_id, instance_name, &seed)?;
-    let signing_key = SigningKey::from_bytes(&app_seed);
-    let public_key_hash = hex::encode(Sha256::digest(signing_key.verifying_key().to_bytes()));
-    config::save_bootstrap_key(paths, &org_name, instance_name, &hex::encode(app_seed))?;
-    Ok(Some(public_key_hash))
+    let derived = derive_template_bootstrap_key(api, paths, instance_name).await?;
+    config::save_bootstrap_key(
+        paths,
+        &derived.org_name,
+        instance_name,
+        &derived.private_key_hex,
+    )?;
+    Ok(Some(derived.hash))
 }
 
 fn template_app_config(template: &HostedTemplate, instance_name: &str) -> AppConfig {
@@ -1513,7 +2084,7 @@ fn ssh_command_stable_endpoint<'a>(
     .into())
 }
 
-fn normalize_slug(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn normalize_slug(value: &str) -> Result<String, Box<dyn std::error::Error>> {
     let slug = value.trim().to_ascii_lowercase();
     if slug.len() < 2
         || slug.len() > 63
@@ -4106,6 +4677,30 @@ fn paas_ssh_command_api_error(error: ApiError) -> Box<dyn std::error::Error> {
     }
 }
 
+fn trusted_deployment_for_resumed_request(
+    request: &CreateTemplateInstanceRequest,
+    deploy_id: &str,
+) -> Result<enclava_cli::descriptor::TrustedDeploymentExpectation, Box<dyn std::error::Error>> {
+    let blob = request.customer_descriptor_blob.as_deref().ok_or(
+        "stored template deploy request is missing its signed descriptor; destroy the app before deploying again",
+    )?;
+    let trusted =
+        enclava_cli::descriptor::trusted_deployment_expectation_from_descriptor_blob(blob).map_err(
+            |err| {
+                format!(
+                    "stored template deploy request could not be read ({err}); destroy the app before deploying again"
+                )
+            },
+        )?;
+    if trusted.deploy_id != deploy_id {
+        return Err(
+            "stored template deploy request does not match its signed descriptor; destroy the app before deploying again"
+                .into(),
+        );
+    }
+    Ok(trusted)
+}
+
 fn template_instance_create_api_error(error: ApiError) -> Box<dyn std::error::Error> {
     if let Some(message) = stable_ssh_managed_ngrok_setup_error_message(&error) {
         message.into()
@@ -6557,6 +7152,7 @@ mod tests {
             status,
             code: code.map(str::to_string),
             message: "test error".to_string(),
+            idempotency_disposition: None,
         };
         let endpoint_retries =
             |status, code| should_retry_template_bootstrap_endpoint_error(&api_error(status, code));
@@ -6820,6 +7416,7 @@ mod tests {
                 status,
                 code: None,
                 message: "temporary".to_string(),
+                idempotency_disposition: None,
             }));
         }
 
@@ -6828,24 +7425,28 @@ mod tests {
                 status,
                 code: None,
                 message: "permanent".to_string(),
+                idempotency_disposition: None,
             }));
         }
         assert!(!should_retry_paas_ssh_command_error(&ApiError::Api {
             status: 502,
             code: Some("cap_response_invalid".to_string()),
             message: "CAP app response included an invalid app domain".to_string(),
+            idempotency_disposition: None,
         }));
         assert!(!should_retry_paas_ssh_command_error(&ApiError::Api {
             status: 502,
             code: Some("stable_ssh_endpoint_missing".to_string()),
             message: "Hosted Debian SSH app is missing its stored stable SSH endpoint expectation"
                 .to_string(),
+            idempotency_disposition: None,
         }));
         assert!(!should_retry_paas_ssh_command_error(&ApiError::Api {
             status: 502,
             code: Some("stable_ssh_endpoint_invalid".to_string()),
             message: "Hosted Debian SSH app has invalid stored stable SSH endpoint expectation"
                 .to_string(),
+            idempotency_disposition: None,
         }));
         assert!(!should_retry_paas_ssh_command_error(
             &ApiError::NotAuthenticated
@@ -6858,6 +7459,7 @@ mod tests {
             status: 502,
             code: Some("stable_ssh_endpoint_missing".to_string()),
             message: "stored endpoint missing".to_string(),
+            idempotency_disposition: None,
         })
         .unwrap();
         assert!(missing.contains("Stable SSH endpoint metadata is missing"));
@@ -6867,6 +7469,7 @@ mod tests {
             status: 502,
             code: Some("stable_ssh_endpoint_invalid".to_string()),
             message: "stored endpoint invalid".to_string(),
+            idempotency_disposition: None,
         })
         .unwrap();
         assert!(invalid.contains("Stable SSH endpoint metadata is invalid"));
@@ -6876,6 +7479,7 @@ mod tests {
             status: 502,
             code: Some("cap_response_invalid".to_string()),
             message: "CAP app /ssh.txt returned an invalid stable SSH endpoint command".to_string(),
+            idempotency_disposition: None,
         })
         .unwrap();
         assert!(cap_invalid.contains(
@@ -6892,6 +7496,7 @@ mod tests {
                 status: 425,
                 code: Some("ssh_command_not_available".to_string()),
                 message: "pending".to_string(),
+                idempotency_disposition: None,
             })
             .is_none()
         );
@@ -6904,6 +7509,7 @@ mod tests {
             code: Some("service_unavailable".to_string()),
             message: "service_unavailable: DEBIAN_SSH_NGROK_AUTHTOKEN is not configured"
                 .to_string(),
+            idempotency_disposition: None,
         })
         .unwrap();
 
@@ -6918,6 +7524,7 @@ mod tests {
                 status: 502,
                 code: Some("cap_write_failed".to_string()),
                 message: "CAP write failed".to_string(),
+                idempotency_disposition: None,
             })
             .is_none()
         );
@@ -7703,6 +8310,7 @@ mod tests {
                 status,
                 code: Some("transient".to_string()),
                 message: "transient".to_string(),
+                idempotency_disposition: None,
             }));
         }
         assert!(
@@ -7710,6 +8318,7 @@ mod tests {
                 status: 503,
                 code: None,
                 message: "proxy unavailable while refreshing config token".to_string(),
+                idempotency_disposition: None,
             }),
             "config token refresh uses the same transient PaaS retry classifier"
         );
@@ -7746,6 +8355,7 @@ mod tests {
                 status,
                 code: Some("permanent".to_string()),
                 message: "permanent".to_string(),
+                idempotency_disposition: None,
             }));
         }
         assert!(!should_retry_template_config_sync_error(

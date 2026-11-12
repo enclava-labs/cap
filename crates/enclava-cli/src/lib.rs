@@ -11,6 +11,7 @@ pub mod platform_release;
 pub mod policy_artifact;
 pub mod registry;
 pub mod tee_client;
+pub mod template_deploy_retry;
 
 /// Serializes tests that mutate process-global state (environment variables
 /// or the working directory). Every env/CWD-mutating test in this crate takes

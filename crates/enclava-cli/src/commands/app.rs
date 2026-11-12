@@ -3079,6 +3079,7 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
             status: 403,
             code: Some(code),
             message,
+            ..
         }) if code == "missing_scope" && message.contains("apps:logs") => {
             return Err(format!(
                 "{message}\nRun `enclava login --approve-logs` and approve the new session to read workload logs."
@@ -3865,8 +3866,19 @@ pub struct DestroyArgs {
 }
 
 pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let app_name = resolve_app_name(&args.app)?;
-    let (api, _paths, _cli_config) = build_api_client()?;
+    let requested = resolve_app_name(&args.app)?;
+    // Template deploy lowercases before it locks and saves. PaaS does the
+    // same in `validate_slug` before DELETE, so `Shell` deletes `shell` and
+    // returns success. An exact-match API 404s on `Shell` and leaves `shell`.
+    // Either way the resume file and the lock are under the slug. Send that
+    // slug, and confirm it, so a 404 or a success is about the same app whose
+    // file we clear. A name that is not a slug is sent unchanged and only its
+    // own key is touched.
+    let app_name = template_resume_instance_name(&requested);
+    let paths = CliPaths::resolve()?;
+    let cli_config = config::load_config(&paths)?;
+    let creds = config::load_credentials(&paths)?;
+    let api = ApiClient::from_config(&cli_config, &creds);
 
     if !args.force {
         super::interactive::require_prompt("pass --force to destroy without confirmation")?;
@@ -3893,6 +3905,14 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
         }
     }
 
+    let scope =
+        crate::commands::template::template_deploy_resume_scope(&api, &creds, &cli_config).await?;
+    // Same per-app lock as `template deploy`, held across deletion and resume
+    // cleanup. `app_name` is already the slug that deploy locks, and it is the
+    // name this delete sends.
+    let _deploy_lock =
+        enclava_cli::template_deploy_retry::lock_template_deploy(&paths, &scope, &app_name).await?;
+
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.red} {msg}")?);
     spinner.set_message(format!("Destroying {app_name}..."));
@@ -3907,7 +3927,32 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
         spinner.finish_with_message(format!("Destroy of '{app_name}' did not complete."));
         eprintln!("Hint: {hint}");
     }
-    result?;
+    let already_gone = matches!(&result, Err(ApiError::Api { status: 404, .. }));
+    if let Err(error) = result {
+        if !already_gone {
+            return Err(error.into());
+        }
+        // The app is already absent. The unreadable-resume refusal tells the
+        // user to destroy and deploy again; a dashboard destroy leaves the
+        // local file, so a 404 must still remove it.
+        return Err(forget_destroyed_app_template_deploy(&paths, &scope, &app_name)
+        .map(|()| {
+            format!(
+                "{error}. The stored template deploy request for `{app_name}` was removed, so deploying this name again will not replay or refuse on it."
+            )
+        })
+        .unwrap_or_else(|clear_error| {
+            format!("{error}; also failed to remove the stored template deploy request: {clear_error}")
+        })
+        .into());
+    }
+
+    forget_destroyed_app_template_deploy(&paths, &scope, &app_name)
+        .map_err(|err| {
+            format!(
+                "app '{app_name}' was destroyed, but the stored template deploy request could not be removed: {err}. Remove that file before deploying this name again."
+            )
+        })?;
 
     spinner.finish_with_message(format!("App '{app_name}' destroyed."));
 
@@ -3923,6 +3968,38 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 #[cfg(test)]
 #[path = "app/tests/mod.rs"]
 pub(crate) mod tests;
+
+/// Slug template deploy locks and PaaS deletes.
+///
+/// Both fold the instance name to lowercase before they store or delete.
+/// Destroy must send, lock, and clear that same slug. Clearing it after a
+/// delete of the raw name is wrong: PaaS has already deleted the slug, and
+/// an exact-match API has not. A name that is not a slug was never a
+/// template-deploy key, so it is left unchanged.
+fn template_resume_instance_name(app_name: &str) -> String {
+    crate::commands::template::normalize_slug(app_name).unwrap_or_else(|_| app_name.to_string())
+}
+
+/// Drop the local template-deploy resume file after the named app is gone.
+///
+/// The file is keyed by the exact app name sent to the API and by the
+/// normalized API base. Leaving it makes the next deploy of that name replay
+/// a descriptor signed for the destroyed app, or refuse forever when the file
+/// cannot be read. `app destroy` is the recovery those refusals document, so
+/// it has to remove the file for the name it actually deleted. The caller
+/// holds the template-deploy lock for this name; clearing without that lock
+/// races a deploy that is about to save or stamp the file.
+fn forget_destroyed_app_template_deploy(
+    paths: &CliPaths,
+    scope: &str,
+    app_name: &str,
+) -> Result<(), String> {
+    enclava_cli::template_deploy_retry::clear_template_deploy_attempt(
+        paths,
+        scope,
+        &template_resume_instance_name(app_name),
+    )
+}
 
 /// Operator guidance for a failed destroy, keyed on the stable API code (or
 /// the in-band cause text hosted deferrals carry). Pure so the prose mapping

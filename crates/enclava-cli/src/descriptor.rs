@@ -281,6 +281,27 @@ pub fn trusted_deployment_expectation_from_descriptor(
     }
 }
 
+/// Recover the trusted deployment identity from a persisted descriptor blob
+/// so a resumed template deploy can still bind a terminal bootstrap diagnostic
+/// to the deployment it is waiting on.
+pub fn trusted_deployment_expectation_from_descriptor_blob(
+    blob: &str,
+) -> Result<TrustedDeploymentExpectation, DescriptorError> {
+    Ok(trusted_deployment_expectation_from_descriptor(
+        &descriptor_from_blob(blob)?.descriptor,
+    ))
+}
+
+/// Unlock mode baked into the signed descriptor. A resumed template deploy
+/// must follow this, not a catalog row fetched on the retry.
+pub fn unlock_mode_from_descriptor_blob(blob: &str) -> Result<String, DescriptorError> {
+    Ok(descriptor_from_blob(blob)?.descriptor.unlock_mode)
+}
+
+fn descriptor_from_blob(blob: &str) -> Result<DeploymentDescriptorEnvelope, DescriptorError> {
+    Ok(serde_json::from_str(blob)?)
+}
+
 pub fn sign(
     deployer: &UserSigningKey,
     descriptor: DeploymentDescriptor,

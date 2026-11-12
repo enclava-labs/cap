@@ -11,6 +11,9 @@ use sha2::{Digest, Sha256};
 pub struct ApiClient {
     base_url: String,
     origin: String,
+    /// Scheme, host, port, and path. Resume files are scoped by this, not by
+    /// `origin`, so `https://host/v1` and `https://host/v2` do not share state.
+    api_base: String,
     http: reqwest::Client,
     auth_token: Option<String>,
     org_hint: Option<String>,
@@ -25,6 +28,9 @@ pub enum ApiError {
         status: u16,
         code: Option<String>,
         message: String,
+        /// `completed` / `deferred` from the error body, or `None` when the
+        /// server did not stamp an idempotency completion boundary.
+        idempotency_disposition: Option<String>,
     },
     #[error("response body decode failed: {0}")]
     Decode(#[from] serde_json::Error),
@@ -51,10 +57,12 @@ impl ApiClient {
             .filter(|url| url.host().is_some())
             .map(|url| url.origin().ascii_serialization())
             .unwrap_or_else(|| base_url.clone());
+        let api_base = normalized_api_base(&base_url);
 
         Self {
             base_url,
             origin,
+            api_base,
             http,
             auth_token,
             org_hint: None,
@@ -65,6 +73,14 @@ impl ApiClient {
     /// state such as the platform-release baseline.
     pub fn origin(&self) -> &str {
         &self.origin
+    }
+
+    /// Normalized API base (scheme, host, port, and path) this client actually
+    /// calls. Unlike [`origin`](Self::origin), a discovered base path such as
+    /// `https://host/v1` is kept. Template-deploy resume state is scoped by
+    /// this so two APIs on one host cannot replay each other's signed request.
+    pub fn api_base(&self) -> &str {
+        &self.api_base
     }
 
     /// Create a client from CLI config and credentials.
@@ -94,6 +110,7 @@ impl ApiClient {
                 status: 0,
                 code: None,
                 message: format!("invalid auth token: {e}"),
+                idempotency_disposition: None,
             })?,
         );
         if let Some(org) = &self.org_hint {
@@ -103,6 +120,7 @@ impl ApiClient {
                     status: 0,
                     code: None,
                     message: format!("invalid org header: {e}"),
+                    idempotency_disposition: None,
                 })?,
             );
         }
@@ -117,21 +135,21 @@ impl ApiClient {
             let status_code = status.as_u16();
             // Bound the error-body read too: a hostile API must not be able
             // to stream an unbounded "error" body into CLI memory either.
-            let (code, message) = match read_bounded_body(resp, MAX_API_ERROR_BODY_BYTES).await {
+            let composed = match read_bounded_body(resp, MAX_API_ERROR_BODY_BYTES).await {
                 Ok(bytes) => match serde_json::from_slice::<ApiErrorBody>(&bytes) {
                     Ok(body) => compose_api_error(status_code, body),
-                    Err(_) => (None, format!("HTTP {status_code}")),
+                    Err(_) => ComposedApiError::plain(format!("HTTP {status_code}")),
                 },
-                Err(ApiError::ResponseTooLarge(cap)) => (
-                    None,
-                    format!("HTTP {status_code} (error body exceeded {cap}-byte cap)"),
-                ),
-                Err(_) => (None, format!("HTTP {status_code}")),
+                Err(ApiError::ResponseTooLarge(cap)) => ComposedApiError::plain(format!(
+                    "HTTP {status_code} (error body exceeded {cap}-byte cap)"
+                )),
+                Err(_) => ComposedApiError::plain(format!("HTTP {status_code}")),
             };
             Err(ApiError::Api {
                 status: status_code,
-                code,
-                message,
+                code: composed.code,
+                message: composed.message,
+                idempotency_disposition: composed.idempotency_disposition,
             })
         }
     }
@@ -546,6 +564,7 @@ impl ApiClient {
                 status: 0,
                 code: Some("request_timeout".to_string()),
                 message: "HTTP request timed out".to_string(),
+                idempotency_disposition: None,
             })?
         } else {
             request.await
@@ -1001,7 +1020,7 @@ fn path_segment(value: &str) -> String {
     encoded
 }
 
-fn template_instance_idempotency_key(req: &CreateTemplateInstanceRequest) -> String {
+pub(crate) fn template_instance_idempotency_key(req: &CreateTemplateInstanceRequest) -> String {
     let mut value = serde_json::json!({
         "template_slug": req.template_slug,
         "instance_name": req.instance_name,
@@ -1048,7 +1067,30 @@ fn optional_sha256_hex(value: Option<&str>) -> Option<String> {
 /// surface -- stays pinned by unit tests. The `label: message` prefix is
 /// decided before the parenthetical suffixes so a body that carries only a
 /// code (the Busy/defer shapes) prints the label once, not twice.
-fn compose_api_error(status_code: u16, body: ApiErrorBody) -> (Option<String>, String) {
+struct ComposedApiError {
+    code: Option<String>,
+    message: String,
+    idempotency_disposition: Option<String>,
+}
+
+impl ComposedApiError {
+    fn plain(message: String) -> Self {
+        Self {
+            code: None,
+            message,
+            idempotency_disposition: None,
+        }
+    }
+}
+
+/// PaaS keeps only these two stamps. Any other value is upstream noise and
+/// must not decide whether a stored template-deploy request is discarded.
+fn accepted_idempotency_disposition(value: Option<String>) -> Option<String> {
+    value.filter(|value| matches!(value.as_str(), "completed" | "deferred"))
+}
+
+fn compose_api_error(status_code: u16, body: ApiErrorBody) -> ComposedApiError {
+    let idempotency_disposition = accepted_idempotency_disposition(body.idempotency_disposition);
     let code = body.code.or_else(|| body.error.clone());
     let label = code
         .clone()
@@ -1081,9 +1123,17 @@ fn compose_api_error(status_code: u16, body: ApiErrorBody) -> (Option<String>, S
         );
     }
     if prefixed {
-        (code, format!("{label}: {message}"))
+        ComposedApiError {
+            code,
+            message: format!("{label}: {message}"),
+            idempotency_disposition,
+        }
     } else {
-        (code, message)
+        ComposedApiError {
+            code,
+            message,
+            idempotency_disposition,
+        }
     }
 }
 
@@ -1184,7 +1234,7 @@ mod tests {
             "retry_after": 42
         }))
         .expect("busy body decodes");
-        let (code, message) = compose_api_error(409, body);
+        let ComposedApiError { code, message, .. } = compose_api_error(409, body);
         assert_eq!(code.as_deref(), Some("app mutation already in progress"));
         assert_eq!(
             message,
@@ -1198,7 +1248,7 @@ mod tests {
             "error": "idempotency_request_in_progress"
         }))
         .expect("defer body decodes");
-        let (code, message) = compose_api_error(409, body);
+        let ComposedApiError { code, message, .. } = compose_api_error(409, body);
         assert_eq!(code.as_deref(), Some("idempotency_request_in_progress"));
         assert_eq!(message, "idempotency_request_in_progress");
     }
@@ -1209,7 +1259,7 @@ mod tests {
             "error": "stale_owner_seed"
         }))
         .expect("stale-seed body decodes");
-        let (code, message) = compose_api_error(409, body);
+        let ComposedApiError { code, message, .. } = compose_api_error(409, body);
         assert_eq!(code.as_deref(), Some("stale_owner_seed"));
         assert!(message.starts_with("stale_owner_seed"), "{message}");
         assert!(message.contains("erase the stale owner seed"), "{message}");
@@ -1223,12 +1273,36 @@ mod tests {
             "cause": "app_delete_teardown_unavailable"
         }))
         .expect("teardown body decodes");
-        let (code, message) = compose_api_error(502, body);
+        let ComposedApiError { code, message, .. } = compose_api_error(502, body);
         assert_eq!(code.as_deref(), Some("app_delete_teardown_unavailable"));
         assert_eq!(
             message,
             "app_delete_teardown_unavailable: the confidential workload teardown did not complete (cause: app_delete_teardown_unavailable)"
         );
+    }
+
+    #[test]
+    fn api_error_keeps_only_completed_and_deferred_dispositions() {
+        for (raw, expected) in [
+            (Some("completed"), Some("completed")),
+            (Some("deferred"), Some("deferred")),
+            (Some("Completed"), None),
+            (Some("consumed"), None),
+            (None, None),
+        ] {
+            let mut body = serde_json::json!({"error": "template_policy_rejected"});
+            if let Some(value) = raw {
+                body["idempotency_disposition"] = serde_json::json!(value);
+            }
+            let parsed: ApiErrorBody = serde_json::from_value(body).expect("error body decodes");
+            let composed = compose_api_error(422, parsed);
+            assert_eq!(composed.code.as_deref(), Some("template_policy_rejected"));
+            assert_eq!(
+                composed.idempotency_disposition.as_deref(),
+                expected,
+                "raw disposition {raw:?}"
+            );
+        }
     }
 
     fn template_request(endpoint: &str) -> CreateTemplateInstanceRequest {
@@ -1305,6 +1379,25 @@ mod tests {
     }
 }
 
+/// Scheme, host, port, and path, with the same host canonicalization as
+/// `origin()` (lowercase host, default ports omitted) plus the request path.
+/// A trailing slash is not part of the base. Unparseable input is returned
+/// unchanged so a client that could be constructed still has a stable key.
+fn normalized_api_base(base_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return base_url.to_string();
+    };
+    if url.host().is_none() {
+        return base_url.to_string();
+    }
+    let mut normalized = url.origin().ascii_serialization();
+    let path = url.path().trim_end_matches('/');
+    if !path.is_empty() {
+        normalized.push_str(path);
+    }
+    normalized
+}
+
 /// True only for http URLs whose parsed host is exactly `localhost` or a
 /// loopback IP. Anything else — including https URLs and unparseable input —
 /// forces TLS.
@@ -1333,6 +1426,7 @@ fn validated_auth_url(raw: &str, label: &str) -> Result<reqwest::Url, ApiError> 
         status: 0,
         code: Some("invalid_auth_discovery".to_string()),
         message: format!("{label} is not a valid absolute URL"),
+        idempotency_disposition: None,
     })?;
     if parsed.host().is_none()
         || (parsed.scheme() != "https" && !loopback_http_url(raw))
@@ -1346,6 +1440,7 @@ fn validated_auth_url(raw: &str, label: &str) -> Result<reqwest::Url, ApiError> 
             message: format!(
                 "{label} must use HTTPS (or loopback HTTP) without credentials or a fragment"
             ),
+            idempotency_disposition: None,
         });
     }
     Ok(parsed)
@@ -1363,6 +1458,7 @@ pub fn validated_discovered_api_url(raw: &str) -> Result<&str, ApiError> {
             status: 0,
             code: Some("invalid_auth_discovery".to_string()),
             message: "discovered API URL must not contain a query".to_string(),
+            idempotency_disposition: None,
         });
     }
     Ok(raw)
@@ -1394,6 +1490,36 @@ mod loopback_tests {
         ] {
             assert!(!loopback_http_url(evil), "{evil}");
         }
+    }
+
+    #[test]
+    fn api_base_keeps_a_discovered_path_and_canonicalizes_the_origin() {
+        for (configured, expected) in [
+            ("https://EXAMPLE.com:443/", "https://example.com"),
+            ("https://example.com", "https://example.com"),
+            ("https://example.com/v1", "https://example.com/v1"),
+            ("https://example.com/v1/", "https://example.com/v1"),
+            (
+                "https://example.com:8443/api",
+                "https://example.com:8443/api",
+            ),
+        ] {
+            assert_eq!(
+                ApiClient::new(configured, None).api_base(),
+                expected,
+                "{configured}"
+            );
+        }
+        assert_ne!(
+            ApiClient::new("https://host.example/v1", None).api_base(),
+            ApiClient::new("https://host.example/v2", None).api_base(),
+            "two base paths on one host must not share resume state"
+        );
+        assert_eq!(
+            ApiClient::new("https://example.com", None).api_base(),
+            ApiClient::new("https://example.com", None).origin(),
+            "a path-less base stays equal to the origin so existing resume files still match"
+        );
     }
 
     #[test]

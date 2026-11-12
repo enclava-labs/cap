@@ -770,6 +770,7 @@ mod tests {
             status: 404,
             code: None,
             message: "HTTP 404".to_string(),
+            idempotency_disposition: None,
         }))
         .unwrap();
         assert!(discovery.is_none());
@@ -778,6 +779,7 @@ mod tests {
             status: 405,
             code: None,
             message: "HTTP 405".to_string(),
+            idempotency_disposition: None,
         }))
         .unwrap();
         assert!(discovery.is_none());
@@ -790,6 +792,7 @@ mod tests {
                 status: 500,
                 code: None,
                 message: "HTTP 500".to_string(),
+                idempotency_disposition: None,
             }))
             .is_err()
         );
