@@ -4462,6 +4462,26 @@ async fn app_delete_retry_finishes_after_namespace_removal() {
         retained, 0,
         "confirmed cleanup must be durably released before KBS failure"
     );
+    // The KBS failure sent no write (no provider is configured), so the
+    // failed delete hands the global fence back at once instead of holding
+    // every other deployment behind it for the reclaim quarantine; the
+    // app's own lane keeps its quarantine.
+    let (kbs_fence_owned, app_lane_owned): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'
+                    AND owner_token IS NOT NULL),
+                (SELECT count(*) FROM app_mutation_leases
+                  WHERE app_id = $1 AND owner_token IS NOT NULL)",
+    )
+    .bind(app_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        (kbs_fence_owned, app_lane_owned),
+        (0, 1),
+        "a write-free KBS failure releases only the global kbs_policy fence"
+    );
     // Advance only finite quarantine. This must never hide an infinite-fence bug.
     sqlx::query("UPDATE app_mutation_leases SET locked_until = clock_timestamp() - interval '2 seconds', reclaim_after = clock_timestamp() - interval '1 second' WHERE app_id = $1")
             .bind(app_id).execute(&state.db).await.unwrap();
