@@ -2043,6 +2043,11 @@ pub(crate) async fn reconcile_success_with_deployment_history(
 
 /// A deployment CAP has accepted but whose workload roll has not finished:
 /// the previous pod may still be the one answering for the app.
+///
+/// `healthy`, `failed` and `rolled_back` are settled. `rolled_back`
+/// intentionally confirms, as in the non-rollout gate: CAP has finished
+/// with this deployment and the workload it restored is the one serving, so
+/// it will not roll (or relock) behind the user after the wait exits.
 pub(crate) fn deployment_rollout_in_flight(status: &str) -> bool {
     matches!(status, "pending" | "applying" | "watching")
 }
