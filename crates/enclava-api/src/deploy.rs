@@ -7485,30 +7485,37 @@ fn recovery_must_classify(rows: &[PublicationRecoveryRow], mode: PublicationReco
     }
 }
 
-/// Stamp `workload_spec_published_at` when the live StatefulSet proves a
-/// generation of this app was written and the stamp was lost.
+/// Decide which deployment `recover_unpublished_workload_spec` would stamp
+/// from the live StatefulSet, without writing. Returns the deployment id of
+/// a written-but-unstamped generation, or None when nothing needs stamping.
 ///
-/// No-ops when every deployment is already stamped. A missing StatefulSet
-/// is not a written spec. Ambiguous evidence, and a failed read while the
-/// mode still has an unclassified generation, refuse the caller.
-pub(crate) async fn recover_unpublished_workload_spec(
+/// Callers that must commit the stamp inside their own authority transaction
+/// use this instead of the autocommitting wrapper: on an already-deleting
+/// app the stamp is the deleting-selector change and must land atomically
+/// with the signed-policy generation bump, or an exit in between strands the
+/// recovered artifact pinned at an already-applied generation.
+///
+/// Refusals mirror `recover_unpublished_workload_spec` exactly: ambiguous
+/// evidence, and a failed read while the mode still has an unclassified
+/// generation, refuse the caller.
+pub(crate) async fn plan_unpublished_workload_spec(
     pool: &PgPool,
     client: &kube::Client,
     app_id: Uuid,
     namespace: &str,
     workload_name: &str,
     mode: PublicationRecoveryMode,
-) -> Result<(), DeployError> {
+) -> Result<Option<Uuid>, DeployError> {
     let rows = load_publication_recovery_rows(pool, app_id).await?;
     if rows.iter().all(|row| row.published) {
-        return Ok(());
+        return Ok(None);
     }
     // Acceptance does not need a cluster read to heal an already-terminal
     // row. Delete admission and the deleting reconciler own that. Holding
     // the deployment lane for a GET on every historical failure would not
     // close the in-flight crash window.
     if mode == PublicationRecoveryMode::BeforeSupersession && !recovery_must_classify(&rows, mode) {
-        return Ok(());
+        return Ok(None);
     }
     let live = match tokio::time::timeout(
         WORKLOAD_PUBLICATION_PROBE_TIMEOUT,
@@ -7528,7 +7535,7 @@ pub(crate) async fn recover_unpublished_workload_spec(
             return if recovery_must_classify(&rows, mode) {
                 Err(DeployError::PublicationUnclassified)
             } else {
-                Ok(())
+                Ok(None)
             };
         }
         Err(elapsed) => {
@@ -7542,7 +7549,7 @@ pub(crate) async fn recover_unpublished_workload_spec(
             return if recovery_must_classify(&rows, mode) {
                 Err(DeployError::PublicationUnclassified)
             } else {
-                Ok(())
+                Ok(None)
             };
         }
     };
@@ -7552,36 +7559,51 @@ pub(crate) async fn recover_unpublished_workload_spec(
         // produced a StatefulSet is also a 404. Failing closed here would
         // wedge supersession of that failure. The crash this issue names
         // leaves the object in place.
-        return Ok(());
+        return Ok(None);
     };
-    apply_live_publication_recovery(pool, app_id, &live_workload_publication(&sts), mode).await
+    plan_live_publication_recovery(pool, app_id, &live_workload_publication(&sts), mode).await
 }
 
-/// Apply an already-read publication identity. Tests and the kube wrapper
-/// share this so a recovery decision is not duplicated.
-pub(crate) async fn apply_live_publication_recovery(
+/// Stamp `workload_spec_published_at` when the live StatefulSet proves a
+/// generation of this app was written and the stamp was lost.
+///
+/// No-ops when every deployment is already stamped. A missing StatefulSet
+/// is not a written spec. Ambiguous evidence, and a failed read while the
+/// mode still has an unclassified generation, refuse the caller.
+pub(crate) async fn recover_unpublished_workload_spec(
+    pool: &PgPool,
+    client: &kube::Client,
+    app_id: Uuid,
+    namespace: &str,
+    workload_name: &str,
+    mode: PublicationRecoveryMode,
+) -> Result<(), DeployError> {
+    if let Some(deployment_id) =
+        plan_unpublished_workload_spec(pool, client, app_id, namespace, workload_name, mode).await?
+    {
+        record_recovered_workload_publication(pool, app_id, deployment_id).await?;
+    }
+    Ok(())
+}
+
+/// Decide an already-read publication identity without writing. Tests and
+/// the kube wrapper share this so a recovery decision is not duplicated.
+/// Returns the deployment id `apply_live_publication_recovery` would stamp.
+pub(crate) async fn plan_live_publication_recovery(
     pool: &PgPool,
     app_id: Uuid,
     live: &LiveWorkloadPublication,
     mode: PublicationRecoveryMode,
-) -> Result<(), DeployError> {
+) -> Result<Option<Uuid>, DeployError> {
     let rows = load_publication_recovery_rows(pool, app_id).await?;
     let deployments: Vec<_> = rows
         .iter()
         .map(PublicationRecoveryRow::deployment)
         .collect();
     match decide_workload_publication_recovery(live, &deployments) {
-        PublicationRecoveryDecision::Stamp(deployment_id) => {
-            record_workload_spec_published(pool, deployment_id).await?;
-            tracing::info!(
-                %app_id,
-                %deployment_id,
-                "recovered workload publication from the live StatefulSet"
-            );
-            Ok(())
-        }
+        PublicationRecoveryDecision::Stamp(deployment_id) => Ok(Some(deployment_id)),
         PublicationRecoveryDecision::AlreadyRecorded | PublicationRecoveryDecision::NotWritten => {
-            Ok(())
+            Ok(None)
         }
         PublicationRecoveryDecision::Ambiguous => {
             tracing::warn!(
@@ -7595,12 +7617,43 @@ pub(crate) async fn apply_live_publication_recovery(
                     %app_id,
                     "leaving workload publication unstamped after ambiguous live evidence"
                 );
-                Ok(())
+                Ok(None)
             } else {
                 Err(DeployError::PublicationUnclassified)
             }
         }
     }
+}
+
+/// Apply an already-read publication identity. Tests share this so a
+/// recovery decision is not duplicated; production callers use the
+/// autocommitting `recover_unpublished_workload_spec` or the plan-plus-tx
+/// pairing.
+#[cfg(test)]
+pub(crate) async fn apply_live_publication_recovery(
+    pool: &PgPool,
+    app_id: Uuid,
+    live: &LiveWorkloadPublication,
+    mode: PublicationRecoveryMode,
+) -> Result<(), DeployError> {
+    if let Some(deployment_id) = plan_live_publication_recovery(pool, app_id, live, mode).await? {
+        record_recovered_workload_publication(pool, app_id, deployment_id).await?;
+    }
+    Ok(())
+}
+
+async fn record_recovered_workload_publication(
+    pool: &PgPool,
+    app_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<(), DeployError> {
+    record_workload_spec_published(pool, deployment_id).await?;
+    tracing::info!(
+        %app_id,
+        %deployment_id,
+        "recovered workload publication from the live StatefulSet"
+    );
+    Ok(())
 }
 
 async fn read_live_statefulset(
@@ -7806,6 +7859,38 @@ async fn record_workload_spec_published(
             Err(error) => return Err(DeployError::Db(error)),
         }
     }
+}
+
+/// Commit the publication stamp inside the caller's authority transaction.
+///
+/// Delete admission on an already-deleting app must land this stamp together
+/// with the signed-policy generation bump the selector change requires: the
+/// deleting arm keys on `workload_spec_published_at`, so a stamp that commits
+/// earlier leaves the recovered artifact pinned at an already-applied
+/// generation whenever the caller exits (supersede Busy, budget refusal, DB
+/// error, crash) before the bump. A rollback leaves the row unstamped and the
+/// deleting reconciler can still stamp and bump together. A caller-side error
+/// rolls the stamp back with the transaction; no transient-failure retries
+/// here — the whole transaction is retryable.
+pub(crate) async fn record_workload_spec_published_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    deployment_id: Uuid,
+) -> Result<(), DeployError> {
+    let result = sqlx::query(
+        "UPDATE deployments
+            SET workload_spec_published_at = COALESCE(
+                    workload_spec_published_at,
+                    clock_timestamp()
+                )
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DeployError::Db(sqlx::Error::RowNotFound));
+    }
+    Ok(())
 }
 
 /// Apply manifests and return durable rollout-observation context.
@@ -8048,4 +8133,4 @@ fn build_verification_material(
     Ok(material)
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

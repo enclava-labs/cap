@@ -567,8 +567,9 @@ async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation(
     let descriptor_hash: Vec<u8> = (0..32).collect();
     let deploy_id = uuid::Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
-         VALUES ($1, $2, $3, 'healthy', '{}'::jsonb)",
+        "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot,
+                             workload_spec_published_at)
+         VALUES ($1, $2, $3, 'healthy', '{}'::jsonb, clock_timestamp())",
     )
     .bind(deploy_id)
     .bind(org_id)
@@ -3290,8 +3291,9 @@ async fn abandon_teardown_proceeds_past_unreachable_workload() {
     .await
     .expect("insert live apply job");
     sqlx::query(
-        "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
-         VALUES ($1, $2, $3, 'watching'::deploy_status_enum, '{}'::jsonb)",
+        "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot,
+                             workload_spec_published_at)
+         VALUES ($1, $2, $3, 'watching'::deploy_status_enum, '{}'::jsonb, clock_timestamp())",
     )
     .bind(live_deployment)
     .bind(auth.org_id)
@@ -3468,8 +3470,9 @@ async fn teardown_failure_after_supersede_keeps_deleting() {
     .await
     .expect("insert apply job");
     sqlx::query(
-        "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
-         VALUES ($1, $2, $3, 'watching'::deploy_status_enum, '{}'::jsonb)",
+        "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot,
+                             workload_spec_published_at)
+         VALUES ($1, $2, $3, 'watching'::deploy_status_enum, '{}'::jsonb, clock_timestamp())",
     )
     .bind(live_deployment)
     .bind(org_id)
@@ -3528,6 +3531,189 @@ async fn teardown_failure_after_supersede_keeps_deleting() {
     );
 
     crate::test_support::drop_isolated_database("cap_supersede_teardown_delete", pool).await;
+}
+
+/// Delete admission on an already-deleting app must not autocommit the
+/// recovered publication stamp (cap#234): the stamp IS the deleting-selector
+/// change, and committing it before the signed-policy generation bump leaves
+/// the recovered artifact pinned at an already-applied generation whenever
+/// the attempt exits early. The budget-refusal exit must leave the row
+/// unstamped and the policy generation unmoved, so the deleting reconciler
+/// can still stamp and bump in one transaction.
+#[tokio::test]
+async fn delete_admission_does_not_autocommit_a_recovered_publication_stamp() {
+    let (_db_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap_delete_recovery_stamp").await;
+    let (org_id, app_id) = crate::kbs::tests::insert_test_app(&pool, "deleting").await;
+    let mut auth = unique_admin_auth();
+    auth.org_id = org_id;
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Delete Recovery Test')")
+        .bind(auth.user_id)
+        .execute(&pool)
+        .await
+        .expect("insert delete recovery user");
+    sqlx::query(
+        "INSERT INTO memberships (user_id, org_id, role, removed_at)
+         VALUES ($1, $2, 'admin'::role_enum, NULL)",
+    )
+    .bind(auth.user_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert delete recovery membership");
+    crate::kbs::tests::insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()])
+        .await;
+    sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("mark workload teardown pending");
+
+    // The last completed workload is stamped; the newer generation is the
+    // crash window — its StatefulSet write landed and only the publication
+    // stamp was lost.
+    let now = chrono::Utc::now();
+    let completed = uuid::Uuid::new_v4();
+    crate::kbs::tests::insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now)
+        .await;
+    let completed_artifact =
+        crate::kbs::tests::insert_test_artifact(&pool, app_id, completed, "aa").await;
+    crate::kbs::tests::insert_test_job(
+        &pool,
+        org_id,
+        app_id,
+        completed,
+        completed,
+        Some((completed, &completed_artifact)),
+    )
+    .await;
+    crate::kbs::tests::mark_test_workload_published(&pool, completed).await;
+    let crashed = uuid::Uuid::new_v4();
+    crate::kbs::tests::insert_test_deployment(
+        &pool,
+        org_id,
+        app_id,
+        crashed,
+        "failed",
+        now + chrono::Duration::seconds(1),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE deployments
+            SET apply_committed_at = clock_timestamp(),
+                manifest_hash = 'written',
+                namespace_fence_generations = ARRAY[4]::bigint[]
+          WHERE id = $1",
+    )
+    .bind(crashed)
+    .execute(&pool)
+    .await
+    .expect("open the crash window");
+    let crashed_artifact =
+        crate::kbs::tests::insert_test_artifact(&pool, app_id, crashed, "de").await;
+    crate::kbs::tests::insert_failed_apply_job(
+        &pool,
+        org_id,
+        app_id,
+        crashed,
+        &crashed_artifact,
+        7,
+    )
+    .await;
+
+    // Trustee already applied the policy generation that lacks the live
+    // artifact — a recovered selector published at this generation would
+    // collide with it.
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 5, configmap_generation = 5, applied_generation = 5",
+    )
+    .execute(&pool)
+    .await
+    .expect("pin the applied policy generation");
+
+    let mut state = unreachable_tee_state();
+    state.db = pool.clone();
+    state.kube_client = crate::deploy::tests::publication_statefulset_client(crashed, false);
+    // A pin growth that crosses the byte budget must be refused before the
+    // stamp exists.
+    state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+        namespace: "cap-test".to_string(),
+        configmap_name: "resource-policy".to_string(),
+        policy_key: "policy.rego".to_string(),
+        deployment_name: "trustee".to_string(),
+        required: false,
+        signed_policy_retention: 6,
+        signed_policy_max_bytes: 1,
+    });
+
+    let app_name: String = sqlx::query_scalar("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read fixture app name");
+    let (status, body) = crate::routes::apps::delete_app_before(
+        auth,
+        State(state.clone()),
+        Path(app_name),
+        None,
+        false,
+    )
+    .await
+    .expect_err("a pin growth past the byte budget must refuse the delete");
+    assert_eq!(status, StatusCode::CONFLICT, "{:?}", body.0);
+    assert_eq!(body.0["error"], "app_delete_kbs_policy_budget_exceeded");
+
+    let (stamped, generation): (bool, i64) = sqlx::query_as(
+        "SELECT deployment.workload_spec_published_at IS NOT NULL,
+                reconciliation.desired_generation
+           FROM deployments AS deployment
+           CROSS JOIN kbs_signed_policy_reconciliation AS reconciliation
+          WHERE deployment.id = $1
+            AND reconciliation.singleton",
+    )
+    .bind(crashed)
+    .fetch_one(&pool)
+    .await
+    .expect("read stamp and policy generation");
+    assert!(
+        !stamped,
+        "the budget refusal must leave the recovered stamp uncommitted"
+    );
+    assert_eq!(
+        generation, 5,
+        "the refusal must not move the policy generation"
+    );
+
+    // The refusal left the row healable: the deleting reconciler stamps and
+    // bumps in one transaction, so the recovered selector publishes at a new
+    // generation instead of colliding with the applied one.
+    let healed = crate::deploy::recover_deleting_workload_publications(&pool, &state.kube_client)
+        .await
+        .expect("heal the deferred publication stamp");
+    assert!(healed, "the reconciler must pick the deferred stamp up");
+    let (stamped, generation): (bool, i64) = sqlx::query_as(
+        "SELECT deployment.workload_spec_published_at IS NOT NULL,
+                reconciliation.desired_generation
+           FROM deployments AS deployment
+           CROSS JOIN kbs_signed_policy_reconciliation AS reconciliation
+          WHERE deployment.id = $1
+            AND reconciliation.singleton",
+    )
+    .bind(crashed)
+    .fetch_one(&pool)
+    .await
+    .expect("read healed stamp and policy generation");
+    assert!(
+        stamped,
+        "the reconciler must stamp the recovered generation"
+    );
+    assert_eq!(
+        generation, 6,
+        "the reconciler must bump the generation together with the stamp"
+    );
+
+    crate::test_support::drop_isolated_database("cap_delete_recovery_stamp", pool).await;
 }
 
 #[tokio::test]
@@ -3626,8 +3812,9 @@ async fn non_running_app_with_seed_evidence_requires_teardown_on_destroy() {
         // seed may already exist in KBS even though the recorded status is
         // not 'running'.
         sqlx::query(
-            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
-             VALUES ($1, $2, $3, 'healthy'::deploy_status_enum, '{}'::jsonb)",
+            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot,
+                             workload_spec_published_at)
+             VALUES ($1, $2, $3, 'healthy'::deploy_status_enum, '{}'::jsonb, clock_timestamp())",
         )
         .bind(uuid::Uuid::new_v4())
         .bind(auth.org_id)

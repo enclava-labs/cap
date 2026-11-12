@@ -9644,7 +9644,7 @@ fn live_workload_publication_reads_the_applied_spec_identity() {
     );
 }
 
-fn publication_statefulset_client(deployment_id: Uuid, fail: bool) -> kube::Client {
+pub(crate) fn publication_statefulset_client(deployment_id: Uuid, fail: bool) -> kube::Client {
     use axum::http::{Request, Response};
     use http_body_util::BodyExt;
     use kube::client::Body;

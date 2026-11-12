@@ -1464,9 +1464,17 @@ async fn load_signed_policy_candidates_for(
 /// eligibility). The delete transition marks the app deleting and sets
 /// `workload_teardown_required` together, so this projection is exactly what
 /// the selector admits once that transition lands.
+///
+/// `pending_publication` names a deployment whose `workload_spec_published_at`
+/// stamp is decided but not yet committed (delete admission defers it into
+/// its authority transaction so it can land with the generation bump).
+/// Projection must treat it as stamped — otherwise admission would compare a
+/// post-stamp projection against it and admit a pin growth that crosses
+/// `signed_policy_max_bytes`.
 async fn load_teardown_policy_unit(
     db: &PgPool,
     app_id: Uuid,
+    pending_publication: Option<Uuid>,
 ) -> Result<Vec<crate::signing_service::SignedPolicyArtifact>, KbsPolicyError> {
     let rows: Vec<serde_json::Value> = sqlx::query_scalar(
         r#"
@@ -1477,7 +1485,8 @@ async fn load_teardown_policy_unit(
                 job.artifact_deployment_id,
                 job.artifact_descriptor_core_hash,
                 deployment.status::text AS deployment_status,
-                deployment.workload_spec_published_at
+                (deployment.workload_spec_published_at IS NOT NULL
+                    OR deployment.id = $2) AS spec_published
             FROM deployment_apply_jobs AS job
             JOIN deployments AS deployment
               ON deployment.id = job.deployment_id
@@ -1502,12 +1511,12 @@ async fn load_teardown_policy_unit(
             UNION
             SELECT artifact_deployment_id, artifact_descriptor_core_hash
               FROM ranked_job_operations
-             WHERE workload_spec_published_at IS NOT NULL
+             WHERE spec_published
                AND generation > COALESCE((SELECT generation FROM max_completed), 0)
                AND generation = (
                    SELECT MAX(generation)
                      FROM ranked_job_operations
-                    WHERE workload_spec_published_at IS NOT NULL
+                    WHERE spec_published
                )
         ),
         job_unit AS (
@@ -1584,6 +1593,7 @@ async fn load_teardown_policy_unit(
         "#,
     )
     .bind(app_id)
+    .bind(pending_publication)
     .fetch_all(db)
     .await?;
     rows.into_iter()
@@ -1623,10 +1633,17 @@ fn dedup_signed_policy_artifacts_by_hash(
 ///
 /// A delete that does not grow the required set is always admitted: an
 /// already-overflowed deployment must still be able to shrink its way back.
+///
+/// `pending_publication` is the not-yet-committed recovered stamp delete
+/// admission decided on an already-deleting app (see
+/// `load_teardown_policy_unit`): the projection must count it, while
+/// `current` stays the committed truth, so a pin growth that crosses the
+/// budget is refused before the stamp exists.
 pub async fn teardown_unit_fits_signed_policy_budget(
     db: &PgPool,
     config: Option<&KbsPolicyConfig>,
     app_id: Uuid,
+    pending_publication: Option<Uuid>,
 ) -> Result<bool, KbsPolicyError> {
     let Some(config) = config else {
         return Ok(true);
@@ -1656,7 +1673,7 @@ pub async fn teardown_unit_fits_signed_policy_budget(
         }
         current.push(candidate.artifact);
     }
-    projected.extend(load_teardown_policy_unit(db, app_id).await?);
+    projected.extend(load_teardown_policy_unit(db, app_id, pending_publication).await?);
     let projected = dedup_signed_policy_artifacts_by_hash(projected);
     let projected_len = signed_policy_artifact_policy_body(&projected)?.len();
     if projected_len <= config.signed_policy_max_bytes {
@@ -1715,7 +1732,10 @@ pub async fn teardown_unit_already_published(
     client: kube::Client,
     app_id: Uuid,
 ) -> Result<bool, KbsPolicyError> {
-    let unit = dedup_signed_policy_artifacts_by_hash(load_teardown_policy_unit(db, app_id).await?);
+    // Called after the delete's phase transaction committed, so the
+    // recovered stamp (if any) is already visible: no pending projection.
+    let unit =
+        dedup_signed_policy_artifacts_by_hash(load_teardown_policy_unit(db, app_id, None).await?);
     let applied: Option<(i64, Vec<u8>)> = sqlx::query_as(
         "SELECT applied_generation, applied_policy_sha256
            FROM kbs_signed_policy_reconciliation
@@ -3214,7 +3234,7 @@ pub fn config_from_env() -> Option<KbsPolicyConfig> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_support::KbsPolicyProvider;
     use chrono::Utc;
@@ -4350,7 +4370,7 @@ resource_bindings := {
         );
     }
 
-    async fn insert_test_app(pool: &PgPool, status: &str) -> (Uuid, Uuid) {
+    pub(crate) async fn insert_test_app(pool: &PgPool, status: &str) -> (Uuid, Uuid) {
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
         let suffix = app_id.simple().to_string();
@@ -4391,7 +4411,7 @@ resource_bindings := {
         (org_id, app_id)
     }
 
-    async fn insert_test_deployment(
+    pub(crate) async fn insert_test_deployment(
         pool: &PgPool,
         org_id: Uuid,
         app_id: Uuid,
@@ -4456,7 +4476,7 @@ resource_bindings := {
         .expect("stamp KBS test setup state");
     }
 
-    async fn mark_test_workload_published(pool: &PgPool, deployment_id: Uuid) {
+    pub(crate) async fn mark_test_workload_published(pool: &PgPool, deployment_id: Uuid) {
         sqlx::query(
             "UPDATE deployments
                 SET workload_spec_published_at = clock_timestamp()
@@ -4484,7 +4504,7 @@ resource_bindings := {
         ))
     }
 
-    async fn insert_test_artifact(
+    pub(crate) async fn insert_test_artifact(
         pool: &PgPool,
         app_id: Uuid,
         deployment_id: Uuid,
@@ -4531,7 +4551,7 @@ resource_bindings := {
         artifact
     }
 
-    async fn insert_test_job(
+    pub(crate) async fn insert_test_job(
         pool: &PgPool,
         org_id: Uuid,
         app_id: Uuid,
@@ -4572,7 +4592,7 @@ resource_bindings := {
     /// owner; the raw signature bytes are irrelevant to candidate selection.
     /// Returns the ids of the user and signing key rows it created so callers
     /// can clean them up without touching other tests' fixtures.
-    async fn insert_test_keyring_version(
+    pub(crate) async fn insert_test_keyring_version(
         pool: &PgPool,
         org_id: Uuid,
         version: i64,
@@ -7449,6 +7469,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len)),
             app_id,
+            None,
         )
         .await
         .expect("admit a teardown unit that fits the shared budget");
@@ -7461,6 +7482,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len - 1)),
             app_id,
+            None,
         )
         .await
         .expect("refuse a teardown unit that exceeds the shared budget");
@@ -7470,6 +7492,114 @@ resource_bindings := {
         );
 
         crate::test_support::drop_isolated_database("cap_teardown_over_budget", pool).await;
+    }
+
+    /// The recovered publication stamp that delete admission defers into its
+    /// authority transaction must be projected into the budget check. On an
+    /// already-deleting app the stamp grows the required pin set, so
+    /// admission has to see that growth — and refuse it — before the stamp
+    /// is committed.
+    #[tokio::test]
+    async fn teardown_admission_projects_a_pending_recovered_publication() {
+        // Exact byte math on the shared candidate set: run on a per-process
+        // database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_pending_stamp").await;
+        let now = Utc::now();
+
+        // The crash window: the last completed workload is stamped, the
+        // newer generation wrote its StatefulSet but lost only the stamp.
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        let completed_artifact = insert_test_artifact(&pool, app_id, completed, "aa").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            completed,
+            completed,
+            Some((completed, &completed_artifact)),
+        )
+        .await;
+        mark_test_workload_published(&pool, completed).await;
+        let pending = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            pending,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let pending_artifact = insert_test_artifact(&pool, app_id, pending, "de").await;
+        insert_failed_apply_job(&pool, org_id, app_id, pending, &pending_artifact, 7).await;
+
+        let without_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                completed_artifact.clone(),
+            ]))
+            .expect("serialize the unit without the pending stamp")
+            .len();
+        let with_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                completed_artifact.clone(),
+                pending_artifact.clone(),
+            ]))
+            .expect("serialize the unit with the pending stamp")
+            .len();
+
+        // The pending stamp grows the unit past the budget: refuse it while
+        // `current` still lacks the artifact.
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(without_len)),
+            app_id,
+            Some(pending),
+        )
+        .await
+        .expect("project the pending recovered stamp");
+        assert!(
+            !fits,
+            "a pending stamp that grows the pin past the byte budget must be refused"
+        );
+
+        // The committed truth alone does not grow: the same budget admits.
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(without_len)),
+            app_id,
+            None,
+        )
+        .await
+        .expect("project the committed truth");
+        assert!(
+            fits,
+            "without the pending stamp the delete does not grow the required set"
+        );
+
+        // A pending stamp that fits is admitted like any other unit.
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(with_len)),
+            app_id,
+            Some(pending),
+        )
+        .await
+        .expect("project a pending stamp that fits the budget");
+        assert!(
+            fits,
+            "a pending stamp within the shared byte budget must be admitted"
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_pending_stamp", pool).await;
     }
 
     /// Other apps' pending teardown pins already occupy the budget: admitting
@@ -7551,6 +7681,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len)),
             app_id,
+            None,
         )
         .await
         .expect("weigh other apps' pending teardown pins");
@@ -7563,6 +7694,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(pin_len + unit_len)),
             app_id,
+            None,
         )
         .await
         .expect("admit a teardown unit alongside existing pins");
@@ -7608,6 +7740,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(1)),
             app_id,
+            None,
         )
         .await
         .expect("admit a delete that does not grow the required set");
@@ -7687,6 +7820,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len / 2)),
             app_id,
+            None,
         )
         .await
         .expect("admission check on a completed teardown");
@@ -7752,6 +7886,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len)),
             app_id,
+            None,
         )
         .await
         .expect("admit the full mixed legacy/job unit");
@@ -7764,6 +7899,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len - 1)),
             app_id,
+            None,
         )
         .await
         .expect("refuse a mixed unit that exceeds the shared budget");
@@ -7784,7 +7920,7 @@ resource_bindings := {
     /// predicate undercounts (teardown denied live authority) or inflates
     /// (phantom 409) the projected unit.
     async fn teardown_projection(pool: &PgPool, app_id: Uuid) -> HashSet<String> {
-        load_teardown_policy_unit(pool, app_id)
+        load_teardown_policy_unit(pool, app_id, None)
             .await
             .expect("project teardown unit")
             .into_iter()
@@ -8229,7 +8365,7 @@ resource_bindings := {
         // Exercise the production unit loader too: the publication predicate
         // must not silently pass because the app's teardown set is empty.
         let loaded_unit = dedup_signed_policy_artifacts_by_hash(
-            load_teardown_policy_unit(&pool, app_id)
+            load_teardown_policy_unit(&pool, app_id, None)
                 .await
                 .expect("load teardown unit"),
         );
@@ -9058,7 +9194,7 @@ resource_bindings := {
         crate::test_support::drop_isolated_database("cap_teardown_bounded", pool).await;
     }
 
-    async fn insert_failed_apply_job(
+    pub(crate) async fn insert_failed_apply_job(
         pool: &PgPool,
         org_id: Uuid,
         app_id: Uuid,
@@ -9347,7 +9483,7 @@ resource_bindings := {
             !hashes.contains(never_wrote_artifact.metadata.descriptor_core_hash.as_str()),
             "entering the StatefulSet step is not a write"
         );
-        let unit = load_teardown_policy_unit(&pool, app_id)
+        let unit = load_teardown_policy_unit(&pool, app_id, None)
             .await
             .expect("project the teardown unit");
         let unit_hashes: HashSet<_> = unit
