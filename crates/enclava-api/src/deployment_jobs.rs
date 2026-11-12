@@ -327,15 +327,19 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TERMINAL_LEASE_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_SETUP_WORKERS: usize = 8;
 const MAX_APPLY_WORKERS: usize = 32;
-/// Bounded workers for extended owner-wait probes: read-only observation of
-/// password-mode creates whose rollout budget is spent and that only wait
-/// for a late unlock. The shared apply lane excludes these candidates (see
-/// [`OwnerWaitProbeFilter`]), so however many apps stay locked, they can
-/// never delay a real deploy. The bound itself caps the concurrent
+/// Bounded workers for past-budget watching observations — the extended
+/// owner-wait probe shape (normally password-mode creates whose rollout
+/// budget is spent and that only wait for a late unlock; see
+/// [`OwnerWaitProbeFilter`] for the claim-time scope). The shared apply
+/// lane excludes these candidates, so however many apps stay locked, they
+/// can never delay a real deploy. The bound itself caps the concurrent
 /// read-only Kubernetes polls a backlog of locked apps generates: with the
-/// 3 s probe slice, two workers re-probe ~28 waiting apps — the backlog that
-/// previously saturated a production 4-slot pool — each within about a
-/// minute, keeping the #386 unlock-notice promise (#387).
+/// 3 s probe slice, two workers re-probe ~28 waiting apps — the backlog
+/// that previously saturated a production 4-slot pool — each within about
+/// a minute, keeping the #386 unlock-notice promise (#387). Headroom is
+/// deliberately fixed for the pre-signup scale the issue targets; revisit
+/// the bound and expose probe-lane queue depth in metrics before signup
+/// opens widely.
 const MAX_OWNER_WAIT_PROBE_WORKERS: usize = 2;
 
 fn apply_worker_limit(configured_apply_concurrency: usize) -> usize {
@@ -1987,10 +1991,16 @@ async fn claim_apply_job(pool: &PgPool) -> Result<Option<ClaimedJob>, Deployment
     .await
 }
 
-/// Claim one extended owner-wait probe for the bounded probe lane: a
-/// requeued observation whose deployment is past its persisted rollout
-/// budget and that only waits for a late unlock. Served outside the shared
-/// apply lane so waiting apps cannot delay real deploys (#387).
+/// Claim one past-budget watching observation for the bounded probe lane —
+/// the extended owner-wait probe shape (normally a locked password-mode
+/// create whose rollout budget is spent and that only waits for a late
+/// unlock). The claim-time predicate reads durable deployment rows only:
+/// the owner-wait classification inputs (password mode, creating snapshot)
+/// live in the frozen job payload, so a past-budget straggler that is not
+/// an owner wait can also land here. That is deliberate — `watch()` gives
+/// such a row a zero-length slice and the publish terminalizes it on its
+/// first claim, at no meaningful cost — and it keeps every past-budget row
+/// on exactly one lane (#387).
 async fn claim_owner_wait_probe_job(
     pool: &PgPool,
 ) -> Result<Option<ClaimedJob>, DeploymentJobError> {
@@ -5855,6 +5865,63 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete lane partition fixtures");
+    }
+
+    #[tokio::test]
+    async fn probe_lane_serves_past_budget_rows_beyond_the_owner_wait_shape() {
+        // The claim-time predicate reads durable deployment rows only; the
+        // owner-wait classification inputs (password mode, creating
+        // snapshot) live in the frozen job payload. A past-budget straggler
+        // that no longer matches the owner-wait shape must still land on
+        // exactly one lane: `watch()` gives it a zero-length slice and the
+        // publish terminalizes it on that first claim. Pinning this superset
+        // keeps future predicate narrowing from pushing such rows back onto
+        // the shared apply lane (#387).
+        let pool = database_test_pool().await;
+        let (app_a, deployment_a) = insert_owner_wait_probe_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE apps
+                SET unlock_mode = 'auto'::unlock_enum,
+                    status = 'running'::app_status_enum
+              WHERE id = $1",
+        )
+        .bind(app_a.id)
+        .execute(&pool)
+        .await
+        .expect("move live app rows past the owner-wait shape");
+
+        assert!(
+            claim_job_candidate(
+                &pool,
+                "pending",
+                "running",
+                Some(deployment_a),
+                false,
+                OwnerWaitProbeFilter::Exclude,
+            )
+            .await
+            .expect("exclude claim for past-budget straggler")
+            .is_none(),
+            "the shared apply lane must still refuse past-budget stragglers"
+        );
+        let probe = claim_job_candidate(
+            &pool,
+            "pending",
+            "running",
+            Some(deployment_a),
+            false,
+            OwnerWaitProbeFilter::Only,
+        )
+        .await
+        .expect("probe-only claim for past-budget straggler")
+        .expect("the past-budget straggler must land on the probe lane");
+        assert_eq!(probe.deployment_id, deployment_a);
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app_a.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete straggler fixture");
     }
 
     #[tokio::test]
