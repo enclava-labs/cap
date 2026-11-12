@@ -7097,9 +7097,19 @@ async fn restart_statefulset_for_ingress(
 }
 
 /// One rollout-observation slice. A durable watcher owns no mutation fence, so
-/// this bound is also the maximum time a waiting workload keeps a worker slot
-/// before the job is released for the next dispatch.
+/// this bound is also the maximum time a waiting workload keeps one of the
+/// bounded apply-worker slots before the job is released for the next
+/// dispatch (#231).
 const ROLLOUT_OBSERVATION_SLICE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Probe slice for an extended owner wait (password mode, rollout budget
+/// exhausted, observing only for a late unlock): two `watch_rollout` poll
+/// intervals. The 60 s observation requeue cap
+/// (`ROLLOUT_OBSERVATION_RETRY_MAX_SECS`) would otherwise pair this branch's
+/// 90 s slice with a 60 s delay and pin ~60% of an apply worker per abandoned
+/// locked app; the probe bounds that to ~10 s of worker time per ~70 s cycle
+/// (~14%) while still reporting an unlock within about a minute (#231).
+const EXTENDED_OWNER_WAIT_PROBE_SLICE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A rollout handle returned after Kubernetes accepted the rendered manifests.
 ///
@@ -7194,7 +7204,9 @@ impl DeploymentRollout {
         let owner_wait = unlock_mode == crate::models::UnlockMode::Password
             && previous_app_status == AppStatus::Creating;
         let slice = if owner_wait && remaining.is_zero() {
-            self.observation_slice
+            // min keeps a deliberately smaller configured slice (tests) in
+            // charge; production always runs the 10 s probe here.
+            self.observation_slice.min(EXTENDED_OWNER_WAIT_PROBE_SLICE)
         } else {
             remaining.min(self.observation_slice)
         };
