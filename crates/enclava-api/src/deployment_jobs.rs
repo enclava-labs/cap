@@ -294,7 +294,11 @@ const ROLLOUT_OBSERVATION_RETRY_BASE_SECS: i64 = 30;
 /// elapsing with rollout budget remaining) wait on external progress that can
 /// finish right after a requeue, so unlike contention the cadence stays near
 /// the base: an owner unlock must reach status within about a minute instead
-/// of waiting out an exponential delay. The 24 h grace still bounds the loop.
+/// of waiting out an exponential delay. Extended owner-wait observations
+/// probe with a short slice (`EXTENDED_OWNER_WAIT_PROBE_SLICE` in deploy.rs),
+/// so this cadence costs ~10 s of apply-worker time per ~70 s per
+/// never-unlocking owner instead of pinning one of the bounded slots (#231).
+/// The 24 h grace still bounds the loop.
 const ROLLOUT_OBSERVATION_RETRY_MAX_SECS: i64 = 60;
 /// Retry backoff grows exponentially with the job's attempt count so a job
 /// that keeps requeueing without reaching a terminal observation releases
