@@ -295,10 +295,10 @@ const ROLLOUT_OBSERVATION_RETRY_BASE_SECS: i64 = 30;
 /// finish right after a requeue, so unlike contention the cadence stays near
 /// the base: an owner unlock must reach status within about a minute instead
 /// of waiting out an exponential delay. Extended owner-wait observations
-/// probe with a short slice (`EXTENDED_OWNER_WAIT_PROBE_SLICE` in deploy.rs),
-/// so this cadence costs ~10 s of apply-worker time per ~70 s per
-/// never-unlocking owner instead of pinning one of the bounded slots (#231).
-/// The 24 h grace still bounds the loop.
+/// probe with a short slice (`EXTENDED_OWNER_WAIT_PROBE_SLICE` in deploy.rs)
+/// on their own bounded dispatch lane (`MAX_OWNER_WAIT_PROBE_WORKERS`), so
+/// this cadence costs no shared apply-worker time at all per never-unlocking
+/// owner (#231, #387). The 24 h grace still bounds the loop.
 const ROLLOUT_OBSERVATION_RETRY_MAX_SECS: i64 = 60;
 /// Retry backoff grows exponentially with the job's attempt count so a job
 /// that keeps requeueing without reaching a terminal observation releases
@@ -327,6 +327,16 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TERMINAL_LEASE_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_SETUP_WORKERS: usize = 8;
 const MAX_APPLY_WORKERS: usize = 32;
+/// Bounded workers for extended owner-wait probes: read-only observation of
+/// password-mode creates whose rollout budget is spent and that only wait
+/// for a late unlock. The shared apply lane excludes these candidates (see
+/// [`OwnerWaitProbeFilter`]), so however many apps stay locked, they can
+/// never delay a real deploy. The bound itself caps the concurrent
+/// read-only Kubernetes polls a backlog of locked apps generates: with the
+/// 3 s probe slice, two workers re-probe ~28 waiting apps — the backlog that
+/// previously saturated a production 4-slot pool — each within about a
+/// minute, keeping the #386 unlock-notice promise (#387).
+const MAX_OWNER_WAIT_PROBE_WORKERS: usize = 2;
 
 fn apply_worker_limit(configured_apply_concurrency: usize) -> usize {
     configured_apply_concurrency
@@ -1853,6 +1863,8 @@ pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::
     let configured_apply_workers =
         apply_worker_limit(state.deployment_apply_permits.available_permits());
     let apply_worker_slots = Arc::new(tokio::sync::Semaphore::new(configured_apply_workers));
+    let owner_wait_probe_slots =
+        Arc::new(tokio::sync::Semaphore::new(MAX_OWNER_WAIT_PROBE_WORKERS));
     crate::reconciler::spawn_reconciler("deployment-dispatcher", shutdown.clone(), async move {
         loop {
             let mut found_work = false;
@@ -1923,6 +1935,29 @@ pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::
                 }
             }
 
+            // Extended owner-wait probes run on their own bounded lane so a
+            // backlog of locked apps can never occupy shared apply-worker
+            // slots or head-of-line block fresh deployments (#387).
+            if let Ok(worker_slot) = owner_wait_probe_slots.clone().try_acquire_owned() {
+                match claim_owner_wait_probe_job(&state.db).await {
+                    Ok(Some(job)) => {
+                        found_work = true;
+                        let worker_state = state.clone();
+                        tokio::spawn(async move {
+                            process_apply_job(worker_state, job, worker_slot).await;
+                        });
+                    }
+                    Ok(None) => drop(worker_slot),
+                    Err(error) => {
+                        drop(worker_slot);
+                        tracing::error!(
+                            error_code = error.code(),
+                            "failed to claim durable deployment owner-wait probe job"
+                        );
+                    }
+                }
+            }
+
             if found_work {
                 tokio::task::yield_now().await;
             } else {
@@ -1937,11 +1972,65 @@ async fn claim_setup_job(pool: &PgPool) -> Result<Option<ClaimedJob>, Deployment
 }
 
 async fn claim_apply_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
-    claim_job(pool, "pending", "running", None).await
+    // The shared apply lane must never pick up extended owner-wait probes:
+    // their job rows stay oldest across the requeue loop, so without the
+    // exclusion their due re-checks head-of-line block fresh deployments for
+    // as long as the owner stays absent (#387).
+    claim_job_candidate(
+        pool,
+        "pending",
+        "running",
+        None,
+        false,
+        OwnerWaitProbeFilter::Exclude,
+    )
+    .await
+}
+
+/// Claim one extended owner-wait probe for the bounded probe lane: a
+/// requeued observation whose deployment is past its persisted rollout
+/// budget and that only waits for a late unlock. Served outside the shared
+/// apply lane so waiting apps cannot delay real deploys (#387).
+async fn claim_owner_wait_probe_job(
+    pool: &PgPool,
+) -> Result<Option<ClaimedJob>, DeploymentJobError> {
+    claim_job_candidate(
+        pool,
+        "pending",
+        "running",
+        None,
+        false,
+        OwnerWaitProbeFilter::Only,
+    )
+    .await
 }
 
 async fn claim_cleanup_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
     claim_job(pool, "cleanup_pending", "cleaning_up", None).await
+}
+
+/// Routing filter for extended owner-wait probe candidates in
+/// [`claim_job_candidate`]. The shared apply lane's `Exclude` and the probe
+/// lane's `Only` are exact complements over the same predicate, so every
+/// row is claimable by exactly one lane and no job can be stranded by both
+/// lanes refusing it. Targeted claims (a concrete `only_deployment_id`, and
+/// the setup/cleanup lanes, whose states never observe rollouts) pass
+/// `Any` and keep claim semantics unchanged.
+#[derive(Debug, Clone, Copy)]
+enum OwnerWaitProbeFilter {
+    Any,
+    Only,
+    Exclude,
+}
+
+impl OwnerWaitProbeFilter {
+    fn as_sql_arg(self) -> Option<bool> {
+        match self {
+            OwnerWaitProbeFilter::Any => None,
+            OwnerWaitProbeFilter::Only => Some(true),
+            OwnerWaitProbeFilter::Exclude => Some(false),
+        }
+    }
 }
 
 async fn claim_job(
@@ -1956,6 +2045,7 @@ async fn claim_job(
         claimed_state,
         only_deployment_id,
         only_deployment_id.is_some(),
+        OwnerWaitProbeFilter::Any,
     )
     .await
 }
@@ -1966,9 +2056,16 @@ async fn claim_job_candidate(
     claimed_state: &str,
     only_deployment_id: Option<Uuid>,
     bypass_recovery_delay: bool,
+    owner_wait_probe: OwnerWaitProbeFilter,
 ) -> Result<Option<ClaimedJob>, DeploymentJobError> {
     let lock_token = Uuid::new_v4();
     let job = sqlx::query_as::<_, ClaimedJob>(
+        // The $9 probe predicate (a deployment durably `watching` past its
+        // persisted rollout budget, still only observing for a late unlock)
+        // is evaluated once here and drives both lane directions: the shared
+        // apply lane passes false and the probe lane true over the exact
+        // same expression, so the lanes partition the candidate set with no
+        // gap a job could fall through (#387).
         "WITH candidate AS (
              SELECT deployment_id
                FROM deployment_apply_jobs
@@ -1987,6 +2084,22 @@ async fn claim_job_candidate(
                 AND (
                     NOT customer_config_hold
                     OR customer_config_released_at IS NOT NULL
+                )
+                AND (
+                    $9::boolean IS NULL
+                    OR (
+                        EXISTS (
+                            SELECT 1
+                              FROM deployments AS observe
+                             WHERE observe.id = deployment_apply_jobs.deployment_id
+                               AND observe.status = 'watching'::deploy_status_enum
+                               AND observe.manifest_hash IS NOT NULL
+                               AND observe.observing_since IS NOT NULL
+                               AND observe.observing_since
+                                   + observe.rollout_timeout_millis * interval '1 millisecond'
+                                   <= clock_timestamp()
+                        )
+                    ) = $9
                 )
               ORDER BY created_at, deployment_id
               FOR UPDATE SKIP LOCKED
@@ -2015,6 +2128,7 @@ async fn claim_job_candidate(
     .bind(LEASE_INTERVAL_SQL)
     .bind(only_deployment_id)
     .bind(bypass_recovery_delay)
+    .bind(owner_wait_probe.as_sql_arg())
     .fetch_optional(pool)
     .await?;
     Ok(job)
@@ -5587,6 +5701,234 @@ pub(crate) mod tests {
         assert_eq!(apply_worker_limit(usize::MAX), MAX_APPLY_WORKERS);
     }
 
+    #[test]
+    fn owner_wait_probe_lane_is_bounded() {
+        // The probe lane serves read-only polls only: it must stay smaller
+        // than the smallest shared apply pool and bounded away from zero.
+        assert!(
+            (1..apply_worker_limit(1)).contains(&MAX_OWNER_WAIT_PROBE_WORKERS),
+            "the read-only probe lane must stay smaller than the smallest shared apply pool"
+        );
+    }
+
+    /// Stage an abandoned locked create: setup accepted, manifests applied,
+    /// the rollout durably `watching` past its persisted budget, and the
+    /// latest nonterminal observation requeued due with the job row kept
+    /// oldest — the exact candidate shape the extended owner-wait probe lane
+    /// serves (#387).
+    async fn insert_owner_wait_probe_fixture(pool: &PgPool) -> (App, Uuid) {
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(pool).await;
+        let setup = claim_job(pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim owner-wait fixture setup")
+            .expect("owner-wait fixture setup exists");
+        mark_setup_accepted(pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept owner-wait fixture setup");
+        let apply = claim_job(pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim owner-wait fixture apply")
+            .expect("owner-wait fixture apply exists");
+        let manifest_hash = "owner-wait-probe-lane-manifest";
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = $2,
+                    observing_since = clock_timestamp() - interval '2 hours',
+                    rollout_timeout_millis = 600000
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(manifest_hash)
+        .execute(pool)
+        .await
+        .expect("stage owner-wait observation past its rollout budget");
+        publish_rollout_outcome(
+            pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect("publish nonterminal owner-wait observation");
+        // Due immediately and the oldest candidate in the table.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET next_attempt_at = clock_timestamp() - interval '1 second',
+                    created_at = created_at - interval '1 hour'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(pool)
+        .await
+        .expect("make owner-wait probe due and oldest");
+        (app, deployment_id)
+    }
+
+    /// Stage a fresh deploy queued behind the owner-wait backlog: setup
+    /// accepted, apply due now (#387).
+    async fn insert_fresh_apply_fixture(pool: &PgPool) -> (App, Uuid) {
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(pool).await;
+        let setup = claim_job(pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim fresh fixture setup")
+            .expect("fresh fixture setup exists");
+        mark_setup_accepted(pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept fresh fixture setup");
+        (app, deployment_id)
+    }
+
+    #[tokio::test]
+    async fn extended_owner_wait_probe_lane_partition_is_exact() {
+        // A locked password-mode create past its rollout budget requeues as
+        // a read-only unlock probe for up to 24 h and its job row stays the
+        // oldest candidate. The shared apply lane and the bounded probe lane
+        // partition these rows exactly, so the probes can neither head-of-
+        // line block fresh deployments nor strand a job both lanes refuse
+        // (#387).
+        let pool = database_test_pool().await;
+        let (app_a, deployment_a) = insert_owner_wait_probe_fixture(&pool).await;
+        let (app_b, deployment_b) = insert_fresh_apply_fixture(&pool).await;
+
+        assert!(
+            claim_job_candidate(
+                &pool,
+                "pending",
+                "running",
+                Some(deployment_a),
+                false,
+                OwnerWaitProbeFilter::Exclude,
+            )
+            .await
+            .expect("exclude claim for owner-wait probe")
+            .is_none(),
+            "the shared apply lane must refuse extended owner-wait probes"
+        );
+        assert!(
+            claim_job_candidate(
+                &pool,
+                "pending",
+                "running",
+                Some(deployment_b),
+                false,
+                OwnerWaitProbeFilter::Only,
+            )
+            .await
+            .expect("probe-only claim for fresh deploy")
+            .is_none(),
+            "the probe lane must refuse fresh deploys"
+        );
+        let probe = claim_job_candidate(
+            &pool,
+            "pending",
+            "running",
+            Some(deployment_a),
+            false,
+            OwnerWaitProbeFilter::Only,
+        )
+        .await
+        .expect("probe-only claim for owner-wait probe")
+        .expect("the owner-wait probe is claimable on the probe lane");
+        assert_eq!(probe.deployment_id, deployment_a);
+        let shared = claim_job_candidate(
+            &pool,
+            "pending",
+            "running",
+            Some(deployment_b),
+            false,
+            OwnerWaitProbeFilter::Exclude,
+        )
+        .await
+        .expect("shared claim for fresh deploy")
+        .expect("the fresh deploy is claimable on the shared lane");
+        assert_eq!(shared.deployment_id, deployment_b);
+
+        sqlx::query("DELETE FROM organizations WHERE id IN ($1, $2)")
+            .bind(app_a.org_id)
+            .bind(app_b.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete lane partition fixtures");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_claim_wrappers_route_owner_wait_probes() {
+        // End-to-end wiring of the lane partition through the dispatcher's
+        // claim entry points. Claim order is oldest-first, so the due probe
+        // fixture is always offered before its fresh sibling: the shared
+        // lane must pass it over and serve the fresh deploy instead (the
+        // head-of-line complaint in #387), and the probe lane must serve it
+        // while leaving fresh deploys alone. Bounded claim loops keep the
+        // assertions stable against rows a previously failed run left
+        // behind in a shared test database.
+        let pool = database_test_pool().await;
+        let (app_a1, deployment_a1) = insert_owner_wait_probe_fixture(&pool).await;
+        let (app_b1, deployment_b1) = insert_fresh_apply_fixture(&pool).await;
+
+        let mut shared_served = Vec::new();
+        for _ in 0..64 {
+            match claim_apply_job(&pool).await.expect("shared apply claim") {
+                Some(job) if job.deployment_id == deployment_b1 => {
+                    shared_served.push(job.deployment_id);
+                    break;
+                }
+                Some(job) => {
+                    assert_ne!(
+                        job.deployment_id, deployment_a1,
+                        "the shared apply lane must never serve an owner-wait probe"
+                    );
+                    shared_served.push(job.deployment_id);
+                }
+                None => break,
+            }
+        }
+        assert!(
+            shared_served.contains(&deployment_b1),
+            "the shared lane must serve the fresh deploy while the older probe is due"
+        );
+
+        let (app_a2, deployment_a2) = insert_owner_wait_probe_fixture(&pool).await;
+        let (app_b2, deployment_b2) = insert_fresh_apply_fixture(&pool).await;
+
+        let mut probe_served_a2 = false;
+        for _ in 0..64 {
+            match claim_owner_wait_probe_job(&pool)
+                .await
+                .expect("probe lane claim")
+            {
+                Some(job) => {
+                    assert_ne!(
+                        job.deployment_id, deployment_b2,
+                        "the probe lane must never serve a fresh deploy"
+                    );
+                    if job.deployment_id == deployment_a2 {
+                        probe_served_a2 = true;
+                    }
+                }
+                None => break,
+            }
+        }
+        assert!(
+            probe_served_a2,
+            "the probe lane must serve the owner-wait probe"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id IN ($1, $2, $3, $4)")
+            .bind(app_a1.org_id)
+            .bind(app_b1.org_id)
+            .bind(app_a2.org_id)
+            .bind(app_b2.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete dispatcher wiring fixtures");
+    }
+
     #[tokio::test]
     async fn expired_setup_and_apply_leases_recover_after_restart() {
         let pool = database_test_pool().await;
@@ -8891,6 +9233,7 @@ pub(crate) mod tests {
                 "setting_up",
                 Some(deployment_id),
                 false,
+                OwnerWaitProbeFilter::Any,
             )
             .await
             .expect("dispatcher claim query")
@@ -8940,6 +9283,7 @@ pub(crate) mod tests {
             "setting_up",
             Some(deployment_id),
             false,
+            OwnerWaitProbeFilter::Any,
         )
         .await
         .expect("dispatcher claim")
