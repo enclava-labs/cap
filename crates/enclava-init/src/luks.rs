@@ -136,10 +136,7 @@ pub fn is_formatted(device: &Path) -> Result<bool> {
                 );
                 return Ok(true);
             }
-            if cryptsetup_is_luks(device)? == Some(true) {
-                return Ok(true);
-            }
-            Ok(false)
+            Ok(cryptsetup_is_luks(device)? == Some(true))
         }
     }
 }
