@@ -2,6 +2,11 @@
 //!
 //! Ports the Python implementation at platform_api/manifests/init_data.py.
 //! The SHA256 hash is computed on the uncompressed TOML string.
+//!
+//! `CC_INIT_DATA_CONTRACT_VERSION` is the CLI↔platform handshake for this
+//! byte layout. Bump it in the same change that alters `build_toml` bytes
+//! in a way the legacy render matrix does not absorb. A platform-release
+//! version does not move with every engine-contract change; this id does.
 
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -11,6 +16,61 @@ use crate::types::ConfidentialApp;
 
 pub const DEFAULT_KBS_URL: &str =
     "http://kbs-service.trustee-operator-system.svc.cluster.local:8080";
+
+/// Monotonic id of the `cc_init_data` byte contract the CLI and the API
+/// both compute. The API publishes it on deployment-context; the CLI pins
+/// this constant before signing.
+///
+/// Absence of the published field means an older platform that does not
+/// speak the handshake. That is not a mismatch: failing closed would brick
+/// every new CLI against every API that has not rolled out yet.
+pub const CC_INIT_DATA_CONTRACT_VERSION: u32 = 1;
+
+/// Compare the CLI's compiled contract to the version the platform
+/// published. `None` is an older platform and is compatible. A published
+/// version that differs is a hard skew: signing would produce a hash the
+/// platform cannot accept, and the hosted proxy drops the field diagnostic.
+pub fn require_compatible_cc_init_data_contract(
+    platform_version: Option<u32>,
+) -> Result<(), String> {
+    match platform_version {
+        None => Ok(()),
+        Some(platform) if platform == CC_INIT_DATA_CONTRACT_VERSION => Ok(()),
+        Some(platform) => Err(cc_init_data_contract_skew_message(
+            CC_INIT_DATA_CONTRACT_VERSION,
+            platform,
+        )),
+    }
+}
+
+/// Actionable skew error. Names both versions and which side to move.
+/// The version is a diagnostic handshake, not a trust anchor: a hostile
+/// deployment-context can lie, and the server hash check remains the gate.
+pub fn cc_init_data_contract_skew_message(cli_version: u32, platform_version: u32) -> String {
+    let remedy = if cli_version < platform_version {
+        "this CLI is older than the platform; upgrade this CLI from a trusted source"
+    } else if cli_version > platform_version {
+        "this CLI is newer than the platform; wait for the platform rollout, or use a CLI built for the platform contract"
+    } else {
+        "both sides advertise the same contract; do not treat this as skew"
+    };
+    format!(
+        "engine-contract skew: this CLI pins cc_init_data contract {cli_version} but the platform reports {platform_version}; {remedy}"
+    )
+}
+
+/// Hash-mismatch diagnostic for a signed `expected_cc_init_data_hash`.
+/// Both values are public measurements of cc_init_data TOML, not secrets.
+/// The leading field name stays stable for log grep.
+pub fn cc_init_data_hash_mismatch_detail(
+    expected_hash_hex: &str,
+    rendered_hash_hex: &str,
+) -> String {
+    format!(
+        "expected_cc_init_data_hash mismatch: signed {expected_hash_hex}, platform rendered {rendered_hash_hex}, platform cc_init_data contract {version}; upgrade this CLI from a trusted source if the platform was upgraded, or wait for the platform rollout if you upgraded the CLI first",
+        version = CC_INIT_DATA_CONTRACT_VERSION,
+    )
+}
 
 /// Trustee KBS base URL written into Kata guest components config.
 ///
@@ -243,6 +303,8 @@ impl CcInitDataOptions {
 ///
 /// The TOML structure follows the Python template in init_data.py, with all
 /// interpolated scalar values emitted through a TOML-safe string encoder.
+/// A byte-layout change that the legacy render matrix does not absorb must
+/// bump `CC_INIT_DATA_CONTRACT_VERSION` in the same change.
 /// It contains:
 /// - policy.rego: agent policy with image digest and namespace
 /// - aa.toml: attestation agent config pointing to KBS
@@ -1094,5 +1156,70 @@ mod round19_tests {
                 "round-trip must be byte-exact for {body:?}; emitted: {toml:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod contract_version_tests {
+    use super::{
+        CC_INIT_DATA_CONTRACT_VERSION, cc_init_data_contract_skew_message,
+        cc_init_data_hash_mismatch_detail, require_compatible_cc_init_data_contract,
+    };
+
+    #[test]
+    fn absent_platform_contract_does_not_brick_a_newer_cli() {
+        require_compatible_cc_init_data_contract(None)
+            .expect("an older platform that omits the field must stay deployable");
+        require_compatible_cc_init_data_contract(Some(CC_INIT_DATA_CONTRACT_VERSION))
+            .expect("matching contract");
+    }
+
+    #[test]
+    fn skew_names_both_versions_and_which_side_to_move() {
+        let older =
+            require_compatible_cc_init_data_contract(Some(CC_INIT_DATA_CONTRACT_VERSION + 1))
+                .expect_err("platform ahead of this CLI");
+        assert!(
+            older.contains(&CC_INIT_DATA_CONTRACT_VERSION.to_string()),
+            "{older}"
+        );
+        assert!(
+            older.contains(&(CC_INIT_DATA_CONTRACT_VERSION + 1).to_string()),
+            "{older}"
+        );
+        assert!(
+            older.contains("this CLI is older than the platform"),
+            "{older}"
+        );
+        assert!(
+            older.contains("upgrade this CLI from a trusted source"),
+            "{older}"
+        );
+
+        let newer = cc_init_data_contract_skew_message(2, 1);
+        assert!(
+            newer.contains("this CLI is newer than the platform"),
+            "{newer}"
+        );
+        assert!(newer.contains("wait for the platform rollout"), "{newer}");
+    }
+
+    #[test]
+    fn hash_mismatch_detail_carries_both_hashes_and_the_contract() {
+        let detail = cc_init_data_hash_mismatch_detail("aa", "bb");
+        assert!(detail.starts_with("expected_cc_init_data_hash"), "{detail}");
+        assert!(detail.contains("signed aa"), "{detail}");
+        assert!(detail.contains("platform rendered bb"), "{detail}");
+        assert!(
+            detail.contains(&format!(
+                "platform cc_init_data contract {CC_INIT_DATA_CONTRACT_VERSION}"
+            )),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("upgrade this CLI from a trusted source"),
+            "{detail}"
+        );
+        assert!(detail.contains("wait for the platform rollout"), "{detail}");
     }
 }
