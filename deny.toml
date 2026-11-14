@@ -10,6 +10,8 @@ ignore = [
     { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained; transitive via nostr (enclava-api, enclava-cli). No fixed nostr release; revisit on nostr upgrade." },
     { id = "RUSTSEC-2025-0119", reason = "`number_prefix` unmaintained; transitive via indicatif (enclava-cli progress bars). Cosmetic dependency; revisit when indicatif drops it." },
     { id = "RUSTSEC-2026-0173", reason = "`proc-macro-error2` unmaintained; transitive via getset/oci-spec/oci-client. Revisit when oci-spec moves off getset." },
+    # RUSTSEC-2024-0449: unmaintained class, patched = []. No fixed version exists.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained (patched = []; last release is 0.2.11). No fixed version exists, so a lockfile bump cannot clear it. Transitive via serde_yaml 0.9.34 (direct enclava-engine dependency, also kube). Accepted until serde_yaml is replaced by a maintained parser." },
 ]
 
 [sources]
