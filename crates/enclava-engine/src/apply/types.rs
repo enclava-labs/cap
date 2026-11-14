@@ -87,11 +87,21 @@ pub struct ApplyConfig {
 }
 
 impl ApplyConfig {
-    /// Rollout budget for this render. Only claims `fresh` marked as lacking
-    /// positive initialization evidence contribute the first-boot allowance:
-    /// an already-initialized volume is opened, never re-scanned, so an
+    /// Rollout budget for this render. The configured baseline (600s in
+    /// [`ApplyConfig::default`]) always applies. Only claims `fresh` marked
+    /// as lacking positive initialization evidence — the admission signal the
+    /// security review called `expects_fresh_volume` — add the first-boot
+    /// allowance: two sequential passes at 32 MiB/s. Selected claims are
+    /// summed in MiB (each already ceiled) and rounded up once
+    /// (`ceil(total_fresh_MiB / 16)` seconds), qualified to the selected
+    /// storage backend, not a universal SLA. An already-initialized volume is opened, never re-scanned, so an
     /// ordinary redeploy or domain reapply must not inherit the fresh-format
     /// wait.
+    ///
+    /// This value is floor and deadline control only. It is not the signed
+    /// volume-provenance claim in cap#249, and it never authorizes skipping
+    /// the in-guest zero scan. Callers persist the result once; observer
+    /// restarts reuse that recorded deadline instead of recomputing it.
     pub fn rollout_timeout_for_storage(
         &self,
         app_data_size: &str,
@@ -109,7 +119,10 @@ impl ApplyConfig {
                     .ok_or("volume initialization size is too large")?;
             }
         }
-        // shortcut: budgets two passes at 32 MiB/s; recalibrate if qualified guests are slower.
+        // Two passes at 32 MiB/s, qualified to the selected storage backend,
+        // not a universal SLA. seconds = ceil(combined fresh MiB / 16), not
+        // a per-claim ceil. Recalibrate if qualified guests on that backend
+        // are slower. Not cap#249: this never skips the in-guest zero scan.
         let seconds = u64::try_from(total_mib.div_ceil(16))
             .map_err(|_| "volume initialization duration is too large")?;
         self.rollout_timeout
@@ -186,6 +199,104 @@ mod tests {
                     },
                 )
                 .unwrap()
+        );
+    }
+
+    /// cap#257: pin the absolute arithmetic, not only relative ordering.
+    /// Default baseline is 600s. Selected fresh claims add
+    /// `ceil(total_fresh_MiB / 16)` seconds (two passes at the qualified
+    /// 32 MiB/s selected-backend estimate) on top of whatever baseline is
+    /// configured. The ceil is on the combined MiB, not per claim. An
+    /// initialized redeploy keeps the baseline alone, at any size.
+    /// Persistence of that result is covered by the API observer test, not
+    /// here.
+    #[test]
+    fn fresh_claim_budget_is_baseline_plus_two_passes_at_32_mib_s() {
+        let config = ApplyConfig::default();
+        let baseline = Duration::from_secs(600);
+        assert_eq!(config.rollout_timeout, baseline);
+
+        let initialized = config
+            .rollout_timeout_for_storage("2Ti", "2Ti", FreshVolumeClaims::NONE)
+            .unwrap();
+        assert_eq!(initialized, baseline);
+
+        // 1Gi = 1024 MiB; two passes at 32 MiB/s = 64s. TLS is not selected,
+        // so a huge tls quantity must not move the budget.
+        let app_only = config
+            .rollout_timeout_for_storage(
+                "1Gi",
+                "2Ti",
+                FreshVolumeClaims {
+                    app_data: true,
+                    tls_data: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(app_only, baseline + Duration::from_secs(64));
+
+        // 32Mi / 32 MiB/s * 2 = 2s. The unselected app quantity is ignored.
+        let tls_only = config
+            .rollout_timeout_for_storage(
+                "not-a-quantity",
+                "32Mi",
+                FreshVolumeClaims {
+                    app_data: false,
+                    tls_data: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(tls_only, baseline + Duration::from_secs(2));
+
+        // 33Mi does not divide 16: ceil(33/16) = 3, not a truncated 2.
+        let rounded = config
+            .rollout_timeout_for_storage(
+                "33Mi",
+                "1Gi",
+                FreshVolumeClaims {
+                    app_data: true,
+                    tls_data: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(rounded, baseline + Duration::from_secs(3));
+
+        let both = config
+            .rollout_timeout_for_storage("1Gi", "32Mi", FreshVolumeClaims::ALL)
+            .unwrap();
+        assert_eq!(both, baseline + Duration::from_secs(64 + 2));
+
+        // Combined ceil, not per-claim: 33+33 = 66 MiB, ceil(66/16) = 5,
+        // not 3+3.
+        let combined = config
+            .rollout_timeout_for_storage("33Mi", "33Mi", FreshVolumeClaims::ALL)
+            .unwrap();
+        assert_eq!(combined, baseline + Duration::from_secs(5));
+
+        // The allowance is added to the configured baseline, not a hardcoded
+        // 600 inside the function. A non-default baseline must survive.
+        let custom = ApplyConfig {
+            rollout_timeout: Duration::from_secs(90),
+            ..ApplyConfig::default()
+        };
+        assert_eq!(
+            custom
+                .rollout_timeout_for_storage("2Ti", "2Ti", FreshVolumeClaims::NONE)
+                .unwrap(),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            custom
+                .rollout_timeout_for_storage(
+                    "32Mi",
+                    "32Mi",
+                    FreshVolumeClaims {
+                        app_data: true,
+                        tls_data: false,
+                    },
+                )
+                .unwrap(),
+            Duration::from_secs(92)
         );
     }
 }
