@@ -42,16 +42,125 @@ const RENEW_TIMEOUT_SECONDS: u64 = 10;
 /// fail-closed: the fence is retained and revisited next cycle.
 const RETAINED_NAMESPACE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Overall budget for one reconciliation pass over every expired retained
-/// namespace fence. Entries the deadline cannot absorb keep their fence and
-/// are revisited next pass (the loop is periodic), so the bound can never
-/// strand a fence — it only stops one slow namespace from delaying the
-/// release of unrelated apps' fences.
-const RETAINED_FENCE_BATCH_DEADLINE: Duration = Duration::from_secs(120);
+/// Worst-case sequential Kubernetes calls for one admitted retained
+/// fence: the initial GET, a pinned DELETE, and a confirmation GET.
+/// Admission cannot know which arm the GET will take, so it reserves
+/// all three. A later wave that only has one probe window left would
+/// otherwise spend it on the GET, then rotate the cursor without
+/// issuing the DELETE (cap#373 review).
+const RETAINED_FENCE_SEQUENCE_CALLS: u32 = 3;
+
+/// Work that sits outside a timed-out probe before the next wave is
+/// polled. The GET timeout starts after the cursor stamp, and
+/// `buffer_unordered` pulls the next fence only after that task clears
+/// its claim. A batch equal to one probe plus one sequence therefore
+/// rejects the second wave with nearly a full sequence left — the
+/// timeout fires at or after the probe, not before it (cap#373 review).
+/// Shorter than one probe, so it does not buy a third wave. A round
+/// trip slower than this fails closed and leaves the fence at the head
+/// of the next pass.
+const RETAINED_FENCE_WAVE_SLACK: Duration = Duration::from_secs(5);
+
+/// Overall budget for one reconciliation pass over expired retained
+/// namespace fences: one probe (when the second wave is polled), plus
+/// [`RETAINED_FENCE_SEQUENCE_CALLS`] probe windows for that wave, plus
+/// [`RETAINED_FENCE_WAVE_SLACK`]. A fence is started only when that
+/// sequence still fits; the rest keep their older probe cursor and are
+/// resumed next pass (cap#240, cap#373 review). The bound still stops
+/// one slow pass from running on without limit — it no longer does that
+/// by handing later fences an expired timeout, by admitting a fence
+/// whose follow-ups cannot finish, or by skipping a wave that a full
+/// probe timeout left nearly a sequence.
+const RETAINED_FENCE_BATCH_DEADLINE: Duration = Duration::from_secs(
+    RETAINED_NAMESPACE_PROBE_TIMEOUT.as_secs() * (RETAINED_FENCE_SEQUENCE_CALLS as u64 + 1)
+        + RETAINED_FENCE_WAVE_SLACK.as_secs(),
+);
 
 /// Concurrent retained-fence reconciles per pass: enough parallelism that
 /// slow entries overlap, small enough not to monopolize the API pool.
 const RETAINED_FENCE_RECONCILE_CONCURRENCY: usize = 4;
+
+/// Shared deadline plus the full window one Kubernetes request needs.
+/// A fence is started only when [`RETAINED_FENCE_SEQUENCE_CALLS`] of
+/// those windows still fit before `batch_deadline` (cap#240, cap#373
+/// review). `captured_deadline` is taken after the cursor stamp, once
+/// that sequence budget is confirmed again, and with no further await
+/// before the first GET. Follow-up calls do not reuse that instant: a
+/// GET that consumed most of it would leave the pinned DELETE and the
+/// confirmation GET no time to finish, and a consistently slow API
+/// would never clear the fence (cap#373 review). Each later Kubernetes
+/// call takes its own probe window via
+/// [`ProbeWindow::follow_up_deadline`], still capped by `batch_deadline`.
+#[derive(Clone, Copy)]
+struct ProbeWindow {
+    batch_deadline: tokio::time::Instant,
+    probe_timeout: Duration,
+    captured_deadline: Option<tokio::time::Instant>,
+}
+
+impl ProbeWindow {
+    /// Deadline for the admitted probe. The captured instant is used when
+    /// set, so the first GET cannot start on a timeout an await after the
+    /// window check already expired.
+    fn request_deadline(&self) -> tokio::time::Instant {
+        self.captured_deadline
+            .unwrap_or_else(|| self.follow_up_deadline())
+    }
+
+    /// Fresh deadline for a Kubernetes call after the admitted GET (pinned
+    /// DELETE, absence confirmation, foreign-namespace bounding re-check).
+    /// Independent of [`Self::captured_deadline`]. Capped by the shared
+    /// batch deadline, so a call whose batch instant has already passed
+    /// fails closed instead of extending the pass.
+    fn follow_up_deadline(&self) -> tokio::time::Instant {
+        self.batch_deadline
+            .min(tokio::time::Instant::now() + self.probe_timeout)
+    }
+
+    /// True when a fence started now can run
+    /// [`RETAINED_FENCE_SEQUENCE_CALLS`] full probe timeouts without
+    /// crossing the batch deadline. One remaining probe window is not
+    /// enough: the GET would consume it and the pinned DELETE would see
+    /// an expired follow-up deadline.
+    fn has_sequence_budget(&self) -> bool {
+        let Some(sequence) = self
+            .probe_timeout
+            .checked_mul(RETAINED_FENCE_SEQUENCE_CALLS)
+        else {
+            return false;
+        };
+        match tokio::time::Instant::now().checked_add(sequence) {
+            Some(end) => end <= self.batch_deadline,
+            None => false,
+        }
+    }
+}
+
+/// Upper bound on fences one pass can start when every probe burns a full
+/// `probe_timeout`, at most `concurrency` run at once, and the first wave
+/// starts with the deadline still intact. Admission requires
+/// [`RETAINED_FENCE_SEQUENCE_CALLS`] probe windows. The next wave is
+/// polled after that timeout plus the stamp and the claim clear, so a
+/// batch equal to one probe plus one sequence counts a second wave here
+/// and then skips it (cap#373 review). [`RETAINED_FENCE_WAVE_SLACK`] is
+/// what makes the counted wave actually start.
+/// [`ProbeWindow::has_sequence_budget`] may start fewer if that overrun
+/// exceeds the slack, and a stamp that consumes the sequence is undone
+/// rather than counted as a probe (cap#240). This is not a guaranteed
+/// `ceil(n / fair_page)` bound.
+#[cfg(test)]
+fn retained_fence_fair_page(batch: Duration, probe: Duration, concurrency: usize) -> usize {
+    let probe_ms = probe.as_millis().max(1);
+    let sequence_ms = probe_ms.saturating_mul(u128::from(RETAINED_FENCE_SEQUENCE_CALLS));
+    let batch_ms = batch.as_millis();
+    if batch_ms < sequence_ms {
+        return 0;
+    }
+    // The next wave starts `probe` after the previous one burned its
+    // timeout. It is admitted only while a full sequence still fits.
+    let waves = usize::try_from((batch_ms - sequence_ms) / probe_ms + 1).unwrap_or(usize::MAX);
+    concurrency.saturating_mul(waves)
+}
 
 /// Marker written to `external_resource_mutation_leases.operation_kind` when a
 /// failed deployment apply intentionally retains its `kubernetes_namespace`
@@ -1318,8 +1427,12 @@ pub async fn reconcile_orphaned_deployment_apply_leases(
 /// name — redeploy or app delete — is rejected as `Busy` even after
 /// Kubernetes finishes the deletion.
 ///
-/// For every expired retained fence the Kubernetes API is asked whether the
-/// namespace still exists. An observed 404 authorizes the release: the exact
+/// For each expired retained fence this pass can give a full
+/// reconciliation sequence (GET, pinned DELETE, confirmation),
+/// the Kubernetes API is asked whether the namespace still exists. Fences
+/// the deadline cannot cover keep their older `updated_at` cursor and are
+/// resumed at the head of the next pass (cap#240) — a pass does not ask
+/// about every expired fence. An observed 404 authorizes the release: the exact
 /// owner/generation/marker row is cleared with a compare-and-swap that also
 /// requires the fence to still be expired, so a snapshot taken before the
 /// (potentially slow) GET cannot authorize the release. A GET error or a
@@ -1341,8 +1454,12 @@ pub async fn reconcile_orphaned_deployment_apply_leases(
 /// generation/expiry/no-remaining-resource guard the documented operator
 /// path uses, and only when a live app row still owns the namespace name,
 /// under that app's deployment-lane advisory lock (the same first lock
-/// `claim`/`finish` take). Multiple API replicas may run this concurrently —
-/// the CAS makes the release exactly-once and harmless to race.
+/// `claim`/`finish` take). Multiple API replicas may run this concurrently.
+/// The release CAS makes a clear exactly-once. The probe-cursor stamp
+/// compare-and-swaps the `updated_at` that replica selected and parks the
+/// claim in the future for the batch budget, so two replicas that loaded
+/// the same snapshot do not both probe that prefix, and a replica that
+/// selects later does not re-probe an in-flight fence.
 pub async fn release_retained_deployment_namespace_fences(
     pool: &PgPool,
     client: &kube::Client,
@@ -1354,31 +1471,177 @@ pub async fn release_retained_deployment_namespace_fences(
     release_retained_deployment_namespace_fences_with(pool, client.clone()).await
 }
 
-/// Expired retained namespace fences to probe this pass. `ORDER BY
-/// random()` ROTATES the candidate order between passes (Codex P2): with a
-/// bounded-concurrency batch under a shared deadline, a slow prefix
-/// returned in a stable order would starve every later fence of a real
-/// probe budget indefinitely (PostgreSQL is free to return the same slow
-/// rows first on every pass without an explicit order). `app_delete` fences
-/// are selected alongside the retained-apply marker (cap#336): the delete
-/// path arms the same infinite fence before its namespace DELETE and a
-/// provider error strands it identically.
+/// Expired retained namespace fences to probe this pass, oldest probe
+/// cursor first. `updated_at` is that cursor (cap#240): a pass stamps it
+/// only when it actually starts a probe, and restores the previous value
+/// if the stamp itself consumes the remaining sequence. The stamp claims the
+/// selected value with a compare-and-swap and parks it in the future for
+/// the batch budget, so a second replica holding this same snapshot skips
+/// that fence, and a replica that selects afterwards does not see it until
+/// the probe returns or the claim expires (cap#373 review). Fences that are
+/// not started stay older and are resumed next pass. A pass that still has
+/// a full reconciliation sequence when its first fence is polled starts
+/// that concurrent wave; scheduling delay may start fewer, so
+/// the bound is not `ceil(n / fair_page)`. `app_delete` fences are selected
+/// alongside the
+/// retained-apply marker (cap#336): the delete path arms the same infinite
+/// fence before its namespace DELETE and a provider error strands it
+/// identically.
 async fn select_expired_retained_namespace_fences(
     pool: &PgPool,
-) -> Result<Vec<(Uuid, String, Uuid, i64, String)>, MutationLeaseError> {
-    Ok(sqlx::query_as::<_, (Uuid, String, Uuid, i64, String)>(
+) -> Result<
+    Vec<(
+        Uuid,
+        String,
+        Uuid,
+        i64,
+        String,
+        chrono::DateTime<chrono::Utc>,
+    )>,
+    MutationLeaseError,
+> {
+    Ok(sqlx::query_as(
         "SELECT resource.owner_token, resource.resource_key, resource.operation_id, resource.generation,
-                resource.operation_kind
+                resource.operation_kind, resource.updated_at
            FROM external_resource_mutation_leases AS resource
           WHERE resource.resource_scope = 'kubernetes_namespace'
             AND resource.operation_kind IN ($1, 'app_delete')
             AND resource.reclaim_after = 'infinity'::timestamptz
             AND resource.locked_until <= clock_timestamp()
-          ORDER BY random()",
+            AND resource.updated_at <= clock_timestamp()
+          ORDER BY resource.updated_at ASC, resource.resource_key ASC",
     )
     .bind(RETAINED_DEPLOYMENT_NAMESPACE_OPERATION)
     .fetch_all(pool)
     .await?)
+}
+
+/// Move a fence we are about to probe behind fences this pass will not
+/// start, and hide it from other replicas until the claim expires.
+/// Returns the stamped `updated_at` so a stamp that consumes the
+/// reconciliation sequence can be undone, and so the caller can drop the
+/// claim when the probe returns. The compare-and-swap stays on the expired retained row
+/// and on the `updated_at` this replica selected, so a release, a renew,
+/// or another replica that already claimed this cursor is left alone and
+/// the caller skips the probe. The new cursor is in the future by
+/// `claim_secs` (the batch budget). Selection ignores a future cursor, so
+/// a replica that loads its snapshot after this stamp does not re-probe
+/// the fence while the claim is in flight (cap#373 review). `locked_until`
+/// is not touched: the settle margin that bounds a foreign namespace reads it.
+#[allow(clippy::too_many_arguments)]
+async fn stamp_retained_fence_probe(
+    pool: &PgPool,
+    namespace: &str,
+    owner_token: Uuid,
+    generation: i64,
+    operation_id: Uuid,
+    operation_kind: &str,
+    previous_updated_at: chrono::DateTime<chrono::Utc>,
+    claim_secs: i64,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, MutationLeaseError> {
+    Ok(sqlx::query_scalar(
+        "UPDATE external_resource_mutation_leases
+            SET updated_at = clock_timestamp()
+                    + ($7::bigint * interval '1 second')
+          WHERE resource_scope = 'kubernetes_namespace'
+            AND resource_key = $1
+            AND owner_token = $2
+            AND generation = $3
+            AND operation_id = $4
+            AND operation_kind = $5
+            AND reclaim_after = 'infinity'::timestamptz
+            AND locked_until <= clock_timestamp()
+            AND updated_at = $6
+            AND updated_at <= clock_timestamp()
+        RETURNING updated_at",
+    )
+    .bind(namespace)
+    .bind(owner_token)
+    .bind(generation)
+    .bind(operation_id)
+    .bind(operation_kind)
+    .bind(previous_updated_at)
+    .bind(claim_secs)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Put a probe cursor back where the select found it. Only the value this
+/// pass just stamped is restored, so a concurrent writer that moved the
+/// cursor further is left alone. A zero-row update means the fence was
+/// released or renewed; there is nothing to probe.
+#[allow(clippy::too_many_arguments)]
+async fn restore_retained_fence_probe_cursor(
+    pool: &PgPool,
+    namespace: &str,
+    owner_token: Uuid,
+    generation: i64,
+    operation_id: Uuid,
+    operation_kind: &str,
+    previous_updated_at: chrono::DateTime<chrono::Utc>,
+    stamped_updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), MutationLeaseError> {
+    sqlx::query(
+        "UPDATE external_resource_mutation_leases
+            SET updated_at = $7
+          WHERE resource_scope = 'kubernetes_namespace'
+            AND resource_key = $1
+            AND owner_token = $2
+            AND generation = $3
+            AND operation_id = $4
+            AND operation_kind = $5
+            AND reclaim_after = 'infinity'::timestamptz
+            AND locked_until <= clock_timestamp()
+            AND updated_at = $6",
+    )
+    .bind(namespace)
+    .bind(owner_token)
+    .bind(generation)
+    .bind(operation_id)
+    .bind(operation_kind)
+    .bind(stamped_updated_at)
+    .bind(previous_updated_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Drop an in-flight probe claim so the fence is selectable again and
+/// sorts behind fences this pass did not start. Only the future cursor
+/// this pass stamped is moved, so a peer that claimed the row after the
+/// claim expired is left alone. A zero-row update means the fence was
+/// released; the release already wrote its own `updated_at`.
+#[allow(clippy::too_many_arguments)]
+async fn clear_retained_fence_probe_claim(
+    pool: &PgPool,
+    namespace: &str,
+    owner_token: Uuid,
+    generation: i64,
+    operation_id: Uuid,
+    operation_kind: &str,
+    stamped_updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), MutationLeaseError> {
+    sqlx::query(
+        "UPDATE external_resource_mutation_leases
+            SET updated_at = clock_timestamp()
+          WHERE resource_scope = 'kubernetes_namespace'
+            AND resource_key = $1
+            AND owner_token = $2
+            AND generation = $3
+            AND operation_id = $4
+            AND operation_kind = $5
+            AND reclaim_after = 'infinity'::timestamptz
+            AND updated_at = $6",
+    )
+    .bind(namespace)
+    .bind(owner_token)
+    .bind(generation)
+    .bind(operation_id)
+    .bind(operation_kind)
+    .bind(stamped_updated_at)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Retry the UID+resourceVersion-pinned namespace DELETE for a retained
@@ -1395,10 +1658,10 @@ async fn retry_retained_namespace_delete(
     namespace: &str,
     uid: String,
     resource_version: String,
-    batch_deadline: tokio::time::Instant,
+    window: ProbeWindow,
 ) -> bool {
     match tokio::time::timeout_at(
-        batch_deadline.min(tokio::time::Instant::now() + RETAINED_NAMESPACE_PROBE_TIMEOUT),
+        window.follow_up_deadline(),
         api.delete(
             namespace,
             &kube::api::DeleteParams {
@@ -1433,15 +1696,12 @@ async fn retry_retained_namespace_delete(
             return false;
         }
     }
-    // The delete was accepted. Confirm absence within the probe budget;
-    // a still-live object (Terminating under finalizers) retains the fence
-    // and converges via the deletionTimestamp path on the next cycle.
-    match tokio::time::timeout_at(
-        batch_deadline.min(tokio::time::Instant::now() + RETAINED_NAMESPACE_PROBE_TIMEOUT),
-        api.get_opt(namespace),
-    )
-    .await
-    {
+    // The delete was accepted. Confirm absence on a fresh probe window,
+    // not whatever the DELETE left of its own — a slow accept must not
+    // starve the 404 check. A still-live object (Terminating under
+    // finalizers) retains the fence and converges via the
+    // deletionTimestamp path on the next cycle.
+    match tokio::time::timeout_at(window.follow_up_deadline(), api.get_opt(namespace)).await {
         Ok(Ok(None)) => true,
         Ok(Ok(Some(_))) => {
             tracing::info!(
@@ -1474,43 +1734,169 @@ async fn release_retained_deployment_namespace_fences_with(
     pool: &PgPool,
     client: kube::Client,
 ) -> Result<u64, MutationLeaseError> {
+    release_retained_deployment_namespace_fences_budgeted(
+        pool,
+        client,
+        RETAINED_FENCE_BATCH_DEADLINE,
+        RETAINED_NAMESPACE_PROBE_TIMEOUT,
+        RETAINED_FENCE_RECONCILE_CONCURRENCY,
+    )
+    .await
+}
+
+/// Same as [`release_retained_deployment_namespace_fences_with`] with an
+/// injectable budget so tests can exhaust a slow-probe pass in milliseconds.
+/// Production callers pass the module constants.
+async fn release_retained_deployment_namespace_fences_budgeted(
+    pool: &PgPool,
+    client: kube::Client,
+    batch_budget: Duration,
+    probe_timeout: Duration,
+    concurrency: usize,
+) -> Result<u64, MutationLeaseError> {
     let retained = select_expired_retained_namespace_fences(pool).await?;
     if retained.is_empty() {
         return Ok(0);
     }
     let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
-    // Codex P2: bound the whole batch. A sequential loop let one slow
-    // namespace (probe + retry DELETE + confirmation, each up to 30 s)
-    // delay the release of every later fence — an unrelated app whose
-    // namespace is already absent stayed Busy behind entries it does not
-    // care about. Every request is capped by the remaining batch deadline
-    // and entries are reconciled with bounded concurrency; anything the
-    // deadline cannot absorb is simply retained and revisited next pass
-    // (the loop is periodic), never dropped.
-    let batch_deadline = tokio::time::Instant::now() + RETAINED_FENCE_BATCH_DEADLINE;
+    // Codex P2 bounded the pass so one slow namespace could not delay every
+    // later fence. cap#240: that shared deadline itself starved later fences
+    // when a slow prefix burned it. Start a probe only while a full
+    // reconciliation sequence remains, and stamp `updated_at` so the next
+    // pass resumes at the fences this pass did not start. Fast probes still
+    // drain the whole set in one pass — there is no hard page cap.
+    let window = ProbeWindow {
+        batch_deadline: tokio::time::Instant::now() + batch_budget,
+        probe_timeout,
+        captured_deadline: None,
+    };
+    // A claim lasts the batch budget, measured from the stamp on the
+    // Postgres clock. Selection ignores that future cursor. Kubernetes
+    // calls are capped by the batch deadline, but the release transaction
+    // can still be waiting on the deployment-lane lock after the claim
+    // expires; a peer may then start a duplicate probe. The release
+    // compare-and-swap still makes the clear exactly-once. The claim is
+    // cleared when the probe returns; a crash leaves it until this
+    // interval elapses. `locked_until` is not the claim.
+    let claim_secs = i64::try_from(batch_budget.as_secs()).unwrap_or(i64::MAX);
     let results = {
         use futures::StreamExt as _;
         futures::stream::iter(retained)
             .map(
-                |(owner_token, namespace, operation_id, generation, operation_kind)| {
+                |(
+                    owner_token,
+                    namespace,
+                    operation_id,
+                    generation,
+                    operation_kind,
+                    previous_updated_at,
+                )| {
                     let api = api.clone();
                     let pool = pool.clone();
                     async move {
-                        reconcile_one_retained_namespace(
+                        // cap#240 / cap#373: do not start a probe the shared
+                        // deadline cannot give a full reconciliation sequence
+                        // (GET, pinned DELETE, confirmation). Leaving
+                        // `updated_at` untouched is what puts this fence ahead
+                        // of the ones we do start, on the next pass. One
+                        // remaining probe window is not that sequence: the
+                        // GET would consume it and the DELETE would see an
+                        // expired follow-up deadline, then the cursor clear
+                        // would rotate a fence that never completed.
+                        if !window.has_sequence_budget() {
+                            tracing::debug!(
+                                namespace = %namespace,
+                                "retained-namespace fence deferred; batch deadline cannot cover the reconciliation sequence"
+                            );
+                            return Ok(false);
+                        }
+                        // Claim the cursor this replica selected. The stamp
+                        // is in the future, so a peer that selects after it
+                        // does not see this fence. A peer that already
+                        // loaded the same snapshot loses the CAS and skips;
+                        // the stream then pulls a later fence.
+                        let Some(stamped_updated_at) = stamp_retained_fence_probe(
+                            &pool,
+                            &namespace,
+                            owner_token,
+                            generation,
+                            operation_id,
+                            &operation_kind,
+                            previous_updated_at,
+                            claim_secs,
+                        )
+                        .await?
+                        else {
+                            return Ok(false);
+                        };
+                        // The stamp is an await. If it consumed the sequence
+                        // budget, put the cursor back and do not call
+                        // reconcile — an expired timeout_at is not a probe,
+                        // and a moved cursor would send this fence to the
+                        // back of the queue.
+                        if !window.has_sequence_budget() {
+                            restore_retained_fence_probe_cursor(
+                                &pool,
+                                &namespace,
+                                owner_token,
+                                generation,
+                                operation_id,
+                                &operation_kind,
+                                previous_updated_at,
+                                stamped_updated_at,
+                            )
+                            .await?;
+                            tracing::debug!(
+                                namespace = %namespace,
+                                "retained-namespace fence probe cursor restored; stamp consumed the reconciliation sequence"
+                            );
+                            return Ok(false);
+                        }
+                        // No await between this capture and the first GET.
+                        // Follow-ups do not reuse it; see follow_up_deadline.
+                        let window = ProbeWindow {
+                            captured_deadline: Some(
+                                tokio::time::Instant::now() + window.probe_timeout,
+                            ),
+                            ..window
+                        };
+                        let outcome = reconcile_one_retained_namespace(
                             &pool,
                             &api,
                             owner_token,
-                            namespace,
+                            namespace.clone(),
                             operation_id,
                             generation,
                             &operation_kind,
-                            batch_deadline,
+                            window,
+                        )
+                        .await;
+                        // Drop the in-flight claim so a retained fence is
+                        // eligible next pass, behind fences this pass did
+                        // not start. A release already cleared the owner
+                        // and matches zero rows.
+                        if let Err(error) = clear_retained_fence_probe_claim(
+                            &pool,
+                            &namespace,
+                            owner_token,
+                            generation,
+                            operation_id,
+                            &operation_kind,
+                            stamped_updated_at,
                         )
                         .await
+                        {
+                            tracing::warn!(
+                                namespace = %namespace,
+                                error = %error,
+                                "retained-namespace fence probe claim could not be cleared; cursor stays hidden until it expires"
+                            );
+                        }
+                        outcome
                     }
                 },
             )
-            .buffer_unordered(RETAINED_FENCE_RECONCILE_CONCURRENCY)
+            .buffer_unordered(concurrency.max(1))
             .collect::<Vec<_>>()
             .await
     };
@@ -1556,7 +1942,7 @@ async fn bound_stranded_foreign_namespace_fence(
     namespace: &str,
     operation_id: Uuid,
     generation: i64,
-    batch_deadline: tokio::time::Instant,
+    window: ProbeWindow,
 ) -> Result<bool, MutationLeaseError> {
     let mut tx = pool.begin().await?;
     let lane_app: Option<Uuid> = sqlx::query_scalar(
@@ -1610,7 +1996,7 @@ async fn bound_stranded_foreign_namespace_fence(
     // retained and the deleting/absence arms converge on their own safe
     // resolutions. GET errors and timeouts roll back too (fail closed).
     let still_live_and_not_deleting = match tokio::time::timeout_at(
-        batch_deadline.min(tokio::time::Instant::now() + RETAINED_NAMESPACE_PROBE_TIMEOUT),
+        window.follow_up_deadline(),
         api.get_opt(namespace),
     )
     .await
@@ -1679,8 +2065,14 @@ async fn retained_marker_namespace_provenance(
 /// kind — [`RETAINED_DEPLOYMENT_NAMESPACE_OPERATION`] or `app_delete`; only
 /// the retained marker authorizes the live-namespace retry/bounding arms
 /// below, while an `app_delete` fence releases on the observed 404 alone
-/// (cap#336). `batch_deadline` caps every Kubernetes request so one entry
-/// cannot stretch the caller's batch budget.
+/// (cap#336). `window` caps every Kubernetes request in this entry. The
+/// captured deadline applies only to the initial GET. The pinned DELETE,
+/// the absence confirmation, and the foreign-namespace re-check each take
+/// a fresh probe window still capped by the batch deadline, so a slow GET
+/// cannot starve the call that clears the fence (cap#373 review).
+/// Admission reserves that full sequence before the first GET, so the
+/// cap is not already expired when the DELETE starts. A follow-up whose
+/// batch deadline has already passed fails closed.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_one_retained_namespace(
     pool: &PgPool,
@@ -1690,18 +2082,15 @@ async fn reconcile_one_retained_namespace(
     operation_id: Uuid,
     generation: i64,
     operation_kind: &str,
-    batch_deadline: tokio::time::Instant,
+    window: ProbeWindow,
 ) -> Result<bool, MutationLeaseError> {
     {
         // Bound each individual probe so one stalled Kubernetes GET cannot
         // block this reconciliation beyond the batch budget. A timed-out
         // probe is treated exactly like a GET error: retain the fence and
         // revisit next cycle.
-        let live = match tokio::time::timeout_at(
-            batch_deadline.min(tokio::time::Instant::now() + RETAINED_NAMESPACE_PROBE_TIMEOUT),
-            api.get_opt(&namespace),
-        )
-        .await
+        let live = match tokio::time::timeout_at(window.request_deadline(), api.get_opt(&namespace))
+            .await
         {
             Ok(Ok(live)) => live,
             Ok(Err(error)) => {
@@ -1815,7 +2204,7 @@ async fn reconcile_one_retained_namespace(
                         &namespace,
                         operation_id,
                         generation,
-                        batch_deadline,
+                        window,
                     )
                     .await;
                 }
@@ -1857,7 +2246,7 @@ async fn reconcile_one_retained_namespace(
                             &namespace,
                             uid,
                             resource_version,
-                            batch_deadline,
+                            window,
                         )
                         .await
                         {
@@ -1890,7 +2279,7 @@ async fn reconcile_one_retained_namespace(
                             &namespace,
                             operation_id,
                             generation,
-                            batch_deadline,
+                            window,
                         )
                         .await;
                     }
@@ -3993,7 +4382,11 @@ pub(crate) mod tests {
                 operation_id,
                 generation,
                 RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
-                tokio::time::Instant::now() + Duration::from_secs(5)
+                ProbeWindow {
+                    batch_deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                    probe_timeout: RETAINED_NAMESPACE_PROBE_TIMEOUT,
+                    captured_deadline: None,
+                },
             )
             .await
             .unwrap()
@@ -4008,7 +4401,11 @@ pub(crate) mod tests {
                 operation_id,
                 generation,
                 RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
-                tokio::time::Instant::now() + Duration::from_secs(5)
+                ProbeWindow {
+                    batch_deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                    probe_timeout: RETAINED_NAMESPACE_PROBE_TIMEOUT,
+                    captured_deadline: None,
+                },
             )
             .await
             .unwrap()
@@ -4649,6 +5046,1651 @@ pub(crate) mod tests {
                 .execute(&pool)
                 .await
                 .expect("remove provenance-fixture organization");
+        }
+    }
+
+    /// cap#240: a slow prefix must not starve a later retained fence. The
+    /// first `fair_page` probes each burn the full probe timeout, so the
+    /// shared batch deadline is spent before a fence ordered after them can
+    /// start. The next pass has to give that fence a real GET — not an
+    /// already-expired timeout — and release it when the namespace is gone.
+    #[tokio::test]
+    async fn later_retained_fence_is_probed_after_slow_prefix_exhausts_the_batch() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let probe = Duration::from_secs(2);
+        // One wave per pass. The sequence is three probe windows (6s);
+        // the extra second is slack so the cursor stamp's Postgres
+        // round-trip cannot eat the budget the way 20ms did. A batch
+        // equal to the sequence would defer everyone: a few microseconds
+        // elapse before the first future is polled. The next wave, one
+        // probe later, no longer holds a full sequence.
+        let batch = Duration::from_secs(7);
+        let concurrency = 4usize;
+        let page = retained_fence_fair_page(batch, probe, concurrency);
+        assert_eq!(
+            page, concurrency,
+            "7s admits exactly one wave of `concurrency`; the next wave no longer holds a 6s sequence"
+        );
+        // Two full pages of slow fences ahead of the deleted namespace, so
+        // it must survive pass 1 and pass 2 and release on pass 3.
+        let slow_count = concurrency * 2;
+
+        let pool = database_test_pool(4).await;
+        // A previous panic leaves expired retained fences in this database,
+        // and the reconciler selects every one of them. Drop those leftovers
+        // before staging so the page under test is the only page.
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND (resource_key LIKE 'retained-kube-%'
+                  OR resource_key LIKE 'delete-fence-%')",
+        )
+        .execute(&pool)
+        .await
+        .expect("drop leftover retained-fence fixtures");
+        let mut slow_namespaces = Vec::with_capacity(slow_count);
+        let mut orgs = Vec::with_capacity(slow_count + 1);
+        for _ in 0..slow_count {
+            let (org, _app, _token, namespace) =
+                stage_retained_namespace_fixture(&pool, Vec::new()).await;
+            slow_namespaces.push(namespace);
+            orgs.push(org);
+        }
+        let (victim_org, _app, _token, victim_namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        orgs.push(victim_org);
+        // Oldest-first cursor: the slow prefix sorts ahead of the deleted
+        // namespace, which is the starvation order cap#240 describes.
+        for namespace in &slow_namespaces {
+            sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                    SET updated_at = clock_timestamp() - interval '2 hours'
+                  WHERE resource_scope = 'kubernetes_namespace'
+                    AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("age slow-prefix cursor");
+        }
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET updated_at = clock_timestamp() - interval '1 hour'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .execute(&pool)
+        .await
+        .expect("age victim cursor behind the slow prefix");
+
+        let gets = Arc::new(Mutex::new(Vec::<String>::new()));
+        let slow = Arc::new(slow_namespaces.clone());
+        let victim = victim_namespace.clone();
+        let hang = probe * 5;
+        let app = Router::new().fallback({
+            let gets = Arc::clone(&gets);
+            let slow = Arc::clone(&slow);
+            let victim = victim.clone();
+            move |request: axum::extract::Request| {
+                let gets = Arc::clone(&gets);
+                let slow = Arc::clone(&slow);
+                let victim = victim.clone();
+                async move {
+                    let name = request
+                        .uri()
+                        .path()
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    if request.method() == axum::http::Method::GET
+                        && (slow.iter().any(|namespace| namespace == &name) || name == victim)
+                    {
+                        gets.lock().await.push(name.clone());
+                    }
+                    if name == victim {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "reason": "NotFound",
+                                "message": "namespaces \"victim\" not found",
+                                "code": 404
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if slow.iter().any(|namespace| namespace == &name) {
+                        tokio::time::sleep(hang).await;
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "reason": "InternalError",
+                                "message": "slow",
+                                "code": 500
+                            })),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Failure",
+                            "reason": "NotFound",
+                            "code": 404
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow-prefix mock API");
+        let address = listener.local_addr().expect("slow-prefix mock address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve slow-prefix mock API");
+        });
+        let client = mock_kube_client(&format!("http://{address}"));
+
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            client.clone(),
+            batch,
+            probe,
+            concurrency,
+        )
+        .await
+        .expect("first pass");
+        let pass1 = gets.lock().await.clone();
+        let contacted_slow: Vec<String> = pass1
+            .iter()
+            .filter(|name| slow_namespaces.iter().any(|namespace| namespace == *name))
+            .cloned()
+            .collect();
+        let rotated: bool = sqlx::query_scalar(
+            "SELECT COALESCE(bool_and(probed.updated_at > victim.updated_at), false)
+               FROM external_resource_mutation_leases AS probed
+               JOIN external_resource_mutation_leases AS victim
+                 ON victim.resource_scope = 'kubernetes_namespace'
+                AND victim.resource_key = $1
+              WHERE probed.resource_scope = 'kubernetes_namespace'
+                AND probed.resource_key = ANY($2)",
+        )
+        .bind(&victim_namespace)
+        .bind(&contacted_slow)
+        .fetch_one(&pool)
+        .await
+        .expect("compare probe cursor");
+        assert!(
+            rotated,
+            "a started probe must rotate that fence behind fences this pass did not start; gets={pass1:?}"
+        );
+        assert!(
+            !pass1.iter().any(|name| name == &victim_namespace),
+            "the later fence must not be probed once the batch window is spent; gets={pass1:?}"
+        );
+        assert_eq!(
+            released, 0,
+            "the deleted namespace is past the first page and must stay fenced"
+        );
+
+        gets.lock().await.clear();
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            client.clone(),
+            batch,
+            probe,
+            concurrency,
+        )
+        .await
+        .expect("second pass");
+        let pass2 = gets.lock().await.clone();
+        assert!(
+            !pass2.iter().any(|name| name == &victim_namespace),
+            "the second page of slow fences must still be ahead of the victim; gets={pass2:?}"
+        );
+        assert_eq!(
+            released, 0,
+            "the deleted namespace is still past the second page"
+        );
+
+        gets.lock().await.clear();
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            client,
+            batch,
+            probe,
+            concurrency,
+        )
+        .await
+        .expect("third pass");
+        let pass3 = gets.lock().await.clone();
+        assert!(
+            pass3.iter().any(|name| name == &victim_namespace),
+            "pass 3 must GET the fence the first two passes skipped; gets={pass3:?}"
+        );
+        assert_eq!(
+            released, 1,
+            "the skipped deleted namespace must release on the pass that probes it"
+        );
+        let victim_released: bool = sqlx::query_scalar(
+            "SELECT owner_token IS NULL
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read victim fence after the 404 probe");
+        assert!(
+            victim_released,
+            "the victim GET must have observed 404 and cleared that fence, not some other row"
+        );
+
+        server.abort();
+        for namespace in slow_namespaces
+            .iter()
+            .chain(std::iter::once(&victim_namespace))
+        {
+            sqlx::query(
+                "DELETE FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("remove starvation-fixture fence");
+        }
+        for org in orgs {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(&pool)
+                .await
+                .expect("remove starvation-fixture organization");
+        }
+    }
+
+    #[test]
+    fn retained_fence_production_page_fits_inside_the_batch_deadline() {
+        let page = retained_fence_fair_page(
+            RETAINED_FENCE_BATCH_DEADLINE,
+            RETAINED_NAMESPACE_PROBE_TIMEOUT,
+            RETAINED_FENCE_RECONCILE_CONCURRENCY,
+        );
+        // Two waves of concurrency 4. The second is polled after one full
+        // probe plus stamp and claim-clear, and still has a 90s sequence
+        // (GET, pinned DELETE, confirmation). Exact equality (probe +
+        // sequence) counts that wave and then skips it: the timeout fires
+        // at or after the probe. A third wave must not fit.
+        assert_eq!(page, 8);
+        let waves = page / RETAINED_FENCE_RECONCILE_CONCURRENCY;
+        assert_eq!(waves, 2);
+        assert_eq!(
+            RETAINED_FENCE_BATCH_DEADLINE,
+            RETAINED_NAMESPACE_PROBE_TIMEOUT * (RETAINED_FENCE_SEQUENCE_CALLS + 1)
+                + RETAINED_FENCE_WAVE_SLACK,
+            "production must be probe + sequence + slack, not the 120s equality that skips the second wave"
+        );
+        assert!(
+            RETAINED_FENCE_WAVE_SLACK < RETAINED_NAMESPACE_PROBE_TIMEOUT,
+            "wave slack must not be large enough for fair_page to count a third wave"
+        );
+        let second_wave = RETAINED_NAMESPACE_PROBE_TIMEOUT;
+        assert!(
+            second_wave
+                + RETAINED_FENCE_WAVE_SLACK
+                + RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS
+                <= RETAINED_FENCE_BATCH_DEADLINE,
+            "the second wave, polled after the timeout plus slack, must still hold a full sequence"
+        );
+        let third_wave = RETAINED_NAMESPACE_PROBE_TIMEOUT * 2;
+        assert!(
+            third_wave + RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS
+                > RETAINED_FENCE_BATCH_DEADLINE,
+            "a third wave must not fit; admitting it with one probe left rotates an unfinished fence"
+        );
+        // A live owned retry is three Kubernetes calls (GET, pinned DELETE,
+        // confirmation), each allowed a full probe window capped by the
+        // batch. A batch shorter than that reintroduces the never-clears
+        // bug even for a fence admitted at the start of the pass. The
+        // remainder after that sequence is also sqlx's default
+        // acquire_timeout (30s); DB work between those calls has to fit
+        // in it when the fence is admitted at the start.
+        let remainder = RETAINED_FENCE_BATCH_DEADLINE
+            - RETAINED_NAMESPACE_PROBE_TIMEOUT * RETAINED_FENCE_SEQUENCE_CALLS;
+        assert!(
+            remainder >= Duration::from_secs(30),
+            "DB work between the three calls has to fit in sqlx's default acquire_timeout when the fence is admitted at the start"
+        );
+    }
+
+    /// A healthy pass (every namespace already gone) must still release the
+    /// whole set in one call. The fairness gate only stops probes that would
+    /// start without a full window; it must not hard-cap a pass whose probes
+    /// return immediately. `fair_page + 1` is the count a static LIMIT would
+    /// leave short.
+    #[tokio::test]
+    async fn retained_fence_pass_releases_every_absent_namespace_when_probes_are_fast() {
+        let fence_count = retained_fence_fair_page(
+            RETAINED_FENCE_BATCH_DEADLINE,
+            RETAINED_NAMESPACE_PROBE_TIMEOUT,
+            RETAINED_FENCE_RECONCILE_CONCURRENCY,
+        ) + 1;
+        let pool = database_test_pool(4).await;
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND (resource_key LIKE 'retained-kube-%'
+                  OR resource_key LIKE 'delete-fence-%')",
+        )
+        .execute(&pool)
+        .await
+        .expect("drop leftover retained-fence fixtures");
+        let mut orgs = Vec::with_capacity(fence_count);
+        let mut namespaces = Vec::with_capacity(fence_count);
+        for _ in 0..fence_count {
+            let (org, _app, _token, namespace) =
+                stage_retained_namespace_fixture(&pool, Vec::new()).await;
+            orgs.push(org);
+            namespaces.push(namespace);
+        }
+        let (server_url, mode, server) =
+            mock_namespace_api_server(None, Arc::new(std::sync::atomic::AtomicI64::new(0))).await;
+        mode.store(MOCK_NS_ABSENT, std::sync::atomic::Ordering::SeqCst);
+        let client = mock_kube_client(&server_url);
+        let released = release_retained_deployment_namespace_fences_with(&pool, client)
+            .await
+            .expect("fast pass");
+        assert_eq!(
+            released, fence_count as u64,
+            "instant 404s must all release in one pass; a hard page cap would leave some Busy"
+        );
+        server.abort();
+        for namespace in &namespaces {
+            sqlx::query(
+                "DELETE FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("remove fast-pass fixture fence");
+        }
+        for org in orgs {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(&pool)
+                .await
+                .expect("remove fast-pass fixture organization");
+        }
+    }
+
+    /// cap#373 review: two replicas that selected the same oldest-first
+    /// cursor must not both stamp it. The update compare-and-swaps that
+    /// `updated_at`; the loser skips the probe. Restoring the winner's
+    /// stamp puts the cursor back, so a replica that did not probe can
+    /// claim it on a later pass.
+    #[tokio::test]
+    async fn retained_fence_probe_cursor_is_claimed_once_per_selected_updated_at() {
+        let pool = database_test_pool(2).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let (org, _app, _token, namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET updated_at = clock_timestamp() - interval '1 hour'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("age the fixture cursor so a won stamp must move it");
+        let selected = select_expired_retained_namespace_fences(&pool)
+            .await
+            .expect("select expired retained fences");
+        let (
+            owner_token,
+            selected_namespace,
+            operation_id,
+            generation,
+            operation_kind,
+            previous_updated_at,
+        ) = selected
+            .into_iter()
+            .find(|row| row.1 == namespace)
+            .expect("fixture fence is selected");
+        assert_eq!(selected_namespace, namespace);
+
+        let (first, second) = tokio::join!(
+            stamp_retained_fence_probe(
+                &pool,
+                &namespace,
+                owner_token,
+                generation,
+                operation_id,
+                &operation_kind,
+                previous_updated_at,
+                120,
+            ),
+            stamp_retained_fence_probe(
+                &pool,
+                &namespace,
+                owner_token,
+                generation,
+                operation_id,
+                &operation_kind,
+                previous_updated_at,
+                120,
+            ),
+        );
+        let first = first.expect("first claim");
+        let second = second.expect("second claim");
+        let wins = [first, second].into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(
+            wins.len(),
+            1,
+            "two replicas holding the same selected cursor must not both claim it"
+        );
+        let stamped = wins[0];
+        assert_ne!(
+            stamped, previous_updated_at,
+            "a won claim must move the probe cursor"
+        );
+        let hidden = select_expired_retained_namespace_fences(&pool)
+            .await
+            .expect("select while the claim is in flight");
+        assert!(
+            hidden.iter().all(|row| row.1 != namespace),
+            "a replica that selects after the stamp must not see the in-flight fence"
+        );
+        let third = stamp_retained_fence_probe(
+            &pool,
+            &namespace,
+            owner_token,
+            generation,
+            operation_id,
+            &operation_kind,
+            previous_updated_at,
+            120,
+        )
+        .await
+        .expect("third claim");
+        assert!(
+            third.is_none(),
+            "a later replica still holding the pre-claim cursor must not stamp over the winner"
+        );
+
+        restore_retained_fence_probe_cursor(
+            &pool,
+            &namespace,
+            owner_token,
+            generation,
+            operation_id,
+            &operation_kind,
+            previous_updated_at,
+            stamped,
+        )
+        .await
+        .expect("restore cursor");
+        let after_restore = stamp_retained_fence_probe(
+            &pool,
+            &namespace,
+            owner_token,
+            generation,
+            operation_id,
+            &operation_kind,
+            previous_updated_at,
+            120,
+        )
+        .await
+        .expect("claim after restore");
+        assert!(
+            after_restore.is_some(),
+            "restoring the cursor must make the unprobed fence claimable again"
+        );
+
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("remove claim-fixture fence");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("remove claim-fixture organization");
+    }
+
+    /// cap#373 review: a replica that starts after another has stamped must
+    /// not GET that fence. The claim parks `updated_at` in the future;
+    /// selection ignores it. Clearing the claim makes the next pass probe
+    /// and release an absent namespace. `locked_until` is not the claim.
+    #[tokio::test]
+    async fn later_pass_does_not_reprobe_an_in_flight_retained_fence_claim() {
+        let pool = database_test_pool(2).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let (org, _app, _token, namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET updated_at = clock_timestamp() - interval '1 hour'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("age the fixture cursor");
+        let (
+            owner_token,
+            _selected_namespace,
+            operation_id,
+            generation,
+            operation_kind,
+            previous_updated_at,
+        ) = select_expired_retained_namespace_fences(&pool)
+            .await
+            .expect("select expired retained fences")
+            .into_iter()
+            .find(|row| row.1 == namespace)
+            .expect("fixture fence is selected");
+        let stamped = stamp_retained_fence_probe(
+            &pool,
+            &namespace,
+            owner_token,
+            generation,
+            operation_id,
+            &operation_kind,
+            previous_updated_at,
+            120,
+        )
+        .await
+        .expect("claim")
+        .expect("the selected cursor is claimable");
+
+        let (server_url, mode, server) =
+            mock_namespace_api_server(None, Arc::new(std::sync::atomic::AtomicI64::new(0))).await;
+        mode.store(MOCK_NS_ABSENT, std::sync::atomic::Ordering::SeqCst);
+        let client = mock_kube_client(&server_url);
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            client.clone(),
+            Duration::from_secs(7),
+            Duration::from_secs(2),
+            1,
+        )
+        .await
+        .expect("pass while the claim is held");
+        assert_eq!(
+            released, 0,
+            "a later pass must not probe a cursor another replica still holds"
+        );
+        let still_owned: bool = sqlx::query_scalar(
+            "SELECT owner_token IS NOT NULL
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("owner during the in-flight claim");
+        assert!(
+            still_owned,
+            "skipping the in-flight fence must not release it"
+        );
+
+        clear_retained_fence_probe_claim(
+            &pool,
+            &namespace,
+            owner_token,
+            generation,
+            operation_id,
+            &operation_kind,
+            stamped,
+        )
+        .await
+        .expect("clear the claim");
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            client,
+            Duration::from_secs(7),
+            Duration::from_secs(2),
+            1,
+        )
+        .await
+        .expect("pass after the claim is cleared");
+        assert_eq!(
+            released, 1,
+            "clearing the claim must let the next pass probe and release the absent namespace"
+        );
+
+        server.abort();
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("remove in-flight-claim fixture fence");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("remove in-flight-claim fixture organization");
+    }
+
+    #[test]
+    fn follow_up_deadline_ignores_a_nearly_spent_captured_instant() {
+        let now = tokio::time::Instant::now();
+        let window = ProbeWindow {
+            batch_deadline: now + Duration::from_secs(90),
+            probe_timeout: Duration::from_secs(30),
+            captured_deadline: Some(now + Duration::from_millis(200)),
+        };
+        assert_eq!(
+            window.request_deadline(),
+            window.captured_deadline.unwrap(),
+            "the admitted GET keeps the captured instant"
+        );
+        let follow = window.follow_up_deadline();
+        assert!(
+            follow > now + Duration::from_secs(20),
+            "a follow-up must not inherit a nearly spent GET deadline"
+        );
+        assert!(follow <= window.batch_deadline);
+
+        let expired = ProbeWindow {
+            batch_deadline: now - Duration::from_secs(1),
+            probe_timeout: Duration::from_secs(30),
+            captured_deadline: Some(now + Duration::from_secs(30)),
+        };
+        assert!(
+            expired.follow_up_deadline() <= now,
+            "a passed batch deadline fail-closes the follow-up even while the captured GET window is still open"
+        );
+        assert!(
+            expired.request_deadline() > now,
+            "the admitted GET still uses its captured instant; only follow-ups are capped by the batch"
+        );
+    }
+
+    #[test]
+    fn sequence_budget_rejects_a_single_remaining_probe_window() {
+        let probe = Duration::from_secs(30);
+        let one_window = ProbeWindow {
+            batch_deadline: tokio::time::Instant::now() + probe,
+            probe_timeout: probe,
+            captured_deadline: None,
+        };
+        assert!(
+            !one_window.has_sequence_budget(),
+            "one probe window covers the GET only; the DELETE and confirmation would expire"
+        );
+        let admits = ProbeWindow {
+            batch_deadline: tokio::time::Instant::now()
+                + probe * RETAINED_FENCE_SEQUENCE_CALLS
+                + Duration::from_secs(1),
+            probe_timeout: probe,
+            captured_deadline: None,
+        };
+        assert!(
+            admits.has_sequence_budget(),
+            "a batch that still holds the full sequence must admit"
+        );
+    }
+
+    /// cap#373 review: `<=` still admits a wave polled at the exact probe
+    /// instant. A timeout fires at or after that instant, and the next
+    /// wave is polled only after the claim clear, so a batch equal to
+    /// probe + sequence rejects it. Wave slack must still admit that
+    /// overrun, and must not keep admitting once the overrun exceeds it.
+    #[tokio::test(start_paused = true)]
+    async fn wave_slack_admits_the_second_wave_past_the_probe_instant() {
+        let probe = RETAINED_NAMESPACE_PROBE_TIMEOUT;
+        let sequence = probe * RETAINED_FENCE_SEQUENCE_CALLS;
+        let start = tokio::time::Instant::now();
+        let tight = ProbeWindow {
+            batch_deadline: start + probe + sequence,
+            probe_timeout: probe,
+            captured_deadline: None,
+        };
+        let with_slack = ProbeWindow {
+            batch_deadline: start + probe + sequence + RETAINED_FENCE_WAVE_SLACK,
+            probe_timeout: probe,
+            captured_deadline: None,
+        };
+        assert!(tight.has_sequence_budget());
+        tokio::time::advance(probe + Duration::from_millis(1)).await;
+        assert!(
+            !tight.has_sequence_budget(),
+            "probe + sequence rejects the wave polled after the timeout fires"
+        );
+        assert!(
+            with_slack.has_sequence_budget(),
+            "wave slack must still admit the wave a full probe timeout left nearly a sequence"
+        );
+        tokio::time::advance(RETAINED_FENCE_WAVE_SLACK).await;
+        assert!(
+            !with_slack.has_sequence_budget(),
+            "slack is a bound; an overrun past it must defer the fence instead of starting a short sequence"
+        );
+    }
+
+    /// A batch deadline that has already passed must not let the pinned
+    /// DELETE run out the captured GET window. The server hangs; reusing
+    /// the captured instant would wait it out.
+    #[tokio::test]
+    async fn passed_batch_deadline_does_not_wait_out_the_captured_get_window() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let app = Router::new().fallback(|_request: axum::extract::Request| async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            StatusCode::OK.into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hung-delete mock");
+        let address = listener.local_addr().expect("hung-delete mock address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve hung-delete mock");
+        });
+        let api = kube::Api::all(mock_kube_client(&format!("http://{address}")));
+        let window = ProbeWindow {
+            batch_deadline: tokio::time::Instant::now() - Duration::from_millis(10),
+            probe_timeout: Duration::from_secs(30),
+            captured_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(30)),
+        };
+        let started = tokio::time::Instant::now();
+        let finished = tokio::time::timeout(
+            Duration::from_secs(5),
+            retry_retained_namespace_delete(&api, "ns", "uid".to_string(), "1".to_string(), window),
+        )
+        .await;
+        assert!(
+            matches!(finished, Ok(false)),
+            "a passed batch deadline must fail the DELETE closed without using the captured GET window; got {finished:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "fail-closed must return before the captured window, not after the server answers"
+        );
+        server.abort();
+    }
+
+    /// Namespace API that delays only `/namespaces/` calls. Other paths
+    /// answer immediately so client discovery cannot consume the probe
+    /// window. `owned_generation: Some` serves the ledgered CAP-created
+    /// shape; `None` serves a live foreign namespace. A DELETE flips later
+    /// GETs to 404 after the same delay, so the confirmation probe is slow
+    /// too.
+    async fn delayed_namespace_server(
+        owned_generation: Option<i64>,
+        delay: Duration,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::atomic::AtomicU32>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let gets = Arc::new(AtomicU32::new(0));
+        let deletes = Arc::new(AtomicU32::new(0));
+        let deleted = Arc::new(AtomicBool::new(false));
+        let gets_state = Arc::clone(&gets);
+        let deletes_state = Arc::clone(&deletes);
+        let deleted_state = Arc::clone(&deleted);
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
+            let gets = Arc::clone(&gets_state);
+            let deletes = Arc::clone(&deletes_state);
+            let deleted = Arc::clone(&deleted_state);
+            async move {
+                let path = request.uri().path().to_string();
+                let namespace_call = path.contains("/namespaces/");
+                if !namespace_call {
+                    // Discovery and other client chatter must not consume
+                    // the probe window. Same instant shape the other mocks
+                    // return for every path.
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": {
+                                "name": "discovery",
+                                "uid": "discovery",
+                                "resourceVersion": "1"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                tokio::time::sleep(delay).await;
+                let name = path.rsplit('/').next().unwrap_or("ns").to_string();
+                if request.method() == axum::http::Method::DELETE {
+                    deletes.fetch_add(1, Ordering::SeqCst);
+                    deleted.store(true, Ordering::SeqCst);
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Success",
+                            "code": 200
+                        })),
+                    )
+                        .into_response();
+                }
+                gets.fetch_add(1, Ordering::SeqCst);
+                if deleted.load(Ordering::SeqCst) {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Failure",
+                            "reason": "NotFound",
+                            "message": "namespaces \"ns\" not found",
+                            "code": 404
+                        })),
+                    )
+                        .into_response();
+                }
+                let Some(generation) = owned_generation else {
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": {
+                                "name": name,
+                                "uid": "foreign",
+                                "resourceVersion": "1"
+                            }
+                        })),
+                    )
+                        .into_response();
+                };
+                let annotations = std::collections::BTreeMap::from([
+                    (
+                        enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
+                            .to_string(),
+                        generation.to_string(),
+                    ),
+                    (
+                        enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                            .to_string(),
+                        generation.to_string(),
+                    ),
+                ]);
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": {
+                            "name": name,
+                            "uid": "fixture",
+                            "resourceVersion": "1",
+                            "creationTimestamp": "2026-10-01T00:00:00Z",
+                            "annotations": annotations,
+                            "managedFields": [{
+                                "manager": "enclava-platform",
+                                "apiVersion": "v1",
+                                "time": "2026-01-01T00:00:00Z",
+                                "fieldsType": "FieldsV1",
+                                "fieldsV1": {
+                                    "f:metadata": {
+                                        "f:annotations": {
+                                            format!(
+                                                "f:{}",
+                                                enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                                            ): {}
+                                        }
+                                    }
+                                }
+                            }]
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed-namespace mock");
+        let address = listener
+            .local_addr()
+            .expect("delayed-namespace mock address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve delayed-namespace mock");
+        });
+        (format!("http://{address}"), gets, deletes, server)
+    }
+
+    async fn drop_leftover_retained_fence_fixtures(pool: &PgPool) {
+        // Same predicate the reconciler selects, not a name prefix: a
+        // panic leftover under another prefix would be probed and change
+        // an exact `released` count.
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND operation_kind IN ($1, 'app_delete')
+                AND reclaim_after = 'infinity'::timestamptz
+                AND locked_until <= clock_timestamp()",
+        )
+        .bind(RETAINED_DEPLOYMENT_NAMESPACE_OPERATION)
+        .execute(pool)
+        .await
+        .expect("drop leftover retained-fence fixtures");
+    }
+
+    /// cap#373 review: a GET that consumes most of the admitted probe
+    /// window must not starve the pinned DELETE or the confirmation GET.
+    /// `delay` is longer than the remainder of that window, and two
+    /// follow-ups cannot share one fresh probe window either — each call
+    /// needs its own. The batch still has room, so the cap is not what
+    /// would fail this pass.
+    #[tokio::test]
+    async fn slow_owned_namespace_get_still_completes_the_pinned_delete() {
+        let probe = Duration::from_secs(3);
+        let batch = Duration::from_secs(20);
+        let delay = Duration::from_secs(2);
+        assert!(delay < probe, "the admitted GET must fit its own window");
+        assert!(
+            delay > probe - delay,
+            "sabotage: the DELETE must be longer than the captured window's remainder"
+        );
+        assert!(
+            delay + delay > probe,
+            "sabotage: DELETE and confirmation must not fit in one shared follow-up window"
+        );
+        assert!(
+            probe + delay + delay < batch,
+            "the batch cap must not be what fails this pass"
+        );
+
+        let pool = database_test_pool(2).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let (org, _app, _token, namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("load retained fence generation");
+        let (url, gets, deletes, server) = delayed_namespace_server(Some(generation), delay).await;
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            mock_kube_client(&url),
+            batch,
+            probe,
+            1,
+        )
+        .await
+        .expect("reconcile a slow owned namespace");
+        assert_eq!(
+            released, 1,
+            "a slow GET must not starve the pinned DELETE or the confirmation GET"
+        );
+        assert!(
+            deletes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the pinned DELETE must have been accepted"
+        );
+        assert!(
+            gets.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the admission GET and the confirmation GET must both have completed"
+        );
+        let owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT owner_token FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read the owned fence after the slow delete");
+        assert_eq!(owner, None, "the exact fence must be cleared");
+        server.abort();
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("remove slow-delete fixture fence");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("remove slow-delete fixture organization");
+    }
+
+    /// Same shared-window bug on the foreign-namespace bounding re-check:
+    /// a slow admission GET must not time out the re-check that commits
+    /// the bound. The marker has already settled.
+    #[tokio::test]
+    async fn slow_foreign_namespace_get_still_bounds_on_its_own_recheck_window() {
+        let probe = Duration::from_secs(3);
+        let batch = Duration::from_secs(20);
+        let delay = Duration::from_secs(2);
+        assert!(delay < probe);
+        assert!(delay > probe - delay);
+
+        let pool = database_test_pool(2).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let (org, _app, _token, namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '10 minutes'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("age the foreign marker past the settle margin");
+        let (url, gets, deletes, server) = delayed_namespace_server(None, delay).await;
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            mock_kube_client(&url),
+            batch,
+            probe,
+            1,
+        )
+        .await
+        .expect("reconcile a slow foreign namespace");
+        assert_eq!(
+            released, 1,
+            "a slow admission GET must not time out the bounding re-check"
+        );
+        assert_eq!(
+            deletes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a foreign namespace must be bounded, not deleted"
+        );
+        assert!(
+            gets.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the admission GET and the bounding re-check must both have completed"
+        );
+        let (infinite, is_future): (bool, bool) = sqlx::query_as(
+            "SELECT reclaim_after = 'infinity'::timestamptz,
+                    reclaim_after > clock_timestamp()
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("load the bounded marker");
+        assert!(!infinite, "a settled foreign marker must not stay infinite");
+        assert!(
+            is_future,
+            "the bound must be a fresh quarantine, not already past"
+        );
+        server.abort();
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("remove slow-recheck fixture fence");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("remove slow-recheck fixture organization");
+    }
+
+    /// cap#373 review: a later wave that still has one probe window must
+    /// not admit a live owned fence. Reconciliation may still need a GET,
+    /// a pinned DELETE, and a confirmation. Admitting it would spend the
+    /// window on the GET, then clear the claim and rotate a fence the
+    /// DELETE never finished. The next pass, which still has the sequence,
+    /// must issue that DELETE and release the fence.
+    #[tokio::test]
+    async fn later_wave_does_not_rotate_an_owned_fence_without_sequence_budget() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let probe = Duration::from_secs(2);
+        let batch = Duration::from_secs(7);
+        let delay = Duration::from_secs(1);
+        let sequence = probe * RETAINED_FENCE_SEQUENCE_CALLS;
+        assert!(batch > sequence, "the first wave must be admissible");
+        assert!(
+            batch - probe < sequence,
+            "after one burned probe the sequence must no longer fit"
+        );
+        assert!(
+            batch - probe >= probe,
+            "sabotage: the old one-window gate would still admit"
+        );
+        assert!(
+            delay * 3 < batch - probe,
+            "sabotage: those three calls would finish in the leftover window"
+        );
+
+        let pool = database_test_pool(2).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let (slow_org, _slow_app, _slow_token, slow_namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        let (victim_org, _victim_app, _victim_token, victim_namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        let victim_generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("load victim fence generation");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET updated_at = clock_timestamp() - interval '2 hours'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&slow_namespace)
+        .execute(&pool)
+        .await
+        .expect("age the slow prefix ahead of the victim");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET updated_at = clock_timestamp() - interval '1 hour'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .execute(&pool)
+        .await
+        .expect("age the victim behind the slow prefix");
+        let victim_cursor_before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT updated_at FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read the victim cursor before the short pass");
+
+        let gets = Arc::new(Mutex::new(Vec::<String>::new()));
+        let deletes = Arc::new(AtomicU32::new(0));
+        let deleted = Arc::new(AtomicBool::new(false));
+        let hang = probe * 5;
+        let app = Router::new().fallback({
+            let gets = Arc::clone(&gets);
+            let deletes = Arc::clone(&deletes);
+            let deleted = Arc::clone(&deleted);
+            let slow_namespace = slow_namespace.clone();
+            let victim_namespace = victim_namespace.clone();
+            move |request: axum::extract::Request| {
+                let gets = Arc::clone(&gets);
+                let deletes = Arc::clone(&deletes);
+                let deleted = Arc::clone(&deleted);
+                let slow_namespace = slow_namespace.clone();
+                let victim_namespace = victim_namespace.clone();
+                async move {
+                    let path = request.uri().path().to_string();
+                    if !path.contains("/namespaces/") {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Namespace",
+                                "metadata": {
+                                    "name": "discovery",
+                                    "uid": "discovery",
+                                    "resourceVersion": "1"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    let name = path.rsplit('/').next().unwrap_or("").to_string();
+                    if name == slow_namespace {
+                        if request.method() == axum::http::Method::GET {
+                            gets.lock().await.push(name);
+                        }
+                        tokio::time::sleep(hang).await;
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "code": 500
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if name != victim_namespace {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "reason": "NotFound",
+                                "code": 404
+                            })),
+                        )
+                            .into_response();
+                    }
+                    tokio::time::sleep(delay).await;
+                    if request.method() == axum::http::Method::DELETE {
+                        deletes.fetch_add(1, Ordering::SeqCst);
+                        deleted.store(true, Ordering::SeqCst);
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Success",
+                                "code": 200
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if request.method() == axum::http::Method::GET {
+                        gets.lock().await.push(name.clone());
+                    }
+                    if deleted.load(Ordering::SeqCst) {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "reason": "NotFound",
+                                "code": 404
+                            })),
+                        )
+                            .into_response();
+                    }
+                    let annotations = std::collections::BTreeMap::from([
+                        (
+                            enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION
+                                .to_string(),
+                            victim_generation.to_string(),
+                        ),
+                        (
+                            enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                                .to_string(),
+                            victim_generation.to_string(),
+                        ),
+                    ]);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": {
+                                "name": name,
+                                "uid": "fixture",
+                                "resourceVersion": "1",
+                                "creationTimestamp": "2026-10-01T00:00:00Z",
+                                "annotations": annotations,
+                                "managedFields": [{
+                                    "manager": "enclava-platform",
+                                    "apiVersion": "v1",
+                                    "time": "2026-01-01T00:00:00Z",
+                                    "fieldsType": "FieldsV1",
+                                    "fieldsV1": {
+                                        "f:metadata": {
+                                            "f:annotations": {
+                                                format!(
+                                                    "f:{}",
+                                                    enclava_engine::apply::generation::NAMESPACE_CREATED_BY_ANNOTATION
+                                                ): {}
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sequence-budget mock");
+        let address = listener.local_addr().expect("sequence-budget mock address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sequence-budget mock");
+        });
+        let client = mock_kube_client(&format!("http://{address}"));
+
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            client.clone(),
+            batch,
+            probe,
+            1,
+        )
+        .await
+        .expect("pass that can finish only the slow prefix");
+        let pass1 = gets.lock().await.clone();
+        assert!(
+            pass1.iter().any(|name| name == &slow_namespace),
+            "the prefix must burn its probe so the victim is checked with one window left; gets={pass1:?}"
+        );
+        assert!(
+            !pass1.iter().any(|name| name == &victim_namespace),
+            "the owned fence must not be probed once the sequence no longer fits; gets={pass1:?}"
+        );
+        assert_eq!(released, 0, "the deferred owned fence must stay retained");
+        assert_eq!(
+            deletes.load(Ordering::SeqCst),
+            0,
+            "a deferred fence must not issue the pinned DELETE"
+        );
+        let victim_cursor_after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT updated_at FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read the victim cursor after the short pass");
+        assert_eq!(
+            victim_cursor_before, victim_cursor_after,
+            "deferring the fence must not rotate its cursor"
+        );
+
+        gets.lock().await.clear();
+        let released =
+            release_retained_deployment_namespace_fences_budgeted(&pool, client, batch, probe, 1)
+                .await
+                .expect("pass with a fresh sequence budget");
+        let pass2 = gets.lock().await.clone();
+        assert!(
+            pass2.iter().any(|name| name == &victim_namespace),
+            "the next pass must GET the fence this pass deferred; gets={pass2:?}"
+        );
+        assert!(
+            deletes.load(Ordering::SeqCst) >= 1,
+            "the admitted owned fence must issue the pinned DELETE"
+        );
+        assert_eq!(
+            released, 1,
+            "the owned fence must release once the sequence fits"
+        );
+        let owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT owner_token FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read the owned fence after the full-sequence pass");
+        assert_eq!(owner, None, "the exact owned fence must be cleared");
+
+        server.abort();
+        for namespace in [&slow_namespace, &victim_namespace] {
+            sqlx::query(
+                "DELETE FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("remove sequence-budget fixture fence");
+        }
+        for org in [slow_org, victim_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(&pool)
+                .await
+                .expect("remove sequence-budget fixture organization");
+        }
+    }
+
+    /// cap#373 review: four GETs that burn a full probe timeout must not
+    /// skip the next wave. That wave is polled only after the stamp and
+    /// the claim clear, so a batch equal to probe + sequence rejects an
+    /// already-absent namespace with nearly a full sequence left. The
+    /// production formula (probe + sequence + wave slack) must GET it and
+    /// release it in this pass.
+    #[tokio::test]
+    async fn slow_probe_wave_still_releases_the_absent_namespace_behind_it() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let probe = Duration::from_secs(2);
+        let batch = probe * (RETAINED_FENCE_SEQUENCE_CALLS + 1) + RETAINED_FENCE_WAVE_SLACK;
+        let concurrency = RETAINED_FENCE_RECONCILE_CONCURRENCY;
+        assert!(
+            batch > probe + probe * RETAINED_FENCE_SEQUENCE_CALLS,
+            "without wave slack the second wave is the skip this test locks"
+        );
+
+        let pool = database_test_pool(8).await;
+        drop_leftover_retained_fence_fixtures(&pool).await;
+        let mut slow_namespaces = Vec::with_capacity(concurrency);
+        let mut orgs = Vec::with_capacity(concurrency + 1);
+        for _ in 0..concurrency {
+            let (org, _app, _token, namespace) =
+                stage_retained_namespace_fixture(&pool, Vec::new()).await;
+            slow_namespaces.push(namespace);
+            orgs.push(org);
+        }
+        let (victim_org, _app, _token, victim_namespace) =
+            stage_retained_namespace_fixture(&pool, Vec::new()).await;
+        orgs.push(victim_org);
+        for namespace in &slow_namespaces {
+            sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                    SET updated_at = clock_timestamp() - interval '2 hours'
+                  WHERE resource_scope = 'kubernetes_namespace'
+                    AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("age slow-prefix cursor ahead of the absent namespace");
+        }
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET updated_at = clock_timestamp() - interval '1 hour'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .execute(&pool)
+        .await
+        .expect("age the absent namespace behind the slow prefix");
+
+        let gets = Arc::new(Mutex::new(Vec::<(String, tokio::time::Instant)>::new()));
+        let hang = probe * 5;
+        let app = Router::new().fallback({
+            let gets = Arc::clone(&gets);
+            let slow_namespaces = slow_namespaces.clone();
+            let victim_namespace = victim_namespace.clone();
+            move |request: axum::extract::Request| {
+                let gets = Arc::clone(&gets);
+                let slow_namespaces = slow_namespaces.clone();
+                let victim_namespace = victim_namespace.clone();
+                async move {
+                    let path = request.uri().path().to_string();
+                    if !path.contains("/namespaces/") {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Namespace",
+                                "metadata": {
+                                    "name": "discovery",
+                                    "uid": "discovery",
+                                    "resourceVersion": "1"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    let name = path.rsplit('/').next().unwrap_or("").to_string();
+                    if request.method() == axum::http::Method::GET
+                        && (slow_namespaces.iter().any(|namespace| namespace == &name)
+                            || name == victim_namespace)
+                    {
+                        gets.lock()
+                            .await
+                            .push((name.clone(), tokio::time::Instant::now()));
+                    }
+                    if name == victim_namespace {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "reason": "NotFound",
+                                "code": 404
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if slow_namespaces.iter().any(|namespace| namespace == &name) {
+                        tokio::time::sleep(hang).await;
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "code": 500
+                            })),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "reason": "NotFound",
+                            "code": 404
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow-wave mock API");
+        let address = listener.local_addr().expect("slow-wave mock address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve slow-wave mock API");
+        });
+        let client = mock_kube_client(&format!("http://{address}"));
+        let released = release_retained_deployment_namespace_fences_budgeted(
+            &pool,
+            client,
+            batch,
+            probe,
+            concurrency,
+        )
+        .await
+        .expect("pass with wave slack");
+        let seen = gets.lock().await.clone();
+        let slow_first = seen
+            .iter()
+            .filter(|(name, _)| slow_namespaces.iter().any(|namespace| namespace == name))
+            .map(|(_, at)| *at)
+            .min();
+        let victim_at = seen
+            .iter()
+            .find(|(name, _)| name == &victim_namespace)
+            .map(|(_, at)| *at);
+        assert!(
+            slow_first.is_some(),
+            "the slow prefix must be probed; gets={seen:?}"
+        );
+        let victim_at =
+            victim_at.expect("the absent namespace behind the slow wave must be probed");
+        assert!(
+            victim_at > slow_first.unwrap() + probe / 2,
+            "the absent namespace must start after the slow wave, not inside it; gets={seen:?}"
+        );
+        assert_eq!(
+            released, 1,
+            "the absent namespace must release in this pass, not wait for the next repair sleep"
+        );
+        let victim_released: bool = sqlx::query_scalar(
+            "SELECT owner_token IS NULL
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&victim_namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read the absent fence after the second wave");
+        assert!(
+            victim_released,
+            "the second-wave GET must have observed 404 and cleared that fence"
+        );
+
+        server.abort();
+        for namespace in slow_namespaces
+            .iter()
+            .chain(std::iter::once(&victim_namespace))
+        {
+            sqlx::query(
+                "DELETE FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+            )
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .expect("remove slow-wave fixture fence");
+        }
+        for org in orgs {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org)
+                .execute(&pool)
+                .await
+                .expect("remove slow-wave fixture organization");
         }
     }
 }
