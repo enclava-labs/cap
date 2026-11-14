@@ -1911,6 +1911,75 @@ pub(crate) async fn delete_app_before(
     let pre_delete_teardown_required = teardown_required_pre_delete(&mut phase_tx, &phase_app)
         .await
         .map_err(|_| internal_server_error())?;
+    // Recover a generation whose StatefulSet write landed but whose
+    // publication stamp was lost to a crash, before the teardown unit is
+    // projected. `apply_committed_at` is not proof — the live object is.
+    // abandon_teardown is the operator escape when the cluster cannot be read.
+    //
+    // On an app that is already deleting the stamp IS the selector change
+    // (the deleting arm keys on `workload_spec_published_at`), so it must
+    // commit atomically with the signed-policy generation bump below: only
+    // plan it here. An autocommit would leave the recovered artifact pinned
+    // at an already-applied generation on any exit before that commit
+    // (supersede Busy, budget refusal, DB error, crash), and the deleting
+    // reconciler cannot heal an already-stamped row — its bump runs only when
+    // its own UPDATE stamps. A first delete autocommits safely: the selector
+    // does not change until this function's `phase_tx` commits the status
+    // flip and the enqueue together.
+    let recovery = if phase_app.status == AppStatus::Deleting {
+        crate::deploy::plan_unpublished_workload_spec(
+            &state.db,
+            &state.kube_client,
+            phase_app.id,
+            &phase_app.namespace,
+            &phase_app.name,
+            crate::deploy::PublicationRecoveryMode::BeforeTeardownSelection,
+        )
+        .await
+    } else {
+        crate::deploy::recover_unpublished_workload_spec(
+            &state.db,
+            &state.kube_client,
+            phase_app.id,
+            &phase_app.namespace,
+            &phase_app.name,
+            crate::deploy::PublicationRecoveryMode::BeforeTeardownSelection,
+        )
+        .await
+        .map(|()| None)
+    };
+    let pending_publication = match recovery {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(
+                app_id = %phase_app.id,
+                error = %error,
+                abandon_teardown,
+                "could not recover workload publication before teardown selection"
+            );
+            if !abandon_teardown {
+                phase_tx
+                    .rollback()
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                delete_mutation
+                    .finish()
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "live workload publication could not be verified; retry deletion. abandon_teardown skips this check and selects teardown authority without a classified live spec"
+                    })),
+                ));
+            }
+            tracing::warn!(
+                app_id = %phase_app.id,
+                "abandon_teardown is selecting teardown authority without a classified live spec"
+            );
+            None
+        }
+    };
     // Admission control for the teardown policy pin (Codex security finding
     // 4a27950: teardown candidates can exhaust the global KBS policy budget).
     // A teardown-pending workload keeps required, retention-exempt signed
@@ -1947,10 +2016,15 @@ pub(crate) async fn delete_app_before(
             pre_delete_teardown_required
         };
         if pin_will_apply {
+            // Project the budget against the pending recovered stamp without
+            // committing it: `current` stays the committed truth, so a pin
+            // growth that crosses the budget is refused before the stamp
+            // exists and the refusal leaves the row unstamped.
             let fits = crate::kbs::teardown_unit_fits_signed_policy_budget(
                 &state.db,
                 state.kbs_policy.as_ref(),
                 phase_app.id,
+                pending_publication,
             )
             .await
             .map_err(|_| internal_server_error())?;
@@ -2032,6 +2106,16 @@ pub(crate) async fn delete_app_before(
     } else {
         pre_delete_teardown_required
     };
+    // Land the deferred recovered stamp and the generation bump in this one
+    // transaction. The stamp is the selector change for an already-deleting
+    // app; a rollback (supersede Busy, DB error, crash) leaves the row
+    // unstamped so `recover_deleting_workload_publications` can still stamp
+    // and bump together later.
+    if let Some(deployment_id) = pending_publication {
+        crate::deploy::record_workload_spec_published_in_tx(&mut phase_tx, deployment_id)
+            .await
+            .map_err(|_| internal_server_error())?;
+    }
     let publish_enqueued = if publication_needed {
         crate::kbs::enqueue_signed_policy_revocation_if_active(&mut phase_tx)
             .await

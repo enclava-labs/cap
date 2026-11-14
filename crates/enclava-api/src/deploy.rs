@@ -5,7 +5,7 @@ use enclava_common::types::{ResourceLimits, UnlockMode as CommonUnlockMode};
 use enclava_engine::apply::{
     engine::ApplyEngine,
     gateway::apply_gateway_resources,
-    generation::MutationGeneration,
+    generation::{MUTATION_GENERATION_ANNOTATION, MutationGeneration},
     namespace::apply_namespace,
     network_policy::apply_network_policy,
     orchestrator::{MANIFEST_HASH_ANNOTATION, manifest_hash},
@@ -6027,6 +6027,12 @@ pub enum DeployError {
          removal did not converge"
     )]
     PullSecretDeleteConflict(String),
+    /// Live StatefulSet evidence did not identify exactly one written spec,
+    /// or the cluster could not be read while an unstamped generation may
+    /// still be serving. Callers must not supersede or select teardown
+    /// authority until a retry can classify it.
+    #[error("live workload publication could not be classified")]
+    PublicationUnclassified,
 }
 
 impl DeployError {
@@ -6046,6 +6052,10 @@ impl DeployError {
             Self::Mutation(_) => "mutation_fence_error",
             Self::PullSecretReconcileDeferred(_) => "pull_secret_reconcile_deferred",
             Self::PullSecretDeleteConflict(_) => "pull_secret_delete_conflict",
+            // Not persisted on the apply job: recovery refuses the caller
+            // before supersession, so this code never has to satisfy the
+            // last_error_code CHECK.
+            Self::PublicationUnclassified => "workload_publication_unclassified",
         }
     }
 }
@@ -7255,6 +7265,555 @@ fn app_status_label(status: AppStatus) -> &'static str {
     }
 }
 
+/// Pod-template label written by `generate_statefulset`. A live StatefulSet
+/// carrying this label has had that operation's spec accepted by the API
+/// server — the fact `workload_spec_published_at` records, and the fact a
+/// crash between `apply_statefulset` and the stamp can lose.
+const WORKLOAD_DEPLOYMENT_ID_LABEL: &str = "enclava.dev/deployment-id";
+
+/// Bound for the publication-recovery GET. Matches the rollout-settling
+/// probe: a hung API server must not hold the deployment lane forever.
+const WORKLOAD_PUBLICATION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How strictly a failed cluster read blocks the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationRecoveryMode {
+    /// Supersession. Fail closed only when an in-flight generation entered
+    /// the StatefulSet step and the live object cannot be classified.
+    BeforeSupersession,
+    /// Delete / teardown selection. Fail closed when any unstamped
+    /// deployment exists and the live object cannot be classified, including
+    /// historical rows the `observing_since` backfill did not cover.
+    BeforeTeardownSelection,
+    /// Policy reconcile. Stamp what the live object proves; never fail the
+    /// global pass because one namespace could not be read.
+    BestEffort,
+}
+
+/// Identity of the spec currently written on a live StatefulSet.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LiveWorkloadPublication {
+    pub deployment_id: Option<Uuid>,
+    pub mutation_generation: Option<i64>,
+    pub manifest_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicationRecoveryDeployment {
+    pub id: Uuid,
+    pub manifest_hash: Option<String>,
+    pub fence_generations: Vec<i64>,
+    /// Pre-0078 rows may have written a StatefulSet without recording the
+    /// generation that did it. The deployment-id label is their proof.
+    pub provenance_incomplete: bool,
+    pub published: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationRecoveryDecision {
+    Stamp(Uuid),
+    AlreadyRecorded,
+    /// The live object is not an unstamped generation of this app.
+    NotWritten,
+    /// Label and generation name different deployments, a fenced generation
+    /// disagrees with the label, or a manifest hash disagrees with the live
+    /// object. Do not guess.
+    Ambiguous,
+}
+
+/// Read the publication identity off a live StatefulSet. Missing or
+/// unparseable fields are absent, not zero: `live_generation` treats a
+/// missing annotation as generation 0, which is not a claimed fence.
+pub(crate) fn live_workload_publication(
+    sts: &k8s_openapi::api::apps::v1::StatefulSet,
+) -> LiveWorkloadPublication {
+    let deployment_id = sts
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.metadata.as_ref())
+        .and_then(|metadata| metadata.labels.as_ref())
+        .and_then(|labels| labels.get(WORKLOAD_DEPLOYMENT_ID_LABEL))
+        .and_then(|raw| Uuid::parse_str(raw).ok());
+    let mutation_generation = sts
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(MUTATION_GENERATION_ANNOTATION))
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .filter(|generation| *generation > 0);
+    let manifest_hash = sts
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(MANIFEST_HASH_ANNOTATION))
+        .filter(|hash| !hash.is_empty())
+        .cloned();
+    LiveWorkloadPublication {
+        deployment_id,
+        mutation_generation,
+        manifest_hash,
+    }
+}
+
+fn hashes_disagree(live: &LiveWorkloadPublication, row: &PublicationRecoveryDeployment) -> bool {
+    match (&live.manifest_hash, &row.manifest_hash) {
+        (Some(live_hash), Some(row_hash)) => live_hash != row_hash,
+        _ => false,
+    }
+}
+
+/// Decide which deployment, if any, the live StatefulSet proves was written.
+///
+/// `apply_committed_at` and `manifest_hash` are stored before
+/// `apply_statefulset` returns, so they are not inputs. A match is either
+/// the pod-template deployment id (the spec that was applied, including
+/// historical rows with no fence provenance) or the mutation-generation
+/// annotation when that generation is in the deployment's namespace fence
+/// (recorded before the provider write, stamped on the object only when
+/// the apply is accepted). Disagreeing signals fail closed.
+pub(crate) fn decide_workload_publication_recovery(
+    live: &LiveWorkloadPublication,
+    deployments: &[PublicationRecoveryDeployment],
+) -> PublicationRecoveryDecision {
+    let by_id = |id: Uuid| deployments.iter().find(|row| row.id == id);
+    let label_owner = live.deployment_id.and_then(by_id);
+    let generation_owner = match live.mutation_generation {
+        Some(generation) => {
+            let mut matches = deployments
+                .iter()
+                .filter(|row| row.fence_generations.contains(&generation));
+            let first = matches.next();
+            if matches.next().is_some() {
+                return PublicationRecoveryDecision::Ambiguous;
+            }
+            first
+        }
+        None => None,
+    };
+
+    if let Some(label) = label_owner {
+        if let Some(generation) = generation_owner {
+            if generation.id != label.id {
+                return PublicationRecoveryDecision::Ambiguous;
+            }
+        } else if let Some(generation) = live.mutation_generation {
+            let fenced = label.fence_generations.contains(&generation);
+            let historical = label.provenance_incomplete || label.fence_generations.is_empty();
+            if !fenced && !historical {
+                return PublicationRecoveryDecision::Ambiguous;
+            }
+        }
+        if hashes_disagree(live, label) {
+            return PublicationRecoveryDecision::Ambiguous;
+        }
+        return if label.published {
+            PublicationRecoveryDecision::AlreadyRecorded
+        } else {
+            PublicationRecoveryDecision::Stamp(label.id)
+        };
+    }
+
+    // A deployment id that is not this app's must not be ignored in favor
+    // of a generation match: the spec identity and the fence disagree.
+    if live.deployment_id.is_some() {
+        return if generation_owner.is_some() {
+            PublicationRecoveryDecision::Ambiguous
+        } else {
+            PublicationRecoveryDecision::NotWritten
+        };
+    }
+
+    let Some(generation) = generation_owner else {
+        return PublicationRecoveryDecision::NotWritten;
+    };
+    if hashes_disagree(live, generation) {
+        // Same tradeoff as the label path: a hash mismatch means the object
+        // was not classified, not that it is someone else's spec. Callers
+        // must retry rather than supersede or select teardown without a stamp.
+        return PublicationRecoveryDecision::Ambiguous;
+    }
+    if generation.published {
+        PublicationRecoveryDecision::AlreadyRecorded
+    } else {
+        PublicationRecoveryDecision::Stamp(generation.id)
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PublicationRecoveryRow {
+    id: Uuid,
+    manifest_hash: Option<String>,
+    namespace_fence_generations: Option<Vec<i64>>,
+    namespace_fence_provenance_incomplete: bool,
+    published: bool,
+    entered_statefulset: bool,
+    in_flight: bool,
+}
+
+impl PublicationRecoveryRow {
+    fn deployment(&self) -> PublicationRecoveryDeployment {
+        PublicationRecoveryDeployment {
+            id: self.id,
+            manifest_hash: self.manifest_hash.clone(),
+            fence_generations: self.namespace_fence_generations.clone().unwrap_or_default(),
+            provenance_incomplete: self.namespace_fence_provenance_incomplete,
+            published: self.published,
+        }
+    }
+}
+
+async fn load_publication_recovery_rows(
+    pool: &PgPool,
+    app_id: Uuid,
+) -> Result<Vec<PublicationRecoveryRow>, DeployError> {
+    let rows = sqlx::query_as(
+        "SELECT id,
+                manifest_hash,
+                namespace_fence_generations,
+                namespace_fence_provenance_incomplete,
+                workload_spec_published_at IS NOT NULL AS published,
+                (
+                    apply_committed_at IS NOT NULL
+                    OR sts_apply_started_at IS NOT NULL
+                    OR observing_since IS NOT NULL
+                ) AS entered_statefulset,
+                status::text IN ('pending', 'applying', 'watching') AS in_flight
+           FROM deployments
+          WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+fn recovery_must_classify(rows: &[PublicationRecoveryRow], mode: PublicationRecoveryMode) -> bool {
+    match mode {
+        PublicationRecoveryMode::BestEffort => false,
+        PublicationRecoveryMode::BeforeSupersession => rows
+            .iter()
+            .any(|row| !row.published && row.in_flight && row.entered_statefulset),
+        PublicationRecoveryMode::BeforeTeardownSelection => rows.iter().any(|row| !row.published),
+    }
+}
+
+/// Decide which deployment `recover_unpublished_workload_spec` would stamp
+/// from the live StatefulSet, without writing. Returns the deployment id of
+/// a written-but-unstamped generation, or None when nothing needs stamping.
+///
+/// Callers that must commit the stamp inside their own authority transaction
+/// use this instead of the autocommitting wrapper: on an already-deleting
+/// app the stamp is the deleting-selector change and must land atomically
+/// with the signed-policy generation bump, or an exit in between strands the
+/// recovered artifact pinned at an already-applied generation.
+///
+/// Refusals mirror `recover_unpublished_workload_spec` exactly: ambiguous
+/// evidence, and a failed read while the mode still has an unclassified
+/// generation, refuse the caller.
+pub(crate) async fn plan_unpublished_workload_spec(
+    pool: &PgPool,
+    client: &kube::Client,
+    app_id: Uuid,
+    namespace: &str,
+    workload_name: &str,
+    mode: PublicationRecoveryMode,
+) -> Result<Option<Uuid>, DeployError> {
+    let rows = load_publication_recovery_rows(pool, app_id).await?;
+    if rows.iter().all(|row| row.published) {
+        return Ok(None);
+    }
+    // Acceptance does not need a cluster read to heal an already-terminal
+    // row. Delete admission and the deleting reconciler own that. Holding
+    // the deployment lane for a GET on every historical failure would not
+    // close the in-flight crash window.
+    if mode == PublicationRecoveryMode::BeforeSupersession && !recovery_must_classify(&rows, mode) {
+        return Ok(None);
+    }
+    let live = match tokio::time::timeout(
+        WORKLOAD_PUBLICATION_PROBE_TIMEOUT,
+        read_live_statefulset(client, namespace, workload_name),
+    )
+    .await
+    {
+        Ok(Ok(live)) => live,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %app_id,
+                namespace,
+                workload = workload_name,
+                error = %error,
+                "could not read the live StatefulSet to recover workload publication"
+            );
+            return if recovery_must_classify(&rows, mode) {
+                Err(DeployError::PublicationUnclassified)
+            } else {
+                Ok(None)
+            };
+        }
+        Err(elapsed) => {
+            tracing::warn!(
+                %app_id,
+                namespace,
+                workload = workload_name,
+                error = %elapsed,
+                "live StatefulSet publication probe timed out"
+            );
+            return if recovery_must_classify(&rows, mode) {
+                Err(DeployError::PublicationUnclassified)
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    let Some(sts) = live else {
+        // A missing object is not proof the write landed. `apply_committed_at`
+        // is stored before `apply_statefulset`, so a first create that never
+        // produced a StatefulSet is also a 404. Failing closed here would
+        // wedge supersession of that failure. The crash this issue names
+        // leaves the object in place.
+        return Ok(None);
+    };
+    plan_live_publication_recovery(pool, app_id, &live_workload_publication(&sts), mode).await
+}
+
+/// Stamp `workload_spec_published_at` when the live StatefulSet proves a
+/// generation of this app was written and the stamp was lost.
+///
+/// No-ops when every deployment is already stamped. A missing StatefulSet
+/// is not a written spec. Ambiguous evidence, and a failed read while the
+/// mode still has an unclassified generation, refuse the caller.
+pub(crate) async fn recover_unpublished_workload_spec(
+    pool: &PgPool,
+    client: &kube::Client,
+    app_id: Uuid,
+    namespace: &str,
+    workload_name: &str,
+    mode: PublicationRecoveryMode,
+) -> Result<(), DeployError> {
+    if let Some(deployment_id) =
+        plan_unpublished_workload_spec(pool, client, app_id, namespace, workload_name, mode).await?
+    {
+        record_recovered_workload_publication(pool, app_id, deployment_id).await?;
+    }
+    Ok(())
+}
+
+/// Decide an already-read publication identity without writing. Tests and
+/// the kube wrapper share this so a recovery decision is not duplicated.
+/// Returns the deployment id `apply_live_publication_recovery` would stamp.
+pub(crate) async fn plan_live_publication_recovery(
+    pool: &PgPool,
+    app_id: Uuid,
+    live: &LiveWorkloadPublication,
+    mode: PublicationRecoveryMode,
+) -> Result<Option<Uuid>, DeployError> {
+    let rows = load_publication_recovery_rows(pool, app_id).await?;
+    let deployments: Vec<_> = rows
+        .iter()
+        .map(PublicationRecoveryRow::deployment)
+        .collect();
+    match decide_workload_publication_recovery(live, &deployments) {
+        PublicationRecoveryDecision::Stamp(deployment_id) => Ok(Some(deployment_id)),
+        PublicationRecoveryDecision::AlreadyRecorded | PublicationRecoveryDecision::NotWritten => {
+            Ok(None)
+        }
+        PublicationRecoveryDecision::Ambiguous => {
+            tracing::warn!(
+                %app_id,
+                ?live.deployment_id,
+                ?live.mutation_generation,
+                "live StatefulSet publication evidence is ambiguous"
+            );
+            if mode == PublicationRecoveryMode::BestEffort {
+                tracing::warn!(
+                    %app_id,
+                    "leaving workload publication unstamped after ambiguous live evidence"
+                );
+                Ok(None)
+            } else {
+                Err(DeployError::PublicationUnclassified)
+            }
+        }
+    }
+}
+
+/// Apply an already-read publication identity. Tests share this so a
+/// recovery decision is not duplicated; production callers use the
+/// autocommitting `recover_unpublished_workload_spec` or the plan-plus-tx
+/// pairing.
+#[cfg(test)]
+pub(crate) async fn apply_live_publication_recovery(
+    pool: &PgPool,
+    app_id: Uuid,
+    live: &LiveWorkloadPublication,
+    mode: PublicationRecoveryMode,
+) -> Result<(), DeployError> {
+    if let Some(deployment_id) = plan_live_publication_recovery(pool, app_id, live, mode).await? {
+        record_recovered_workload_publication(pool, app_id, deployment_id).await?;
+    }
+    Ok(())
+}
+
+async fn record_recovered_workload_publication(
+    pool: &PgPool,
+    app_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<(), DeployError> {
+    record_workload_spec_published(pool, deployment_id).await?;
+    tracing::info!(
+        %app_id,
+        %deployment_id,
+        "recovered workload publication from the live StatefulSet"
+    );
+    Ok(())
+}
+
+async fn read_live_statefulset(
+    client: &kube::Client,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<k8s_openapi::api::apps::v1::StatefulSet>, DeployError> {
+    let api: Api<k8s_openapi::api::apps::v1::StatefulSet> =
+        Api::namespaced(client.clone(), namespace);
+    match api.get(name).await {
+        Ok(sts) => Ok(Some(sts)),
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(None),
+        Err(error) => Err(enclava_engine::apply::engine::ApplyError::Kube(error).into()),
+    }
+}
+
+/// Best-effort recovery for every deleting app whose teardown selector
+/// still depends on `workload_spec_published_at`. A single unread namespace
+/// must not fail the global policy pass.
+///
+/// Returns whether a stamp was committed. The stamp and the signed-policy
+/// generation bump are one transaction: a recovered selector must not be
+/// published at a generation Trustee already applied.
+pub(crate) async fn recover_deleting_workload_publications(
+    pool: &PgPool,
+    client: &kube::Client,
+) -> Result<bool, DeployError> {
+    let apps: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT app.id, app.namespace, app.name
+           FROM apps AS app
+          WHERE app.status = 'deleting'
+            AND app.workload_teardown_required
+            AND app.workload_teardown_completed_at IS NULL
+            AND EXISTS (
+                SELECT 1
+                  FROM deployments AS deployment
+                 WHERE deployment.app_id = app.id
+                   AND deployment.workload_spec_published_at IS NULL
+            )",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut pending = Vec::new();
+    for (app_id, namespace, name) in apps {
+        match publication_stamp_candidate(pool, client, app_id, &namespace, &name).await {
+            Ok(Some(deployment_id)) => pending.push(deployment_id),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %app_id,
+                    error = %error,
+                    "skipping workload publication recovery for a deleting app"
+                );
+            }
+        }
+    }
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    let mut tx = pool.begin().await?;
+    let mut stamped = false;
+    for deployment_id in pending {
+        let result = sqlx::query(
+            "UPDATE deployments
+                SET workload_spec_published_at = clock_timestamp()
+              WHERE id = $1
+                AND workload_spec_published_at IS NULL",
+        )
+        .bind(deployment_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 1 {
+            stamped = true;
+            tracing::info!(
+                %deployment_id,
+                "recovered workload publication from the live StatefulSet"
+            );
+        }
+    }
+    if stamped {
+        crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
+            .await
+            .map_err(DeployError::KbsPolicy)?;
+    }
+    tx.commit().await?;
+    Ok(stamped)
+}
+
+/// The deployment a live StatefulSet proves should be stamped, if any.
+/// Does not write. Best-effort: ambiguous or unreadable evidence is None
+/// so one namespace cannot fail the global pass.
+async fn publication_stamp_candidate(
+    pool: &PgPool,
+    client: &kube::Client,
+    app_id: Uuid,
+    namespace: &str,
+    workload_name: &str,
+) -> Result<Option<Uuid>, DeployError> {
+    let rows = load_publication_recovery_rows(pool, app_id).await?;
+    if rows.iter().all(|row| row.published) {
+        return Ok(None);
+    }
+    let live = match tokio::time::timeout(
+        WORKLOAD_PUBLICATION_PROBE_TIMEOUT,
+        read_live_statefulset(client, namespace, workload_name),
+    )
+    .await
+    {
+        Ok(Ok(Some(sts))) => live_workload_publication(&sts),
+        Ok(Ok(None)) => return Ok(None),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %app_id,
+                error = %error,
+                "could not read the live StatefulSet to recover workload publication"
+            );
+            return Ok(None);
+        }
+        Err(elapsed) => {
+            tracing::warn!(
+                %app_id,
+                error = %elapsed,
+                "live StatefulSet publication probe timed out"
+            );
+            return Ok(None);
+        }
+    };
+    let deployments: Vec<_> = rows
+        .iter()
+        .map(PublicationRecoveryRow::deployment)
+        .collect();
+    match decide_workload_publication_recovery(&live, &deployments) {
+        PublicationRecoveryDecision::Stamp(deployment_id) => Ok(Some(deployment_id)),
+        PublicationRecoveryDecision::AlreadyRecorded | PublicationRecoveryDecision::NotWritten => {
+            Ok(None)
+        }
+        PublicationRecoveryDecision::Ambiguous => {
+            tracing::warn!(
+                %app_id,
+                ?live.deployment_id,
+                ?live.mutation_generation,
+                "leaving workload publication unstamped after ambiguous live evidence"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// Stamp attempts for `record_workload_spec_published` before the failure is
 /// allowed to terminalize a job whose StatefulSet write already happened.
 const WORKLOAD_SPEC_PUBLISHED_STAMP_ATTEMPTS: u32 = 4;
@@ -7263,15 +7822,21 @@ async fn record_workload_spec_published(
     pool: &PgPool,
     deployment_id: Uuid,
 ) -> Result<(), DeployError> {
-    // shortcut: crash after StatefulSet apply and before this commit, then lease expiry and supersession, looks unpublished; upgrade when supersession can tell a written spec from an applying row that never reached the StatefulSet
+    // A crash after `apply_statefulset` returns and before this commit used
+    // to leave the generation unpublished through lease expiry and
+    // supersession. `recover_unpublished_workload_spec` stamps it from the
+    // live StatefulSet (deployment-id label or namespace-fence generation)
+    // before supersession and before teardown selection. This retry only
+    // covers a transient database error on the original writer.
     //
     // The stamp runs in its own autocommit after the StatefulSet write. A
     // failed stamp would terminalize a job whose StatefulSet is already live
     // and leave the generation looking unpublished forever — its teardown
     // unit would then pin no authority. Retry before failing so only a
     // sustained database outage (which breaks every path anyway) can lose
-    // the stamp to an error return; the crash window above stays the only
-    // known gap.
+    // the stamp to an error return; the crash window is recovered from the
+    // live object, not from `apply_committed_at` or `manifest_hash` (both
+    // are stored before the StatefulSet write).
     let mut attempts = 0;
     loop {
         attempts += 1;
@@ -7306,6 +7871,38 @@ async fn record_workload_spec_published(
             Err(error) => return Err(DeployError::Db(error)),
         }
     }
+}
+
+/// Commit the publication stamp inside the caller's authority transaction.
+///
+/// Delete admission on an already-deleting app must land this stamp together
+/// with the signed-policy generation bump the selector change requires: the
+/// deleting arm keys on `workload_spec_published_at`, so a stamp that commits
+/// earlier leaves the recovered artifact pinned at an already-applied
+/// generation whenever the caller exits (supersede Busy, budget refusal, DB
+/// error, crash) before the bump. A rollback leaves the row unstamped and the
+/// deleting reconciler can still stamp and bump together. A caller-side error
+/// rolls the stamp back with the transaction; no transient-failure retries
+/// here — the whole transaction is retryable.
+pub(crate) async fn record_workload_spec_published_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    deployment_id: Uuid,
+) -> Result<(), DeployError> {
+    let result = sqlx::query(
+        "UPDATE deployments
+            SET workload_spec_published_at = COALESCE(
+                    workload_spec_published_at,
+                    clock_timestamp()
+                )
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DeployError::Db(sqlx::Error::RowNotFound));
+    }
+    Ok(())
 }
 
 /// Apply manifests and return durable rollout-observation context.
@@ -7553,4 +8150,4 @@ fn build_verification_material(
     Ok(material)
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
