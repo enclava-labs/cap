@@ -55,8 +55,15 @@ async fn resolve_tag(
     let base_url = registry_base_url(image_ref.registry())?;
     let repository =
         enclava_common::registry::manifest_repository(image_ref.registry(), image_ref.repository());
-    let url = reqwest::Url::parse(&format!("{base_url}/v2/{repository}/manifests/{tag}"))
+    let Some(expected_path) = enclava_common::registry::literal_manifest_path(&repository, tag)
+    else {
+        return Err("image reference is not a literal repository and OCI tag".to_string());
+    };
+    let url = reqwest::Url::parse(&format!("{base_url}{expected_path}"))
         .map_err(|e| format!("registry URL is not valid: {e}"))?;
+    if url.path() != expected_path || url.query().is_some() {
+        return Err("image reference does not round-trip to a literal manifest URL".to_string());
+    }
     validate_destination(&url, blocked)?;
 
     let mut response = client
@@ -136,6 +143,13 @@ fn validate_destination(url: &reqwest::Url, blocked: &BlockedNetworks) -> Result
 /// Complete an RFC 7235 Bearer token flow against the challenge realm and
 /// return the access token. The realm is registry-supplied input: https-only,
 /// and its host must be the registry's own host (or a known auth service).
+///
+/// Platform `GHCR_*` pull credentials are intentionally not attached here
+/// (issue #228). Those credentials belong to the API resolver, behind the
+/// repository allowlist. Forwarding them from the CLI would be a new
+/// credential path. Reading the operator's own `~/.docker/config.json` is
+/// the issue's named sub-question and is a separate decision — this function
+/// stays anonymous.
 async fn fetch_bearer_token(
     client: &reqwest::Client,
     challenge: enclava_common::registry::BearerChallenge,
@@ -248,6 +262,33 @@ mod tests {
             "https://reg.example"
         );
         assert!(registry_base_url("localhost").is_err());
+    }
+
+    #[tokio::test]
+    async fn tag_resolution_rejects_dot_segment_repository_before_network() {
+        let image = ImageRef::parse("ghcr.io/team/app/../other:tag").unwrap();
+        let err = resolve_image_digest(&image).await.unwrap_err();
+        assert!(
+            err.contains("literal repository and OCI tag"),
+            "dot-segment repository must be refused before any request: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_resolution_rejects_path_rewriting_tags_before_network() {
+        for tag in [
+            "../../../enclava-labs/private/manifests/latest",
+            "%2e%2e/%2e%2e/%2e%2e/enclava-labs/private/manifests/latest",
+            r"..\..\..\enclava-labs\private\manifests\latest",
+        ] {
+            let raw = format!("ghcr.io/team/app:{tag}");
+            let image = ImageRef::parse(&raw).unwrap();
+            let err = resolve_image_digest(&image).await.unwrap_err();
+            assert!(
+                err.contains("literal repository and OCI tag"),
+                "{raw} must be refused before a retargeted manifest GET: {err}"
+            );
+        }
     }
 }
 

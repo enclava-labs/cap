@@ -523,6 +523,176 @@ fn tenant_image_pull_secret_without_scope_fails_closed() {
     ));
 }
 
+/// Issue #228: tag resolution may use the platform pull credentials only
+/// for a repository the operator explicitly allowed. Empty, absent, or
+/// invalid allowlists, incomplete credentials, other registries, and
+/// out-of-scope repositories all fail closed to anonymous resolution.
+#[test]
+fn tag_resolution_credentials_fail_closed_without_explicit_scope() {
+    let allow = Some("ghcr.io/team/app,ghcr.io/team/nested/*");
+    assert!(
+        resolution_pull_credentials_from("ghcr.io", "team/app", Some("cap-bot"), Some("tok"), None)
+            .is_none()
+    );
+    for raw in [
+        "",
+        "   ",
+        "bogus",
+        "ghcr.io/team/app,bogus",
+        "docker.io/team/app",
+    ] {
+        assert!(
+            resolution_pull_credentials_from(
+                "ghcr.io",
+                "team/app",
+                Some("cap-bot"),
+                Some("tok"),
+                Some(raw),
+            )
+            .is_none(),
+            "allowlist {raw:?} must not yield credentials"
+        );
+    }
+    assert!(
+        resolution_pull_credentials_from("ghcr.io", "team/app", None, Some("tok"), allow).is_none()
+    );
+    assert!(
+        resolution_pull_credentials_from("ghcr.io", "team/app", Some("cap-bot"), None, allow)
+            .is_none()
+    );
+    assert!(
+        resolution_pull_credentials_from("ghcr.io", "team/app", Some("  "), Some("tok"), allow)
+            .is_none()
+    );
+    assert!(
+        resolution_pull_credentials_from("ghcr.io", "team/app", Some("cap-bot"), Some("  "), allow)
+            .is_none()
+    );
+    // GHCR credentials must never be returned for a registry they cannot
+    // authenticate, even when the repository path matches an entry.
+    assert!(
+        resolution_pull_credentials_from(
+            "docker.io",
+            "team/app",
+            Some("cap-bot"),
+            Some("tok"),
+            allow
+        )
+        .is_none()
+    );
+    assert!(
+        resolution_pull_credentials_from(
+            "ghcr.io.attacker.example",
+            "team/app",
+            Some("cap-bot"),
+            Some("tok"),
+            allow,
+        )
+        .is_none()
+    );
+    assert!(
+        resolution_pull_credentials_from(
+            "ghcr.io",
+            "other/app",
+            Some("cap-bot"),
+            Some("tok"),
+            allow
+        )
+        .is_none()
+    );
+    // An exact entry does not widen to subrepositories.
+    assert!(
+        resolution_pull_credentials_from(
+            "ghcr.io",
+            "team/app/child",
+            Some("cap-bot"),
+            Some("tok"),
+            Some("ghcr.io/team/app"),
+        )
+        .is_none()
+    );
+    // A wildcard must not match a sibling prefix.
+    assert!(
+        resolution_pull_credentials_from(
+            "ghcr.io",
+            "team/nested-evil",
+            Some("cap-bot"),
+            Some("tok"),
+            Some("ghcr.io/team/nested/*"),
+        )
+        .is_none()
+    );
+    // Repository paths stay case-sensitive.
+    assert!(
+        resolution_pull_credentials_from(
+            "GHCR.IO",
+            "Org/app",
+            Some("cap-bot"),
+            Some("tok"),
+            Some("ghcr.io/org/app"),
+        )
+        .is_none()
+    );
+    // Dot segments satisfy a string prefix and then normalize to a different
+    // repository once reqwest builds the URL. They must not receive credentials.
+    for repository in [
+        "team/app/../other",
+        "team/app/../../victim/private",
+        "team/nested/../nested-evil",
+        "team/./app",
+        "team//app",
+    ] {
+        assert!(
+            resolution_pull_credentials_from(
+                "ghcr.io",
+                repository,
+                Some("cap-bot"),
+                Some("tok"),
+                Some("ghcr.io/team/app/*,ghcr.io/team/nested/*"),
+            )
+            .is_none(),
+            "{repository} must not yield credentials"
+        );
+    }
+}
+
+/// Issue #228: a matching ghcr.io repository returns the trimmed platform
+/// credentials and nothing else. Wildcard entries include subrepositories;
+/// registry spelling is case-insensitive.
+#[test]
+fn tag_resolution_credentials_attach_only_for_matching_ghcr_repository() {
+    let exact = resolution_pull_credentials_from(
+        "ghcr.io",
+        "team/app",
+        Some(" cap-bot "),
+        Some(" test-token "),
+        Some("ghcr.io/team/app"),
+    )
+    .unwrap();
+    assert_eq!(exact, ("cap-bot".to_string(), "test-token".to_string()));
+
+    let wildcard = resolution_pull_credentials_from(
+        "GHCR.IO",
+        "team/nested/child",
+        Some("cap-bot"),
+        Some("test-token"),
+        Some("ghcr.io/team/nested/*"),
+    )
+    .unwrap();
+    assert_eq!(wildcard.0, "cap-bot");
+    assert_eq!(wildcard.1, "test-token");
+
+    let second = resolution_pull_credentials_from(
+        "ghcr.io",
+        "other/app",
+        Some("cap-bot"),
+        Some("test-token"),
+        Some("ghcr.io/team/app, ghcr.io/other/app"),
+    )
+    .unwrap();
+    assert_eq!(second.1, "test-token");
+}
+
 /// Issue #225: a scope list with invalid entries must not silently
 /// degrade into a different (or missing) scope.
 #[test]
