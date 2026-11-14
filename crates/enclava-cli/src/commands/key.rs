@@ -974,11 +974,19 @@ async fn rotate_owner(
         }
     }
     let next = sign_keyring(&replacement_owner, next);
+    // Directive binding (issue #188): the superseded keyring version and
+    // its creation witness, exactly as the API stored and reported them.
+    // The witness is server-assigned at version insertion, so a directive
+    // covering it provably post-dates the version it supersedes.
+    let base_keyring_version = i64::try_from(remote_response.version)?;
+    let base_keyring_created_at = remote_response.created_at;
     let signed_at = chrono::Utc::now();
     let directive = owner_rotation_directive_bytes(
         org_id,
         &current_owner.public.to_bytes(),
         &replacement_owner.public.to_bytes(),
+        base_keyring_version,
+        base_keyring_created_at,
         signed_at,
         reason.trim(),
     );
@@ -991,6 +999,8 @@ async fn rotate_owner(
                 signature: hex::encode(next.signature.to_bytes()),
                 replacement_signing_pubkey: hex::encode(replacement_owner.public.to_bytes()),
                 current_signing_pubkey: hex::encode(current_owner.public.to_bytes()),
+                base_keyring_version,
+                base_keyring_created_at: base_keyring_created_at.to_rfc3339(),
                 signed_at: signed_at.to_rfc3339(),
                 reason: reason.trim().to_string(),
                 rotation_signature: hex::encode(current_owner.sign(&directive).to_bytes()),

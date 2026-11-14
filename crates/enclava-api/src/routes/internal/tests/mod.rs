@@ -6700,6 +6700,7 @@ fn signed_rotation_body(
     user_id: Uuid,
     current_key: &ed25519_dalek::SigningKey,
     replacement_key: &ed25519_dalek::SigningKey,
+    base: crate::test_support::KeyringBase,
 ) -> serde_json::Value {
     use chrono::TimeZone;
     use ed25519_dalek::Signer;
@@ -6720,6 +6721,8 @@ fn signed_rotation_body(
         org_id,
         &current_pubkey,
         &replacement_pubkey,
+        base.version,
+        base.created_at,
         signed_at,
         reason,
     );
@@ -6740,6 +6743,8 @@ fn signed_rotation_body(
         "signature": hex::encode(keyring_signature.to_bytes()),
         "replacement_signing_pubkey": hex::encode(replacement_pubkey),
         "current_signing_pubkey": hex::encode(current_pubkey),
+        "base_keyring_version": base.version,
+        "base_keyring_created_at": base.created_at.to_rfc3339(),
         "signed_at": signed_at,
         "reason": reason,
         "rotation_signature": hex::encode(rotation_signature.to_bytes()),
@@ -7131,7 +7136,13 @@ async fn rotate_owner_committed_pending_defers_and_exact_replay_retries_publicat
 
     let idempotency_key = format!("keyring-pending-rotate-{}", Uuid::new_v4());
     let headers = config_token_actor_headers(&idempotency_key, &paas_user_id);
-    let rotation = signed_rotation_body(org_id, user_id, &current_key, &replacement_key);
+    let rotation = signed_rotation_body(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        crate::test_support::latest_keyring_base(&pool, org_id).await,
+    );
 
     let deferred = rotate_paas_keyring_owner(
         internal_test_auth(),
@@ -8886,7 +8897,13 @@ async fn keyring_unrelated_five_xx_stays_fail_closed() {
     state.management_mode = crate::state::CapManagementMode::PaasManaged;
     let idempotency_key = format!("keyring-pending-unrelated-{}", Uuid::new_v4());
     let headers = config_token_actor_headers(&idempotency_key, &paas_user_id);
-    let rotation = signed_rotation_body(org_id, user_id, &current_key, &replacement_key);
+    let rotation = signed_rotation_body(
+        org_id,
+        user_id,
+        &current_key,
+        &replacement_key,
+        crate::test_support::latest_keyring_base(&pool, org_id).await,
+    );
     let call = |state: AppState, headers: HeaderMap| {
         rotate_paas_keyring_owner(
             internal_test_auth(),

@@ -1846,6 +1846,36 @@ pub(crate) mod test_support {
         pool
     }
 
+    /// The keyring version an owner-rotation directive binds as its base:
+    /// the superseded version plus its creation witness (issue #188).
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct KeyringBase {
+        pub(crate) version: i64,
+        pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    /// The org's latest keyring version as a directive base. Falls back to
+    /// a `(0, epoch)` sentinel when no keyring exists yet, for tests whose
+    /// requests are rejected before any keyring is read.
+    pub(crate) async fn latest_keyring_base(pool: &sqlx::PgPool, org_id: Uuid) -> KeyringBase {
+        let row: Option<(i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "SELECT version, created_at FROM org_keyrings
+              WHERE org_id = $1 ORDER BY version DESC LIMIT 1",
+        )
+        .bind(org_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read latest keyring base");
+        row.map(|(version, created_at)| KeyringBase {
+            version,
+            created_at,
+        })
+        .unwrap_or(KeyringBase {
+            version: 0,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+        })
+    }
+
     pub(crate) fn auth_context(role: Role, scopes: &[&str]) -> AuthContext {
         AuthContext {
             user_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
