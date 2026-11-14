@@ -25,8 +25,11 @@ RUN cargo chef cook --locked --release --bin enclava-appraiser
 FROM dependencies AS builder
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+# Binaries only in the layer diff: deleting target/ in the same RUN keeps
+# the gha cache export off the per-commit compile tree.
 RUN cargo build --locked --release --bin enclava-appraiser && \
-    cp target/release/enclava-appraiser /usr/local/bin/enclava-appraiser
+    cp target/release/enclava-appraiser /usr/local/bin/enclava-appraiser && \
+    rm -rf target
 
 FROM alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c1e2d1cc7d4 AS runtime
 RUN addgroup -g 1000 enclava && adduser -D -u 1000 -G enclava enclava

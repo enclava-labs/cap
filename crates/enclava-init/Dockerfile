@@ -1,5 +1,18 @@
-FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
+FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS cargo-chef
+ARG TARGETARCH
+COPY scripts/install-cargo-chef.sh /usr/local/bin/install-cargo-chef.sh
+RUN sh /usr/local/bin/install-cargo-chef.sh "$TARGETARCH" && cargo-chef --version
 
+FROM cargo-chef AS planner
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
+COPY crates/ crates/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# GHA exports layers, not cache mounts: cooked dependencies stay in this
+# layer so source-only crate changes reuse them (same pattern as enclava-api).
+FROM cargo-chef AS dependencies
 ARG BUILD_PROFILE=release
 
 RUN apt-get update && \
@@ -14,10 +27,29 @@ RUN apt-get update && \
 RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+COPY vendor/ vendor/
+RUN if [ "${BUILD_PROFILE}" = "release" ]; then \
+      cargo chef cook --locked --release -p enclava-init --features prod-strict --bin enclava-init --bin enclava-log-relay && \
+      cargo chef cook --locked --release -p enclava-wait-exec --features prod-strict --target x86_64-unknown-linux-musl; \
+    elif [ "${BUILD_PROFILE}" = "debug" ]; then \
+      cargo chef cook --locked -p enclava-init --bin enclava-init --bin enclava-log-relay && \
+      cargo chef cook --locked -p enclava-wait-exec --target x86_64-unknown-linux-musl; \
+    else \
+      echo "unsupported BUILD_PROFILE=${BUILD_PROFILE}; expected debug or release" >&2; \
+      exit 1; \
+    fi
+
+FROM dependencies AS builder
+ARG BUILD_PROFILE=release
+
+WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY vendor ./vendor
 COPY crates ./crates
 
+# Binaries only in the layer diff: deleting target/ in the same RUN keeps
+# the gha cache export off the per-commit compile tree.
 RUN if [ "${BUILD_PROFILE}" = "release" ]; then \
       cargo build --locked --release -p enclava-init --features prod-strict --bin enclava-init && \
       cargo build --locked --release -p enclava-init --features prod-strict --bin enclava-log-relay && \
@@ -25,7 +57,8 @@ RUN if [ "${BUILD_PROFILE}" = "release" ]; then \
       mkdir -p /out && \
       cp target/release/enclava-init /out/enclava-init && \
       cp target/release/enclava-log-relay /out/enclava-log-relay && \
-      cp target/x86_64-unknown-linux-musl/release/enclava-wait-exec /out/enclava-wait-exec; \
+      cp target/x86_64-unknown-linux-musl/release/enclava-wait-exec /out/enclava-wait-exec && \
+      rm -rf target; \
     elif [ "${BUILD_PROFILE}" = "debug" ]; then \
       cargo build --locked -p enclava-init --bin enclava-init && \
       cargo build --locked -p enclava-init --bin enclava-log-relay && \
@@ -33,7 +66,8 @@ RUN if [ "${BUILD_PROFILE}" = "release" ]; then \
       mkdir -p /out && \
       cp target/debug/enclava-init /out/enclava-init && \
       cp target/debug/enclava-log-relay /out/enclava-log-relay && \
-      cp target/x86_64-unknown-linux-musl/debug/enclava-wait-exec /out/enclava-wait-exec; \
+      cp target/x86_64-unknown-linux-musl/debug/enclava-wait-exec /out/enclava-wait-exec && \
+      rm -rf target; \
     else \
       echo "unsupported BUILD_PROFILE=${BUILD_PROFILE}; expected debug or release" >&2; \
       exit 1; \
