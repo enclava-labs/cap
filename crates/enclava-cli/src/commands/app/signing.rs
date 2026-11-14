@@ -448,12 +448,17 @@ async fn fetch_generated_agent_policy(
     api: &ApiClient,
     release: &PlatformRelease,
     descriptor: &enclava_cli::descriptor::DeploymentDescriptor,
+    log_encryption: Option<LogEncryptionConfig>,
+    pin_log_encryption: bool,
 ) -> Result<(GeneratedAgentPolicy, Option<LogEncryptionConfig>), Box<dyn std::error::Error>> {
     let response = api
         .generate_agent_policy(
             &descriptor.app_name,
             &AgentPolicyRequest {
                 descriptor: descriptor.clone(),
+                // Pinning sends null for an explicit no-recipient. Omitting the
+                // field is the ordinary-deploy signal that a broker may select.
+                log_encryption: pin_log_encryption.then(|| log_encryption.clone()),
             },
         )
         .await?;
@@ -556,6 +561,15 @@ pub(crate) struct SignedDeployBlobParams<'a> {
     pub image: &'a str,
     pub target_unlock_mode: Option<&'a str>,
     pub workload_security_profile: WorkloadSecurityProfile,
+    /// Primary container name. Local project files have none and keep `web`.
+    pub container_name: &'a str,
+    /// Generation log recipient. `None` is an explicit no-recipient sign when
+    /// `pin_log_encryption` is set (unlock disable). Ordinary deploys leave
+    /// the pin unset so a policy broker may still select a recipient.
+    pub log_encryption: Option<LogEncryptionConfig>,
+    /// When true, the signing service must echo `log_encryption`. When false,
+    /// a broker-selected recipient is signed instead of failing the echo.
+    pub pin_log_encryption: bool,
 }
 
 pub(crate) struct SignedDeployBlobs {
@@ -589,6 +603,9 @@ pub(crate) async fn build_signed_deploy_blobs(
         image,
         target_unlock_mode,
         workload_security_profile,
+        container_name,
+        log_encryption,
+        pin_log_encryption,
     } = params;
     let image_ref = enclava_common::image::ImageRef::parse(image)?;
     let image_ref = if image_ref.has_digest() {
@@ -734,7 +751,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         image_digest: image_ref.digest().to_string(),
         signer_identity,
         oci_runtime_spec: cap_app_oci_runtime_spec(CapAppOciRuntimeSpecInput {
-            container_name: "web".to_string(),
+            container_name: container_name.to_string(),
             port: app_config.app.port,
             workload_command: app_config.app.command.clone(),
             storage_paths: app_config.storage.paths.clone(),
@@ -788,8 +805,29 @@ pub(crate) async fn build_signed_deploy_blobs(
         omit_luks2_header_seal_claim: !release_carries_seal_claim,
         omit_log_spool_bind_claim: !log_spool_state_bind_supported,
     };
-    let (generated_agent_policy, log_encryption) =
-        fetch_generated_agent_policy(api, &release, &descriptor).await?;
+    let (generated_agent_policy, echoed_log_encryption) = fetch_generated_agent_policy(
+        api,
+        &release,
+        &descriptor,
+        log_encryption.clone(),
+        pin_log_encryption,
+    )
+    .await?;
+    // Unlock disable pins the locked generation's recipient, including an
+    // explicit none. Ordinary deploys do not: a broker may select a key, and
+    // failing `None == response` would retire that contract.
+    let log_encryption = if pin_log_encryption {
+        if echoed_log_encryption != log_encryption {
+            return Err(
+                "policy signing service did not echo the locked generation log_encryption; refusing \
+                 to sign a descriptor that would drop encrypted logging"
+                    .into(),
+            );
+        }
+        log_encryption
+    } else {
+        echoed_log_encryption
+    };
     descriptor.expected_agent_policy_hash = generated_agent_policy.policy_sha256;
     let cc_app = confidential_app_for_cc_hash(
         app,

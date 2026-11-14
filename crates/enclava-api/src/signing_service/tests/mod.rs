@@ -7,8 +7,8 @@ use enclava_common::descriptor::{
 use enclava_common::image::ImageRef;
 use enclava_common::types::{Durability, ResourceLimits, UnlockMode};
 use enclava_engine::types::{
-    AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec, VolumeSpec,
-    WorkloadArtifactBinding, WorkloadSecurityProfile,
+    AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, LogEncryptionConfig,
+    StorageSpec, VolumeSpec, WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
 
 #[test]
@@ -108,6 +108,46 @@ fn descriptor() -> DeploymentDescriptor {
             expected_kbs_policy_hash: Sha256::digest(b"package policy\n\ndefault allow := false\n")
                 .into(),
         }
+}
+
+#[test]
+fn agent_policy_broker_keeps_explicit_null_distinct_from_an_omit() {
+    let descriptor_json = serde_json::to_value(descriptor()).unwrap();
+    let absent = serde_json::json!({ "descriptor": descriptor_json });
+    let parsed: crate::routes::deployments::AgentPolicyRequest =
+        serde_json::from_value(absent).unwrap();
+    assert!(
+        parsed.log_encryption.is_none(),
+        "an omitted field is the broker-may-select signal"
+    );
+
+    let mut null_body = serde_json::json!({ "descriptor": descriptor_json });
+    null_body["log_encryption"] = serde_json::Value::Null;
+    let parsed: crate::routes::deployments::AgentPolicyRequest =
+        serde_json::from_value(null_body).unwrap();
+    assert_eq!(parsed.log_encryption, Some(None));
+    let forwarded = AgentPolicyRequest {
+        descriptor: descriptor(),
+        log_encryption: parsed.log_encryption,
+    };
+    let wire = serde_json::to_value(&forwarded).unwrap();
+    assert!(
+        wire.get("log_encryption")
+            .is_some_and(|value| value.is_null()),
+        "a null pin must be forwarded as null, not dropped: {wire}"
+    );
+
+    let config = LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs".to_string(),
+        public_key_base64url: "abc".to_string(),
+        public_key_sha256: "sha256:abc".to_string(),
+    };
+    let mut object_body = serde_json::json!({ "descriptor": descriptor_json });
+    object_body["log_encryption"] = serde_json::to_value(&config).unwrap();
+    let parsed: crate::routes::deployments::AgentPolicyRequest =
+        serde_json::from_value(object_body).unwrap();
+    assert_eq!(parsed.log_encryption, Some(Some(config)));
 }
 
 /// Platform binding matching the fixture descriptor: the sidecar digests and

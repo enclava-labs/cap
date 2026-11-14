@@ -386,8 +386,9 @@ fn parse_signing_service_timeout(raw: Option<String>) -> Result<Duration, Signin
 #[derive(Debug, Serialize)]
 pub struct AgentPolicyRequest {
     pub descriptor: DeploymentDescriptor,
+    /// `Some(None)` serializes null so a pinned no-recipient is not an omit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub log_encryption: Option<LogEncryptionConfig>,
+    pub log_encryption: Option<Option<LogEncryptionConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
