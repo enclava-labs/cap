@@ -14,6 +14,7 @@ use base64::{
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use enclava_common::canonical::ce_v1_bytes;
+use enclava_common::descriptor::LaunchIdentity;
 use enclava_engine::types::LogEncryptionConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -347,6 +348,11 @@ enum TransitionQuoteError {
     /// Revocation/validity collateral was missing, malformed, stale, or it
     /// revoked the ASK/VCEK.
     RevocationRejected,
+    /// The app has no recorded TEE instance identity to bind the quote to.
+    NoRecordedIdentity,
+    /// The report is not from one of the app's recorded TEE instances:
+    /// its HOST_DATA / launch measurement match no admitted launch identity.
+    IdentityMismatch,
 }
 
 impl TransitionQuoteError {
@@ -366,6 +372,12 @@ impl TransitionQuoteError {
             }
             Self::RevocationRejected => {
                 "transition_attestation.quote failed AMD revocation/validity checking"
+            }
+            Self::NoRecordedIdentity => {
+                "the app has no recorded TEE instance identity to bind the transition quote"
+            }
+            Self::IdentityMismatch => {
+                "transition_attestation.quote is not from the app's recorded TEE instance identity"
             }
         }
     }
@@ -442,7 +454,28 @@ fn decode_bounded_quote_b64(field: &str, max_der_bytes: usize) -> Option<Vec<u8>
 ///   not confidential, mirroring the CLI's
 ///   `ensure_snp_report_production_policy`),
 /// - the report is signed by the VCEK and the VCEK binds to the report's
-///   chipID and reported TCB, and
+///   chipID and reported TCB,
+/// - the report's HOST_DATA and launch measurement match one of the app's
+///   recorded TEE launch identities ([`LaunchIdentity`] as loaded from the
+///   app's admitted workload artifacts, the same authority every
+///   SNP-attested channel binds to). `report_data`'s binding inputs below
+///   are all caller-observable, so without this check an app owner
+///   controlling any other production-policy EPYC/SNP machine could
+///   fabricate a matching `report_data`; HOST_DATA (the cc_init_data hash,
+///   which commits the app's `tenant_instance_identity_hash`) and the
+///   launch measurement are frozen at VM launch, so a match proves the
+///   report came from a VM launched with THIS app's recorded launch
+///   inputs (#192) — a guest/tenant attacker cannot set either field.
+///   Residual risk (the explicit decision #192 asks for): a foreign HOST
+///   operator launching a VM with these exact launch inputs (the platform
+///   firmware image plus this app's cc_init_data as HOST_DATA) would also
+///   match — closing that needs per-instance `chip_id` pinning, for which
+///   no server-side record exists yet (follow-up #379). This gate lifts
+///   the bar from "unforgeable by software" to "unforgeable without a
+///   launch-capable SNP host presenting the recorded launch inputs".
+///   Legacy descriptors pin only the first 32 of the 48 measurement bytes
+///   ([`enclava_common::descriptor::FirmwareMeasurement::Legacy`]), which
+///   is commensurately weaker for those apps, and
 /// - the guest-committed `report_data` binds the TEE domain, the caller
 ///   nonce, the observed TLS leaf SPKI, and the TEE receipt key -- the same
 ///   values `verify_transition_receipt`/`verify_transition_attestation`
@@ -451,6 +484,7 @@ fn decode_bounded_quote_b64(field: &str, max_der_bytes: usize) -> Option<Vec<u8>
 fn verify_transition_snp_quote(
     attestation: &TransitionReceiptAttestation,
     receipt: &SignedReceiptResponse,
+    recorded_identities: &[LaunchIdentity],
     now_unix_seconds: u64,
 ) -> Result<(), TransitionQuoteError> {
     use enclava_verifier::{
@@ -547,6 +581,28 @@ fn verify_transition_snp_quote(
     verify_vcek_report_binding(&report, &vcek_der)
         .map_err(|_| TransitionQuoteError::InvalidEvidence)?;
 
+    // Instance binding (#192): the report must come from one of the app's
+    // recorded TEE launch identities, not merely from some genuine
+    // production-policy AMD machine. HOST_DATA (the cc_init_data hash) and
+    // the launch measurement are frozen at VM launch, so only a VM launched
+    // with this app's recorded launch inputs can report them; both must
+    // match the same identity (`LaunchIdentity::matches_report`), so a
+    // partial match still fails closed. An app with no recorded identity
+    // has nothing to bind to and fails closed as well, matching the
+    // SNP-attested channel posture (`tee_attestation`). Residual risk: a
+    // foreign host operator replaying these exact launch inputs is
+    // indistinguishable here (chip_id pinning, follow-up #379); see the
+    // fn doc for the full decision.
+    if recorded_identities.is_empty() {
+        return Err(TransitionQuoteError::NoRecordedIdentity);
+    }
+    if !recorded_identities
+        .iter()
+        .any(|identity| identity.matches_report(&report.host_data, &report.measurement))
+    {
+        return Err(TransitionQuoteError::IdentityMismatch);
+    }
+
     // The report_data binding reproduces the client-side
     // `tee_tls_report_data` contract: transcript hash over domain, nonce,
     // leaf SPKI, then a binding hash including the receipt key hash. The
@@ -589,7 +645,20 @@ fn unlock_database_error() -> UnlockModeError {
 fn unlock_transition_conflict(message: &'static str) -> UnlockModeError {
     (
         StatusCode::CONFLICT,
-        Json(serde_json::json!({"error": message})),
+        Json(serde_json::json!({ "error": message })),
+    )
+}
+
+/// Fixed-shape rejection for the SNP quote gate: content-free reasons only
+/// (`TransitionQuoteError::reason`).
+fn quote_gate_error_response(error: TransitionQuoteError) -> UnlockModeError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "invalid transition_attestation",
+            "field": "transition_attestation.quote",
+            "reason": error.reason(),
+        })),
     )
 }
 
@@ -1362,6 +1431,21 @@ pub async fn update_unlock_mode(
                 })),
             )
         })?;
+    // Server-side freshness window: without it, captured quote/receipt
+    // pairs can be replayed once (monotonicity and the unique receipt
+    // index only block reuse after the first consumption). Checked before
+    // the SNP quote gate so a stale replay fails on a timestamp comparison
+    // instead of burning the RSA chain + CRL walk first (#192).
+    if !transition_receipt_is_fresh(verified_receipt.receipt_timestamp, Utc::now()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid transition_receipt",
+                "field": "transition_receipt.payload.timestamp",
+                "reason": "transition receipt outside freshness window",
+            })),
+        ));
+    }
     let transition_attestation = body.transition_attestation.as_ref().ok_or((
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({
@@ -1379,30 +1463,42 @@ pub async fn update_unlock_mode(
             )
         },
     )?;
-    verify_transition_snp_quote(transition_attestation, receipt, quote_verification_now())
-        .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid transition_attestation",
-                    "field": "transition_attestation.quote",
-                    "reason": error.reason(),
-                })),
-            )
-        })?;
-    // Server-side freshness window: without it, captured quote/receipt
-    // pairs can be replayed once (monotonicity and the unique receipt
-    // index only block reuse after the first consumption).
-    if !transition_receipt_is_fresh(verified_receipt.receipt_timestamp, Utc::now()) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "invalid transition_receipt",
-                "field": "transition_receipt.payload.timestamp",
-                "reason": "transition receipt outside freshness window",
-            })),
+    // Bind the transition quote to the app's recorded TEE instance identity
+    // (#192): the report must match one of the launch identities the app's
+    // admitted workload artifacts record — the same authority every
+    // SNP-attested channel binds to (`tee_attestation`). This is what makes
+    // the quote evidence about THIS app's instance instead of any genuine
+    // production-policy AMD machine.
+    let recorded_identities =
+        crate::tee_attestation::load_admissible_launch_identities(&state.db, &app)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    app = %app.id,
+                    category = error.category(),
+                    reason = error.reason(),
+                    "recorded TEE launch identities unavailable for unlock-mode transition"
+                );
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": "launch identity unavailable" })),
+                )
+            })?;
+    // Fail fast before the RSA chain + CRL walk when nothing could match:
+    // the empty set is known here without any of the quote's expensive work
+    // (the same posture `attest_teardown_channel` takes before connecting).
+    if recorded_identities.is_empty() {
+        return Err(quote_gate_error_response(
+            TransitionQuoteError::NoRecordedIdentity,
         ));
     }
+    verify_transition_snp_quote(
+        transition_attestation,
+        receipt,
+        &recorded_identities,
+        quote_verification_now(),
+    )
+    .map_err(quote_gate_error_response)?;
 
     let signing_artifacts = crate::signing_service::decode_optional_blobs(
         body.customer_descriptor_blob.clone(),
@@ -1702,10 +1798,10 @@ mod tests {
         crate::signing_service::DescriptorPlatformBinding::EMPTY;
 
     use super::{
-        BUILTIN_AMD_ARK_SHA256_PINS, ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode,
-        SignedReceiptResponse, TransitionQuoteError, TransitionReceiptAttestation,
-        TransitionSnpQuote, UnlockModeCommitRequest, auto_unlock_disabled_error,
-        commit_unlock_mode_transition, snp_guest_policy_allows_debug,
+        BUILTIN_AMD_ARK_SHA256_PINS, LaunchIdentity, ReceiptEnvelope, ReceiptPayloadView,
+        RequestedUnlockMode, SignedReceiptResponse, TransitionQuoteError,
+        TransitionReceiptAttestation, TransitionSnpQuote, UnlockModeCommitRequest,
+        auto_unlock_disabled_error, commit_unlock_mode_transition, snp_guest_policy_allows_debug,
         tee_ownership_state_from_value, transition_receipt_is_fresh, unlock_status,
         validate_transition, verify_transition_attestation, verify_transition_receipt,
         verify_transition_snp_quote,
@@ -2410,6 +2506,20 @@ mod tests {
         }
     }
 
+    /// A recorded launch identity exactly matching the live fixture's
+    /// report: the app's TEE instance as its signed descriptor records it
+    /// (HOST_DATA = the cc_init_data hash, plus the full launch measurement).
+    fn live_quote_identity(fixture: &LiveQuoteFixture) -> LaunchIdentity {
+        let report =
+            enclava_verifier::parse_snp_report(&fixture.report).expect("fixture SNP report parses");
+        LaunchIdentity {
+            expected_cc_init_data_hash: report.host_data,
+            expected_firmware_measurement: enclava_common::descriptor::FirmwareMeasurement::Full(
+                report.measurement,
+            ),
+        }
+    }
+
     /// Trusted time for the prove-it-live fixture: the capture time
     /// recorded by `enclava-verifier`'s `live_bundle.rs` (2026-08-04
     /// 12:00:00 UTC), inside the bundle CRL's this/nextUpdate window.
@@ -2420,8 +2530,107 @@ mod tests {
         let fixture = live_quote_fixture();
         let attestation = live_quote_attestation(&fixture);
         let receipt = live_quote_receipt(&fixture);
-        verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
-            .expect("live VCEK-signed SNP quote with matching binding verifies");
+        verify_transition_snp_quote(
+            &attestation,
+            &receipt,
+            &[live_quote_identity(&fixture)],
+            LIVE_QUOTE_TRUSTED_TIME_UNIX,
+        )
+        .expect("live VCEK-signed SNP quote with matching binding verifies");
+    }
+
+    /// Regression (#192): a genuine VCEK-signed quote whose HOST_DATA /
+    /// launch measurement belong to a DIFFERENT launch must be rejected.
+    /// Without the recorded-identity gate the report_data binding is
+    /// satisfied by any production-policy EPYC machine whose guest repeats
+    /// the caller-observable binding inputs.
+    #[test]
+    fn rejects_transition_snp_quote_that_matches_no_recorded_identity() {
+        let fixture = live_quote_fixture();
+        let attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        // A recorded identity from a different launch: same platform
+        // firmware measurement, but a different cc_init_data (HOST_DATA).
+        let foreign = LaunchIdentity {
+            expected_cc_init_data_hash: [0x77; 32],
+            expected_firmware_measurement: live_quote_identity(&fixture)
+                .expected_firmware_measurement,
+        };
+        assert_eq!(
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[foreign],
+                LIVE_QUOTE_TRUSTED_TIME_UNIX,
+            )
+            .unwrap_err(),
+            TransitionQuoteError::IdentityMismatch
+        );
+    }
+
+    /// Multi-generation apps carry several admissible identities (the
+    /// latest admitted operation plus the prior healthy workload while a
+    /// replacement is unconfirmed): the quote must match ANY one of them,
+    /// not just the first.
+    #[test]
+    fn verifies_transition_snp_quote_matching_a_non_first_recorded_identity() {
+        let fixture = live_quote_fixture();
+        let attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        let foreign = LaunchIdentity {
+            expected_cc_init_data_hash: [0x77; 32],
+            expected_firmware_measurement: live_quote_identity(&fixture)
+                .expected_firmware_measurement,
+        };
+        verify_transition_snp_quote(
+            &attestation,
+            &receipt,
+            &[foreign, live_quote_identity(&fixture)],
+            LIVE_QUOTE_TRUSTED_TIME_UNIX,
+        )
+        .expect("quote matching any recorded identity verifies");
+    }
+
+    /// Regression (#192): HOST_DATA alone is not enough — the launch
+    /// measurement must match the same recorded identity, so a genuine
+    /// report from a VM launched with this app's cc_init_data under
+    /// non-platform firmware is rejected.
+    #[test]
+    fn rejects_transition_snp_quote_when_launch_measurement_differs_from_record() {
+        let fixture = live_quote_fixture();
+        let attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        let identity = LaunchIdentity {
+            expected_cc_init_data_hash: live_quote_identity(&fixture).expected_cc_init_data_hash,
+            expected_firmware_measurement: enclava_common::descriptor::FirmwareMeasurement::Full(
+                [0x22; 48],
+            ),
+        };
+        assert_eq!(
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[identity],
+                LIVE_QUOTE_TRUSTED_TIME_UNIX,
+            )
+            .unwrap_err(),
+            TransitionQuoteError::IdentityMismatch
+        );
+    }
+
+    /// Regression (#192): an app with no recorded TEE instance identity
+    /// has nothing to bind the quote to and must fail closed — accepting
+    /// it would recreate the unforgeable-by-software gap.
+    #[test]
+    fn rejects_transition_snp_quote_when_app_has_no_recorded_identity() {
+        let fixture = live_quote_fixture();
+        let attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, &[], LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::NoRecordedIdentity
+        );
     }
 
     /// Combined check against a fully valid signed receipt: the route's
@@ -2454,8 +2663,13 @@ mod tests {
         )
         .expect("receipt passes every signature/payload check on its own");
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
-                .unwrap_err(),
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[live_quote_identity(&fixture)],
+                LIVE_QUOTE_TRUSTED_TIME_UNIX,
+            )
+            .unwrap_err(),
             TransitionQuoteError::InvalidEvidence
         );
     }
@@ -2472,8 +2686,13 @@ mod tests {
         receipt.payload.attestation_quote_sha256 = Some(foreign_hash.clone());
         attestation.attestation_evidence_sha256 = foreign_hash;
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
-                .unwrap_err(),
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[live_quote_identity(&fixture)],
+                LIVE_QUOTE_TRUSTED_TIME_UNIX,
+            )
+            .unwrap_err(),
             TransitionQuoteError::EvidenceMismatch
         );
     }
@@ -2507,8 +2726,13 @@ mod tests {
         receipt.payload.attestation_quote_sha256 = Some(tampered_hash.clone());
         attestation.attestation_evidence_sha256 = tampered_hash;
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
-                .unwrap_err(),
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[live_quote_identity(&fixture)],
+                LIVE_QUOTE_TRUSTED_TIME_UNIX,
+            )
+            .unwrap_err(),
             TransitionQuoteError::DebugPolicy
         );
     }
@@ -2557,8 +2781,13 @@ mod tests {
         receipt.payload.attestation_quote_sha256 = Some(tampered_hash.clone());
         attestation.attestation_evidence_sha256 = tampered_hash;
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
-                .unwrap_err(),
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[live_quote_identity(&fixture)],
+                LIVE_QUOTE_TRUSTED_TIME_UNIX,
+            )
+            .unwrap_err(),
             TransitionQuoteError::InvalidEvidence
         );
     }
@@ -2570,8 +2799,13 @@ mod tests {
         let receipt = live_quote_receipt(&fixture);
         attestation.tee_domain = "attacker.example".to_string();
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
-                .unwrap_err(),
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[live_quote_identity(&fixture)],
+                LIVE_QUOTE_TRUSTED_TIME_UNIX,
+            )
+            .unwrap_err(),
             TransitionQuoteError::InvalidEvidence
         );
     }
@@ -2589,8 +2823,13 @@ mod tests {
             ..attestation.quote.clone().expect("quote present")
         });
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
-                .unwrap_err(),
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[live_quote_identity(&fixture)],
+                LIVE_QUOTE_TRUSTED_TIME_UNIX,
+            )
+            .unwrap_err(),
             TransitionQuoteError::InvalidEvidence
         );
     }
@@ -2602,8 +2841,13 @@ mod tests {
         let receipt = live_quote_receipt(&fixture);
         attestation.quote = None;
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
-                .unwrap_err(),
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[live_quote_identity(&fixture)],
+                LIVE_QUOTE_TRUSTED_TIME_UNIX,
+            )
+            .unwrap_err(),
             TransitionQuoteError::Missing
         );
     }
@@ -2621,8 +2865,13 @@ mod tests {
             ..attestation.quote.clone().expect("quote present")
         });
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
-                .unwrap_err(),
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[live_quote_identity(&fixture)],
+                LIVE_QUOTE_TRUSTED_TIME_UNIX,
+            )
+            .unwrap_err(),
             TransitionQuoteError::Malformed
         );
     }
@@ -2637,7 +2886,13 @@ mod tests {
         // expired. 2027-01-01T00:00:00Z.
         const PAST_NEXT_UPDATE: u64 = 1_792_761_600;
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt, PAST_NEXT_UPDATE).unwrap_err(),
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[live_quote_identity(&fixture)],
+                PAST_NEXT_UPDATE,
+            )
+            .unwrap_err(),
             TransitionQuoteError::RevocationRejected
         );
     }
@@ -2678,8 +2933,13 @@ mod tests {
             let mut attestation = live_quote_attestation(&fixture);
             attestation.quote = Some(oversized);
             assert_eq!(
-                verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
-                    .unwrap_err(),
+                verify_transition_snp_quote(
+                    &attestation,
+                    &receipt,
+                    &[live_quote_identity(&fixture)],
+                    LIVE_QUOTE_TRUSTED_TIME_UNIX,
+                )
+                .unwrap_err(),
                 TransitionQuoteError::Malformed
             );
         }
@@ -2700,8 +2960,13 @@ mod tests {
             ..attestation.quote.clone().expect("quote present")
         });
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
-                .unwrap_err(),
+            verify_transition_snp_quote(
+                &attestation,
+                &receipt,
+                &[live_quote_identity(&fixture)],
+                LIVE_QUOTE_TRUSTED_TIME_UNIX,
+            )
+            .unwrap_err(),
             TransitionQuoteError::RevocationRejected
         );
     }
