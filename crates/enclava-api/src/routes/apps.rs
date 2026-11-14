@@ -173,6 +173,9 @@ enum AppDeleteFailure {
     KbsTlsBinding,
     KbsPolicy,
     KbsPolicyBudget,
+    TeardownLivePodUnavailable,
+    TeardownLivePodUnnamed,
+    TeardownLivePodUncovered,
 }
 
 impl AppDeleteFailure {
@@ -192,6 +195,9 @@ impl AppDeleteFailure {
             Self::KbsTlsBinding => "app_delete_kbs_tls_binding_failed",
             Self::KbsPolicy => "app_delete_kbs_policy_failed",
             Self::KbsPolicyBudget => "app_delete_kbs_policy_budget_exceeded",
+            Self::TeardownLivePodUnavailable => "app_delete_teardown_live_pod_unavailable",
+            Self::TeardownLivePodUnnamed => "app_delete_teardown_live_pod_unnamed",
+            Self::TeardownLivePodUncovered => "app_delete_teardown_live_pod_uncovered",
         }
     }
 
@@ -209,7 +215,10 @@ impl AppDeleteFailure {
             | Self::Namespace
             | Self::KbsOwnerBinding
             | Self::KbsTlsBinding
-            | Self::KbsPolicy => StatusCode::BAD_GATEWAY,
+            | Self::KbsPolicy
+            | Self::TeardownLivePodUnavailable
+            | Self::TeardownLivePodUnnamed
+            | Self::TeardownLivePodUncovered => StatusCode::BAD_GATEWAY,
         }
     }
 }
@@ -228,6 +237,29 @@ fn app_delete_failure<T>(
         "app deletion step failed"
     );
     (status, Json(serde_json::json!({"error": code})))
+}
+
+fn teardown_live_pod_failure(
+    app_id: Uuid,
+    error: crate::kbs::TeardownLivePodError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let failure = match error {
+        crate::kbs::TeardownLivePodError::Db(_) | crate::kbs::TeardownLivePodError::Projection => {
+            return internal_server_error();
+        }
+        crate::kbs::TeardownLivePodError::KubernetesUnavailable => {
+            AppDeleteFailure::TeardownLivePodUnavailable
+        }
+        crate::kbs::TeardownLivePodError::Unnamed => AppDeleteFailure::TeardownLivePodUnnamed,
+        crate::kbs::TeardownLivePodError::Uncovered => AppDeleteFailure::TeardownLivePodUncovered,
+    };
+    tracing::warn!(
+        app_id = %app_id,
+        error = %error,
+        code = failure.code(),
+        "teardown live pod could not be named or its artifact is not in the published unit"
+    );
+    app_delete_failure(app_id, failure, error)
 }
 
 fn app_delete_dns_failure(
@@ -1839,6 +1871,61 @@ pub(crate) async fn delete_app_before(
         ))
         .ok_or_else(internal_server_error)?;
 
+    // Name the owned ordinal-0 pod before admission when an intermediate
+    // publication exists (#235). The read is not a provider mutation, and the
+    // pin is not written here: a deleting retry already contributes the stored
+    // pin to the selector. Replacing it before admission would change that
+    // selector with no generation bump, and the budget check would treat the
+    // replacement as already required. The decision is committed with the
+    // deleting phase below. A failure here releases the lease without flipping
+    // status or the pin. abandon_teardown must stay reachable when the cluster
+    // cannot be read, and a retry whose teardown already completed must not
+    // depend on it.
+    let pin_applies = if app.status == AppStatus::Deleting {
+        let (required, completed): (bool, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+            "SELECT workload_teardown_required, workload_teardown_completed_at
+               FROM apps WHERE id = $1",
+        )
+        .bind(app.id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| internal_server_error())?;
+        required && completed.is_none()
+    } else if requires_workload_teardown(app.status) {
+        true
+    } else {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM deployments WHERE app_id = $1)
+             OR EXISTS(SELECT 1 FROM kbs_owner_bindings WHERE app_id = $1)",
+        )
+        .bind(app.id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| internal_server_error())?
+    };
+    let pin_decision = if !abandon_teardown && pin_applies {
+        match crate::kbs::observe_teardown_live_deployment_pin(
+            &state.db,
+            &state.kube_client,
+            app.id,
+            &app.namespace,
+            &app.name,
+        )
+        .await
+        {
+            Ok(decision) => Some(decision),
+            Err(error) => {
+                delete_mutation
+                    .finish()
+                    .await
+                    .map_err(|_| internal_server_error())?;
+                return Err(teardown_live_pod_failure(app.id, error));
+            }
+        }
+    } else {
+        None
+    };
+
     // Persist the durable deleting phase and whether confidential teardown is
     // required before any external call. Retries must reuse that decision
     // instead of inferring it from status='deleting', which every in-flight
@@ -1917,8 +2004,11 @@ pub(crate) async fn delete_app_before(
     // policy authority for as long as it can still be serving, and the byte
     // budget fail-closes the whole reconciliation when the required set
     // overflows — stacked deletions would then wedge every app's policy
-    // convergence. Refuse the delete here, under the global kbs_policy fence
-    // and before the pin exists, when this app's teardown unit no longer fits.
+    // convergence. Refuse the delete here, under the global kbs_policy fence, after the
+    // live pod has been observed and before the app is marked deleting, when
+    // this app's teardown unit no longer fits. The observed pin is projected
+    // against the stored one and is not written until the generation bump
+    // below; a refusal leaves the previous pin selected.
     // Nothing is dropped from the policy to make a delete fit. `abandon_teardown`
     // proceeds anyway: its deletion completes in this flow (the pin stays
     // transient), and the operator override must remain reachable to unwind a
@@ -1947,10 +2037,17 @@ pub(crate) async fn delete_app_before(
             pre_delete_teardown_required
         };
         if pin_will_apply {
-            let fits = crate::kbs::teardown_unit_fits_signed_policy_budget(
+            let proposal = match pin_decision {
+                Some(decision) => {
+                    crate::kbs::TeardownPinProposal::Replace(decision.deployment_id())
+                }
+                None => crate::kbs::TeardownPinProposal::Stored,
+            };
+            let fits = crate::kbs::teardown_unit_fits_signed_policy_budget_proposing(
                 &state.db,
                 state.kbs_policy.as_ref(),
                 phase_app.id,
+                proposal,
             )
             .await
             .map_err(|_| internal_server_error())?;
@@ -2033,6 +2130,17 @@ pub(crate) async fn delete_app_before(
         pre_delete_teardown_required
     };
     let publish_enqueued = if publication_needed {
+        // Same transaction as the generation bump. A refusal or rollback above
+        // never reaches this write, so the previous pin stays selected.
+        if let Some(decision) = pin_decision {
+            crate::kbs::commit_teardown_live_pin(
+                &mut phase_tx,
+                phase_app.id,
+                decision.deployment_id(),
+            )
+            .await
+            .map_err(|_| internal_server_error())?;
+        }
         crate::kbs::enqueue_signed_policy_revocation_if_active(&mut phase_tx)
             .await
             .map_err(|_| internal_server_error())?
@@ -2170,6 +2278,26 @@ pub(crate) async fn delete_app_before(
         }
     } else {
         None
+    };
+    let teardown = if teardown.is_none()
+        && teardown_required
+        && teardown_completed_at.is_none()
+        && !abandon_teardown
+    {
+        match crate::kbs::named_live_pod_is_authorized(
+            &state.db,
+            &state.kube_client,
+            deleting_app.id,
+            &deleting_app.namespace,
+            &deleting_app.name,
+        )
+        .await
+        {
+            Ok(()) => teardown,
+            Err(error) => Some(teardown_live_pod_failure(deleting_app.id, error)),
+        }
+    } else {
+        teardown
     };
     let teardown = match teardown {
         Some(failure) => Err(failure),
