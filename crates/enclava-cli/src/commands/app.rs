@@ -682,9 +682,13 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Deploy-time config delivery: fetch the config token, attest the TEE, then
-/// push every `--set` pair over the SPKI-pinned channel `attest_receipt_key`
-/// returns. The raw token/ownership client is never used for mutations.
+/// Deploy-time config delivery: fetch a token bound to this deployment's
+/// apply generation, attest the TEE, then push every `--set` pair over the
+/// SPKI-pinned channel `attest_receipt_key` returns. The app-scoped token
+/// route is not used: it stamps the app's maximum generation, so a newer
+/// deploy created during the runtime wait could accept this command's stale
+/// keys. An unbound id is refused rather than falling back to that route.
+/// The raw token/ownership client is never used for mutations.
 async fn push_deploy_config(
     api: &ApiClient,
     app_domain: &str,
@@ -696,10 +700,17 @@ async fn push_deploy_config(
     if config_pairs.is_empty() {
         return Ok(());
     }
+    let deployment_id = deployment.deployment_id;
+    if deployment_id.is_empty() || deployment_id == "pending" {
+        return Err(
+            "deploy config push requires a deployment id; refusing the app-scoped config token"
+                .into(),
+        );
+    }
     pb.set_position(4);
     pb.set_message(counted_progress("Customer config", 0, config_pairs.len()));
 
-    let token_resp = api.get_config_token(app_name).await?;
+    let token_resp = api.get_deployment_config_token(deployment_id).await?;
     let tee = token_resp
         .tee_url
         .as_deref()

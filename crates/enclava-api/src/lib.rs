@@ -1,6 +1,7 @@
 pub mod acme;
 pub mod auth;
 pub mod clients;
+pub mod config_generation;
 pub mod cosign;
 pub mod db;
 pub mod deploy;

@@ -181,6 +181,7 @@ async fn begin_test_config_token_receipt(
         ConfigTokenIdempotencyOptions {
             binding: Some(binding),
             legacy_request_hash: None,
+            deployment_generation: None,
         },
     )
     .await
@@ -447,6 +448,7 @@ async fn migration_terminalizes_only_stale_legacy_reservations_without_data_leak
                     NULL::smallint AS capability_receipt_version,
                     NULL::uuid AS capability_resource_id,
                     NULL::text AS capability_instance_id,
+                    NULL::bigint AS capability_config_generation,
                     false AS known_not_applied,
                     completed_at, created_at, updated_at,
                     clock_timestamp() AS database_now
@@ -490,6 +492,7 @@ async fn migration_terminalizes_only_stale_legacy_reservations_without_data_leak
                     NULL::smallint AS capability_receipt_version,
                     NULL::uuid AS capability_resource_id,
                     NULL::text AS capability_instance_id,
+                    NULL::bigint AS capability_config_generation,
                     false AS known_not_applied,
                     completed_at, created_at, updated_at,
                     clock_timestamp() AS database_now
@@ -787,6 +790,25 @@ async fn deterministic_config_token_migration_scrubs_legacy_and_enforces_confide
     assert_eq!(null_kind_terminal.2, None);
     assert!(!null_kind_terminal.3.contains(&null_kind_secret));
 
+    // The scrub checks above ran on the 0043/0045 schema. Current replay
+    // code writes capability_config_generation, so apply that column before
+    // exercising it against this isolated schema.
+    let generation_migration = migrations
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("0090_"))
+        })
+        .cloned()
+        .expect("find config-token generation migration");
+    let generation_sql = std::fs::read_to_string(&generation_migration)
+        .expect("read config-token generation migration");
+    sqlx::raw_sql(&generation_sql)
+        .execute(&mut connection)
+        .await
+        .expect("apply config-token generation column before current replay code");
+
     let replay_options = database_url
         .parse::<sqlx::postgres::PgConnectOptions>()
         .expect("parse isolated config-token migration database URL")
@@ -807,6 +829,7 @@ async fn deterministic_config_token_migration_scrubs_legacy_and_enforces_confide
             &legacy_auth,
             &legacy_body,
             &binding,
+            None,
         )
         .await
         .expect("replay migrated null-kind config-token terminal"),
@@ -822,6 +845,7 @@ async fn deterministic_config_token_migration_scrubs_legacy_and_enforces_confide
         &legacy_auth,
         &legacy_body,
         &binding,
+        None,
     )
     .await
     .err()
@@ -2287,6 +2311,13 @@ async fn app_config_token_route_replays_exactly_and_rejects_name_recreation() {
 
 #[tokio::test]
 async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() {
+    // Debug state for this fixture exceeds the 2MB libtest stack once the
+    // route future is embedded in it. Box the body so that future stays on
+    // the heap while each route call is constructed.
+    Box::pin(generic_deployment_config_token_route_replays_and_rejects_app_rebind_body()).await;
+}
+
+async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind_body() {
     let pool = database_test_pool().await;
     let suffix = Uuid::new_v4().simple().to_string();
     let org_id = Uuid::new_v4();
@@ -2309,6 +2340,25 @@ async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() 
     )
     .await;
     insert_config_token_test_app(&pool, org_id, &org_name, app_a, &app_name_a, "a").await;
+    let mut fx = pool
+        .begin()
+        .await
+        .expect("begin generic config-token deployment");
+    sqlx::query(
+        "INSERT INTO deployment_apply_jobs (
+             deployment_id, app_id, org_id, source_deployment_id,
+             payload_version, payload, payload_sha256,
+             cleanup_app_on_setup_failure, signed_required, state
+         ) VALUES ($1, $2, $3, $1, 1, '{\"version\":1,\"log_encryption\":null}'::jsonb, $4,
+                   false, false, 'completed')",
+    )
+    .bind(deployment_id)
+    .bind(app_a)
+    .bind(org_id)
+    .bind(vec![9u8; 32])
+    .execute(&mut *fx)
+    .await
+    .expect("insert generic config-token apply job");
     sqlx::query(
         "INSERT INTO deployments
                  (id, org_id, app_id, trigger, status, spec_snapshot)
@@ -2317,24 +2367,56 @@ async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() 
     .bind(deployment_id)
     .bind(org_id)
     .bind(app_a)
-    .execute(&pool)
+    .execute(&mut *fx)
     .await
     .expect("insert generic config-token deployment");
+    fx.commit()
+        .await
+        .expect("commit generic config-token deployment");
     let state = idempotency_test_state(pool.clone());
     let key = format!("generic-config-route-{suffix}");
     let headers = config_token_actor_headers(&key, &paas_user_id);
     let call = |state: AppState, headers: HeaderMap| {
-        issue_paas_generic_config_token(
+        Box::pin(issue_paas_generic_config_token(
             internal_test_auth(),
             State(state),
             Path((paas_org_id.clone(), deployment_id)),
             headers,
             Json(serde_json::json!({})),
-        )
+        ))
     };
     let (first_status, Json(first)) = call(state.clone(), headers.clone())
         .await
         .expect("issue first generic config token");
+    let later = Uuid::new_v4();
+    let mut later_tx = pool.begin().await.expect("begin later generation");
+    sqlx::query(
+        "INSERT INTO deployment_apply_jobs (
+             deployment_id, app_id, org_id, source_deployment_id,
+             payload_version, payload, payload_sha256,
+             cleanup_app_on_setup_failure, signed_required, state
+         ) VALUES ($1, $2, $3, $1, 1, '{\"version\":1,\"log_encryption\":null}'::jsonb, $4,
+                   false, false, 'pending')",
+    )
+    .bind(later)
+    .bind(app_a)
+    .bind(org_id)
+    .bind(vec![8u8; 32])
+    .execute(&mut *later_tx)
+    .await
+    .expect("insert later apply job");
+    sqlx::query(
+        "INSERT INTO deployments
+                 (id, org_id, app_id, trigger, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'api', 'pending', '{}'::jsonb)",
+    )
+    .bind(later)
+    .bind(org_id)
+    .bind(app_a)
+    .execute(&mut *later_tx)
+    .await
+    .expect("insert later deployment");
+    later_tx.commit().await.expect("commit later generation");
     let (duplicate_status, Json(duplicate)) = call(state.clone(), headers.clone())
         .await
         .expect("regenerate exact generic config token");
@@ -2348,6 +2430,41 @@ async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() 
     // fixture admits no workload, so there is nothing to attest against.
     assert_eq!(first["launch_identities"], serde_json::json!([]));
     assert_eq!(duplicate["launch_identities"], first["launch_identities"]);
+    let stored_generation = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT capability_config_generation
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("stored config generation")
+    .expect("deployment mint stores a generation");
+    let payload = first["token"]
+        .as_str()
+        .expect("token")
+        .split('.')
+        .nth(1)
+        .expect("jwt payload");
+    let claims: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("jwt payload decodes"),
+    )
+    .expect("jwt payload is json");
+    assert_eq!(claims["deployment_generation"], stored_generation);
+    assert_eq!(duplicate["token"], first["token"]);
+    let later_generation = sqlx::query_scalar::<_, i64>(
+        "SELECT generation FROM deployment_apply_jobs WHERE deployment_id = $1",
+    )
+    .bind(later)
+    .fetch_one(&pool)
+    .await
+    .expect("later generation");
+    assert!(
+        later_generation > stored_generation,
+        "replay must ignore a later apply job"
+    );
 
     insert_config_token_test_app(&pool, org_id, &org_name, app_b, &app_name_b, "b").await;
     sqlx::query("DELETE FROM deployments WHERE id = $1")
@@ -2523,6 +2640,7 @@ async fn deleted_and_rebound_config_token_routes_do_not_extend_or_mask_expiry() 
             &auth,
             &body,
             &app_binding,
+            None,
         )
         .await
         .expect("reserve incomplete app receipt"),
@@ -2535,6 +2653,7 @@ async fn deleted_and_rebound_config_token_routes_do_not_extend_or_mask_expiry() 
             &auth,
             &body,
             &deployment_binding,
+            None,
         )
         .await
         .expect("reserve incomplete deployment receipt"),
@@ -2833,6 +2952,7 @@ async fn deleted_legacy_config_token_routes_preserve_extended_terminal_proof() {
                         reservation_token, operation_id, lease_expires_at,
                         recovery_kind, capability_receipt_version,
                         capability_resource_id, capability_instance_id,
+                        capability_config_generation,
                         known_not_applied,
                         completed_at, created_at, updated_at,
                         clock_timestamp() AS database_now
@@ -2936,6 +3056,7 @@ async fn legacy_completed_config_token_sanitizer_preserves_extended_lease_proof(
                     reservation_token, operation_id, lease_expires_at,
                     recovery_kind, capability_receipt_version,
                     capability_resource_id, capability_instance_id,
+                    capability_config_generation,
                     known_not_applied,
                     completed_at, created_at, updated_at,
                     clock_timestamp() AS database_now
@@ -3004,7 +3125,7 @@ async fn legacy_config_token_receipt_uses_conservative_lease_proof() {
     let headers = idempotency_headers(&key);
     let (status, proof) = expect_idempotency_replay(
         begin_actor_deterministic_config_token_request(
-            &state, &headers, &path, &auth, &body, &binding,
+            &state, &headers, &path, &auth, &body, &binding, None,
         )
         .await
         .expect("terminalize legacy config-token lease"),

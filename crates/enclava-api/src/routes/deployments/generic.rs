@@ -533,10 +533,21 @@ async fn generic_config_token_inner(
             .await?
         }
         None => {
-            crate::routes::config::issue_config_token_route(
+            let deployment_generation =
+                crate::config_generation::deployment_apply_generation(&state.db, deployment_id)
+                    .await
+                    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+                    .ok_or_else(|| {
+                        json_error(
+                            StatusCode::CONFLICT,
+                            "deployment has no apply generation to bind the config token to",
+                        )
+                    })?;
+            crate::routes::config::issue_config_token_route_for_deployment_generation(
                 auth,
-                State(state),
-                Path(app.name.clone()),
+                state,
+                app.name.clone(),
+                Some(deployment_generation),
             )
             .await?
         }

@@ -3976,7 +3976,7 @@ async fn deploy_config_push_attests_before_writing_and_syncs_each_key() {
     )
     .await;
     let api_address = spawn_json_api_stub(events.clone(), move |path| {
-        if path == "/apps/shell/config-token" {
+        if path == "/deployments/deploy-1/config-token" {
             (
                 200,
                 serde_json::json!({
@@ -4017,12 +4017,18 @@ async fn deploy_config_push_attests_before_writing_and_syncs_each_key() {
     let k2_put = event_position(&recorded, "tee:put /.well-known/confidential/config/K2");
     let k2_sync = event_position(&recorded, "\"key_name\":\"K2\"");
     assert!(
-        event_position(&recorded, "POST /apps/shell/config-token") < attest
+        event_position(&recorded, "POST /deployments/deploy-1/config-token") < attest
             && attest < k1_put
             && k1_put < k1_sync
             && k1_sync < k2_put
             && k2_put < k2_sync,
-        "the token fetch and attestation must precede every TEE write, and each write precedes its sync: {recorded:?}"
+        "the deployment-scoped token fetch and attestation must precede every TEE write, and each write precedes its sync: {recorded:?}"
+    );
+    assert!(
+        !recorded
+            .iter()
+            .any(|event| event.contains("/apps/shell/config-token")),
+        "deploy --set must not mint an app-scoped token: {recorded:?}"
     );
 }
 
@@ -4040,7 +4046,7 @@ async fn deploy_config_push_writes_nothing_when_attestation_fails() {
         .await;
         let api_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let api_address = spawn_json_api_stub(api_requests.clone(), move |path| {
-            if path == "/apps/shell/config-token" {
+            if path == "/deployments/deploy-1/config-token" {
                 (
                     200,
                     serde_json::json!({
@@ -4087,6 +4093,39 @@ async fn deploy_config_push_writes_nothing_when_attestation_fails() {
                 .iter()
                 .any(|request| request.contains("/config/sync")),
             "no config sync may follow a failed attestation (refused={refused})"
+        );
+        let api_recorded = api_requests.lock().unwrap().clone();
+        assert!(
+            api_recorded
+                .iter()
+                .any(|request| request.contains("POST /deployments/deploy-1/config-token"))
+                && !api_recorded
+                    .iter()
+                    .any(|request| request.contains("/apps/shell/config-token")),
+            "failed attestation still fetched a deployment-scoped token, not the app route (refused={refused}): {api_recorded:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deploy_config_push_refuses_unbound_deployment_without_minting() {
+    let api = ApiClient::new("http://127.0.0.1:1", Some("test".to_string()));
+    let pairs = vec![("K".to_string(), "v".to_string())];
+    for deployment_id in ["", "pending"] {
+        let error = push_deploy_config(
+            &api,
+            "unused.example",
+            "shell",
+            DeploymentWait::new(deployment_id),
+            &pairs,
+            &ProgressBar::hidden(),
+        )
+        .await
+        .expect_err("an unbound deployment must not mint an app-scoped token");
+        let message = error.to_string();
+        assert!(
+            message.contains("refusing the app-scoped config token"),
+            "refusal must name the missing fence for {deployment_id:?}: {message}"
         );
     }
 }
