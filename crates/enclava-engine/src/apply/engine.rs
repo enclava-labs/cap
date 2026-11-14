@@ -1,6 +1,15 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use kube::Client;
 
+use super::compensation::UnresolvedCompensationSink;
 use super::types::ApplyConfig;
+
+/// Default budget for one post-create compensating delete, including the
+/// durable-record write that must precede it (cap#254). Sized below the
+/// 180 s mutation lease so shared fences are released before reclaim.
+pub(crate) const DEFAULT_COMPENSATION_BUDGET: Duration = Duration::from_secs(90);
 
 /// Error type for all K8s apply/watch/cleanup operations.
 #[derive(Debug, thiserror::Error)]
@@ -115,6 +124,10 @@ pub struct ApplyEngine {
     /// the legacy evidence-preservation behavior, and every DELETION
     /// authority that matters lives in the API's ledger-gated cleanup.
     creation_ledger: Option<std::sync::Arc<super::creation_ledger::CreationLedgerBuffer>>,
+    /// Durable record of a create whose compensating DELETE has not resolved
+    /// (cap#254). Absent on engines outside the control-plane apply path.
+    compensation_sink: Option<Arc<dyn UnresolvedCompensationSink>>,
+    compensation_budget: Duration,
 }
 
 impl ApplyEngine {
@@ -124,6 +137,8 @@ impl ApplyEngine {
             client,
             config,
             creation_ledger: None,
+            compensation_sink: None,
+            compensation_budget: DEFAULT_COMPENSATION_BUDGET,
         }
     }
 
@@ -135,6 +150,8 @@ impl ApplyEngine {
             client,
             config: ApplyConfig::default(),
             creation_ledger: None,
+            compensation_sink: None,
+            compensation_budget: DEFAULT_COMPENSATION_BUDGET,
         })
     }
 
@@ -145,6 +162,8 @@ impl ApplyEngine {
             client,
             config,
             creation_ledger: None,
+            compensation_sink: None,
+            compensation_budget: DEFAULT_COMPENSATION_BUDGET,
         })
     }
 
@@ -165,6 +184,31 @@ impl ApplyEngine {
         &self,
     ) -> Option<&std::sync::Arc<super::creation_ledger::CreationLedgerBuffer>> {
         self.creation_ledger.as_ref()
+    }
+
+    /// Attach the control-plane recorder for unresolved post-create
+    /// compensation (cap#254). Without it, an unresolved compensating DELETE
+    /// cannot be made durable and is fail-closed (logged, not treated as
+    /// recorded).
+    pub fn with_compensation_sink(mut self, sink: Arc<dyn UnresolvedCompensationSink>) -> Self {
+        self.compensation_sink = Some(sink);
+        self
+    }
+
+    pub(crate) fn compensation_sink(&self) -> Option<&Arc<dyn UnresolvedCompensationSink>> {
+        self.compensation_sink.as_ref()
+    }
+
+    pub(crate) fn compensation_budget(&self) -> Duration {
+        self.compensation_budget
+    }
+
+    /// Shorten the compensation budget. Tests use this so a stalled DELETE
+    /// fails closed without waiting out the production 90 s budget.
+    #[cfg(test)]
+    pub(crate) fn with_compensation_budget(mut self, budget: Duration) -> Self {
+        self.compensation_budget = budget;
+        self
     }
 
     /// Returns a reference to the underlying kube::Client.

@@ -110,8 +110,10 @@ pub async fn apply_namespace(
                         // CAP-created namespace survives without valid
                         // creation evidence and is then never cleaned up.
                         if let Err(verify_error) = verify_creation_stamp(&created, generation) {
-                            super::generation::compensate_created_object(&api, name, &created)
-                                .await;
+                            super::generation::compensate_created_object(
+                                engine, &api, name, &created, generation,
+                            )
+                            .await;
                             return Err(verify_error);
                         }
                         // cap#272: record the namespace creation at the only
