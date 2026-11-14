@@ -500,6 +500,87 @@ fn stable_ssh_endpoint_from_app_requires_debian_ssh_template_metadata() {
 }
 
 #[test]
+fn status_projects_ready_frp_stable_ssh_endpoint() {
+    let mut app = test_app_response();
+    app.template_slug = Some("debian-ssh-frp".to_string());
+    app.template_expected.stable_ssh_endpoint = Some("relay.enclava.me:20001".to_string());
+
+    let state = stable_ssh_endpoint_state_from_app(&app);
+    assert_eq!(
+        state,
+        StableSshEndpointState::Ready("relay.enclava.me:20001".to_string())
+    );
+
+    let status = enclava_cli::api_types::AppStatus {
+        app_name: "demo".to_string(),
+        status: "running".to_string(),
+        pod_phase: None,
+        tee_status: None,
+        unlock_status: None,
+        domain: "demo.example".to_string(),
+        last_deployed: None,
+        tee_error: None,
+        observation: None,
+        deployment: None,
+    };
+    let payload = status_json_payload(&status, &state, None, None).expect("serializes");
+    assert_eq!(payload["stable_ssh_endpoint"]["state"], "ready");
+    assert_eq!(
+        payload["stable_ssh_endpoint"]["endpoint"],
+        "relay.enclava.me:20001"
+    );
+
+    app.template_expected.stable_ssh_endpoint = None;
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Missing
+    );
+
+    app.template_expected.stable_ssh_endpoint = Some("   ".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Missing
+    );
+
+    app.template_expected.stable_ssh_endpoint = Some(" TCP://Relay.Enclava.Me:020001 ".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Invalid
+    );
+
+    app.template_expected.stable_ssh_endpoint = Some("example.com:22".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Invalid
+    );
+
+    app.template_expected.stable_ssh_endpoint = Some("6.tcp.eu.ngrok.io:17958".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Ready("6.tcp.eu.ngrok.io:17958".to_string()),
+        "an FRP slug accepts a canonical ngrok host, matching ssh-command"
+    );
+
+    app.template_slug = Some("debian-ssh-ngrok".to_string());
+    app.template_expected.stable_ssh_endpoint = Some("relay.enclava.me:20001".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Ready("relay.enclava.me:20001".to_string()),
+        "an ngrok slug accepts a canonical FRP relay, matching ssh-command"
+    );
+
+    // A non-SSH template stays not_stable_template even with an FRP-shaped
+    // endpoint. The slug gate is the same one ssh-command uses
+    // (`is_supported_stable_ssh_template`), not a deploy-only check.
+    app.template_slug = Some("mini-enclava-go".to_string());
+    app.template_expected.stable_ssh_endpoint = Some("relay.enclava.me:20001".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::NotStableTemplate
+    );
+}
+
+#[test]
 fn deploy_claims_fresh_created_password_app_when_unlock_status_is_unavailable() {
     assert!(deploy_needs_initial_claim(true, None, "creating"));
 }

@@ -1531,7 +1531,7 @@ fn normalize_slug(value: &str) -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
-fn is_supported_stable_ssh_template(slug: &str) -> bool {
+pub(crate) fn is_supported_stable_ssh_template(slug: &str) -> bool {
     matches!(slug, DEBIAN_SSH_NGROK_TEMPLATE | DEBIAN_SSH_FRP_TEMPLATE)
 }
 
@@ -3163,12 +3163,15 @@ fn read_ssh_bytes(blob: &[u8], offset: usize) -> Option<(&[u8], usize)> {
     Some((value, end))
 }
 
+#[cfg(test)]
 pub(crate) fn normalize_ngrok_tcp_url(value: &str) -> Result<String, Box<dyn std::error::Error>> {
     normalize_reserved_endpoint(value, is_ngrok_tcp_host)
         .map_err(|_| "reserved stable SSH endpoint must look like 6.tcp.eu.ngrok.io:17958".into())
 }
 
-fn normalize_stable_ssh_endpoint(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn normalize_stable_ssh_endpoint(
+    value: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     normalize_reserved_endpoint(value, |host| is_ngrok_tcp_host(host) || is_frp_relay_host(host))
         .map_err(|_| {
             format!(
