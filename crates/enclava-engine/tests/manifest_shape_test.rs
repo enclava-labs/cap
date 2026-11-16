@@ -343,3 +343,148 @@ fn vm_vcpu_model_matches_rendered_pod_cpu_limits() {
         );
     }
 }
+
+/// cap#392: a low application CPU limit keeps the guest at the approved vCPU
+/// count through the Kata baseline annotation, and the app's CPU request
+/// follows the limit down so the pod stays admissible.
+#[test]
+fn low_cpu_app_renders_padded_vm_and_lowered_request() {
+    let mut app = sample_app();
+    app.resources.cpu = "100m".to_string();
+    let manifests = generate_all_manifests(&app);
+    let sts = &manifests.statefulset;
+
+    let annotations = sts
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.metadata.as_ref())
+        .and_then(|m| m.annotations.as_ref())
+        .expect("pod template annotations");
+    // 1.9 baseline + (0.1 app + 1.5 platform) = 3.5, which Kata rounds to 4.
+    assert_eq!(
+        annotations
+            .get(shape::KATA_DEFAULT_VCPUS_ANNOTATION)
+            .map(String::as_str),
+        Some("1.9")
+    );
+
+    let spec = pod_spec(sts);
+    let app_container = spec
+        .containers
+        .iter()
+        .find(|c| {
+            c.resources
+                .as_ref()
+                .and_then(|r| r.limits.as_ref())
+                .and_then(|l| l.get("cpu"))
+                .is_some_and(|q| q.0 == "100m")
+        })
+        .expect("application container carries the 100m limit");
+    let request = &app_container
+        .resources
+        .as_ref()
+        .and_then(|r| r.requests.as_ref())
+        .and_then(|r| r.get("cpu"))
+        .expect("cpu request")
+        .0;
+    assert_eq!(request, "100m", "request must not exceed the limit");
+}
+
+#[test]
+fn default_cpu_app_renders_without_vcpu_annotation() {
+    let mut app = sample_app();
+    app.resources.cpu = "1".to_string();
+    let manifests = generate_all_manifests(&app);
+    let annotations = manifests
+        .statefulset
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.metadata.as_ref())
+        .and_then(|m| m.annotations.as_ref())
+        .expect("pod template annotations");
+    assert!(
+        !annotations.contains_key(shape::KATA_DEFAULT_VCPUS_ANNOTATION),
+        "pods the runtime baseline already sizes correctly must render unchanged"
+    );
+}
+
+/// Review on cap#394: the admission grammar accepts sub-millicore CPU limits,
+/// and Kubernetes compares request against limit exactly. The request must be
+/// the limit itself, and the tenant quota must cover the pod's rounded-up
+/// totals rather than a truncated float sum.
+#[test]
+fn fractional_millicore_limits_keep_request_within_limit_and_quota() {
+    for cpu in ["0.1005", "249.5m", "0.0001", "0.57", "1.0005"] {
+        let mut app = sample_app();
+        app.resources.cpu = cpu.to_string();
+        let manifests = generate_all_manifests(&app);
+        let spec = pod_spec(&manifests.statefulset);
+
+        let quantity = |c: &Container, kind: &str| -> String {
+            let resources = c.resources.as_ref().expect("container resources");
+            let map = match kind {
+                "requests" => resources.requests.as_ref(),
+                _ => resources.limits.as_ref(),
+            };
+            map.and_then(|m| m.get("cpu"))
+                .expect("cpu quantity")
+                .0
+                .clone()
+        };
+        let app_container = spec
+            .containers
+            .iter()
+            .find(|c| quantity(c, "limits") == cpu)
+            .unwrap_or_else(|| panic!("application container carries limit {cpu}"));
+        let request = quantity(app_container, "requests");
+        let below_standard = shape::cpu_quantity_millis(cpu).unwrap() <= 250 && cpu != "250m";
+        if below_standard {
+            assert_eq!(request, cpu, "request must equal the exact limit");
+        } else {
+            assert_eq!(request, "250m", "cpu={cpu}");
+        }
+
+        let hard = manifests
+            .resource_quota
+            .spec
+            .as_ref()
+            .and_then(|s| s.hard.as_ref())
+            .expect("quota hard limits");
+        for (kind, key) in [("requests", "requests.cpu"), ("limits", "limits.cpu")] {
+            let pod_millis: u64 = spec
+                .containers
+                .iter()
+                .map(|c| shape::cpu_quantity_millis(&quantity(c, kind)).unwrap())
+                .sum();
+            let quota_millis = shape::cpu_quantity_millis(&hard[key].0).unwrap();
+            assert!(
+                quota_millis >= pod_millis,
+                "cpu={cpu}: quota {key}={} must cover the pod's {pod_millis}m",
+                hard[key].0
+            );
+        }
+    }
+}
+
+/// The signing service (enclava-labs/policy-templates) renders its own copy
+/// of the pod and must produce the same `default_vcpus` annotation, or the
+/// agent policy refuses the padded pod. Both repositories check their
+/// implementation against this mirrored vector file, so a one-sided change
+/// to the arithmetic fails here instead of at deploy time.
+#[test]
+fn vcpu_baseline_annotation_matches_mirrored_golden_vectors() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/cap-vm-vcpu-baseline-vectors.json"))
+            .expect("golden vector fixture is valid JSON");
+    let vectors = fixture["vectors"].as_array().expect("vectors array");
+    assert!(!vectors.is_empty());
+    for vector in vectors {
+        let cpu_limit = vector["cpu_limit"].as_str().expect("cpu_limit string");
+        let expected = vector["default_vcpus"].as_str();
+        assert_eq!(
+            shape::vm_vcpu_baseline_annotation(cpu_limit, false).as_deref(),
+            expected,
+            "cpu_limit={cpu_limit}"
+        );
+    }
+}

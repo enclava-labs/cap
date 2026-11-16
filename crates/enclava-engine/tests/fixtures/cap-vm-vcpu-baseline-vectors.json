@@ -1,0 +1,23 @@
+{
+  "description": "Golden vectors for the Kata default_vcpus annotation CAP renders to keep a low-CPU confidential VM on the approved vCPU count (cap#392). This file is mirrored byte-for-byte between enclava-labs/cap (crates/enclava-engine/tests/fixtures/) and enclava-labs/policy-templates (fixtures/): the signing service must render the same annotation into the pod it generates the agent policy from. Change both copies together.",
+  "layout": "non-legacy pod: attestation-proxy 500m + tenant-ingress 500m + enclava-init 500m, Kata baseline 1 vCPU, approved count 4",
+  "vectors": [
+    { "cpu_limit": "1m", "default_vcpus": "1.999" },
+    { "cpu_limit": "0.0001", "default_vcpus": "1.999" },
+    { "cpu_limit": "50m", "default_vcpus": "1.95" },
+    { "cpu_limit": "100m", "default_vcpus": "1.9" },
+    { "cpu_limit": "0.1", "default_vcpus": "1.9" },
+    { "cpu_limit": "0.1005", "default_vcpus": "1.899" },
+    { "cpu_limit": "249.5m", "default_vcpus": "1.75" },
+    { "cpu_limit": "250m", "default_vcpus": "1.75" },
+    { "cpu_limit": "0.5", "default_vcpus": "1.5" },
+    { "cpu_limit": "500m", "default_vcpus": "1.5" },
+    { "cpu_limit": "500.5m", "default_vcpus": null },
+    { "cpu_limit": "501m", "default_vcpus": null },
+    { "cpu_limit": "1", "default_vcpus": null },
+    { "cpu_limit": "1.5", "default_vcpus": null },
+    { "cpu_limit": "1500m", "default_vcpus": null },
+    { "cpu_limit": "2", "default_vcpus": null },
+    { "cpu_limit": "bogus", "default_vcpus": null }
+  ]
+}

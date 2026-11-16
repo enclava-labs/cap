@@ -497,7 +497,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
                 );
                 m.insert(
                     "cpu".to_string(),
-                    Quantity(crate::manifest::shape::APP_CPU_REQUEST.to_string()),
+                    Quantity(crate::manifest::shape::app_cpu_request(&app.resources.cpu)),
                 );
                 m
             }),

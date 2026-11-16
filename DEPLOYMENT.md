@@ -316,15 +316,25 @@ scheduler CPU request. Tenant quota totals include this limit and RuntimeClass
 overhead. Keep the signing service's pod resource rendering aligned. Existing
 pods are not resized in place.
 
-Kata sizes each confidential VM statically from the pod's CPU limits: one
-baseline vCPU plus the summed container limits, rounded up. Every vCPU is part
-of the SNP launch measurement, and Trustee and the signed platform release
-approve the measurement of one vCPU count (four). An application CPU limit that
-boots any other count is rejected at admission with
-`400 unsupported_cpu_shape`; with the sidecar limits above that leaves limits
-above `500m` and up to `1500m`. Without the rejection such a workload attests
-successfully and is then denied every key release by the KBS resource policy.
-Changing a sidecar CPU limit moves this range.
+Kata sizes each confidential VM statically from the pod's CPU limits: a
+baseline (`default_vcpus`, one by default) plus the summed container limits,
+rounded up. Every vCPU is part of the SNP launch measurement, and Trustee and
+the signed platform release approve the measurement of one vCPU count (four).
+CAP therefore keeps every guest at four vCPUs:
+
+- An application CPU limit that would boot fewer is padded: the pod carries
+  `io.katacontainers.config.hypervisor.default_vcpus` so baseline plus limits
+  totals 3.5, which Kata rounds to four. The limit still applies inside the
+  guest. The application CPU request follows a limit below `250m` down.
+- A limit that would boot more (above `1500m` with the sidecar limits above)
+  is rejected at admission with `400 unsupported_cpu_shape`. Without the
+  rejection such a workload attests successfully and is then denied every key
+  release by the KBS resource policy.
+
+The Kata handler must allow-list the `default_vcpus` annotation, and the
+signing service must render the same annotation into the pod it generates the
+agent policy from: the policy rejects annotations it did not see. Changing a
+sidecar CPU limit moves both thresholds.
 
 Image verification uses the upstream Sigstore verifier with the guarded OCI
 transport and the existing pinned trust root. Legacy `.sig` layers require a

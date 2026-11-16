@@ -68,6 +68,18 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     }
 
     let legacy = legacy_bootstrap_enabled();
+    // cap#392: a low CPU limit must not shrink the guest below the vCPU
+    // count whose launch measurement is approved. The simulated dev class is
+    // not measured and its handler does not allow-list the annotation.
+    if runtime_class != cc_init_data::COCO_DEV_RUNTIME_CLASS
+        && let Some(baseline) =
+            crate::manifest::shape::vm_vcpu_baseline_annotation(&app.resources.cpu, legacy)
+    {
+        annotations.insert(
+            crate::manifest::shape::KATA_DEFAULT_VCPUS_ANNOTATION.to_string(),
+            baseline,
+        );
+    }
 
     let mut node_selector = BTreeMap::new();
     node_selector.insert(

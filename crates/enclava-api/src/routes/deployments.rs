@@ -129,7 +129,6 @@ fn vm_cpu_shape_error_response(
             "cpu": error.cpu_limit,
             "vm_vcpus": error.vm_vcpus,
             "approved_vm_vcpus": error.approved_vm_vcpus,
-            "min_cpu_exclusive": format!("{}m", error.min_cpu_exclusive_millis),
             "max_cpu": format!("{}m", error.max_cpu_inclusive_millis),
         })),
     )
@@ -2643,35 +2642,31 @@ mod tests {
             tls_data_size: "2Gi".to_string(),
         };
 
-        // The default and the whole 4-vCPU band are accepted.
-        for cpu in ["1", "501m", "1.5"] {
+        // The default band boots the approved vCPU count on the runtime
+        // baseline; lower limits are padded up to it (cap#392: hello-tee
+        // ships cpu = "0.5").
+        for cpu in ["1", "1.5", "0.5", "250m", "50m"] {
             super::validate_vm_cpu_shape(&resources(cpu))
                 .unwrap_or_else(|_| panic!("cpu {cpu} boots the approved vCPU count"));
         }
 
-        // cap#392: a 3-vCPU guest attests but is denied its keys; refuse it
-        // by name before anything is signed or applied.
-        let (status, Json(body)) = super::validate_vm_cpu_shape(&resources("250m"))
-            .expect_err("a low cpu limit boots an unapproved vCPU count");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "unsupported_cpu_shape");
-        assert_eq!(body["cpu"], "250m");
-        assert_eq!(body["vm_vcpus"], 3);
-        assert_eq!(body["approved_vm_vcpus"], 4);
-        assert_eq!(body["min_cpu_exclusive"], "500m");
-        assert_eq!(body["max_cpu"], "1500m");
-        assert!(
-            body["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("above 500m and at most 1500m")),
-            "{body}"
-        );
-
+        // A limit that needs more vCPUs than the approved measurement covers
+        // would attest and then be denied its keys; refuse it by name before
+        // anything is signed or applied.
         let (status, Json(body)) = super::validate_vm_cpu_shape(&resources("2"))
             .expect_err("a high cpu limit boots an unapproved vCPU count");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "unsupported_cpu_shape");
+        assert_eq!(body["cpu"], "2");
         assert_eq!(body["vm_vcpus"], 5);
+        assert_eq!(body["approved_vm_vcpus"], 4);
+        assert_eq!(body["max_cpu"], "1500m");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("at most 1500m")),
+            "{body}"
+        );
     }
 
     #[tokio::test]
