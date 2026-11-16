@@ -716,6 +716,51 @@ fn deployment_failure_message_includes_api_error_code_detail() {
 }
 
 #[test]
+fn deployment_failure_message_names_the_engine_contract_for_render_mismatch() {
+    // #377/#392: the durable apply job catches a signed-vs-rendered
+    // cc_init_data hash skew pre-claim and publishes the bare
+    // `signed_artifact_mismatch` code (the projection redacts anything
+    // else); the failure text must carry the skew family and the remedy.
+    let deployment = DeploymentEntry {
+        id: "deploy-123".to_string(),
+        status: "failed".to_string(),
+        image_digest: None,
+        error_message: Some("signed_artifact_mismatch".to_string()),
+        template_slug: None,
+        template_version: None,
+        template_expected: Default::default(),
+        created_at: "2026-07-03T15:48:25Z".to_string(),
+        completed_at: None,
+    };
+
+    let message = template_deployment_failure_message(&deployment, "deploy-123");
+    assert!(
+        message.starts_with("deployment deploy-123 failed: signed_artifact_mismatch"),
+        "{message}"
+    );
+    assert!(message.contains("cc_init_data contract"), "{message}");
+    assert!(
+        message.contains("upgrade this CLI from a trusted source"),
+        "{message}"
+    );
+    assert!(
+        message.contains("wait for the platform rollout"),
+        "{message}"
+    );
+
+    // Unknown strings still render unchanged — the remedy is keyed on the
+    // exact code, never on free-form text.
+    let other = DeploymentEntry {
+        error_message: Some("kbs_policy_error".to_string()),
+        ..deployment
+    };
+    assert_eq!(
+        template_deployment_failure_message(&other, "deploy-123"),
+        "deployment deploy-123 failed: kbs_policy_error"
+    );
+}
+
+#[test]
 fn wait_attempt_budget_is_finite_and_bounded_by_the_wait() {
     // Far deadline: the per-attempt budget is finite (so a stalled attempt is
     // cut and the loop retries) and comfortably long (so slow-but-valid

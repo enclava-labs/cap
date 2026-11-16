@@ -255,7 +255,7 @@ pub(crate) fn signing_error_response(
     (status, Json(body))
 }
 
-fn bounded_signing_detail(field: &str) -> String {
+pub(crate) fn bounded_signing_detail(field: &str) -> String {
     // Spool/seal diagnostics append the hash sentence. 1024 covers both
     // 64-byte hashes plus the remedy without truncating the actionable part.
     const MAX: usize = 1024;
@@ -649,6 +649,10 @@ const PUBLIC_DEPLOYMENT_ERROR_CODES: &[&str] = &[
     "invalid_job_payload",
     "unsupported_job_payload_version",
     "artifact_invalid",
+    // #377/#392: the apply job's cc_init_data render validation publishes
+    // under the sync deploy path's mismatch code so the pre-claim skew is
+    // named on the durable surface too (admitted with the 0092 CHECK)
+    "signed_artifact_mismatch",
     "lease_lost",
     "apply_limiter_closed",
     "side_effect_admission_closed",

@@ -570,6 +570,17 @@ pub enum DeploymentJobError {
     SetupFailed,
     #[error("stored deployment artifact is unavailable or malformed")]
     Artifact,
+    /// Named sibling of [`DeploymentJobError::Artifact`] for the cc_init_data
+    /// render check (#392 pre-claim surface, folded into #377): the apply job
+    /// runs `validate_and_pin_cc_init_data_render` before any pod exists, so
+    /// a signed-vs-rendered hash skew (e.g. `kbs_url` resolved from the
+    /// signed release by the CLI but env/DEFAULT by the API) fails HERE —
+    /// pre-claim — and must surface with the sync path's
+    /// `signed_artifact_mismatch` name and diagnostic instead of the opaque
+    /// `artifact_invalid` that hides the skew from operators. The payload is
+    /// the same bounded server-authored sentence the sync 400 body carries.
+    #[error("signed artifact render mismatch: {0}")]
+    ArtifactMismatch(String),
     #[error("deployment job lease was lost")]
     LeaseLost,
     #[error("deployment authority changed before apply")]
@@ -599,6 +610,7 @@ impl DeploymentJobError {
             Self::UnsupportedPayloadVersion => "unsupported_job_payload_version",
             Self::SetupFailed => "deployment_setup_failed",
             Self::Artifact => "artifact_invalid",
+            Self::ArtifactMismatch(_) => "signed_artifact_mismatch",
             Self::LeaseLost => "lease_lost",
             Self::Authority => "deployment_authority_changed",
             Self::Apply(error) => error.public_code(),
@@ -3699,12 +3711,32 @@ fn validate_signed_render(
     // the job worker renders the exact bytes the artifact was signed over.
     loaded
         .validate_and_pin_cc_init_data_render(&mut app_spec)
-        .map_err(|_| DeploymentJobError::Artifact)?;
+        .map_err(deployment_job_error_for_signed_render)?;
     *binding = app_spec
         .workload_artifact_binding
         .take()
         .expect("binding was set above");
     Ok(())
+}
+
+/// Map the apply-time cc_init_data render validation to its job error.
+/// A `Mismatch` carries the server-authored, actionable sentence (both
+/// hashes, the contract id, and the remedy — same text the sync deploy
+/// path returns as the 400 `detail`); keeping the blanket `Artifact`
+/// mapping would publish that failure as a bare `artifact_invalid`, the
+/// unnamed surface #392/#377 close here. Every other signing-service
+/// failure stays `Artifact` exactly as before.
+fn deployment_job_error_for_signed_render(
+    error: crate::signing_service::SigningServiceError,
+) -> DeploymentJobError {
+    match error {
+        crate::signing_service::SigningServiceError::Mismatch(field) => {
+            DeploymentJobError::ArtifactMismatch(
+                crate::routes::deployments::bounded_signing_detail(&field),
+            )
+        }
+        _ => DeploymentJobError::Artifact,
+    }
 }
 
 async fn deployment_is_terminal(
@@ -3803,6 +3835,19 @@ async fn fail_apply_job_with_mutation(
     mut mutation: Option<crate::mutation_leases::AppMutationLease>,
     failed_app: Option<&App>,
 ) {
+    // The render-mismatch classification publishes under the sync path's
+    // `signed_artifact_mismatch` code (allowlisted through the projection
+    // and the CHECK constraint in lockstep). The actionable sentence itself
+    // stays server-side: the public projection redacts any non-code string,
+    // by design. Log it for operators here.
+    if let DeploymentJobError::ArtifactMismatch(detail) = error {
+        tracing::warn!(
+            deployment_id = %job.deployment_id,
+            app_id = %job.app_id,
+            detail = %detail,
+            "deployment apply failed: signed cc_init_data render mismatch (#392 surface)"
+        );
+    }
     let published =
         match publish_apply_failure_with_mutation(&state.db, job, error.code(), mutation.as_mut())
             .await
@@ -11628,6 +11673,96 @@ pub(crate) mod tests {
                 .await
                 .expect("delete classified failure fixture");
         }
+    }
+
+    #[tokio::test]
+    async fn apply_failure_publishes_render_mismatch_detail_beside_the_code() {
+        // #377/#392: the pre-claim cc_init_data render skew is caught by the
+        // apply job's validate_and_pin_cc_init_data_render before any pod
+        // exists; its failure must publish the actionable sentence (hashes +
+        // contract + remedy) in `error_message` — which the CLI prints
+        // verbatim — while `last_error_code` keeps the stable machine code.
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim mismatch-detail fixture setup")
+            .expect("mismatch-detail fixture setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept mismatch-detail fixture setup");
+        let job = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim mismatch-detail fixture apply")
+            .expect("mismatch-detail fixture apply exists");
+
+        let detail =
+            enclava_engine::manifest::cc_init_data::cc_init_data_hash_mismatch_detail("aa", "bb");
+        publish_apply_failure_with_mutation(
+            &pool,
+            &job,
+            DeploymentJobError::ArtifactMismatch(detail).code(),
+            None,
+        )
+        .await
+        .expect("publish render-mismatch failure");
+
+        let (deploy_status, error_message, job_code): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT d.status::text, d.error_message, j.last_error_code
+               FROM deployments d
+               JOIN deployment_apply_jobs j ON j.deployment_id = d.id
+              WHERE d.id = $1",
+            )
+            .bind(deployment_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load render-mismatch failure row");
+        assert_eq!(deploy_status, "failed");
+        // The public projection redacts any non-code string, so the row keeps
+        // exactly the allowlisted code; the actionable sentence rides the
+        // operator log instead (fail_apply_job_with_mutation).
+        assert_eq!(error_message.as_deref(), Some("signed_artifact_mismatch"));
+        assert_eq!(job_code.as_deref(), Some("signed_artifact_mismatch"));
+        assert_eq!(
+            crate::routes::deployments::public_deployment_error_message(error_message.as_deref())
+                .as_deref(),
+            Some("signed_artifact_mismatch"),
+            "the named code must survive the public projection"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete render-mismatch failure fixture");
+    }
+
+    #[test]
+    fn signed_render_mapping_names_the_mismatch_and_keeps_other_failures_opaque() {
+        // The render check's Mismatch payload is the actionable sentence and
+        // must keep its name on the durable path; any other signing-service
+        // failure stays the legacy opaque Artifact classification.
+        let mismatch = deployment_job_error_for_signed_render(
+            crate::signing_service::SigningServiceError::Mismatch(
+                enclava_engine::manifest::cc_init_data::cc_init_data_hash_mismatch_detail(
+                    "aa", "bb",
+                ),
+            ),
+        );
+        assert_eq!(mismatch.code(), "signed_artifact_mismatch");
+        let displayed = mismatch.to_string();
+        assert!(displayed.contains("signed aa"), "{displayed}");
+        assert!(displayed.contains("platform rendered bb"), "{displayed}");
+
+        let other = deployment_job_error_for_signed_render(
+            crate::signing_service::SigningServiceError::Blob("decode".into()),
+        );
+        assert_eq!(other.code(), "artifact_invalid");
+        // The render-mismatch failure is terminal like Artifact: it never
+        // requeues (a re-render cannot fix a signed-hash skew).
+        assert!(!mismatch.should_requeue_without_terminal_failure());
+        assert!(!other.should_requeue_without_terminal_failure());
     }
 
     #[tokio::test]
