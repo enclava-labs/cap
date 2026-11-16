@@ -236,6 +236,19 @@ pub const APPROVED_SNP_VM_VCPUS: u64 = 4;
 /// `validate_resource_limits` having run first and must treat `None` as a
 /// rejection, never as "no limit".
 pub fn cpu_quantity_millis(value: &str) -> Option<u64> {
+    let (whole_millis, sub_millicore) = cpu_quantity_parts(value)?;
+    if sub_millicore {
+        whole_millis.checked_add(1)
+    } else {
+        Some(whole_millis)
+    }
+}
+
+/// A CPU quantity split into its whole millicores and whether a non-zero
+/// sub-millicore remainder follows. Kubernetes keeps that remainder when it
+/// compares a request against a limit, so exact comparisons need it kept
+/// apart from the rounded value.
+fn cpu_quantity_parts(value: &str) -> Option<(u64, bool)> {
     if value.is_empty() || value.trim() != value {
         return None;
     }
@@ -260,23 +273,19 @@ pub fn cpu_quantity_millis(value: &str) -> Option<u64> {
         whole.parse().ok()?
     };
     let mut millis = whole.checked_mul(millis_per_unit)?;
-    // Fractional digits beyond millicore precision round the quantity up.
     let kept_digits = if millis_per_unit == 1000 { 3 } else { 0 };
     let mut scale = millis_per_unit;
-    let mut round_up = false;
+    let mut sub_millicore = false;
     for (index, digit) in fraction.bytes().enumerate() {
         let digit = u64::from(digit - b'0');
         if index < kept_digits {
             scale /= 10;
             millis = millis.checked_add(digit * scale)?;
         } else if digit != 0 {
-            round_up = true;
+            sub_millicore = true;
         }
     }
-    if round_up {
-        millis = millis.checked_add(1)?;
-    }
-    Some(millis)
+    Some((millis, sub_millicore))
 }
 
 /// Summed CPU limit, in millicores, of the platform containers that share the
@@ -355,13 +364,19 @@ pub fn max_app_cpu_limit_millis(legacy_bootstrap: bool) -> u64 {
     (APPROVED_SNP_VM_VCPUS * 1000).saturating_sub(fixed)
 }
 
-/// Application container CPU request: the standard 250m, lowered to the limit
-/// for smaller limits so the request never exceeds it.
+/// Application container CPU request: the standard 250m, or the limit itself
+/// when the limit is smaller, so the request never exceeds it.
+///
+/// The limit is reused verbatim rather than rounded: Kubernetes compares the
+/// two quantities exactly, so a request rounded up to the next millicore
+/// (`101m` for a `0.1005` limit) would be rejected.
 pub fn app_cpu_request(cpu_limit: &str) -> String {
     let standard =
         cpu_quantity_millis(APP_CPU_REQUEST).expect("APP_CPU_REQUEST is a valid quantity");
-    match cpu_quantity_millis(cpu_limit) {
-        Some(limit) if limit < standard => format!("{limit}m"),
+    match cpu_quantity_parts(cpu_limit) {
+        // Whole millicores below the standard request mean the exact limit
+        // is below it too, whatever sub-millicore remainder follows.
+        Some((whole_millis, _)) if whole_millis < standard => cpu_limit.to_string(),
         _ => APP_CPU_REQUEST.to_string(),
     }
 }
@@ -562,9 +577,16 @@ mod tests {
     fn cpu_request_never_exceeds_limit() {
         assert_eq!(app_cpu_request("1"), "250m");
         assert_eq!(app_cpu_request("250m"), "250m");
+        assert_eq!(app_cpu_request("0.25"), "250m");
         assert_eq!(app_cpu_request("249m"), "249m");
-        assert_eq!(app_cpu_request("0.1"), "100m");
-        assert_eq!(app_cpu_request("0.0001"), "1m");
+        assert_eq!(app_cpu_request("0.1"), "0.1");
+        // Kubernetes compares request and limit exactly, sub-millicore
+        // digits included: the request must be the limit, not a rounding.
+        assert_eq!(app_cpu_request("0.1005"), "0.1005");
+        assert_eq!(app_cpu_request("249.5m"), "249.5m");
+        assert_eq!(app_cpu_request("0.0001"), "0.0001");
+        // Just above the standard request keeps the standard request.
+        assert_eq!(app_cpu_request("250.5m"), "250m");
         // Unparseable limits keep today's rendering; admission rejects them.
         assert_eq!(app_cpu_request("bogus"), "250m");
     }

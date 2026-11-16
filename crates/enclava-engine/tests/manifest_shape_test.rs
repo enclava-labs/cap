@@ -407,3 +407,61 @@ fn default_cpu_app_renders_without_vcpu_annotation() {
         "pods the runtime baseline already sizes correctly must render unchanged"
     );
 }
+
+/// Review on cap#394: the admission grammar accepts sub-millicore CPU limits,
+/// and Kubernetes compares request against limit exactly. The request must be
+/// the limit itself, and the tenant quota must cover the pod's rounded-up
+/// totals rather than a truncated float sum.
+#[test]
+fn fractional_millicore_limits_keep_request_within_limit_and_quota() {
+    for cpu in ["0.1005", "249.5m", "0.0001", "0.57", "1.0005"] {
+        let mut app = sample_app();
+        app.resources.cpu = cpu.to_string();
+        let manifests = generate_all_manifests(&app);
+        let spec = pod_spec(&manifests.statefulset);
+
+        let quantity = |c: &Container, kind: &str| -> String {
+            let resources = c.resources.as_ref().expect("container resources");
+            let map = match kind {
+                "requests" => resources.requests.as_ref(),
+                _ => resources.limits.as_ref(),
+            };
+            map.and_then(|m| m.get("cpu"))
+                .expect("cpu quantity")
+                .0
+                .clone()
+        };
+        let app_container = spec
+            .containers
+            .iter()
+            .find(|c| quantity(c, "limits") == cpu)
+            .unwrap_or_else(|| panic!("application container carries limit {cpu}"));
+        let request = quantity(app_container, "requests");
+        let below_standard = shape::cpu_quantity_millis(cpu).unwrap() <= 250 && cpu != "250m";
+        if below_standard {
+            assert_eq!(request, cpu, "request must equal the exact limit");
+        } else {
+            assert_eq!(request, "250m", "cpu={cpu}");
+        }
+
+        let hard = manifests
+            .resource_quota
+            .spec
+            .as_ref()
+            .and_then(|s| s.hard.as_ref())
+            .expect("quota hard limits");
+        for (kind, key) in [("requests", "requests.cpu"), ("limits", "limits.cpu")] {
+            let pod_millis: u64 = spec
+                .containers
+                .iter()
+                .map(|c| shape::cpu_quantity_millis(&quantity(c, kind)).unwrap())
+                .sum();
+            let quota_millis = shape::cpu_quantity_millis(&hard[key].0).unwrap();
+            assert!(
+                quota_millis >= pod_millis,
+                "cpu={cpu}: quota {key}={} must cover the pod's {pod_millis}m",
+                hard[key].0
+            );
+        }
+    }
+}

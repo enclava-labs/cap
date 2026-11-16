@@ -123,21 +123,20 @@ fn split_quantity(q: &str) -> (&str, &str) {
     (&q[..pos], &q[pos..])
 }
 
+/// Sum CPU quantities in exact millicores, rounding each one up. The quota
+/// must never admit less than the pod asks for: float parsing truncated
+/// values such as `0.57` to `569m` and dropped sub-millicore remainders,
+/// leaving the quota below the pod's own total.
 fn sum_cpu_quantities(values: &[&str]) -> String {
-    let mut total_millis = 0f64;
+    let total_millis: u64 = values
+        .iter()
+        .map(|value| crate::manifest::shape::cpu_quantity_millis(value).unwrap_or(0))
+        .fold(0u64, u64::saturating_add);
 
-    for value in values {
-        if let Some(millis) = value.strip_suffix('m') {
-            total_millis += millis.parse::<f64>().unwrap_or(0.0);
-        } else {
-            total_millis += value.parse::<f64>().unwrap_or(0.0) * 1000.0;
-        }
-    }
-
-    if total_millis % 1000.0 == 0.0 {
-        format!("{}", (total_millis / 1000.0) as i64)
+    if total_millis.is_multiple_of(1000) {
+        format!("{}", total_millis / 1000)
     } else {
-        format!("{}m", total_millis as i64)
+        format!("{total_millis}m")
     }
 }
 
