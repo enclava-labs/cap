@@ -316,6 +316,16 @@ scheduler CPU request. Tenant quota totals include this limit and RuntimeClass
 overhead. Keep the signing service's pod resource rendering aligned. Existing
 pods are not resized in place.
 
+Kata sizes each confidential VM statically from the pod's CPU limits: one
+baseline vCPU plus the summed container limits, rounded up. Every vCPU is part
+of the SNP launch measurement, and Trustee and the signed platform release
+approve the measurement of one vCPU count (four). An application CPU limit that
+boots any other count is rejected at admission with
+`400 unsupported_cpu_shape`; with the sidecar limits above that leaves limits
+above `500m` and up to `1500m`. Without the rejection such a workload attests
+successfully and is then denied every key release by the KBS resource policy.
+Changing a sidecar CPU limit moves this range.
+
 Image verification uses the upstream Sigstore verifier with the guarded OCI
 transport and the existing pinned trust root. Legacy `.sig` layers require a
 verified Rekor SET; DSSE image signatures require the cosign sign-v1 predicate,

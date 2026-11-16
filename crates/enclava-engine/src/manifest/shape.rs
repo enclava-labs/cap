@@ -211,6 +211,159 @@ pub fn gateway_container_requests(
     }
 }
 
+/// Kata's baseline vCPU count (`default_vcpus`) for the SNP handler, in
+/// millicores. Kata sizes a confidential VM statically: the guest boots with
+/// `ceil(default_vcpus + sum of container CPU limits)` vCPUs.
+pub const KATA_BASELINE_VCPU_MILLIS: u64 = 1000;
+
+/// The vCPU count whose SNP launch measurement the platform approves.
+///
+/// Every vCPU contributes a measured VMSA, so a guest booted with any other
+/// count reports a different launch measurement. Trustee's reference values
+/// and the signed platform release (`expected_firmware_measurement`) carry
+/// exactly one measurement, computed for this count; a guest outside it gets
+/// a successful attestation token whose appraisal is not affirming, and the
+/// KBS resource policy then denies every key release with a bare
+/// `PolicyDeny` (cap#392).
+pub const APPROVED_SNP_VM_VCPUS: u64 = 4;
+
+/// A CPU quantity (`250m`, `1`, `1.5`) in millicores, rounded up to the next
+/// whole millicore exactly as Kubernetes rounds a container limit. `None` for
+/// values outside the admission grammar or too large to represent.
+pub fn cpu_quantity_millis(value: &str) -> Option<u64> {
+    if value.is_empty() || value.trim() != value {
+        return None;
+    }
+    let (number, millis_per_unit) = match value.strip_suffix('m') {
+        Some(number) => (number, 1u64),
+        None => (value, 1000u64),
+    };
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !whole
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let mut millis = whole.checked_mul(millis_per_unit)?;
+    // Fractional digits beyond millicore precision round the quantity up.
+    let kept_digits = if millis_per_unit == 1000 { 3 } else { 0 };
+    let mut scale = millis_per_unit;
+    let mut round_up = false;
+    for (index, digit) in fraction.bytes().enumerate() {
+        let digit = u64::from(digit - b'0');
+        if index < kept_digits {
+            scale /= 10;
+            millis = millis.checked_add(digit * scale)?;
+        } else if digit != 0 {
+            round_up = true;
+        }
+    }
+    if round_up {
+        millis = millis.checked_add(1)?;
+    }
+    Some(millis)
+}
+
+/// Summed CPU limit, in millicores, of the platform containers that share the
+/// pod with the application container. Must match the containers
+/// `generate_statefulset` renders: attestation-proxy and tenant-ingress always,
+/// plus the enclava-init sidecar outside the legacy bootstrap layout.
+pub fn platform_container_cpu_limit_millis(legacy_bootstrap: bool) -> u64 {
+    let limit = |quantity: &str| {
+        cpu_quantity_millis(quantity).expect("platform CPU limit constants are valid quantities")
+    };
+    let sidecars = 2 * limit(SIDECAR_CPU_LIMIT);
+    if legacy_bootstrap {
+        sidecars
+    } else {
+        sidecars + limit(INIT_CPU_LIMIT)
+    }
+}
+
+/// vCPU count Kata boots the confidential VM with for an application CPU
+/// limit. `None` when the limit is not a representable CPU quantity.
+pub fn snp_vm_vcpus(app_cpu_limit: &str, legacy_bootstrap: bool) -> Option<u64> {
+    let total = KATA_BASELINE_VCPU_MILLIS
+        .checked_add(platform_container_cpu_limit_millis(legacy_bootstrap))?
+        .checked_add(cpu_quantity_millis(app_cpu_limit)?)?;
+    Some(total.div_ceil(1000))
+}
+
+/// Application CPU limits, in millicores, that boot the approved vCPU count:
+/// strictly above the first value, up to and including the second.
+pub fn approved_app_cpu_limit_range_millis(legacy_bootstrap: bool) -> (u64, u64) {
+    let fixed = KATA_BASELINE_VCPU_MILLIS + platform_container_cpu_limit_millis(legacy_bootstrap);
+    let max_inclusive = (APPROVED_SNP_VM_VCPUS * 1000).saturating_sub(fixed);
+    (max_inclusive.saturating_sub(1000), max_inclusive)
+}
+
+/// An application CPU limit that would boot a confidential VM whose launch
+/// measurement is not approved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnapprovedVmCpuShape {
+    pub cpu_limit: String,
+    /// vCPU count the limit would boot; `None` when it cannot be computed.
+    pub vm_vcpus: Option<u64>,
+    pub approved_vm_vcpus: u64,
+    pub min_cpu_exclusive_millis: u64,
+    pub max_cpu_inclusive_millis: u64,
+}
+
+impl std::fmt::Display for UnapprovedVmCpuShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.vm_vcpus {
+            Some(vcpus) => write!(
+                f,
+                "cpu limit {} boots a {vcpus}-vCPU confidential VM",
+                self.cpu_limit
+            )?,
+            None => write!(f, "cpu limit {} is not supported", self.cpu_limit)?,
+        }
+        write!(
+            f,
+            "; only the {}-vCPU launch measurement is approved, so its keys would never be \
+             released. Use a cpu limit above {}m and at most {}m",
+            self.approved_vm_vcpus, self.min_cpu_exclusive_millis, self.max_cpu_inclusive_millis
+        )
+    }
+}
+
+/// Reject an application CPU limit that boots a vCPU count other than
+/// [`APPROVED_SNP_VM_VCPUS`]. Applies only to SNP runtime classes: the
+/// simulated CoCo dev class has no launch measurement to appraise.
+pub fn check_vm_cpu_shape(
+    app_cpu_limit: &str,
+    deployment_runtime_class: &str,
+    legacy_bootstrap: bool,
+) -> Result<(), UnapprovedVmCpuShape> {
+    if deployment_runtime_class == crate::manifest::cc_init_data::COCO_DEV_RUNTIME_CLASS {
+        return Ok(());
+    }
+    let vm_vcpus = snp_vm_vcpus(app_cpu_limit, legacy_bootstrap);
+    if vm_vcpus == Some(APPROVED_SNP_VM_VCPUS) {
+        return Ok(());
+    }
+    let (min_cpu_exclusive_millis, max_cpu_inclusive_millis) =
+        approved_app_cpu_limit_range_millis(legacy_bootstrap);
+    Err(UnapprovedVmCpuShape {
+        cpu_limit: app_cpu_limit.to_string(),
+        vm_vcpus,
+        approved_vm_vcpus: APPROVED_SNP_VM_VCPUS,
+        min_cpu_exclusive_millis,
+        max_cpu_inclusive_millis,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +391,73 @@ mod tests {
         // Unparseable limits fail safe to today's rendering; the API's own
         // validation rejects them before they reach the engine.
         assert_eq!(shape_for_memory_limit("bogus"), WorkloadShape::Standard);
+    }
+
+    #[test]
+    fn cpu_quantities_round_up_to_millicores() {
+        assert_eq!(cpu_quantity_millis("250m"), Some(250));
+        assert_eq!(cpu_quantity_millis("1"), Some(1000));
+        assert_eq!(cpu_quantity_millis("1.5"), Some(1500));
+        assert_eq!(cpu_quantity_millis("0.25"), Some(250));
+        assert_eq!(cpu_quantity_millis(".5"), Some(500));
+        assert_eq!(cpu_quantity_millis("0.5m"), Some(1));
+        assert_eq!(cpu_quantity_millis("1.0000000000000000001"), Some(1001));
+        assert_eq!(cpu_quantity_millis("1.5000"), Some(1500));
+        assert_eq!(cpu_quantity_millis(""), None);
+        assert_eq!(cpu_quantity_millis(" 1"), None);
+        assert_eq!(cpu_quantity_millis("-1"), None);
+        assert_eq!(cpu_quantity_millis("1e3"), None);
+        assert_eq!(cpu_quantity_millis("m"), None);
+        assert_eq!(cpu_quantity_millis("99999999999999999999999"), None);
+    }
+
+    #[test]
+    fn only_the_approved_vcpu_count_passes() {
+        let snp = "kata-qemu-snp";
+        // baseline 1 + proxy 0.5 + ingress 0.5 + init 0.5 + app
+        assert_eq!(snp_vm_vcpus("1", false), Some(4));
+        assert_eq!(snp_vm_vcpus("500m", false), Some(3));
+        assert_eq!(snp_vm_vcpus("501m", false), Some(4));
+        assert_eq!(snp_vm_vcpus("1500m", false), Some(4));
+        assert_eq!(snp_vm_vcpus("1501m", false), Some(5));
+        assert_eq!(approved_app_cpu_limit_range_millis(false), (500, 1500));
+
+        assert!(check_vm_cpu_shape("1", snp, false).is_ok());
+        assert!(check_vm_cpu_shape("1.5", snp, false).is_ok());
+        assert!(check_vm_cpu_shape("1", SMALL_RUNTIME_CLASS, false).is_ok());
+
+        let low = check_vm_cpu_shape("250m", snp, false).unwrap_err();
+        assert_eq!(low.vm_vcpus, Some(3));
+        assert_eq!(low.approved_vm_vcpus, 4);
+        assert_eq!(
+            low.to_string(),
+            "cpu limit 250m boots a 3-vCPU confidential VM; only the 4-vCPU launch \
+             measurement is approved, so its keys would never be released. Use a cpu limit \
+             above 500m and at most 1500m"
+        );
+        let high = check_vm_cpu_shape("2", snp, false).unwrap_err();
+        assert_eq!(high.vm_vcpus, Some(5));
+        assert_eq!(
+            check_vm_cpu_shape("bogus", snp, false)
+                .unwrap_err()
+                .vm_vcpus,
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_bootstrap_layout_has_no_init_sidecar() {
+        assert_eq!(snp_vm_vcpus("1", true), Some(3));
+        assert_eq!(approved_app_cpu_limit_range_millis(true), (1000, 2000));
+        assert!(check_vm_cpu_shape("2", "kata-qemu-snp", true).is_ok());
+        assert!(check_vm_cpu_shape("1", "kata-qemu-snp", true).is_err());
+    }
+
+    #[test]
+    fn simulated_dev_runtime_class_is_not_measured() {
+        let dev = crate::manifest::cc_init_data::COCO_DEV_RUNTIME_CLASS;
+        assert!(check_vm_cpu_shape("250m", dev, false).is_ok());
+        assert!(check_vm_cpu_shape("8", dev, false).is_ok());
     }
 
     #[test]

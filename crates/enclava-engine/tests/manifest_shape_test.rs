@@ -284,3 +284,62 @@ fn standard_app_output_is_unchanged() {
     verify_runtime_class_binding(&manifests.statefulset, &app)
         .expect("standard app must bind runtime class");
 }
+
+/// cap#392: the admission check derives the VM's vCPU count from the platform
+/// CPU limit constants. It is only sound while those constants describe the
+/// containers the pod actually carries, so a new sidecar or a changed limit
+/// must fail here instead of silently shifting which application CPU limits
+/// boot the approved measurement.
+#[test]
+fn vm_vcpu_model_matches_rendered_pod_cpu_limits() {
+    for memory in ["1Gi", "128Mi"] {
+        let mut app = sample_app();
+        app.resources.memory = memory.to_string();
+        app.resources.cpu = "1".to_string();
+        let manifests = generate_all_manifests(&app);
+        let spec = pod_spec(&manifests.statefulset);
+
+        let rendered_millis: u64 = spec
+            .containers
+            .iter()
+            .map(|c| {
+                let limit = &c
+                    .resources
+                    .as_ref()
+                    .and_then(|r| r.limits.as_ref())
+                    .and_then(|l| l.get("cpu"))
+                    .unwrap_or_else(|| panic!("container {} must carry a cpu limit", c.name))
+                    .0;
+                shape::cpu_quantity_millis(limit)
+                    .unwrap_or_else(|| panic!("unparseable cpu limit {limit}"))
+            })
+            .sum();
+        let modelled_millis = shape::platform_container_cpu_limit_millis(false)
+            + shape::cpu_quantity_millis(&app.resources.cpu).unwrap();
+        assert_eq!(rendered_millis, modelled_millis, "memory={memory}");
+
+        // Regular init containers run before the long-running set and only
+        // raise the pod limit when one exceeds that set's sum.
+        for init in spec.init_containers.iter().flatten() {
+            let limit = init
+                .resources
+                .as_ref()
+                .and_then(|r| r.limits.as_ref())
+                .and_then(|l| l.get("cpu"))
+                .map(|q| shape::cpu_quantity_millis(&q.0).unwrap())
+                .unwrap_or(0);
+            assert!(limit <= rendered_millis, "init container {}", init.name);
+            assert_ne!(
+                init.restart_policy.as_deref(),
+                Some("Always"),
+                "a restartable init container adds to the pod CPU limit"
+            );
+        }
+
+        assert_eq!(
+            shape::snp_vm_vcpus(&app.resources.cpu, false),
+            Some(shape::APPROVED_SNP_VM_VCPUS),
+            "the default cpu limit must boot the approved vCPU count"
+        );
+    }
+}
