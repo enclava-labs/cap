@@ -172,21 +172,15 @@ fn verify_migration_ledger(
 mod tests {
     use super::*;
 
-    async fn schema_test_pool() -> sqlx::PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = sqlx::PgPool::connect(&database_url)
-            .await
-            .expect("connect schema guard test database");
-        run_migrations(&pool)
-            .await
-            .expect("migrate schema guard test database");
-        pool
+    async fn schema_test_pool() -> (crate::test_support::IsolatedDatabaseCleanup, sqlx::PgPool) {
+        // cap#391: per-test database — the guard tests mutate schema state
+        // and no longer share the suite-wide database.
+        crate::test_support::database_test_pool().await
     }
 
     #[tokio::test]
     async fn prepare_schema_accepts_a_valid_purge_index() {
-        let pool = schema_test_pool().await;
+        let (_test_db, pool) = schema_test_pool().await;
         prepare_schema(&pool, MigrationMode::Verify)
             .await
             .expect("verify mode must accept a fully migrated database with a valid purge index");
@@ -199,7 +193,7 @@ mod tests {
     /// The catalog-hack case needs a superuser role, which CI's
     /// `POSTGRES_USER` provides.
     async fn guard_error_after(mutations: &[&str]) -> String {
-        let pool = schema_test_pool().await;
+        let (_test_db, pool) = schema_test_pool().await;
         let mut tx = pool.begin().await.expect("begin guard test transaction");
         for sql in mutations {
             sqlx::query(sql)

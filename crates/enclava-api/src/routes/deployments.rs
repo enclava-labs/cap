@@ -2199,18 +2199,6 @@ mod tests {
         assert!(decoded.tls_storage.is_none());
     }
 
-    async fn database_test_pool() -> sqlx::PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = sqlx::PgPool::connect(&database_url)
-            .await
-            .expect("connect deployment regression database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate deployment regression database");
-        pool
-    }
-
     async fn insert_setup_test_app(pool: &sqlx::PgPool) -> App {
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
@@ -2258,7 +2246,7 @@ mod tests {
 
     #[tokio::test]
     async fn stored_auto_deploys_are_rejected_before_validation_or_persistence() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let mut app = insert_setup_test_app(&pool).await;
         app.unlock_mode = crate::models::UnlockMode::Auto;
         let mut state = crate::test_support::lazy_state();
@@ -2398,7 +2386,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_app_insert_statement_accepts_every_bound_column() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let mut app = insert_setup_test_app(&pool).await;
         // Execute the exact AppMutation::Insert statement with the handler's
         // bind order: an added column without its SELECT placeholder makes
@@ -2671,7 +2659,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_volume_floor_rejects_sub_luks2_minimum_sizes_synchronously() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
 
         // 24 Mi passed the old grammar-only checks (positive binary
@@ -2772,7 +2760,7 @@ mod tests {
 
     #[tokio::test]
     async fn deployment_acceptance_waits_for_membership_removal_and_rejects() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
         let user_id = Uuid::new_v4();
         sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Removed Deployer')")
@@ -2865,7 +2853,7 @@ mod tests {
 
     #[tokio::test]
     async fn existing_app_acceptance_waits_for_and_rejects_concurrent_authority_change() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
         let expected = insert_authority_rows(&pool, &app).await;
 
@@ -2922,7 +2910,7 @@ mod tests {
 
     #[tokio::test]
     async fn existing_app_acceptance_rejects_stale_container_and_resource_rows() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
         let expected = insert_authority_rows(&pool, &app).await;
 
@@ -2974,7 +2962,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_metadata_acceptance_persists_dispatchable_post_mutation_payload() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
         insert_authority_rows(&pool, &app).await;
         let deployment_id = Uuid::new_v4();
@@ -3106,7 +3094,7 @@ mod tests {
 
     #[tokio::test]
     async fn superseded_watcher_cannot_publish_over_new_manifest() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
         insert_authority_rows(&pool, &app).await;
         let containers: Vec<AppContainer> =
@@ -3312,7 +3300,7 @@ mod tests {
 
     #[tokio::test]
     async fn prior_healthy_deployment_evidence_distinguishes_a_live_failed_app() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
         async fn has_healthy(pool: &sqlx::PgPool, app_id: Uuid) -> bool {
             let mut tx = pool.begin().await.expect("begin evidence probe");
@@ -3368,7 +3356,7 @@ mod tests {
 
     #[tokio::test]
     async fn rollout_in_flight_evidence_distinguishes_frozen_holds() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
 
         async fn in_flight(pool: &sqlx::PgPool, app_id: Uuid) -> bool {
@@ -3676,7 +3664,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_rollback_artifact_fails_before_container_or_deployment_commit() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
         let target_id = Uuid::new_v4();
         let original_image = format!("ghcr.io/acme/original@sha256:{}", "aa".repeat(32));
@@ -3789,7 +3777,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_insert_failure_aborts_the_candidate_transaction() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
         insert_authority_rows(&pool, &app).await;
         let suffix = app.id.simple().to_string();

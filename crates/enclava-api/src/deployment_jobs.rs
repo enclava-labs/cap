@@ -4513,7 +4513,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn trustee_rollout_timeout_requeues_the_apply_and_frees_its_fences() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -4730,18 +4730,6 @@ pub(crate) mod tests {
             heartbeat_size <= 8 * 1024,
             "lease heartbeat amplified future state from {operation_size} to {heartbeat_size} bytes"
         );
-    }
-
-    async fn database_test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("connect deployment job test database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate deployment job test database");
-        pool
     }
 
     fn test_app(org_id: Uuid, app_id: Uuid) -> App {
@@ -5589,7 +5577,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn expired_setup_and_apply_leases_recover_after_restart() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let original_setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -5668,7 +5656,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn expired_watching_lease_is_reclaimed_and_publishes_terminal_result() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -5758,7 +5746,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn nonterminal_password_rollout_preserves_authority_for_delayed_retry() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -5864,7 +5852,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn apply_contention_requeue_scales_backoff_with_attempts() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -5951,7 +5939,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn exhausted_contention_requeue_terminalizes_the_apply_job() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -6183,7 +6171,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn retry_exhaustion_runs_compensating_cleanup_and_frees_the_fences() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -6293,7 +6281,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn exhaustion_claim_blocker_treats_armed_infinity_leases_as_waitable() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -6336,7 +6324,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn retry_exhaustion_compensation_reclaims_its_own_abandoned_lease() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -6505,7 +6493,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn retry_exhaustion_compensation_waits_out_unrelated_global_fence_contention() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -6639,7 +6627,7 @@ pub(crate) mod tests {
     /// job's partial namespace indefinitely.
     #[tokio::test]
     async fn retry_exhaustion_compensation_waits_out_bounded_desired_state_owner() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -6774,7 +6762,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn retry_exhaustion_compensation_retries_after_live_desired_state_finishes() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -6861,7 +6849,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn retry_exhaustion_compensation_retries_after_live_setup_finishes() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -6949,7 +6937,7 @@ pub(crate) mod tests {
     /// skipping immediately instead of waiting out (or stealing) its rows.
     #[tokio::test]
     async fn retry_exhaustion_compensation_still_skips_the_app_delete_owner() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -7039,7 +7027,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn retry_exhaustion_compensation_skips_a_foreign_owned_fence_immediately() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -7134,7 +7122,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn provenance_migration_marks_existing_active_rows_but_not_new_deployments() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let mut tx = pool.begin().await.expect("migration test transaction");
         // Shadow only this transaction's deployments table: exercise the actual
         // migration against pre-column rows without rewriting the shared schema.
@@ -7183,7 +7171,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn incomplete_migrated_provenance_exhausts_and_preserves_pre_ledger_provenance() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -7245,7 +7233,7 @@ pub(crate) mod tests {
     // directly — these two cover both early-return branches.
     #[tokio::test]
     async fn evidence_loss_marker_lands_before_provenance_error_retention() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -7300,7 +7288,7 @@ pub(crate) mod tests {
     // retention path must still run (lease pool), never a plain release.
     #[tokio::test]
     async fn evidence_loss_marker_failure_still_retains_fence_on_provenance_error() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -7370,7 +7358,7 @@ pub(crate) mod tests {
     }
 
     async fn check_provenance_lookup_failure_retention(generation_lookup_failed: bool) {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -7428,7 +7416,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn incomplete_migrated_observation_publishes_terminal_exhaustion() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -7480,7 +7468,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn retry_exhaustion_compensation_classifies_against_the_recorded_attempt_generation() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -7706,7 +7694,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn aged_nonterminal_observation_terminalizes_exhausted_rollout() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -7847,7 +7835,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn owner_wait_observation_requeue_caps_backoff_at_sixty_seconds() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -7949,7 +7937,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn superseded_watching_lease_cannot_publish_after_reclaim_window() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -8028,7 +8016,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn stale_setup_token_cannot_publish_false_acceptance() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -8062,7 +8050,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn existing_app_setup_failure_is_terminal_without_cleanup_marker() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -8112,7 +8100,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn deferred_gate_rejects_old_style_insert_and_accepts_same_tx_job() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, _deployment_id, _setup_lease, payload) = insert_job_fixture(&pool).await;
 
         let old_style_id = Uuid::new_v4();
@@ -8170,7 +8158,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn unsupported_future_payload_version_waits_for_compatible_worker() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let mut future_payload = serde_json::to_value(payload).expect("serialize future payload");
         future_payload["version"] = serde_json::json!(JOB_PAYLOAD_VERSION + 1);
@@ -8395,7 +8383,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn customer_config_hold_blocks_setup_until_release_and_expiry_does_not_roll() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup, _payload) = insert_job_fixture(&pool).await;
         sqlx::query(
             "UPDATE deployment_apply_jobs
@@ -8533,7 +8521,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn pre_hold_worker_claim_requires_customer_config_release() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup, _payload) =
             insert_job_fixture_with_hold(&pool, Some(3600)).await;
         let wake = sqlx::query(
@@ -8602,7 +8590,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn late_release_past_an_unswept_deadline_fails_the_hold_without_rolling() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup, _payload) =
             insert_job_fixture_with_hold(&pool, Some(3600)).await;
         sqlx::query(
@@ -8675,7 +8663,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn release_deadline_race_fails_the_hold_terminal_not_ambiguous() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup, _payload) =
             insert_job_fixture_with_hold(&pool, Some(3600)).await;
 
@@ -8750,7 +8738,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn cross_app_and_empty_setup_payloads_are_quarantined_not_reclaimed() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         for cross_app in [false, true] {
             let (app, deployment_id, setup_handle, payload) = insert_job_fixture(&pool).await;
             let mut malformed = serde_json::to_value(payload).expect("serialize payload");
@@ -8801,7 +8789,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn semantic_apply_payload_failure_is_token_conditionally_quarantined() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -8863,7 +8851,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn setup_handoff_is_unowned_until_request_claim_and_dispatcher_honors_delay() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let (state, token, lease, recovery_delayed): (
             String,
@@ -8923,7 +8911,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn dispatcher_winner_is_observed_without_duplicate_request_setup() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, setup_handle, _payload) = insert_job_fixture(&pool).await;
         sqlx::query(
             "UPDATE deployment_apply_jobs
@@ -8975,7 +8963,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn request_owned_dns_failure_preserves_typed_error_mapping() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, setup_handle, _payload) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -9101,7 +9089,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn signed_job_and_artifact_snapshots_cannot_be_downgraded_or_mutated() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let descriptor_hash =
             replace_job_with_fake_signed_binding(&pool, deployment_id, payload).await;
@@ -9288,7 +9276,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn permit_wait_revalidates_latest_keyring_before_rendering() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -9475,7 +9463,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn cross_app_kbs_fence_contention_requeues_without_terminal_failure() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (holder_app, _, _, _) = insert_job_fixture(&pool).await;
         let (queued_app, queued_deployment, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
@@ -9571,7 +9559,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn watching_generation_holds_no_shared_fences_for_other_tenants() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (waiting_app, waiting_deployment, _, waiting_payload) = insert_job_fixture(&pool).await;
         let (peer_app, _peer_deployment, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
@@ -9996,7 +9984,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn watching_rollout_releases_admission_slot_before_observing() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -10130,7 +10118,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn resumed_observer_uses_accepted_payload_not_mutated_app_row() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, mut payload) = insert_job_fixture(&pool).await;
         // The accepted payload describes an update of a previously-running
         // password-mode app.
@@ -10245,7 +10233,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn stale_apply_releases_pre_provider_app_and_resource_claims() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -10310,7 +10298,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn transient_default_size_volume_lookup_requeues_without_mutation_ownership() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -10411,7 +10399,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn removed_claim_under_fences_refuses_sub_floor_waiver() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -10489,7 +10477,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn transient_final_volume_read_releases_fences_and_requeues() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -10569,7 +10557,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn orphan_reconciler_repairs_only_exact_inactive_deployment_owner() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -10785,7 +10773,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn retained_namespace_fence_is_exempt_from_orphan_repair_until_reconciled() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -10988,7 +10976,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn shared_dns_fence_contention_requeues_setup_without_failure() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (holder_app, _, _, _) = insert_job_fixture(&pool).await;
         let (queued_app, queued_deployment, _, _) = insert_job_fixture(&pool).await;
         let shared_hostname = queued_app.domain.clone();
@@ -11047,7 +11035,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn supersession_rejects_unexpired_mutator_and_accepts_expired_owner() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -11103,7 +11091,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn malformed_cleanup_owned_payload_remains_reconcilable_by_relational_app_id() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, setup_handle, mut payload) = insert_job_fixture(&pool).await;
         payload.delete_app_on_setup_failure = true;
         let mut malformed = serde_json::to_value(payload).expect("serialize cleanup payload");
@@ -11139,7 +11127,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn database_rejects_false_cleanup_state_and_terminal_job_stranding() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let cleanup_error = sqlx::query(
             "UPDATE deployment_apply_jobs SET state = 'cleanup_pending'
@@ -11206,7 +11194,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn database_rejects_payload_without_relational_version_match() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let mut tx = pool
             .begin()
@@ -11254,7 +11242,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn artifact_binding_is_unique_and_exact_hash_mismatch_is_absent() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_lease, _payload) = insert_job_fixture(&pool).await;
         sqlx::query(
             "INSERT INTO workload_artifacts (
@@ -11316,7 +11304,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn deployment_identity_must_match_durable_payload() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_lease, mut payload) = insert_job_fixture(&pool).await;
         let claimed = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -11337,7 +11325,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn stale_apply_token_cannot_publish_rollout_success() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -11434,7 +11422,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn stale_apply_token_cannot_publish_failure() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -11522,7 +11510,7 @@ pub(crate) mod tests {
     /// such rows (they keep the full ownership veto).
     #[tokio::test]
     async fn failure_publish_stamps_observation_for_watching_rows() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -11586,7 +11574,7 @@ pub(crate) mod tests {
         // signed-policy budget rejection) must be persisted on the
         // deployments row so the public projection allowlist can surface
         // the real reason instead of a constant `deployment_apply_failed`.
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         // Each publication terminalizes its job and deployment, so use a
         // fresh fixture per code.
         for failure_code in ["kbs_policy_error", "signed_policy_budget_exceeded"] {
@@ -11632,7 +11620,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn publisher_and_acceptance_share_app_then_job_lock_order() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
@@ -11705,7 +11693,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn cleanup_is_reclaimed_after_crash_and_retried_after_transient_failure() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (app, deployment_id, _setup_handle, mut payload) = insert_job_fixture(&pool).await;
         payload.delete_app_on_setup_failure = true;
         replace_job_with_raw_payload(

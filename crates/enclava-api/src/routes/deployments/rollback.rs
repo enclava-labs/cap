@@ -723,18 +723,6 @@ pub async fn rollback(
 mod exact_snapshot_tests {
     use super::*;
 
-    async fn database_test_pool() -> sqlx::PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = sqlx::PgPool::connect(&database_url)
-            .await
-            .expect("connect rollback regression database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate rollback regression database");
-        pool
-    }
-
     async fn insert_rollback_test_app(pool: &sqlx::PgPool) -> App {
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
@@ -923,7 +911,7 @@ mod exact_snapshot_tests {
 
     #[tokio::test]
     async fn restores_exact_signed_and_unsigned_command_storage_profile_and_resources() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         for signed in [false, true] {
             let app = insert_rollback_test_app(&pool).await;
             let target = exact_target_snapshot(app.id, signed);
@@ -964,7 +952,7 @@ mod exact_snapshot_tests {
 
     #[tokio::test]
     async fn implicit_target_excludes_only_the_latest_accepted_generation() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app = insert_rollback_test_app(&pool).await;
         let oldest_healthy = insert_generation(&pool, &app, "healthy").await;
         let newest_healthy = insert_generation(&pool, &app, "healthy").await;

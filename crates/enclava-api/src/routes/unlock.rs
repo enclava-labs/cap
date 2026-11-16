@@ -1825,18 +1825,6 @@ mod tests {
         }
     }
 
-    async fn database_test_pool() -> sqlx::PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = sqlx::PgPool::connect(&database_url)
-            .await
-            .expect("connect unlock regression database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate unlock regression database");
-        pool
-    }
-
     struct UnlockTestFixture {
         app: App,
         user_id: Uuid,
@@ -2761,7 +2749,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_failure_rolls_back_unlock_mode_runtime_receipt_and_deployment() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let UnlockTestFixture {
             app,
             user_id,
@@ -2915,7 +2903,7 @@ mod tests {
 
     #[tokio::test]
     async fn deployment_insert_failure_rolls_back_unlock_mode_and_receipt() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let UnlockTestFixture {
             app,
             user_id,
@@ -3023,7 +3011,7 @@ mod tests {
 
     #[tokio::test]
     async fn durable_job_insert_failure_rolls_back_entire_unlock_transition() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let UnlockTestFixture {
             app,
             user_id,
@@ -3168,7 +3156,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_artifact_authority_rejects_unlock_atomically() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let UnlockTestFixture {
             app,
             user_id,
@@ -3287,7 +3275,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_duplicate_transition_receipt_commits_exactly_once() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let UnlockTestFixture {
             app,
             user_id,
@@ -3443,7 +3431,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlock_mode_transition_rejects_while_app_mutation_lease_is_live() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let UnlockTestFixture {
             app,
             user_id,
@@ -3592,7 +3580,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_authority_rejects_auto_target_before_any_persistence() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let UnlockTestFixture {
             app,
             user_id,
@@ -3774,7 +3762,7 @@ mod tests {
             }
         });
 
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let fixture = insert_unlock_test_app(&pool).await;
         let app_name = fixture.app.name.clone();
         let tee_domain = fixture.app.tee_domain.clone().expect("fixture tee_domain");

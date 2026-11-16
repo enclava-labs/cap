@@ -526,16 +526,10 @@ mod tests {
         assert!(require_config_metadata_write(&auth(Role::Owner, &[])).is_ok());
     }
 
-    async fn scopes_test_pool() -> sqlx::PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = sqlx::PgPool::connect(&database_url)
-            .await
-            .expect("connect membership role lock regression database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate membership role lock regression database");
-        pool
+    async fn scopes_test_pool() -> (crate::test_support::IsolatedDatabaseCleanup, sqlx::PgPool) {
+        // cap#391: per-test database — membership rows no longer share the
+        // suite-wide database, so parallel test threads cannot collide.
+        crate::test_support::database_test_pool().await
     }
 
     /// Regression test for #131: the in-transaction membership role read must
@@ -543,7 +537,7 @@ mod tests {
     /// role check and the caller's commit.
     #[tokio::test]
     async fn active_membership_role_read_blocks_concurrent_demotion() {
-        let pool = scopes_test_pool().await;
+        let (_test_db, pool) = scopes_test_pool().await;
         let org_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
         let suffix = org_id.simple().to_string();

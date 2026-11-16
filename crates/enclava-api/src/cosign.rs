@@ -186,12 +186,20 @@ pub struct PortableVerificationMaterial {
 }
 
 fn env_flag(name: &str) -> bool {
+    // cap#391: share the env snapshot with any env-mutating test (no-op
+    // outside the test build).
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     std::env::var(name)
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
+    // cap#391: shared the env snapshot with any env-mutating test (no-op
+    // outside the test build).
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     std::env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
@@ -267,6 +275,10 @@ struct CosignRegistryCredentials {
 
 impl CosignRegistryCredentials {
     fn from_env() -> Self {
+        // Snapshot the credential trio atomically (cap#391): a env-mutating
+        // test must not be able to slip between the three reads.
+        #[cfg(test)]
+        let _env_read = crate::test_support::env_read_guard();
         Self {
             bearer_token: env_nonempty("COSIGN_REGISTRY_BEARER_TOKEN"),
             username: env_nonempty("COSIGN_REGISTRY_USERNAME"),
@@ -305,6 +317,10 @@ fn registry_auth_with_allowlist(
     credentials: Option<&CosignRegistryCredentials>,
     allowed_hosts: &[String],
 ) -> Auth {
+    // cap#391: the GHCR fallback below reads env vars env-mutating tests
+    // set; hold the shared env snapshot for the whole decision.
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     // Platform registry credentials must never be forwarded to a host the
     // tenant picked (issue #225): image references — including digest-pinned
     // ones, which skip the registry allowlist — are attacker-controlled
@@ -493,6 +509,9 @@ async fn exchange_registry_basic_auth(
 /// allowlisted for this host wins inside [`registry_auth_with_allowlist`];
 /// only the fallback that selected `GHCR_*` must be pinned to ghcr.io.
 fn legacy_ghcr_credentials_selected(registry: &str) -> bool {
+    // cap#391: snapshot the env pair atomically against env-mutating tests.
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     if registry != "ghcr.io" || env_nonempty("GHCR_TOKEN").is_none() {
         return false;
     }
@@ -529,20 +548,32 @@ async fn registry_auth_from_env_with_realm_policy(
     registry_base: &str,
     image: &Reference,
 ) -> Result<Auth, CosignError> {
-    let registry = image.resolve_registry();
-    let auth = registry_auth_from_env(registry);
-    let allowed_hosts = registry_realm_allowed_hosts(
-        registry,
-        cosign_registry_allowed_hosts_from_env(),
-        legacy_ghcr_credentials_selected(registry),
-    );
+    // cap#391: one env snapshot across the whole decision — the auth
+    // selection, the allowlist read, the GHCR-fallback probe, and the
+    // allow-http flag must not observe different environments (nested
+    // readers are reentrancy-safe). The guard is scoped to the synchronous
+    // reads so it is never held across the `.await` below.
+    let (auth, allowed_hosts, allow_http) = {
+        #[cfg(test)]
+        let _env_read = crate::test_support::env_read_guard();
+        let registry = image.resolve_registry();
+        (
+            registry_auth_from_env(registry),
+            registry_realm_allowed_hosts(
+                registry,
+                cosign_registry_allowed_hosts_from_env(),
+                legacy_ghcr_credentials_selected(registry),
+            ),
+            env_flag("COSIGN_ALLOW_HTTP_REGISTRY"),
+        )
+    };
     exchange_registry_basic_auth(
         proxy_url,
         registry_base,
         image.repository(),
         auth,
         &allowed_hosts,
-        env_flag("COSIGN_ALLOW_HTTP_REGISTRY"),
+        allow_http,
     )
     .await
 }
@@ -642,6 +673,9 @@ fn incomplete_basic_pair_error(username: Option<&str>, password: Option<&str>) -
 /// silently downgrading every registry to anonymous would break private-
 /// registry verification in confusing ways, so misconfiguration must be loud.
 pub fn cosign_registry_credentials_startup_error() -> Option<String> {
+    // cap#391: keep the credential/allowlist reads one snapshot.
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     let patterns = cosign_registry_allowed_hosts_from_env();
     if let Some(raw) = env_nonempty(COSIGN_REGISTRY_ALLOWED_HOSTS_ENV) {
         let invalid: Vec<String> = raw
@@ -731,12 +765,21 @@ pub fn parse_image_parts(image_ref: &str) -> Result<(String, String), CosignErro
     }
 }
 
+/// cap#391: read `SIGSTORE_TUF_ROOT_PATH` inside the shared env snapshot so
+/// an env-mutating test cannot interleave with this decision (no-op outside
+/// the test build).
+fn sigstore_tuf_root_path_env() -> Result<String, std::env::VarError> {
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
+    std::env::var("SIGSTORE_TUF_ROOT_PATH")
+}
+
 /// Build a sigstore trust root, preferring a bundled TUF snapshot when
 /// `SIGSTORE_TUF_ROOT_PATH` is set.
 async fn load_trust_root() -> Result<Arc<TrustedRoot>, CosignError> {
     // Note: an EMPTY SIGSTORE_TUF_ROOT_PATH fails closed below (read error),
     // which is deliberate — do not "helpfully" treat empty as unset.
-    if let Ok(path) = std::env::var("SIGSTORE_TUF_ROOT_PATH") {
+    if let Ok(path) = sigstore_tuf_root_path_env() {
         let data = std::fs::read(&path).map_err(|e| {
             CosignError::TrustRoot(format!("failed to read SIGSTORE_TUF_ROOT_PATH {path}: {e}"))
         })?;
@@ -2188,6 +2231,12 @@ fn build_pin_from_env(
         })?
         .to_string();
 
+    // cap#391: share the env snapshot with any env-mutating test (no-op
+    // outside the test build); the fallback chain below must observe one
+    // consistent environment.
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
+
     if let Some(pem) = read_public_key_policy(public_key_b64_var, public_key_pem_var)? {
         return Ok(SidecarPin {
             label,
@@ -2227,6 +2276,11 @@ fn read_public_key_policy(
     public_key_b64_var: &str,
     public_key_pem_var: &str,
 ) -> Result<Option<String>, CosignError> {
+    // cap#391: share the env snapshot with any env-mutating test (no-op
+    // outside the test build); the whole var-probing decision must observe
+    // one consistent environment.
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     for name in [
         public_key_b64_var,
         "PLATFORM_SIDECAR_SIGNER_PUBLIC_KEY_BASE64",
@@ -2271,6 +2325,9 @@ mod tests {
 
     #[tokio::test]
     async fn verify_image_rejects_literal_ip_registry_before_any_io() {
+        // cap#391: mutates SIGSTORE_TUF_ROOT_PATH; serialized against every
+        // env reader.
+        let _env_write = crate::test_support::env_write_guard();
         // The sigstore transport is unguarded; the pre-flight guard must
         // reject a tenant-chosen literal-IP registry host (issue #224)
         // before the sigstore client dials anything. SIGSTORE_TUF_ROOT_PATH
@@ -2318,6 +2375,9 @@ mod tests {
 
     #[tokio::test]
     async fn verify_image_rejects_unallowlisted_registry_before_any_io() {
+        // cap#391: mutates SIGSTORE_TUF_ROOT_PATH; serialized against every
+        // env reader.
+        let _env_write = crate::test_support::env_write_guard();
         let root =
             std::env::temp_dir().join(format!("cap-224-trusted-root-{}.json", std::process::id()));
         std::fs::write(&root, b"{}").unwrap();
@@ -2549,6 +2609,9 @@ mod tests {
 
     #[test]
     fn build_pin_from_env_url_subject_picks_url_policy() {
+        // cap#391: mutates the sidecar identity env vars; serialized
+        // against every env reader.
+        let _env_write = crate::test_support::env_write_guard();
         unsafe {
             std::env::set_var(
                 "TEST_SIDECAR_SUBJECT_URL",
@@ -2580,6 +2643,9 @@ mod tests {
 
     #[test]
     fn build_pin_from_env_public_key_overrides_fulcio_vars() {
+        // cap#391: mutates the sidecar key env vars; serialized against
+        // every env reader.
+        let _env_write = crate::test_support::env_write_guard();
         let pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAeDjxjxz1f2yWqSX+F2TSLujEc5tMLMMIRxI2CPOXKv8=\n-----END PUBLIC KEY-----\n";
         unsafe {
             std::env::set_var("TEST_SIDECAR_PUBLIC_KEY_B64", B64.encode(pem));
@@ -2601,6 +2667,9 @@ mod tests {
 
     #[test]
     fn build_pin_from_env_rejects_invalid_public_key_base64() {
+        // cap#391: mutates the sidecar key env vars; serialized against
+        // every env reader.
+        let _env_write = crate::test_support::env_write_guard();
         unsafe {
             std::env::set_var("TEST_SIDECAR_BAD_PUBLIC_KEY_B64", "not base64");
             std::env::remove_var("TEST_SIDECAR_BAD_PUBLIC_KEY_PEM");
@@ -2815,6 +2884,9 @@ mod tests {
 
     #[test]
     fn registry_auth_from_env_uses_basic_credentials() {
+        // cap#391: mutates the registry credential env vars; serialized
+        // against every env reader.
+        let _env_write = crate::test_support::env_write_guard();
         unsafe {
             std::env::set_var("COSIGN_REGISTRY_USERNAME", "cap-bot");
             std::env::set_var("COSIGN_REGISTRY_PASSWORD", "ghp_example");

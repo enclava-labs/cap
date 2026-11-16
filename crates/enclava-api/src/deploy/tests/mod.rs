@@ -1364,7 +1364,7 @@ fn statefulset_rollout_settled_matches_the_rollout_completion_criterion() {
 
 #[tokio::test]
 async fn supersession_serializes_customer_config_delivery() {
-    let pool = crate::test_support::database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let (app, deployment_id, _, _) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
     sqlx::query(
         "UPDATE deployment_apply_jobs
@@ -1751,7 +1751,7 @@ async fn terminal_failed_deployment_cannot_admit_restart_of_live_unready_pod() {
     // but the pod it left behind is still mid first-boot. The verdict
     // consults live cluster state only, so it must refuse regardless of
     // the recorded status.
-    let pool = crate::test_support::database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let (app, deployment_id, _, _) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
     sqlx::query("UPDATE deployments SET status = 'failed'::deploy_status_enum WHERE id = $1")
         .bind(deployment_id)
@@ -5229,35 +5229,12 @@ async fn sweep_keeps_active_lease_generation_secret_until_lease_release() {
 async fn sweep_keeps_quarantined_lease_equal_generation_secret() {
     use std::sync::{Arc, Mutex};
 
-    let pool = crate::test_support::database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let namespace = format!("quar{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let owner = uuid::Uuid::new_v4();
     let operation_id = uuid::Uuid::new_v4();
-    struct DeleteQuarantineLease {
-        namespace: String,
-    }
-    impl Drop for DeleteQuarantineLease {
-        fn drop(&mut self) {
-            let url = std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-            let _ = std::process::Command::new("psql")
-                .env("PGPASSWORD", "test")
-                .arg(&url)
-                .arg("-v")
-                .arg("ON_ERROR_STOP=1")
-                .arg("-c")
-                .arg(format!(
-                    "DELETE FROM external_resource_mutation_leases \
-                         WHERE resource_scope = 'kubernetes_namespace' \
-                           AND resource_key = '{}'",
-                    self.namespace
-                ))
-                .output();
-        }
-    }
-    let _cleanup = DeleteQuarantineLease {
-        namespace: namespace.clone(),
-    };
+    // cap#391: the quarantine lease lives in this test's private database,
+    // which the cleanup guard drops — no post-hoc psql cleanup needed.
     sqlx::query(
         "INSERT INTO external_resource_mutation_leases(\
                 resource_scope, resource_key, generation, owner_token, \
@@ -7527,8 +7504,8 @@ async fn armed_transport_recovery_persists_before_step_error() {
     // previously the `?` exited apply_all before any persistence gate,
     // leaving the UID memory-only (failure cleanup could not prove
     // provenance).
-    let _reset = ResetStaleRolloutAuthority;
-    let pool = crate::test_support::database_test_pool().await;
+    let _env_write = crate::test_support::env_write_guard();
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     sqlx::query(
             "UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0",
         )
@@ -7664,7 +7641,7 @@ async fn scoped_deploy_create_timeout_keeps_other_writers_secret() {
 
 #[tokio::test]
 async fn publish_missing_namespace_lease_does_not_clobber_a_claim() {
-    let pool = crate::test_support::database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let fresh = format!("pub{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let held = format!("hld{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let owner = uuid::Uuid::new_v4();
@@ -8378,7 +8355,8 @@ async fn sweep_recreate_attributes_and_verifies_field_manager_ownership() {
 
 #[tokio::test]
 async fn empty_fleet_publishes_rollout_authority_before_inventory() {
-    let pool = crate::test_support::database_test_pool().await;
+    let _env_write = crate::test_support::env_write_guard();
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     sqlx::query(
             "UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0",
         )
@@ -8420,7 +8398,8 @@ async fn empty_fleet_publishes_rollout_authority_before_inventory() {
 /// compare against) both collapse into this check.
 #[tokio::test]
 async fn rollout_authority_defers_stale_replicas_and_never_rewinds() {
-    let pool = crate::test_support::database_test_pool().await;
+    let _env_write = crate::test_support::env_write_guard();
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let (scope, credential) = raise_tenant_pull_secret_rollout_authority(&pool, 0, 0)
         .await
         .unwrap();
@@ -8508,35 +8487,6 @@ fn stale_rollout_manifests(namespace: &str) -> enclava_engine::manifest::Generat
     }
 }
 
-fn reset_stale_rollout_authority_blocking() {
-    unsafe {
-        std::env::remove_var("TENANT_IMAGE_PULL_SCOPE_GENERATION");
-        std::env::remove_var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION");
-    }
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-    let _ = std::process::Command::new("psql")
-        .env("PGPASSWORD", "test")
-        .arg(&url)
-        .arg("-v")
-        .arg("ON_ERROR_STOP=1")
-        .arg("-c")
-        .arg(
-            "UPDATE tenant_pull_secret_rollout_authority \
-                 SET max_scope_epoch = 0, max_credential_epoch = 0; \
-                 DELETE FROM tenant_pull_secret_scope_fences \
-                 WHERE namespace = 'devin-stale-rollout-ns'",
-        )
-        .output();
-}
-
-struct ResetStaleRolloutAuthority;
-impl Drop for ResetStaleRolloutAuthority {
-    fn drop(&mut self) {
-        reset_stale_rollout_authority_blocking();
-    }
-}
-
 /// Devin review on #278 (SEC, "Stale rollout resurrects narrowed credentials").
 /// An older replica passes `raise_tenant_pull_secret_rollout_authority`,
 /// then a narrowing rollout deletes the secret and raises the epoch. The
@@ -8544,8 +8494,8 @@ impl Drop for ResetStaleRolloutAuthority {
 /// platform secret.
 #[tokio::test]
 async fn rollout_transition_waits_for_deploy_and_sweep_mutation_guards() {
-    let _reset = ResetStaleRolloutAuthority;
-    let pool = crate::test_support::database_test_pool().await;
+    let _env_write = crate::test_support::env_write_guard();
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     sqlx::query("UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0")
             .execute(&pool).await.unwrap();
     // Deploy and sweep both hold this guard across Secret writes and
@@ -8590,8 +8540,8 @@ async fn rollout_transition_waits_for_deploy_and_sweep_mutation_guards() {
 
 #[tokio::test]
 async fn pull_secret_mutation_guard_keeps_its_lock_while_idle() {
-    let _reset = ResetStaleRolloutAuthority;
-    let pool = crate::test_support::database_test_pool().await;
+    let _env_write = crate::test_support::env_write_guard();
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     sqlx::query("UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0")
             .execute(&pool).await.unwrap();
     let guarded_pool = sqlx::postgres::PgPoolOptions::new()
@@ -8634,8 +8584,8 @@ async fn pull_secret_mutation_guard_keeps_its_lock_while_idle() {
 
 #[tokio::test]
 async fn stale_replica_does_not_recreate_secret_deleted_by_newer_rollout() {
-    let _reset = ResetStaleRolloutAuthority;
-    let pool = crate::test_support::database_test_pool().await;
+    let _env_write = crate::test_support::env_write_guard();
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     sqlx::query(
             "UPDATE tenant_pull_secret_rollout_authority SET max_scope_epoch = 0, max_credential_epoch = 0",
         )

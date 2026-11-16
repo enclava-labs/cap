@@ -438,16 +438,10 @@ mod tests {
         JsonUtil::as_json(&event)
     }
 
-    async fn nostr_test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = sqlx::PgPool::connect(&database_url)
-            .await
-            .expect("connect NIP-98 replay regression database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate NIP-98 replay regression database");
-        pool
+    async fn nostr_test_pool() -> (crate::test_support::IsolatedDatabaseCleanup, PgPool) {
+        // cap#391: per-test database — NIP-98 replay rows no longer share the
+        // suite-wide database, so parallel test threads cannot collide.
+        crate::test_support::database_test_pool().await
     }
 
     #[test]
@@ -482,7 +476,7 @@ mod tests {
     /// inside the 60-second freshness window.
     #[tokio::test]
     async fn verify_and_consume_rejects_replayed_event_within_freshness_window() {
-        let pool = nostr_test_pool().await;
+        let (_test_db, pool) = nostr_test_pool().await;
         let url = "https://api.example.test/auth/login";
         let event_json = signed_http_auth_event("u", url, "POST");
 
@@ -512,7 +506,7 @@ mod tests {
     /// was rejected — the cache rejects ids, not users.
     #[tokio::test]
     async fn verify_and_consume_accepts_new_event_after_replay_rejected() {
-        let pool = nostr_test_pool().await;
+        let (_test_db, pool) = nostr_test_pool().await;
         let url = "https://api.example.test/auth/login";
         let event_json = signed_http_auth_event("u", url, "POST");
 
@@ -553,7 +547,7 @@ mod tests {
     /// accept that re-signed event: its id is distinct and unclaimed.
     #[tokio::test]
     async fn verify_and_consume_accepts_same_second_resign_with_fresh_nonce() {
-        let pool = nostr_test_pool().await;
+        let (_test_db, pool) = nostr_test_pool().await;
         let url = "https://api.example.test/auth/login";
         let keys = Keys::generate();
         let created = Timestamp::now();
@@ -596,7 +590,7 @@ mod tests {
     /// cannot flake them via fixed-id collisions or leftover rows.
     #[tokio::test]
     async fn reap_nip98_replay_cache_deletes_only_expired_rows() {
-        let pool = nostr_test_pool().await;
+        let (_test_db, pool) = nostr_test_pool().await;
         let stale = format!("reap-test-stale-{}", Uuid::new_v4());
         let fresh = format!("reap-test-fresh-{}", Uuid::new_v4());
 
@@ -641,7 +635,7 @@ mod tests {
     /// repeated batches drain the backlog completely.
     #[tokio::test]
     async fn reap_nip98_replay_cache_batches_are_bounded_and_drain_fully() {
-        let pool = nostr_test_pool().await;
+        let (_test_db, pool) = nostr_test_pool().await;
         let ids: Vec<String> = (0..3)
             .map(|_| format!("reap-batch-test-{}", Uuid::new_v4()))
             .collect();

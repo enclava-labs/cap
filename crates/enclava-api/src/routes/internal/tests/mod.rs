@@ -26,32 +26,6 @@ fn create_app_request_without_resources_serializes_legacy_form() {
     assert!(decoded.resources.is_none());
 }
 
-async fn database_test_pool() -> sqlx::PgPool {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-    let pool = sqlx::PgPool::connect(&database_url)
-        .await
-        .expect("connect membership sync regression database");
-    crate::db::pool::run_migrations(&pool)
-        .await
-        .expect("migrate membership sync regression database");
-    pool
-}
-
-async fn named_database_test_pool(application_name: &str) -> sqlx::PgPool {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-    let options = database_url
-        .parse::<sqlx::postgres::PgConnectOptions>()
-        .expect("parse membership sync regression database URL")
-        .application_name(application_name);
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect_with(options)
-        .await
-        .expect("connect named membership sync pool")
-}
-
 async fn wait_for_named_lock_waiters(pool: &sqlx::PgPool, application_name: &str, expected: i64) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -991,7 +965,7 @@ fn deterministic_operation_identity_is_stable_and_request_bound() {
 
 #[tokio::test]
 async fn abandoned_lease_reclaims_once_and_replays_the_committed_response() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("lease-reclaim-{suffix}");
@@ -1060,7 +1034,7 @@ async fn abandoned_lease_reclaims_once_and_replays_the_committed_response() {
 
 #[tokio::test]
 async fn idempotency_receipt_reports_what_a_same_key_retry_would_do() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("receipt-{suffix}");
@@ -1151,7 +1125,7 @@ async fn idempotency_receipt_reports_what_a_same_key_retry_would_do() {
 
 #[tokio::test]
 async fn idempotency_receipt_matches_the_retry_decision_for_legacy_and_released_rows() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let hash = Sha256::digest(b"receipt-shape-request").to_vec();
     // (label, has reservation token, lease offset seconds, known_not_applied,
@@ -1241,18 +1215,10 @@ async fn idempotency_receipt_matches_the_retry_decision_for_legacy_and_released_
 
 #[tokio::test]
 async fn live_lease_does_not_starve_a_single_connection_pool() {
-    let migration_pool = database_test_pool().await;
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-    let options = database_url
-        .parse::<sqlx::postgres::PgConnectOptions>()
-        .expect("parse single-connection idempotency database URL")
-        .application_name(&format!("idempotency-pool-one-{}", Uuid::new_v4()));
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .expect("connect single-connection idempotency pool");
+    // cap#391: the single-connection pool must be a per-test database (the
+    // shared test database is no longer migrated by anything, so a raw
+    // DATABASE_URL pool would 500 on a fresh CI runner).
+    let (_test_db, pool) = crate::test_support::provision_test_database(1).await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("pool-one-{suffix}");
@@ -1292,12 +1258,11 @@ async fn live_lease_does_not_starve_a_single_connection_pool() {
         ),
         (StatusCode::OK, response)
     );
-    drop(migration_pool);
 }
 
 #[tokio::test]
 async fn stale_owner_and_pre_upgrade_completion_are_fenced_after_reclaim() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("owner-fence-{suffix}");
@@ -1375,7 +1340,7 @@ async fn stale_owner_and_pre_upgrade_completion_are_fenced_after_reclaim() {
 
 #[tokio::test]
 async fn recovery_deadlines_are_decided_by_the_database_clock() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let legacy_key = format!("database-clock-legacy-{suffix}");
@@ -1499,7 +1464,7 @@ async fn recovery_deadlines_are_decided_by_the_database_clock() {
 
 #[tokio::test]
 async fn expiring_capability_plaintext_never_enters_idempotency_ledger() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("capability-confidentiality-{suffix}");
@@ -1568,7 +1533,7 @@ async fn expiring_capability_plaintext_never_enters_idempotency_ledger() {
 
 #[tokio::test]
 async fn deterministic_config_token_receipt_regenerates_exact_bearer_without_plaintext() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let deployment_id = Uuid::new_v4();
@@ -1678,7 +1643,7 @@ async fn deterministic_config_token_receipt_regenerates_exact_bearer_without_pla
 
 #[tokio::test]
 async fn deterministic_config_token_errors_cancel_and_live_then_stale_lease_reclaims() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let deployment_id = Uuid::new_v4();
@@ -1749,7 +1714,7 @@ async fn deterministic_config_token_errors_cancel_and_live_then_stale_lease_recl
 
 #[tokio::test]
 async fn deterministic_config_token_policy_cannot_reclaim_generic_deploy_mutation() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("generic-deploy-not-config-{suffix}");
@@ -1799,7 +1764,7 @@ async fn deterministic_config_token_policy_cannot_reclaim_generic_deploy_mutatio
 
 #[tokio::test]
 async fn config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authority() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let path = format!(
@@ -1930,7 +1895,7 @@ async fn config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authori
 
 #[tokio::test]
 async fn config_token_timeout_is_bounded_and_completion_cancellation_is_cas_safe() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("bounded-cancellation-{suffix}");
@@ -2011,7 +1976,7 @@ async fn config_token_timeout_is_bounded_and_completion_cancellation_is_cas_safe
 
 #[tokio::test]
 async fn config_token_finish_error_releases_exact_reservation_for_retry() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("finish-error-{suffix}");
@@ -2075,7 +2040,7 @@ async fn config_token_finish_error_releases_exact_reservation_for_retry() {
 
 #[tokio::test]
 async fn config_token_binding_mismatch_rejects_same_key() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("binding-mismatch-{suffix}");
@@ -2112,7 +2077,7 @@ async fn config_token_binding_mismatch_rejects_same_key() {
 
 #[tokio::test]
 async fn app_config_token_route_replays_exactly_and_rejects_name_recreation() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let suffix = Uuid::new_v4().simple().to_string();
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
@@ -2287,7 +2252,7 @@ async fn app_config_token_route_replays_exactly_and_rejects_name_recreation() {
 
 #[tokio::test]
 async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let suffix = Uuid::new_v4().simple().to_string();
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
@@ -2428,7 +2393,7 @@ async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() 
 
 #[tokio::test]
 async fn deleted_and_rebound_config_token_routes_do_not_extend_or_mask_expiry() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let suffix = Uuid::new_v4().simple().to_string();
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
@@ -2729,7 +2694,7 @@ async fn deleted_and_rebound_config_token_routes_do_not_extend_or_mask_expiry() 
 
 #[tokio::test]
 async fn deleted_legacy_config_token_routes_preserve_extended_terminal_proof() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let suffix = Uuid::new_v4().simple().to_string();
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
@@ -2872,7 +2837,7 @@ async fn deleted_legacy_config_token_routes_preserve_extended_terminal_proof() {
 
 #[tokio::test]
 async fn legacy_completed_config_token_sanitizer_preserves_extended_lease_proof() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("legacy-sanitizer-{suffix}");
     let path = format!("/internal/test/legacy-sanitizer/{suffix}");
@@ -2954,7 +2919,7 @@ async fn legacy_completed_config_token_sanitizer_preserves_extended_lease_proof(
 
 #[tokio::test]
 async fn legacy_config_token_receipt_uses_conservative_lease_proof() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("legacy-config-receipt-{suffix}");
@@ -3024,7 +2989,7 @@ async fn legacy_config_token_receipt_uses_conservative_lease_proof() {
 
 #[tokio::test]
 async fn ordinary_handler_error_is_completed_and_replayed_without_side_effect_retry() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("error-replay-{suffix}");
@@ -3077,7 +3042,7 @@ async fn ordinary_handler_error_is_completed_and_replayed_without_side_effect_re
 
 #[tokio::test]
 async fn completed_error_is_stamped_in_returned_and_cached_body() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("completed-stamp-{suffix}");
@@ -3119,7 +3084,7 @@ async fn completed_error_is_stamped_in_returned_and_cached_body() {
 
 #[tokio::test]
 async fn deferred_response_is_stamped_and_leaves_row_incomplete() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("deferred-stamp-{suffix}");
@@ -3152,7 +3117,7 @@ async fn deferred_response_is_stamped_and_leaves_row_incomplete() {
 
 #[tokio::test]
 async fn known_not_applied_retry_preserves_original_key_binding() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("known-not-applied-binding-{suffix}");
@@ -3214,7 +3179,7 @@ async fn known_not_applied_retry_preserves_original_key_binding() {
 
 #[tokio::test]
 async fn replayed_hold_refresh_distinguishes_terminal_and_released_holds() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
 
@@ -3405,7 +3370,7 @@ async fn whitelisted_known_not_applied_outcomes_preserve_binding_and_re_execute(
     // match ("... changed ...; retry", "authority changed", deletion) is
     // now terminal and lives in
     // permanent_conflicts_are_stamped_completed_and_cached.
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let hash = Sha256::digest(b"transient-retry-cancel-request").to_vec();
@@ -3483,7 +3448,7 @@ async fn permanent_conflicts_are_stamped_completed_and_cached() {
     // cancelling/re-running would spin or replay a stale block. A few
     // ("app creation was superseded", "app signer authority is
     // unavailable") are terminal for side-effect / heartbeat reasons.
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let hash = Sha256::digest(b"permanent-conflict-stamp-request").to_vec();
@@ -3550,9 +3515,19 @@ async fn permanent_conflicts_are_stamped_completed_and_cached() {
     }
 }
 
-async fn app_delete_fixture() -> (AppState, AuthContext, String, Uuid) {
-    let pool = database_test_pool().await;
-    app_delete_fixture_on(pool).await
+async fn app_delete_fixture() -> (
+    crate::test_support::IsolatedDatabaseCleanup,
+    AppState,
+    AuthContext,
+    String,
+    Uuid,
+) {
+    // cap#391: the per-test database guard must outlive this helper — the
+    // caller keeps using `state.db` after we return, and dropping the guard
+    // here would drop the database out from under the test.
+    let (test_db, pool) = crate::test_support::database_test_pool().await;
+    let (state, auth, app_name, app_id) = app_delete_fixture_on(pool).await;
+    (test_db, state, auth, app_name, app_id)
 }
 
 async fn app_delete_fixture_on(pool: sqlx::PgPool) -> (AppState, AuthContext, String, Uuid) {
@@ -3584,7 +3559,7 @@ async fn app_delete_fixture_on(pool: sqlx::PgPool) -> (AppState, AuthContext, St
 
 #[tokio::test]
 async fn app_mutation_busy_names_holder_and_retry_window() {
-    let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+    let (_test_db, state, _auth, _app_name, app_id) = app_delete_fixture().await;
     // Ensure a lane row exists, then simulate a live holder (a deployment
     // that claimed the lane ~60s ago).
     sqlx::query(
@@ -3641,7 +3616,7 @@ async fn app_mutation_busy_names_holder_and_retry_window() {
 
 #[tokio::test]
 async fn app_mutation_busy_hint_follows_reclaim_quarantine() {
-    let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+    let (_test_db, state, _auth, _app_name, app_id) = app_delete_fixture().await;
     // A lost owner: the renewable lock lapsed but the row still blocks
     // claims until the reclaim quarantine expires. The hint must track
     // THAT deadline -- the dead lock expiry admits nothing, and a hint
@@ -3680,7 +3655,7 @@ async fn app_mutation_busy_hint_follows_reclaim_quarantine() {
 
 #[tokio::test]
 async fn app_mutation_busy_resolves_resource_fence_holder() {
-    let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+    let (_test_db, state, _auth, _app_name, app_id) = app_delete_fixture().await;
     // A resource-fence conflict rolls the app-row claim back, so the
     // holder lives on the contested fence's row (which can belong to
     // another app or a global provider operation): the hint must read
@@ -3724,7 +3699,7 @@ async fn app_mutation_busy_resolves_resource_fence_holder() {
 
 #[tokio::test]
 async fn app_delete_partial_failure_defers_and_same_key_reexecutes() {
-    let (state, auth, app_name, _) = app_delete_fixture().await;
+    let (_test_db, state, auth, app_name, _) = app_delete_fixture().await;
     let key = format!("partial-delete-{}", Uuid::new_v4());
     let headers = idempotency_headers(&key);
     let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
@@ -3864,7 +3839,7 @@ async fn app_delete_deferral_carries_teardown_disposition() {
 
 #[tokio::test]
 async fn app_delete_budget_conflict_defers_instead_of_terminalizing() {
-    let (state, auth, app_name, _) = app_delete_fixture().await;
+    let (_test_db, state, auth, app_name, _) = app_delete_fixture().await;
     let key = format!("budget-defer-{}", Uuid::new_v4());
     let headers = idempotency_headers(&key);
     let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
@@ -3915,7 +3890,7 @@ async fn app_delete_budget_conflict_defers_instead_of_terminalizing() {
 
 #[tokio::test]
 async fn app_delete_terminal_failure_recovery_preserves_success_and_incarnation() {
-    let (state, auth, app_name, app_id) = app_delete_fixture().await;
+    let (_test_db, state, auth, app_name, app_id) = app_delete_fixture().await;
     let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
     let body = serde_json::json!({});
     for (index, status, response, recover) in [
@@ -4131,7 +4106,7 @@ async fn app_delete_terminal_failure_recovery_preserves_success_and_incarnation(
 
 #[tokio::test]
 async fn app_delete_recovery_has_one_reservation_winner() {
-    let (state, auth, app_name, _) = app_delete_fixture().await;
+    let (_test_db, state, auth, app_name, _) = app_delete_fixture().await;
     let key = format!("concurrent-delete-{}", Uuid::new_v4());
     let headers = idempotency_headers(&key);
     let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
@@ -4182,7 +4157,7 @@ async fn app_delete_recovery_has_one_reservation_winner() {
 
 #[tokio::test]
 async fn app_delete_locked_teardown_defers_and_same_key_reexecutes() {
-    let (state, auth, app_name, _) = app_delete_fixture().await;
+    let (_test_db, state, auth, app_name, _) = app_delete_fixture().await;
     let key = format!("locked-delete-{}", Uuid::new_v4());
     let headers = idempotency_headers(&key);
     let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
@@ -4250,22 +4225,12 @@ async fn app_delete_locked_teardown_defers_and_same_key_reexecutes() {
 async fn app_delete_retry_finishes_after_namespace_removal() {
     const CHILD: &str = "CAP_APP_DELETE_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        // KBS policy state and provider leases are global within a schema.
-        // Other tests (including failed runs) must not select an earlier failure.
-        let pool = database_test_pool().await;
-        let schema = format!("app_delete_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        let mut database_url = reqwest::Url::parse(
-            &std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".into()),
-        )
-        .unwrap();
-        database_url
-            .query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
+        // The parent only hosts the mock provider/kube endpoints; the child
+        // re-executes this test and provisions its own private per-test
+        // database (cap#391), so no cross-test schema isolation is needed.
+        let (_test_db, _pool) = crate::test_support::database_test_pool().await;
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
         // Isolate kube's process-wide configuration from other lib tests.
         let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let namespace_deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4362,10 +4327,6 @@ async fn app_delete_retry_finishes_after_namespace_removal() {
         let output = tokio::time::timeout(std::time::Duration::from_secs(60), output).await;
         task.abort();
         std::fs::remove_file(config).unwrap();
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-            .execute(&pool)
-            .await
-            .unwrap();
         let output = output.expect("delete retry must not deadlock").unwrap();
         assert!(
             output.status.success(),
@@ -4391,7 +4352,7 @@ async fn app_delete_retry_finishes_after_namespace_removal() {
         .with_ansi(false)
         .with_test_writer()
         .init();
-    let (mut state, auth, app_name, app_id) = app_delete_fixture().await;
+    let (_test_db, mut state, auth, app_name, app_id) = app_delete_fixture().await;
     state.kube_client = kube::Client::try_default()
         .await
         .expect("fixture kubeconfig");
@@ -4546,21 +4507,12 @@ async fn app_delete_retry_finishes_after_namespace_removal() {
 async fn app_delete_retry_finishes_after_teardown_completion_marker() {
     const CHILD: &str = "CAP_APP_DELETE_TEST_TEARDOWN_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        // KBS policy state and provider leases are global within a schema.
-        let pool = database_test_pool().await;
-        let schema = format!("app_delete_td_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        let mut database_url = reqwest::Url::parse(
-            &std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".into()),
-        )
-        .unwrap();
-        database_url
-            .query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
+        // The parent only hosts the mock provider/kube endpoints; the child
+        // re-executes this test and provisions its own private per-test
+        // database (cap#391), so no cross-test schema isolation is needed.
+        let (_test_db, _pool) = crate::test_support::database_test_pool().await;
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
         // Isolate kube's process-wide configuration from other lib tests.
         let mock_deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let resources = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
@@ -4652,10 +4604,6 @@ async fn app_delete_retry_finishes_after_teardown_completion_marker() {
         let output = tokio::time::timeout(std::time::Duration::from_secs(60), output).await;
         task.abort();
         std::fs::remove_file(config).unwrap();
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-            .execute(&pool)
-            .await
-            .unwrap();
         let output = output.expect("teardown retry must not deadlock").unwrap();
         assert!(
             output.status.success(),
@@ -4670,7 +4618,7 @@ async fn app_delete_retry_finishes_after_teardown_completion_marker() {
         .with_ansi(false)
         .with_test_writer()
         .init();
-    let (mut state, auth, app_name, app_id) = app_delete_fixture().await;
+    let (_test_db, mut state, auth, app_name, app_id) = app_delete_fixture().await;
     state.kube_client = kube::Client::try_default()
         .await
         .expect("fixture kubeconfig");
@@ -4809,20 +4757,11 @@ async fn app_delete_retry_finishes_after_teardown_completion_marker() {
 async fn abandoned_destroy_records_waiver_and_blocks_recreate() {
     const CHILD: &str = "CAP_APP_DELETE_TEST_ABANDON_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let pool = database_test_pool().await;
-        let schema = format!("app_delete_ab_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        let mut database_url = reqwest::Url::parse(
-            &std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".into()),
-        )
-        .unwrap();
-        database_url
-            .query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
+        // The child re-executes this test and provisions its own private
+        // per-test database (cap#391); the parent only hosts the mocks.
+        let (_test_db, _pool) = crate::test_support::database_test_pool().await;
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
         let mock_deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let resources = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
             String,
@@ -4920,10 +4859,6 @@ async fn abandoned_destroy_records_waiver_and_blocks_recreate() {
         let output = tokio::time::timeout(std::time::Duration::from_secs(60), output).await;
         task.abort();
         std::fs::remove_file(config).unwrap();
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-            .execute(&pool)
-            .await
-            .unwrap();
         let output = output
             .expect("abandoned destroy must not deadlock")
             .unwrap();
@@ -4946,7 +4881,7 @@ async fn abandoned_destroy_records_waiver_and_blocks_recreate() {
         .with_ansi(false)
         .with_test_writer()
         .init();
-    let (mut state, auth, app_name, app_id) = app_delete_fixture().await;
+    let (_test_db, mut state, auth, app_name, app_id) = app_delete_fixture().await;
     state.kube_client = kube::Client::try_default()
         .await
         .expect("fixture kubeconfig");
@@ -5136,7 +5071,7 @@ async fn abandoned_destroy_records_waiver_and_blocks_recreate() {
 
 #[tokio::test]
 async fn successful_teardown_persists_completion_marker() {
-    let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+    let (_test_db, state, _auth, _app_name, app_id) = app_delete_fixture().await;
     let app: crate::models::App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(app_id)
         .fetch_one(&state.db)
@@ -5176,7 +5111,7 @@ async fn successful_teardown_persists_completion_marker() {
 
 #[tokio::test]
 async fn untyped_post_lease_five_xx_fails_closed_without_reexecution() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let hash = Sha256::digest(b"untyped-five-xx-request").to_vec();
@@ -5237,7 +5172,7 @@ async fn five_xx_in_config_token_path_cancels_bounded_proof_reclaim_intact() {
     // within validity, terminalize after expiry) act only on incomplete rows
     // left by timeouts/regenerate, which a handler 5xx never produces, so
     // they are structurally isolated from A-2.
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("five-xx-config-token-{suffix}");
@@ -5287,7 +5222,7 @@ async fn five_xx_in_capability_path_defers_preserving_capability_lease() {
     // the capability window instead of collapsing to `recovery_required`
     // seconds after a transient 5xx. `complete_expiring_capability_result`
     // intercepts the 5xx before delegating for exactly this reason.
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("five-xx-capability-{suffix}");
@@ -5368,7 +5303,7 @@ async fn pre_lease_error_bypasses_idempotency_boundary_uncached_and_unstamped() 
     // in `require_deploy_entitlement`'s read) follows the identical
     // no-lease path and remains retryable. The 400 here is the cheapest
     // deterministic pre-lease trigger.
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("pre-lease-{suffix}");
@@ -5405,7 +5340,7 @@ async fn pre_lease_error_bypasses_idempotency_boundary_uncached_and_unstamped() 
 
 #[tokio::test]
 async fn unsafe_legacy_recovery_terminalizes_with_nonretryable_disposition() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let key = format!("fail-closed-{suffix}");
@@ -5473,7 +5408,7 @@ async fn unsafe_legacy_recovery_terminalizes_with_nonretryable_disposition() {
 
 #[tokio::test]
 async fn create_app_adopts_only_the_exact_operation_after_response_loss() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
     let org_name = format!("idemapp{}", &suffix[..8]);
@@ -5609,7 +5544,7 @@ async fn create_app_adopts_only_the_exact_operation_after_response_loss() {
 
 #[tokio::test]
 async fn generic_deployment_setup_pending_stays_retriable_then_adopts_exactly() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let app_id = Uuid::new_v4();
@@ -5907,7 +5842,7 @@ async fn generic_deployment_setup_pending_stays_retriable_then_adopts_exactly() 
 
 #[tokio::test]
 async fn membership_idempotency_key_cannot_replay_across_tenants() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_a = Uuid::new_v4();
     let org_b = Uuid::new_v4();
     let suffix = org_a.simple().to_string();
@@ -5974,7 +5909,7 @@ async fn membership_idempotency_key_cannot_replay_across_tenants() {
 
 #[tokio::test]
 async fn membership_transaction_rollback_does_not_strand_idempotency_reservation() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let missing_user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -6034,7 +5969,7 @@ async fn membership_transaction_rollback_does_not_strand_idempotency_reservation
 
 #[tokio::test]
 async fn concurrent_same_key_membership_sync_has_one_mutation_and_audit() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
     let paas_org_id = format!("paas-same-key-org-{suffix}");
@@ -6049,7 +5984,8 @@ async fn concurrent_same_key_membership_sync_has_one_mutation_and_audit() {
 
     let application_name = format!("member-same-key-{suffix}");
     let mut state = crate::test_support::lazy_state();
-    state.db = named_database_test_pool(&application_name).await;
+    let named_pool = _test_db.named_pool(&application_name).await;
+    state.db = named_pool;
     let mut blocker = pool.begin().await.expect("begin same-key mapping blocker");
     lock_paas_user_mapping_lane(&mut blocker, &paas_user_id)
         .await
@@ -6113,7 +6049,7 @@ async fn concurrent_same_key_membership_sync_has_one_mutation_and_audit() {
 
 #[tokio::test]
 async fn exact_membership_replay_repairs_legacy_projection_before_success() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -6230,7 +6166,7 @@ async fn exact_membership_replay_repairs_legacy_projection_before_success() {
 
 #[tokio::test]
 async fn membership_sync_rejects_stale_or_divergent_authority_and_replays_exactly() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
     let org_name = format!("member-authority-{suffix}");
@@ -6440,7 +6376,7 @@ async fn membership_sync_rejects_stale_or_divergent_authority_and_replays_exactl
 
 #[tokio::test]
 async fn exact_org_replay_does_not_overwrite_global_display_from_another_org() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_a = Uuid::new_v4();
     let org_b = Uuid::new_v4();
     let suffix = org_a.simple().to_string();
@@ -6512,7 +6448,7 @@ async fn exact_org_replay_does_not_overwrite_global_display_from_another_org() {
 
 #[tokio::test]
 async fn concurrent_same_user_syncs_across_orgs_share_one_atomic_mapping() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_a = Uuid::new_v4();
     let org_b = Uuid::new_v4();
     let suffix = org_a.simple().to_string();
@@ -6540,7 +6476,7 @@ async fn concurrent_same_user_syncs_across_orgs_share_one_atomic_mapping() {
     }
 
     let application_name = format!("member-map-{suffix}");
-    let writer_pool = named_database_test_pool(&application_name).await;
+    let writer_pool = _test_db.named_pool(&application_name).await;
     let mut state = crate::test_support::lazy_state();
     state.db = writer_pool;
 
@@ -9177,7 +9113,7 @@ mod confidentiality_tests {
 
 #[tokio::test]
 async fn idempotency_reaper_terminalizes_only_long_abandoned_reservations() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let state = idempotency_test_state(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
     let hash = Sha256::digest(b"reaper-request").to_vec();

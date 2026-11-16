@@ -1815,9 +1815,13 @@ mod runtime_gate_tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     /// Serializes tests that mutate or assert on the global
-    /// `kbs_signed_policy_reconciliation` singleton row: cargo runs lib
-    /// tests in parallel against one shared database, so unsynchronized
-    /// generation bumps from one test would corrupt another's assertions.
+    /// `kbs_signed_policy_reconciliation` singleton row. Historically the
+    /// whole suite shared one database, so unsynchronized generation bumps
+    /// from one test corrupted another's assertions. Tests now provision
+    /// private databases ([`database_test_pool`]), which makes the lock
+    /// redundant for them — it is kept because some tests still reach the
+    /// shared database through [`lazy_state`]'s lazy pool and must not race
+    /// each other on the singleton row.
     pub(crate) static SIGNED_POLICY_SINGLETON_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
 
@@ -1834,16 +1838,496 @@ pub(crate) mod test_support {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    pub(crate) async fn database_test_pool() -> sqlx::PgPool {
-        let database_url = std::env::var("DATABASE_URL")
+    fn database_url() -> String {
+        let raw = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = sqlx::PgPool::connect(&database_url)
+        // cap#391: the child-process tests (app_delete_*) re-execute the
+        // test binary with a DATABASE_URL carrying
+        // `options=-csearch_path=<parent's schema>` so the child used to
+        // land in the parent's schema on the shared database. That
+        // search_path must not leak into per-test provisioning: the
+        // template and the cloned per-test databases contain no such
+        // schema, so migrations and queries would fail with "no schema
+        // has been selected". Strip exactly the search_path options and
+        // let every other query parameter survive.
+        let Ok(mut url) = reqwest::Url::parse(&raw) else {
+            return raw;
+        };
+        let preserved: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(name, value)| !(name == "options" && value.contains("search_path")))
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        url.query_pairs_mut().clear();
+        for (name, value) in preserved {
+            url.query_pairs_mut().append_pair(&name, &value);
+        }
+        url.into()
+    }
+
+    /// Stable FNV-1a 64-bit digest. `DefaultHasher` is not stable across
+    /// Rust releases, and the digest names databases on the shared test
+    /// server, so the hash must not depend on the toolchain that computes it.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Name of the shared migrated template database for the migrations this
+    /// build embeds. The digest covers every migration's (version, checksum),
+    /// so worktrees with different migrations never share a template while
+    /// identical checkouts — and repeated runs — reuse one.
+    fn test_template_name() -> String {
+        let mut digest_input = Vec::new();
+        for migration in crate::db::pool::MIGRATOR.iter() {
+            digest_input.extend_from_slice(&migration.version.to_le_bytes());
+            digest_input.extend_from_slice(&migration.checksum);
+        }
+        format!("cap_test_tmpl_{:016x}", fnv1a64(&digest_input))
+    }
+
+    static TEST_TEMPLATE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+
+    /// Ensure the shared, fully migrated template database for this build's
+    /// migrations exists on the test server, and return its name.
+    ///
+    /// Creation is serialized across processes with a Postgres session
+    /// advisory lock, so sibling test runs (other worktrees, other test
+    /// binaries) cooperate instead of failing on duplicate creation. A
+    /// template left half-built by a crashed run is repaired, not dropped:
+    /// [`crate::db::pool::run_migrations`] is idempotent and completes
+    /// whatever is missing (its own advisory lock serializes healers).
+    ///
+    /// The template outlives the run and is reused by later runs of the same
+    /// migration state. Its name changes exactly when the migrations change,
+    /// so a leftover template from an older migration state is inert; it can
+    /// be dropped by hand whenever the test server needs the space back.
+    async fn ensure_test_template() -> &'static str {
+        TEST_TEMPLATE
+            .get_or_init(|| async {
+                let template = test_template_name();
+                let base_url = database_url();
+                let admin = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&base_url)
+                    .await
+                    .expect("connect test database admin");
+                let mut conn = admin
+                    .acquire()
+                    .await
+                    .expect("acquire test template admin connection");
+                let lock_key = fnv1a64(template.as_bytes()) as i64;
+                sqlx::query("SELECT pg_advisory_lock($1)")
+                    .bind(lock_key)
+                    .execute(&mut *conn)
+                    .await
+                    .expect("lock test template creation");
+                let exists: Option<(i64,)> =
+                    sqlx::query_as("SELECT 1::int8 FROM pg_database WHERE datname = $1")
+                        .bind(&template)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .expect("probe test template database");
+                if exists.is_none() {
+                    sqlx::query(&format!("CREATE DATABASE \"{template}\""))
+                        .execute(&mut *conn)
+                        .await
+                        .expect("create test template database");
+                }
+                {
+                    let options = base_url
+                        .parse::<sqlx::postgres::PgConnectOptions>()
+                        .expect("parse DATABASE_URL for test template")
+                        .database(&template);
+                    let pool = PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect_with(options)
+                        .await
+                        .expect("connect test template database");
+                    crate::db::pool::run_migrations(&pool)
+                        .await
+                        .expect("migrate test template database");
+                    pool.close().await;
+                }
+                let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(lock_key)
+                    .execute(&mut *conn)
+                    .await;
+                drop(conn);
+                admin.close().await;
+                template
+            })
+            .await
+    }
+
+    /// Within one process, template clones must not overlap: a
+    /// `CREATE DATABASE ... TEMPLATE` run opens the source database, and a
+    /// concurrent clone fails with "source database is being accessed by
+    /// other users". Sibling processes can still race each other; that error
+    /// is transient and retried in [`provision_test_database`].
+    static TEMPLATE_CLONE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Provision a dedicated, fully migrated database for one test.
+    ///
+    /// The database is cloned from the shared template (see
+    /// [`ensure_test_template`]), so the per-test cost is one
+    /// `CREATE DATABASE`, not a full migration run. The returned
+    /// [`IsolatedDatabaseCleanup`] must be held for the whole test (binding
+    /// it to a local such as `_test_db` is enough): it drops the database
+    /// when the test ends, on the panic path as well.
+    pub(crate) async fn provision_test_database(
+        max_connections: u32,
+    ) -> (IsolatedDatabaseCleanup, sqlx::PgPool) {
+        let base_url = database_url();
+        let template = ensure_test_template().await;
+        let db_name = format!(
+            "cap_test_{}_{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        );
+        let cleanup = IsolatedDatabaseCleanup {
+            db_name: db_name.clone(),
+            base_url: base_url.clone(),
+        };
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&base_url)
+            .await
+            .expect("connect test database admin");
+        let _clone = TEMPLATE_CLONE_LOCK.lock().await;
+        let mut attempt = 0;
+        loop {
+            match sqlx::query(&format!(
+                "CREATE DATABASE \"{db_name}\" TEMPLATE \"{template}\""
+            ))
+            .execute(&admin)
+            .await
+            {
+                Ok(_) => break,
+                Err(err) if attempt < 8 && err.to_string().contains("being accessed") => {
+                    // Exponential backoff: a sibling process cloning the same
+                    // template keeps the source briefly busy, and a loaded
+                    // shared server must not starve the clone the way a
+                    // fixed short budget could.
+                    let delay_ms = 250_u64.saturating_mul(1 << attempt).min(4_000);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                }
+                Err(err) => panic!("create test database from template: {err}"),
+            }
+        }
+        admin.close().await;
+        let options = base_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("parse DATABASE_URL for test database")
+            .database(&db_name);
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect_with(options)
             .await
             .expect("connect test database");
-        crate::db::pool::run_migrations(&pool)
+        (cleanup, pool)
+    }
+
+    /// Per-test database for DB-backed lib tests (cap#391).
+    ///
+    /// Every call provisions a private database cloned from the shared
+    /// migrated template, so DB-backed tests no longer share rows, provider
+    /// fences, or singleton state and can run on parallel test threads. The
+    /// returned cleanup guard must stay bound for the whole test (a
+    /// `_test_db` local does this) so the database is dropped afterwards.
+    pub(crate) async fn database_test_pool() -> (IsolatedDatabaseCleanup, sqlx::PgPool) {
+        provision_test_database(4).await
+    }
+
+    /// A named pool on an existing per-test database, for tests that assert
+    /// on `pg_stat_activity` style provenance (see
+    /// [`IsolatedDatabaseCleanup::named_pool`]).
+    impl IsolatedDatabaseCleanup {
+        /// A pool tagged with `application_name` connected to the SAME
+        /// per-test database this guard owns (cap#391). Tests that watch a
+        /// named writer block on a lock via `pg_stat_activity` need the
+        /// writer and the watched locks inside one database; provisioning a
+        /// second database would make the writer never block.
+        pub(crate) async fn named_pool(&self, application_name: &str) -> sqlx::PgPool {
+            let options = self
+                .base_url
+                .parse::<sqlx::postgres::PgConnectOptions>()
+                .expect("parse DATABASE_URL for named test pool")
+                .database(&self.db_name)
+                .application_name(application_name);
+            PgPoolOptions::new()
+                .max_connections(4)
+                .connect_with(options)
+                .await
+                .expect("connect named test pool")
+        }
+    }
+
+    /// Process-global variables that env-mutating tests set. The
+    /// [`env_write_guard`] snapshots and restores exactly these, so a test
+    /// that forgets its own cleanup cannot leak values into later tests.
+    const MUTATED_ENV_VARS: &[&str] = &[
+        "TENANT_IMAGE_PULL_SCOPE_GENERATION",
+        "TENANT_IMAGE_PULL_CREDENTIAL_GENERATION",
+        "SIGSTORE_TUF_ROOT_PATH",
+        "TEST_SIDECAR_SUBJECT_URL",
+        "TEST_SIDECAR_ISSUER_URL",
+        "TEST_SIDECAR_PUBLIC_KEY_B64",
+        "TEST_SIDECAR_PUBLIC_KEY_PEM",
+        "TEST_SIDECAR_BAD_PUBLIC_KEY_B64",
+        "TEST_SIDECAR_BAD_PUBLIC_KEY_PEM",
+        "PLATFORM_SIDECAR_SIGNER_PUBLIC_KEY_BASE64",
+        "PLATFORM_SIDECAR_SIGNER_PUBLIC_KEY_PEM",
+        "COSIGN_REGISTRY_USERNAME",
+        "COSIGN_REGISTRY_PASSWORD",
+        "COSIGN_REGISTRY_BEARER_TOKEN",
+        "COSIGN_REGISTRY_ALLOWED_HOSTS",
+        "GHCR_USERNAME",
+        "GHCR_TOKEN",
+    ];
+
+    /// Serializes tests that mutate process-global environment variables
+    /// against every env read those mutations can race with (cap#391).
+    ///
+    /// A handful of tests assert on env-gated behaviour and therefore call
+    /// `std::env::set_var`/`remove_var`. Under parallel test threads those
+    /// mutations race in both directions with every read of the same
+    /// variables — including reads inside production code paths exercised by
+    /// unrelated tests. The contract:
+    ///
+    /// * a test that mutates env vars holds [`env_write_guard`] for its whole
+    ///   body (exclusive);
+    /// * production env readers take [`env_read_guard`] around their reads
+    ///   (shared) — every reader funnels through a small number of functions,
+    ///   so instrumenting those covers all callers;
+    /// * both guards are re-entrant on their own thread: mutating tests call
+    ///   the instrumented readers while holding the write lock, and reader
+    ///   functions nest (e.g. `configured_tenant_image_pull_secret_name`
+    ///   reads through `env_nonempty`).
+    ///
+    /// The guards are thin wrappers around a [`std::sync::RwLock`] rather
+    /// than the raw guard types so `clippy::await_holding_lock` stays useful
+    /// for real locks: the write guard is deliberately held across `.await`
+    /// in test bodies, on single-threaded test runtimes only.
+    static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    thread_local! {
+        static ENV_WRITE_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static ENV_READ_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The `Read`/`Write` variants hold RAII lock handles that exist purely
+    /// for their lifetime side effects; nothing reads the payloads.
+    #[allow(dead_code)]
+    pub(crate) enum EnvGuard<'a> {
+        Read(std::sync::RwLockReadGuard<'a, ()>),
+        Write {
+            guard: std::sync::RwLockWriteGuard<'a, ()>,
+            saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        },
+        Reentrant,
+    }
+
+    impl Drop for EnvGuard<'_> {
+        fn drop(&mut self) {
+            match self {
+                EnvGuard::Read(_) => {
+                    ENV_READ_HELD.with(|held| held.set(false));
+                }
+                EnvGuard::Write { saved, .. } => {
+                    // Restore before releasing the lock so no reader observes
+                    // the scratch values this test set.
+                    for (name, prior) in saved.drain(..) {
+                        unsafe {
+                            match prior {
+                                Some(value) => std::env::set_var(name, value),
+                                None => std::env::remove_var(name),
+                            }
+                        }
+                    }
+                    ENV_WRITE_HELD.with(|held| held.set(false));
+                }
+                EnvGuard::Reentrant => {}
+            }
+        }
+    }
+
+    /// Shared guard for production env readers. Takes a no-op guard when the
+    /// calling thread already holds the write lock (mutating tests read
+    /// through the same functions) or an outer read guard (reader functions
+    /// nest; re-acquiring the lock here could deadlock against a queued
+    /// writer).
+    pub(crate) fn env_read_guard() -> EnvGuard<'static> {
+        if ENV_WRITE_HELD.with(|held| held.get()) || ENV_READ_HELD.with(|held| held.get()) {
+            return EnvGuard::Reentrant;
+        }
+        ENV_READ_HELD.with(|held| held.set(true));
+        EnvGuard::Read(ENV_LOCK.read().unwrap_or_else(|err| err.into_inner()))
+    }
+
+    /// Exclusive guard for tests that mutate env vars: hold it for the whole
+    /// test. On drop it restores every [`MUTATED_ENV_VARS`] entry to its
+    /// pre-test value.
+    pub(crate) fn env_write_guard() -> EnvGuard<'static> {
+        let guard = ENV_LOCK.write().unwrap_or_else(|err| err.into_inner());
+        ENV_WRITE_HELD.with(|held| held.set(true));
+        let saved = MUTATED_ENV_VARS
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        EnvGuard::Write { guard, saved }
+    }
+
+    /// Regression test for cap#391: `database_test_pool` used to hand every
+    /// test the same shared database, which forced the suite to run with
+    /// `--test-threads=1`. Each call must return a private, fully migrated
+    /// database instead.
+    #[tokio::test]
+    async fn database_test_pool_provisions_a_private_migrated_database_per_call() {
+        let (_first_db, first) = database_test_pool().await;
+        let (_second_db, second) = database_test_pool().await;
+        let first_name: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&first)
             .await
-            .expect("migrate test database");
-        pool
+            .unwrap();
+        let second_name: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&second)
+            .await
+            .unwrap();
+        assert_ne!(
+            first_name, second_name,
+            "two tests must not share one database"
+        );
+        for pool in [&first, &second] {
+            let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                applied as usize,
+                crate::db::pool::MIGRATOR.iter().count(),
+                "cloned database must carry the full migration ledger"
+            );
+        }
+        // Writes stay private to the database that made them.
+        sqlx::query(
+            "INSERT INTO organizations (id, name, cust_slug) VALUES ($1, 'cap391-iso', '00000391')",
+        )
+        .bind(Uuid::new_v4())
+        .execute(&first)
+        .await
+        .unwrap();
+        let leaked: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM organizations WHERE name = 'cap391-iso'")
+                .fetch_one(&second)
+                .await
+                .unwrap();
+        assert_eq!(leaked, 0, "writes must not leak across test databases");
+    }
+
+    /// Concurrent provisioning must work: clones from one template serialize
+    /// inside the process and still complete for every caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn provision_test_database_supports_concurrent_tests() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                tokio::spawn(async {
+                    let (_db, pool) = database_test_pool().await;
+                    let name: String = sqlx::query_scalar("SELECT current_database()")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                    let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                    (name, applied)
+                })
+            })
+            .collect();
+        let mut names = std::collections::HashSet::new();
+        for handle in handles {
+            let (name, applied) = handle.await.unwrap();
+            assert_eq!(
+                applied as usize,
+                crate::db::pool::MIGRATOR.iter().count(),
+                "every concurrent clone must be fully migrated"
+            );
+            assert!(
+                names.insert(name),
+                "concurrent clones must not share a database"
+            );
+        }
+    }
+
+    /// The env guards must be exclusive across threads and re-entrant on the
+    /// write holder's own thread.
+    #[test]
+    fn env_write_guard_excludes_other_threads_and_is_reentrant_on_its_own() {
+        let write = env_write_guard();
+        // Re-entrant read on the same thread must not deadlock.
+        let reentrant = env_read_guard();
+        drop(reentrant);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _read = env_read_guard();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a reader must not run while the write guard is held"
+        );
+        drop(write);
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("reader must proceed once the write guard drops");
+        reader.join().unwrap();
+    }
+
+    /// The write guard restores the mutated variables it snapshot on drop.
+    #[test]
+    fn env_write_guard_restores_mutated_variables() {
+        let name = "TENANT_IMAGE_PULL_SCOPE_GENERATION";
+        let prior = std::env::var_os(name);
+        {
+            let _write = env_write_guard();
+            unsafe { std::env::set_var(name, "987654321") };
+            assert_eq!(
+                std::env::var_os(name).as_deref(),
+                Some("987654321".as_ref())
+            );
+        }
+        assert_eq!(
+            std::env::var_os(name),
+            prior,
+            "guard drop must restore the value"
+        );
+    }
+
+    /// Reader functions nest (`configured_tenant_image_pull_secret_name`
+    /// reads through `env_nonempty`); a nested read must not re-acquire the
+    /// lock, which could deadlock against a queued writer. Runs on its own
+    /// thread so a regression fails the assertion instead of hanging the
+    /// whole harness.
+    #[test]
+    fn env_read_guard_is_reentrant_for_nested_readers() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outer = env_read_guard();
+            let inner = env_read_guard();
+            drop(inner);
+            drop(outer);
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            "nested read guards must not deadlock"
+        );
     }
 
     pub(crate) fn auth_context(role: Role, scopes: &[&str]) -> AuthContext {

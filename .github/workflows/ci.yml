@@ -111,14 +111,37 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run tests
+      - name: Run enclava-api lib tests (parallel)
+        # cap#391: enclava-api lib tests now provision a private database
+        # per test (cloned from a shared migrated template) and serialize
+        # the few env-mutating tests against every env reader through
+        # test_support's env guards, so they no longer need
+        # --test-threads=1. Everything that still shares global state
+        # (enclava-api bins/integration, enclava-cli, enclava-init,
+        # enclava-wait-exec env mutation and init surface paths) stays
+        # serialized in the steps below.
+        run: cargo test --locked -p enclava-api --lib
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test
+
+      - name: Run enclava-api bin and integration tests (serial)
+        # `--tests` would also re-run every lib unit test serially, so the
+        # targets are enumerated: main.rs unit tests (they mutate
+        # process-global env vars: PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX,
+        # SIGNING_SERVICE_PUBKEY_HEX) plus the two integration targets.
+        run: cargo test --locked -p enclava-api --bins --test integration_test --test contract_files -- --test-threads=1
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test
+
+      - name: Run remaining workspace tests (serial)
         # Database-backed tests share one PostgreSQL service and exercise
         # intentionally global provider fences; enclava-cli, enclava-init,
         # and enclava-wait-exec also mutate process-global env or init
-        # surface paths, so the whole suite stays serialized. Workspace
-        # doctests run inside this selection, so no separate cargo test
-        # --doc step is needed.
-        run: cargo test --workspace -- --test-threads=1
+        # surface paths, so everything outside the enclava-api lib suite
+        # stays serialized. Workspace doctests (all outside enclava-api,
+        # which has none) run inside this selection, so no separate
+        # cargo test --doc step is needed.
+        run: cargo test --workspace --exclude enclava-api -- --test-threads=1
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test
 

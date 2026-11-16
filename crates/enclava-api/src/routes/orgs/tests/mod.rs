@@ -135,32 +135,6 @@ fn owner_rotation_preserves_every_member_except_owner_public_key() {
     );
 }
 
-async fn database_test_pool() -> sqlx::PgPool {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-    let pool = sqlx::PgPool::connect(&database_url)
-        .await
-        .expect("connect keyring regression database");
-    crate::db::pool::run_migrations(&pool)
-        .await
-        .expect("migrate keyring regression database");
-    pool
-}
-
-async fn named_database_test_pool(application_name: &str) -> sqlx::PgPool {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-    let options = database_url
-        .parse::<sqlx::postgres::PgConnectOptions>()
-        .expect("parse keyring regression database URL")
-        .application_name(application_name);
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect_with(options)
-        .await
-        .expect("connect named keyring regression pool")
-}
-
 async fn wait_for_named_lock_waiter(pool: &sqlx::PgPool, application_name: &str) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -2418,7 +2392,7 @@ fn rotation_request(
 
 #[tokio::test]
 async fn owner_rotation_directive_is_fresh_bound_and_single_use() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -2693,7 +2667,7 @@ async fn owner_rotation_directive_is_fresh_bound_and_single_use() {
 // Unsigned fields must not change recovery identity or break legacy replay.
 #[tokio::test]
 async fn owner_rotation_intent_digest_uses_registration_normalized_encoding() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -2923,7 +2897,7 @@ async fn owner_rotation_intent_digest_uses_registration_normalized_encoding() {
 
 #[tokio::test]
 async fn owner_rotation_intent_quota_preserves_exact_replays() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -3084,7 +3058,7 @@ async fn owner_rotation_intent_quota_preserves_exact_replays() {
 // count/insert, and the count must observe a post-lock snapshot.
 #[tokio::test]
 async fn owner_rotation_intent_quota_lock_serializes_concurrent_writers() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -3143,7 +3117,8 @@ async fn owner_rotation_intent_quota_lock_serializes_concurrent_writers() {
 
     let application = format!("keyring-intent-quota-writer-{suffix}");
     let mut writer_state = crate::test_support::lazy_state();
-    writer_state.db = named_database_test_pool(&application).await;
+    let named_pool = _test_db.named_pool(&application).await;
+    writer_state.db = named_pool;
     writer_state.signing_service = state.signing_service.clone();
     let writer = tokio::spawn(rotate_org_owner(
         auth.clone(),
@@ -3225,7 +3200,7 @@ async fn owner_rotation_rejects_future_dated_directive_despite_version_recency()
     // even though it predates v2. On the insert-new-version path
     // signed_at must not be in the future at all (measured after the
     // signing-authority lane is acquired).
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -3350,7 +3325,7 @@ async fn owner_rotation_consumed_directive_conflict_is_rejected() {
     // been used). Seed the digest directly, keep signed_at inside the
     // window and not before the current version's created_at, and
     // expect 409 "already used" rather than any time-bound rejection.
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -4810,7 +4785,7 @@ async fn owner_rotation_version_ceiling_rejects_successor_and_preserves_replay()
 async fn owner_rotation_lane_waiter_rereads_owner_before_remote_rotation() {
     // Both requests queue while the upstream owner is still the original key.
     // A pre-lane snapshot would send the duplicate RPC with the revoked signer.
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -4884,7 +4859,8 @@ async fn owner_rotation_lane_waiter_rereads_owner_before_remote_rotation() {
 
     let winner_application = format!("keyring-lane-waiter-winner-{suffix}");
     let mut winner_state = crate::test_support::lazy_state();
-    winner_state.db = named_database_test_pool(&winner_application).await;
+    let named_pool = _test_db.named_pool(&winner_application).await;
+    winner_state.db = named_pool;
     winner_state.signing_service = state.signing_service.clone();
     let winner_request = rotation_request(
         org_id,
@@ -4910,7 +4886,8 @@ async fn owner_rotation_lane_waiter_rereads_owner_before_remote_rotation() {
     // receipt) instead of its pre-lane snapshot.
     let waiter_application = format!("keyring-lane-waiter-retry-{suffix}");
     let mut waiter_state = crate::test_support::lazy_state();
-    waiter_state.db = named_database_test_pool(&waiter_application).await;
+    let named_pool = _test_db.named_pool(&waiter_application).await;
+    waiter_state.db = named_pool;
     waiter_state.signing_service = state.signing_service.clone();
     let waiter = tokio::spawn(rotate_org_owner(
         auth.clone(),
@@ -4980,7 +4957,7 @@ async fn owner_rotation_expired_exact_retry_stays_idempotent() {
     // ledger proves the exact directive authorized the completed
     // rotation. The mock signing service starts with the replacement
     // owner already pinned, standing in for the committed first attempt.
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -5136,7 +5113,7 @@ async fn owner_rotation_version_bound_uses_actual_keyring_insertion_time() {
     // accepted, defeating the pre-creation replay bound. Migration 0063
     // switches the default to clock_timestamp() and this test fails
     // against the old transaction-start semantics.
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -5204,7 +5181,8 @@ async fn owner_rotation_version_bound_uses_actual_keyring_insertion_time() {
 
     let writer_application = format!("keyring-lane-lag-writer-{suffix}");
     let mut writer_state = crate::test_support::lazy_state();
-    writer_state.db = named_database_test_pool(&writer_application).await;
+    let named_pool = _test_db.named_pool(&writer_application).await;
+    writer_state.db = named_pool;
     writer_state.signing_service = state.signing_service.clone();
     let writer = tokio::spawn(put_keyring(
         auth.clone(),
@@ -5307,7 +5285,7 @@ fn list_orgs_api_key_is_limited_to_bound_org() {
 }
 #[tokio::test]
 async fn keyring_acceptance_waits_for_membership_removal_and_rejects() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let remover_id = Uuid::new_v4();
@@ -5346,9 +5324,11 @@ async fn keyring_acceptance_waits_for_membership_removal_and_rejects() {
     let removal_application = format!("member-removal-{suffix}");
     let keyring_application = format!("keyring-after-removal-{suffix}");
     let mut removal_state = crate::test_support::lazy_state();
-    removal_state.db = named_database_test_pool(&removal_application).await;
+    let named_pool = _test_db.named_pool(&removal_application).await;
+    removal_state.db = named_pool;
     let mut keyring_state = crate::test_support::lazy_state();
-    keyring_state.db = named_database_test_pool(&keyring_application).await;
+    let named_pool = _test_db.named_pool(&keyring_application).await;
+    keyring_state.db = named_pool;
     let keyring_auth = AuthContext {
         user_id,
         org_id,
@@ -5429,7 +5409,7 @@ async fn keyring_acceptance_waits_for_membership_removal_and_rejects() {
 
 #[tokio::test]
 async fn put_keyring_response_returns_normalized_deployable_keyring() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -5556,7 +5536,7 @@ async fn keyring_rotation_preserves_pinned_owner_and_one_immutable_v2_winner() {
     // bump the shared signed-policy generation whenever it is nonzero,
     // which would corrupt concurrent tests asserting exact values.
     let _singleton = keyring_enqueue_guard().await;
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     // Run as an unsigned install: this test asserts keyring authority,
     // not KBS publication, and the shared database's singleton row must
     // stay out of active signed mode for the whole flow.
@@ -5808,7 +5788,7 @@ fn membership_test_auth(user_id: Uuid, org_id: Uuid, org_name: &str, role: Role)
 /// check, which is where the overflow hit).
 #[tokio::test]
 async fn owner_rotation_rejects_stale_version_at_i64_ceiling_without_overflow() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -5902,7 +5882,7 @@ async fn owner_rotation_rejects_stale_version_at_i64_ceiling_without_overflow() 
 /// second owner-status GET, before the phase-2 membership lock.
 #[tokio::test]
 async fn owner_rotation_rejects_removed_caller_mid_request() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -6116,7 +6096,7 @@ async fn owner_rotation_rejects_removed_caller_mid_request() {
 /// soon as the service owner and the pinned owner agree again.
 #[tokio::test]
 async fn keyring_upload_fence_refuses_successor_while_service_owner_diverges() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -6258,7 +6238,7 @@ async fn keyring_upload_fence_refuses_successor_while_service_owner_diverges() {
 
 #[tokio::test]
 async fn membership_privileged_role_changes_require_owner() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let owner_id = Uuid::new_v4();
     let admin_id = Uuid::new_v4();
@@ -6548,7 +6528,7 @@ async fn membership_privileged_role_changes_require_owner() {
 // valid directive still record an intent.
 #[tokio::test]
 async fn owner_rotation_prechecks_reject_invalid_directives_without_persisting_intents() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
@@ -6853,7 +6833,7 @@ async fn owner_rotation_prechecks_reject_invalid_directives_without_persisting_i
 // taken before the transaction started.
 #[tokio::test]
 async fn queued_intent_created_at_excludes_pre_lock_wait() {
-    let pool = database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let org_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
     let org_name = format!("intent-clock-{suffix}");

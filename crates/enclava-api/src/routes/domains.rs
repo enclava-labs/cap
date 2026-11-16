@@ -1005,7 +1005,7 @@ mod tests {
         // An 'applying' or 'watching' deployment means a workload mutation —
         // possibly a first-boot volume format — is live; verification must
         // conflict instead of restarting the pod mid-initialization.
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         for status in ["applying", "watching"] {
             let (org_id, app_id) = insert_guard_app(&pool, status).await;
             let Err((code, _)) = guard_verdict(&pool, app_id).await else {
@@ -1024,7 +1024,7 @@ mod tests {
     async fn queued_or_finished_apply_allows_domain_verify() {
         // 'pending' rows produced no provider objects (the predeploy path
         // still works) and terminal rows no longer mutate anything.
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         for status in ["pending", "healthy", "failed"] {
             let (org_id, app_id) = insert_guard_app(&pool, status).await;
             guard_verdict(&pool, app_id)
@@ -1040,7 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn other_apps_in_progress_apply_does_not_block_verify() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (org_id, app_id) = insert_guard_app(&pool, "pending").await;
         let (other_org, _) = insert_guard_app(&pool, "watching").await;
         guard_verdict(&pool, app_id)
