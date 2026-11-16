@@ -16,11 +16,12 @@ pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
 
     let ws = shape::shape_for_app(app);
     let app_mem_req = shape::app_memory_request(&app.resources.memory);
+    let app_cpu_req = shape::app_cpu_request(&app.resources.cpu);
     let (sidecar_req, sidecar_lim) = shape::sidecar_memory(ws);
     let (rc_cpu, rc_mem) = shape::rc_overhead(ws);
 
     let request_cpu = vec![
-        shape::APP_CPU_REQUEST,     // workload
+        app_cpu_req.as_str(),       // workload
         shape::SIDECAR_CPU_REQUEST, // attestation-proxy
         shape::SIDECAR_CPU_REQUEST, // tenant-ingress
         shape::INIT_CPU_REQUEST,    // enclava-init sidecar

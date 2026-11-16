@@ -343,3 +343,67 @@ fn vm_vcpu_model_matches_rendered_pod_cpu_limits() {
         );
     }
 }
+
+/// cap#392: a low application CPU limit keeps the guest at the approved vCPU
+/// count through the Kata baseline annotation, and the app's CPU request
+/// follows the limit down so the pod stays admissible.
+#[test]
+fn low_cpu_app_renders_padded_vm_and_lowered_request() {
+    let mut app = sample_app();
+    app.resources.cpu = "100m".to_string();
+    let manifests = generate_all_manifests(&app);
+    let sts = &manifests.statefulset;
+
+    let annotations = sts
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.metadata.as_ref())
+        .and_then(|m| m.annotations.as_ref())
+        .expect("pod template annotations");
+    // 1.9 baseline + (0.1 app + 1.5 platform) = 3.5, which Kata rounds to 4.
+    assert_eq!(
+        annotations
+            .get(shape::KATA_DEFAULT_VCPUS_ANNOTATION)
+            .map(String::as_str),
+        Some("1.9")
+    );
+
+    let spec = pod_spec(sts);
+    let app_container = spec
+        .containers
+        .iter()
+        .find(|c| {
+            c.resources
+                .as_ref()
+                .and_then(|r| r.limits.as_ref())
+                .and_then(|l| l.get("cpu"))
+                .is_some_and(|q| q.0 == "100m")
+        })
+        .expect("application container carries the 100m limit");
+    let request = &app_container
+        .resources
+        .as_ref()
+        .and_then(|r| r.requests.as_ref())
+        .and_then(|r| r.get("cpu"))
+        .expect("cpu request")
+        .0;
+    assert_eq!(request, "100m", "request must not exceed the limit");
+}
+
+#[test]
+fn default_cpu_app_renders_without_vcpu_annotation() {
+    let mut app = sample_app();
+    app.resources.cpu = "1".to_string();
+    let manifests = generate_all_manifests(&app);
+    let annotations = manifests
+        .statefulset
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.metadata.as_ref())
+        .and_then(|m| m.annotations.as_ref())
+        .expect("pod template annotations");
+    assert!(
+        !annotations.contains_key(shape::KATA_DEFAULT_VCPUS_ANNOTATION),
+        "pods the runtime baseline already sizes correctly must render unchanged"
+    );
+}

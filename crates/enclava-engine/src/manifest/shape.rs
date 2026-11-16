@@ -290,21 +290,75 @@ pub fn platform_container_cpu_limit_millis(legacy_bootstrap: bool) -> u64 {
     }
 }
 
+/// Kata annotation that overrides the runtime's `default_vcpus` for one pod.
+pub const KATA_DEFAULT_VCPUS_ANNOTATION: &str = "io.katacontainers.config.hypervisor.default_vcpus";
+
+/// Summed CPU limit of every long-running container in the pod, in millicores.
+fn pod_cpu_limit_millis(app_cpu_limit: &str, legacy_bootstrap: bool) -> Option<u64> {
+    platform_container_cpu_limit_millis(legacy_bootstrap)
+        .checked_add(cpu_quantity_millis(app_cpu_limit)?)
+}
+
+/// VM baseline, in millicores, that CAP pins for a pod whose CPU limits would
+/// otherwise boot fewer vCPUs than [`APPROVED_SNP_VM_VCPUS`].
+///
+/// A low application CPU limit is a scheduling and cgroup budget, not a
+/// reason to boot a smaller guest: the limit still applies inside the VM, and
+/// only the approved vCPU count has an approved launch measurement. The
+/// baseline is chosen so the VM total lands half a vCPU below the approved
+/// count, which Kata rounds up; aiming at the exact count would let its
+/// `f32` sum of baseline and workload round up to one vCPU too many.
+///
+/// `None` when the runtime's own baseline already boots the approved count
+/// or more, so pods in that band render exactly as before.
+pub fn vm_vcpu_baseline_millis(app_cpu_limit: &str, legacy_bootstrap: bool) -> Option<u64> {
+    let pod = pod_cpu_limit_millis(app_cpu_limit, legacy_bootstrap)?;
+    let unpadded_vcpus = KATA_BASELINE_VCPU_MILLIS.checked_add(pod)?.div_ceil(1000);
+    if unpadded_vcpus >= APPROVED_SNP_VM_VCPUS {
+        return None;
+    }
+    Some(APPROVED_SNP_VM_VCPUS * 1000 - 500 - pod)
+}
+
+/// Value for [`KATA_DEFAULT_VCPUS_ANNOTATION`] (cores, e.g. `1.9`), or `None`
+/// when the runtime's default baseline applies.
+pub fn vm_vcpu_baseline_annotation(app_cpu_limit: &str, legacy_bootstrap: bool) -> Option<String> {
+    let millis = vm_vcpu_baseline_millis(app_cpu_limit, legacy_bootstrap)?;
+    let fraction = format!("{:03}", millis % 1000);
+    let fraction = fraction.trim_end_matches('0');
+    Some(if fraction.is_empty() {
+        (millis / 1000).to_string()
+    } else {
+        format!("{}.{fraction}", millis / 1000)
+    })
+}
+
 /// vCPU count Kata boots the confidential VM with for an application CPU
-/// limit. `None` when the limit is not a representable CPU quantity.
+/// limit, including the pinned baseline for low limits. `None` when the limit
+/// is not a representable CPU quantity.
 pub fn snp_vm_vcpus(app_cpu_limit: &str, legacy_bootstrap: bool) -> Option<u64> {
-    let total = KATA_BASELINE_VCPU_MILLIS
-        .checked_add(platform_container_cpu_limit_millis(legacy_bootstrap))?
-        .checked_add(cpu_quantity_millis(app_cpu_limit)?)?;
+    let baseline = vm_vcpu_baseline_millis(app_cpu_limit, legacy_bootstrap)
+        .unwrap_or(KATA_BASELINE_VCPU_MILLIS);
+    let total = baseline.checked_add(pod_cpu_limit_millis(app_cpu_limit, legacy_bootstrap)?)?;
     Some(total.div_ceil(1000))
 }
 
-/// Application CPU limits, in millicores, that boot the approved vCPU count:
-/// strictly above the first value, up to and including the second.
-pub fn approved_app_cpu_limit_range_millis(legacy_bootstrap: bool) -> (u64, u64) {
+/// Largest application CPU limit, in millicores, that still boots the
+/// approved vCPU count. Lower limits are padded up to it.
+pub fn max_app_cpu_limit_millis(legacy_bootstrap: bool) -> u64 {
     let fixed = KATA_BASELINE_VCPU_MILLIS + platform_container_cpu_limit_millis(legacy_bootstrap);
-    let max_inclusive = (APPROVED_SNP_VM_VCPUS * 1000).saturating_sub(fixed);
-    (max_inclusive.saturating_sub(1000), max_inclusive)
+    (APPROVED_SNP_VM_VCPUS * 1000).saturating_sub(fixed)
+}
+
+/// Application container CPU request: the standard 250m, lowered to the limit
+/// for smaller limits so the request never exceeds it.
+pub fn app_cpu_request(cpu_limit: &str) -> String {
+    let standard =
+        cpu_quantity_millis(APP_CPU_REQUEST).expect("APP_CPU_REQUEST is a valid quantity");
+    match cpu_quantity_millis(cpu_limit) {
+        Some(limit) if limit < standard => format!("{limit}m"),
+        _ => APP_CPU_REQUEST.to_string(),
+    }
 }
 
 /// An application CPU limit that would boot a confidential VM whose launch
@@ -315,7 +369,6 @@ pub struct UnapprovedVmCpuShape {
     /// vCPU count the limit would boot; `None` when it cannot be computed.
     pub vm_vcpus: Option<u64>,
     pub approved_vm_vcpus: u64,
-    pub min_cpu_exclusive_millis: u64,
     pub max_cpu_inclusive_millis: u64,
 }
 
@@ -332,8 +385,8 @@ impl std::fmt::Display for UnapprovedVmCpuShape {
         write!(
             f,
             "; only the {}-vCPU launch measurement is approved, so its keys would never be \
-             released. Use a cpu limit above {}m and at most {}m",
-            self.approved_vm_vcpus, self.min_cpu_exclusive_millis, self.max_cpu_inclusive_millis
+             released. Use a cpu limit of at most {}m",
+            self.approved_vm_vcpus, self.max_cpu_inclusive_millis
         )
     }
 }
@@ -353,14 +406,11 @@ pub fn check_vm_cpu_shape(
     if vm_vcpus == Some(APPROVED_SNP_VM_VCPUS) {
         return Ok(());
     }
-    let (min_cpu_exclusive_millis, max_cpu_inclusive_millis) =
-        approved_app_cpu_limit_range_millis(legacy_bootstrap);
     Err(UnapprovedVmCpuShape {
         cpu_limit: app_cpu_limit.to_string(),
         vm_vcpus,
         approved_vm_vcpus: APPROVED_SNP_VM_VCPUS,
-        min_cpu_exclusive_millis,
-        max_cpu_inclusive_millis,
+        max_cpu_inclusive_millis: max_app_cpu_limit_millis(legacy_bootstrap),
     })
 }
 
@@ -416,27 +466,24 @@ mod tests {
         let snp = "kata-qemu-snp";
         // baseline 1 + proxy 0.5 + ingress 0.5 + init 0.5 + app
         assert_eq!(snp_vm_vcpus("1", false), Some(4));
-        assert_eq!(snp_vm_vcpus("500m", false), Some(3));
         assert_eq!(snp_vm_vcpus("501m", false), Some(4));
         assert_eq!(snp_vm_vcpus("1500m", false), Some(4));
         assert_eq!(snp_vm_vcpus("1501m", false), Some(5));
-        assert_eq!(approved_app_cpu_limit_range_millis(false), (500, 1500));
+        assert_eq!(max_app_cpu_limit_millis(false), 1500);
 
         assert!(check_vm_cpu_shape("1", snp, false).is_ok());
         assert!(check_vm_cpu_shape("1.5", snp, false).is_ok());
         assert!(check_vm_cpu_shape("1", SMALL_RUNTIME_CLASS, false).is_ok());
 
-        let low = check_vm_cpu_shape("250m", snp, false).unwrap_err();
-        assert_eq!(low.vm_vcpus, Some(3));
-        assert_eq!(low.approved_vm_vcpus, 4);
-        assert_eq!(
-            low.to_string(),
-            "cpu limit 250m boots a 3-vCPU confidential VM; only the 4-vCPU launch \
-             measurement is approved, so its keys would never be released. Use a cpu limit \
-             above 500m and at most 1500m"
-        );
         let high = check_vm_cpu_shape("2", snp, false).unwrap_err();
         assert_eq!(high.vm_vcpus, Some(5));
+        assert_eq!(high.approved_vm_vcpus, 4);
+        assert_eq!(
+            high.to_string(),
+            "cpu limit 2 boots a 5-vCPU confidential VM; only the 4-vCPU launch \
+             measurement is approved, so its keys would never be released. Use a cpu limit \
+             of at most 1500m"
+        );
         assert_eq!(
             check_vm_cpu_shape("bogus", snp, false)
                 .unwrap_err()
@@ -446,11 +493,86 @@ mod tests {
     }
 
     #[test]
+    fn low_cpu_limits_are_padded_to_the_approved_vcpu_count() {
+        let snp = "kata-qemu-snp";
+        // cap#392: hello-tee ships cpu = "0.5". Unpadded that is
+        // 1 + 1.5 + 0.5 = 3 vCPUs; the pinned baseline lifts it to 4.
+        for cpu in ["1m", "50m", "100m", "250m", "0.5", "500m"] {
+            assert_eq!(snp_vm_vcpus(cpu, false), Some(4), "cpu={cpu}");
+            assert!(check_vm_cpu_shape(cpu, snp, false).is_ok(), "cpu={cpu}");
+        }
+        // baseline + pod limits always lands on 3.5 vCPUs, half a vCPU clear
+        // of both neighbours.
+        assert_eq!(vm_vcpu_baseline_millis("500m", false), Some(1500));
+        assert_eq!(vm_vcpu_baseline_millis("100m", false), Some(1900));
+        assert_eq!(vm_vcpu_baseline_millis("1m", false), Some(1999));
+        assert_eq!(
+            vm_vcpu_baseline_annotation("500m", false),
+            Some("1.5".to_string())
+        );
+        assert_eq!(
+            vm_vcpu_baseline_annotation("100m", false),
+            Some("1.9".to_string())
+        );
+        assert_eq!(
+            vm_vcpu_baseline_annotation("1m", false),
+            Some("1.999".to_string())
+        );
+
+        // Limits the runtime baseline already sizes correctly keep rendering
+        // without the annotation, so existing pods are not rewritten.
+        for cpu in ["501m", "1", "1.5"] {
+            assert_eq!(vm_vcpu_baseline_annotation(cpu, false), None, "cpu={cpu}");
+        }
+        // Padding never applies above the approved count.
+        assert_eq!(vm_vcpu_baseline_annotation("2", false), None);
+        assert_eq!(vm_vcpu_baseline_annotation("bogus", false), None);
+    }
+
+    #[test]
+    fn kata_f32_sizing_agrees_with_the_padded_model() {
+        // Kata computes ceil(f32(default_vcpus) + f32(quota) / f32(period)).
+        // Replay that arithmetic for every millicore the padding covers.
+        for legacy in [false, true] {
+            for app_millis in 1..=max_app_cpu_limit_millis(legacy) {
+                let cpu = format!("{app_millis}m");
+                let pod_millis = platform_container_cpu_limit_millis(legacy) + app_millis;
+                let baseline: f32 = match vm_vcpu_baseline_annotation(&cpu, legacy) {
+                    Some(value) => value.parse().unwrap(),
+                    None => 1.0,
+                };
+                let quota = (pod_millis * 100) as f32;
+                let kata_vcpus = (baseline + quota / 100_000.0_f32).ceil() as u64;
+                assert_eq!(kata_vcpus, 4, "legacy={legacy} cpu={cpu}");
+                assert_eq!(snp_vm_vcpus(&cpu, legacy), Some(4));
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_request_never_exceeds_limit() {
+        assert_eq!(app_cpu_request("1"), "250m");
+        assert_eq!(app_cpu_request("250m"), "250m");
+        assert_eq!(app_cpu_request("249m"), "249m");
+        assert_eq!(app_cpu_request("0.1"), "100m");
+        assert_eq!(app_cpu_request("0.0001"), "1m");
+        // Unparseable limits keep today's rendering; admission rejects them.
+        assert_eq!(app_cpu_request("bogus"), "250m");
+    }
+
+    #[test]
     fn legacy_bootstrap_layout_has_no_init_sidecar() {
-        assert_eq!(snp_vm_vcpus("1", true), Some(3));
-        assert_eq!(approved_app_cpu_limit_range_millis(true), (1000, 2000));
+        // baseline 1 + proxy 0.5 + ingress 0.5 + app
+        assert_eq!(max_app_cpu_limit_millis(true), 2000);
+        assert_eq!(snp_vm_vcpus("2", true), Some(4));
+        assert_eq!(snp_vm_vcpus("1", true), Some(4));
+        assert_eq!(
+            vm_vcpu_baseline_annotation("1", true),
+            Some("1.5".to_string())
+        );
+        assert_eq!(vm_vcpu_baseline_annotation("1001m", true), None);
         assert!(check_vm_cpu_shape("2", "kata-qemu-snp", true).is_ok());
-        assert!(check_vm_cpu_shape("1", "kata-qemu-snp", true).is_err());
+        assert!(check_vm_cpu_shape("2001m", "kata-qemu-snp", true).is_err());
     }
 
     #[test]
