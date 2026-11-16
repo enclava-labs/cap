@@ -1125,12 +1125,24 @@ fn compose_api_error(status_code: u16, body: ApiErrorBody) -> ComposedApiError {
     // cap#392: CAP's message names the accepted CPU range, but the hosted
     // sanitizer keeps only the code. Restore the remediation client-side when
     // the message did not survive; a direct CAP response already carries it.
+    // Prefer the server's own `max_cpu` when it survived. Otherwise use the
+    // standard pod layout: the only other layout (legacy bootstrap) is a
+    // debug-only server setting that release builds refuse at startup, and
+    // the sanitizing hosted path always fronts a release server.
     if code.as_deref() == Some("unsupported_cpu_shape") && !prefixed {
+        let max_cpu = body
+            .max_cpu
+            .filter(|value| enclava_engine::manifest::shape::cpu_quantity_millis(value).is_some())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}m",
+                    enclava_engine::manifest::shape::max_app_cpu_limit_millis(false)
+                )
+            });
         message = format!(
             "{message} (every confidential VM boots with the {} vCPUs its approved launch \
-             measurement covers, so [resources] cpu must be at most {}m)",
+             measurement covers, so [resources] cpu must be at most {max_cpu})",
             enclava_engine::manifest::shape::APPROVED_SNP_VM_VCPUS,
-            enclava_engine::manifest::shape::max_app_cpu_limit_millis(false),
         );
     }
     if prefixed {
@@ -1303,6 +1315,25 @@ mod tests {
             !message.contains("every confidential VM boots"),
             "{message}"
         );
+
+        // A server-reported bound wins over the standard-layout default (a
+        // debug server on the legacy bootstrap layout accepts up to 2000m).
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "unsupported_cpu_shape",
+            "max_cpu": "2000m"
+        }))
+        .expect("cpu-shape body with max_cpu decodes");
+        let ComposedApiError { message, .. } = compose_api_error(400, body);
+        assert!(message.contains("at most 2000m"), "{message}");
+
+        // A malformed bound is not echoed.
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "unsupported_cpu_shape",
+            "max_cpu": "lots"
+        }))
+        .expect("cpu-shape body with bad max_cpu decodes");
+        let ComposedApiError { message, .. } = compose_api_error(400, body);
+        assert!(message.contains("at most 1500m"), "{message}");
     }
 
     #[test]
