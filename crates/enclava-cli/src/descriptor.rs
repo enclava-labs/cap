@@ -65,7 +65,6 @@ pub const CAP_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 pub const CAP_APP_SEED_PATH: &str = "/state/app/seed";
 pub const CAP_APP_UID: u32 = 10001;
 pub const CAP_APP_GID: u32 = 10001;
-pub const CAP_APP_CPU_REQUEST: &str = "250m";
 pub const CAP_APP_MEMORY_REQUEST: &str = "512Mi";
 const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
     &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
@@ -179,7 +178,10 @@ pub fn cap_app_oci_runtime_spec(input: CapAppOciRuntimeSpecInput) -> OciRuntimeS
         security_context,
         resources: Resources {
             requests: vec![
-                named_value("cpu", CAP_APP_CPU_REQUEST),
+                named_value(
+                    "cpu",
+                    &enclava_engine::manifest::shape::app_cpu_request(&input.cpu_limit),
+                ),
                 named_value(
                     "memory",
                     &enclava_engine::manifest::shape::app_memory_request(&input.memory_limit),

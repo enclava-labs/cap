@@ -73,6 +73,67 @@ fn resource_limit_error_response(
     }
 }
 
+/// Reject a CPU limit that would boot a confidential VM with an unapproved
+/// SNP launch measurement (cap#392).
+///
+/// Kata sizes the guest from the pod's CPU limits, and the platform approves
+/// the launch measurement of exactly one vCPU count. Outside it the workload
+/// still attests, but the KBS resource policy denies every key release with a
+/// bare `PolicyDeny`, so the deploy wedges at the first owner-seed fetch with
+/// no named cause. Refuse the shape at admission instead.
+pub(crate) fn validate_vm_cpu_shape(
+    resources: &AppResources,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    // Startup already refused an invalid runtime class; treat a late failure
+    // as the measured default rather than skipping the check.
+    let default_runtime_class = enclava_engine::manifest::cc_init_data::try_runtime_class()
+        .unwrap_or_else(|_| {
+            enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS.to_string()
+        });
+    vm_cpu_shape_for_default_class(
+        resources,
+        &default_runtime_class,
+        enclava_engine::manifest::containers::legacy_bootstrap_enabled(),
+    )
+    .map_err(vm_cpu_shape_error_response)
+}
+
+/// Check the CPU shape against the RuntimeClass the pod will actually bind,
+/// not the deployment default: a small-memory app always binds the measured
+/// small SNP class, even on a deployment whose default is the unmeasured
+/// simulated class, so it must not inherit that class's exemption.
+fn vm_cpu_shape_for_default_class(
+    resources: &AppResources,
+    default_runtime_class: &str,
+    legacy_bootstrap: bool,
+) -> Result<(), enclava_engine::manifest::shape::UnapprovedVmCpuShape> {
+    let bound_runtime_class = enclava_engine::manifest::shape::runtime_class_for(
+        &resources.memory_limit,
+        default_runtime_class,
+    );
+    enclava_engine::manifest::shape::check_vm_cpu_shape(
+        &resources.cpu_limit,
+        &bound_runtime_class,
+        legacy_bootstrap,
+    )
+}
+
+fn vm_cpu_shape_error_response(
+    error: enclava_engine::manifest::shape::UnapprovedVmCpuShape,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "unsupported_cpu_shape",
+            "message": error.to_string(),
+            "cpu": error.cpu_limit,
+            "vm_vcpus": error.vm_vcpus,
+            "approved_vm_vcpus": error.approved_vm_vcpus,
+            "max_cpu": format!("{}m", error.max_cpu_inclusive_millis),
+        })),
+    )
+}
+
 pub(crate) async fn enforce_authoritative_entitlement(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: Uuid,
@@ -102,6 +163,7 @@ pub(crate) async fn enforce_authoritative_entitlement(
     })?;
     crate::entitlements::validate_resource_limits(resources, limits)
         .map_err(resource_limit_error_response)?;
+    validate_vm_cpu_shape(resources)?;
     // The 32 MiB LUKS2 fresh-format floor (shared with enclava-init's
     // MIN_VOLUME_BYTES), enforced per claim: only sizes that would
     // provision a NEW PVC are checked. Surviving sub-floor claims are
@@ -1287,6 +1349,7 @@ async fn deploy_app_candidate(
     })?;
     crate::entitlements::validate_resource_limits(&candidate_resources, early_limits)
         .map_err(resource_limit_error_response)?;
+    validate_vm_cpu_shape(&candidate_resources)?;
     let candidate_container = if let Some(container) = candidate_containers
         .iter_mut()
         .find(|row| row.name == container_name)
@@ -2535,6 +2598,75 @@ mod tests {
             validate_log_encryption_config(Some(config)).expect_err("algorithm rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "unsupported log_encryption.algorithm");
+    }
+
+    #[test]
+    fn vm_cpu_shape_exemption_follows_the_bound_runtime_class() {
+        let resources = |cpu: &str, memory: &str| crate::models::AppResources {
+            app_id: Uuid::nil(),
+            cpu_limit: cpu.to_string(),
+            memory_limit: memory.to_string(),
+            app_data_size: "5Gi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        };
+        let dev = enclava_engine::manifest::cc_init_data::COCO_DEV_RUNTIME_CLASS;
+        let snp = enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS;
+
+        // On a simulated-CoCo deployment a standard-memory app binds the
+        // unmeasured dev class, so any CPU limit is fine.
+        super::vm_cpu_shape_for_default_class(&resources("2", "1Gi"), dev, false)
+            .expect("the simulated dev class has no launch measurement");
+
+        // A small-memory app binds kata-qemu-snp-small regardless of the
+        // deployment default, so it is measured and must be checked.
+        let rejected = super::vm_cpu_shape_for_default_class(&resources("2", "128Mi"), dev, false)
+            .expect_err("a small-shape app binds the measured small SNP class");
+        assert_eq!(rejected.vm_vcpus, Some(5));
+        super::vm_cpu_shape_for_default_class(&resources("1", "128Mi"), dev, false)
+            .expect("the approved vCPU count passes under the small class");
+
+        // The measured default is checked for both shapes.
+        for memory in ["1Gi", "128Mi"] {
+            super::vm_cpu_shape_for_default_class(&resources("2", memory), snp, false)
+                .expect_err("SNP classes are always checked");
+        }
+    }
+
+    #[test]
+    fn unapproved_vm_cpu_shape_is_a_named_rejection() {
+        let resources = |cpu: &str| crate::models::AppResources {
+            app_id: Uuid::nil(),
+            cpu_limit: cpu.to_string(),
+            memory_limit: "512Mi".to_string(),
+            app_data_size: "5Gi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        };
+
+        // The default band boots the approved vCPU count on the runtime
+        // baseline; lower limits are padded up to it (cap#392: hello-tee
+        // ships cpu = "0.5").
+        for cpu in ["1", "1.5", "0.5", "250m", "50m"] {
+            super::validate_vm_cpu_shape(&resources(cpu))
+                .unwrap_or_else(|_| panic!("cpu {cpu} boots the approved vCPU count"));
+        }
+
+        // A limit that needs more vCPUs than the approved measurement covers
+        // would attest and then be denied its keys; refuse it by name before
+        // anything is signed or applied.
+        let (status, Json(body)) = super::validate_vm_cpu_shape(&resources("2"))
+            .expect_err("a high cpu limit boots an unapproved vCPU count");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "unsupported_cpu_shape");
+        assert_eq!(body["cpu"], "2");
+        assert_eq!(body["vm_vcpus"], 5);
+        assert_eq!(body["approved_vm_vcpus"], 4);
+        assert_eq!(body["max_cpu"], "1500m");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("at most 1500m")),
+            "{body}"
+        );
     }
 
     #[tokio::test]

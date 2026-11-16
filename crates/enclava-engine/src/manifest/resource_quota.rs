@@ -16,11 +16,12 @@ pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
 
     let ws = shape::shape_for_app(app);
     let app_mem_req = shape::app_memory_request(&app.resources.memory);
+    let app_cpu_req = shape::app_cpu_request(&app.resources.cpu);
     let (sidecar_req, sidecar_lim) = shape::sidecar_memory(ws);
     let (rc_cpu, rc_mem) = shape::rc_overhead(ws);
 
     let request_cpu = vec![
-        shape::APP_CPU_REQUEST,     // workload
+        app_cpu_req.as_str(),       // workload
         shape::SIDECAR_CPU_REQUEST, // attestation-proxy
         shape::SIDECAR_CPU_REQUEST, // tenant-ingress
         shape::INIT_CPU_REQUEST,    // enclava-init sidecar
@@ -122,21 +123,25 @@ fn split_quantity(q: &str) -> (&str, &str) {
     (&q[..pos], &q[pos..])
 }
 
+/// Sum CPU quantities in exact millicores, rounding each one up. The quota
+/// must never admit less than the pod asks for: float parsing truncated
+/// values such as `0.57` to `569m` and dropped sub-millicore remainders,
+/// leaving the quota below the pod's own total.
+///
+/// A quantity that cannot be represented saturates the total instead of
+/// counting as zero, for the same reason: `validate_app` rejects malformed
+/// quantities before generation, and if one slips through anyway the pod's
+/// own limit is what fails, not a quota that silently came out too small.
 fn sum_cpu_quantities(values: &[&str]) -> String {
-    let mut total_millis = 0f64;
+    let total_millis: u64 = values
+        .iter()
+        .map(|value| crate::manifest::shape::cpu_quantity_millis(value).unwrap_or(u64::MAX))
+        .fold(0u64, u64::saturating_add);
 
-    for value in values {
-        if let Some(millis) = value.strip_suffix('m') {
-            total_millis += millis.parse::<f64>().unwrap_or(0.0);
-        } else {
-            total_millis += value.parse::<f64>().unwrap_or(0.0) * 1000.0;
-        }
-    }
-
-    if total_millis % 1000.0 == 0.0 {
-        format!("{}", (total_millis / 1000.0) as i64)
+    if total_millis.is_multiple_of(1000) {
+        format!("{}", total_millis / 1000)
     } else {
-        format!("{}m", total_millis as i64)
+        format!("{total_millis}m")
     }
 }
 
