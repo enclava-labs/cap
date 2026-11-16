@@ -97,6 +97,15 @@ impl DnsRecordHandle {
     pub fn hostname(&self) -> &str {
         &self.hostname
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(zone_id: &str, record_id: &str, hostname: &str) -> Self {
+        Self {
+            zone_id: zone_id.to_string(),
+            record_id: record_id.to_string(),
+            hostname: hostname.to_string(),
+        }
+    }
 }
 
 fn cloudflare_error(errors: &[CloudflareApiError]) -> String {
@@ -279,6 +288,12 @@ async fn update_record(
         .ok_or_else(|| DnsError::Cloudflare("update record response had no result".to_string()))
 }
 
+/// TTL written on ACME DNS-01 TXT records. A resolver that cached the
+/// previous challenge can keep serving that value for this long after the
+/// authoritative server stopped. The provider-confirm settle is shorter
+/// and must not treat a live stale answer as propagated.
+pub const ACME_TXT_TTL_SECONDS: u32 = 60;
+
 /// Create one immutable ACME TXT record and return its provider identity.
 /// Multiple concurrent challenges for the same hostname intentionally create
 /// distinct records; cleanup must never update or delete a sibling challenge.
@@ -292,8 +307,16 @@ pub async fn create_txt_record(
         return Err(DnsError::OutsideManagedZone(hostname.to_string()));
     }
     let zone_id = resolve_zone_id(client, config).await?;
-    let record =
-        create_record_by_type(client, config, &zone_id, "TXT", hostname, content, 60).await?;
+    let record = create_record_by_type(
+        client,
+        config,
+        &zone_id,
+        "TXT",
+        hostname,
+        content,
+        ACME_TXT_TTL_SECONDS,
+    )
+    .await?;
     Ok(DnsRecordHandle {
         zone_id,
         record_id: record.id,
@@ -330,6 +353,106 @@ pub async fn delete_txt_record(
         )));
     }
     Ok(())
+}
+
+/// Outcome of reading the TXT row this issuance created.
+///
+/// [`CreatedTxtRead::Match`] means the provider row exists and its content
+/// is the expected challenge. It is not evidence that a recursive resolver
+/// or Let's Encrypt can see that value. Callers must not treat it as
+/// fulfillment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreatedTxtRead {
+    Match,
+    /// Row missing, a 404 for this record handle, outside the managed zone,
+    /// or not this challenge. A 404 is absence: the handle is gone, so a
+    /// prior confirmation must not survive it.
+    Absent,
+    /// Transport, non-404 HTTP, parse, or `success: false`. The label is
+    /// static: `transport`, `http`, `rejected`, or `parse`. It never carries
+    /// a token, URL, or response body.
+    Unreadable(&'static str),
+}
+
+/// Read the TXT row this issuance created over the same HTTPS API as
+/// create/delete. No port 53. A caching recursive denial of a just-deleted
+/// same-name challenge cannot hide a row the provider already accepted;
+/// this read is how the caller tells "absent" from "unreadable".
+pub async fn read_created_txt(
+    client: &reqwest::Client,
+    config: &DnsConfig,
+    record: &DnsRecordHandle,
+    expected: &str,
+) -> CreatedTxtRead {
+    if !config.manages_hostname(&record.hostname) {
+        return CreatedTxtRead::Absent;
+    }
+    let response = match client
+        .get(config.api_url(&format!(
+            "/zones/{}/dns_records/{}",
+            record.zone_id, record.record_id
+        )))
+        .bearer_auth(&config.cloudflare_api_token)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return CreatedTxtRead::Unreadable("transport"),
+    };
+    if response.status() == StatusCode::NOT_FOUND {
+        return CreatedTxtRead::Absent;
+    }
+    if !response.status().is_success() {
+        return CreatedTxtRead::Unreadable("http");
+    }
+    #[derive(Deserialize)]
+    struct CreatedTxt {
+        #[serde(rename = "type")]
+        record_type: String,
+        name: String,
+        content: String,
+    }
+    let body = match response.json::<CloudflareSingle<CreatedTxt>>().await {
+        Ok(body) => body,
+        Err(_) => return CreatedTxtRead::Unreadable("parse"),
+    };
+    if !body.success {
+        return CreatedTxtRead::Unreadable("rejected");
+    }
+    let Some(created) = body.result else {
+        return CreatedTxtRead::Absent;
+    };
+    if !created.record_type.eq_ignore_ascii_case("TXT")
+        || !dns_name_eq(&created.name, &record.hostname)
+        || !txt_content_eq(&created.content, expected)
+    {
+        return CreatedTxtRead::Absent;
+    }
+    CreatedTxtRead::Match
+}
+
+fn dns_name_eq(left: &str, right: &str) -> bool {
+    left.trim()
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case(right.trim().trim_end_matches('.'))
+}
+
+/// Cloudflare may store a space-free TXT value and return it wrapped in
+/// one pair of double quotes. Compare the unquoted challenge, not the
+/// wrapping.
+fn txt_content_eq(raw: &str, expected: &str) -> bool {
+    let trimmed = raw.trim();
+    let unquoted = strip_one_quote_pair(trimmed);
+    unquoted == expected
+}
+
+fn strip_one_quote_pair(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
 }
 
 pub async fn ensure_dns_record(

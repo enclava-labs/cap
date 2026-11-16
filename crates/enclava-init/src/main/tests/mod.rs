@@ -126,6 +126,7 @@ fn failure_surfaces_render_safe_json_and_stage_markers_stay_in_stage_file() {
         "error": "acme_rate_limited",
         "terminal": true,
         "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "stage": "provisioning static tls certificate",
     });
     let error_body = std::fs::read_to_string(&env.error).unwrap();
     let termination_body = std::fs::read_to_string(&env.termination).unwrap();
@@ -139,7 +140,10 @@ fn failure_surfaces_render_safe_json_and_stage_markers_stay_in_stage_file() {
         assert!(body.ends_with('\n'));
         assert!(!body.contains("SYNTHETIC-PROVIDER-SENTINEL"));
         assert!(!body.contains("/supplied/raw-path"));
+        // The anyhow context is not the diagnostic stage. Only the exact
+        // vocabulary phrase recorded before the failure is carried.
         assert!(!body.contains("provisioning static TLS certificate"));
+        assert!(body.contains("provisioning static tls certificate"));
     }
 
     // Stage markers remain available in their own file for operators.
@@ -181,6 +185,41 @@ fn generic_bootstrap_failures_render_generic_safe_code() {
     assert_eq!(
         std::fs::read_to_string(&env.termination).unwrap(),
         error_body
+    );
+}
+
+#[test]
+fn failure_diagnostic_omits_a_non_vocabulary_stage() {
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
+    std::fs::write(
+        &env.stage,
+        "provisioning static tls certificate SYNTHETIC-STAGE-SENTINEL\n",
+    )
+    .unwrap();
+
+    report_failure(&anyhow!("bootstrap failed"));
+
+    let error_body = std::fs::read_to_string(&env.error).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(error_body.trim()).unwrap();
+    assert!(parsed.get("stage").is_none());
+    assert!(!error_body.contains("SYNTHETIC-STAGE-SENTINEL"));
+}
+
+#[test]
+fn failure_diagnostic_carries_the_vocabulary_stage_into_the_termination_log() {
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
+    record_stage("binding workload mount namespaces").unwrap();
+
+    report_failure(&anyhow!("bind failed"));
+
+    let error_body = std::fs::read_to_string(&env.error).unwrap();
+    let termination_body = std::fs::read_to_string(&env.termination).unwrap();
+    assert_eq!(error_body, termination_body);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(error_body.trim()).unwrap()["stage"],
+        "binding workload mount namespaces"
     );
 }
 

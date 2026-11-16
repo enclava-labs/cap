@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -12,7 +12,7 @@ use enclava_init::config::{
     Config, LOG_SPOOL_STORAGE_STATE_BIND, LogEncryptionHandoff, LogEncryptionHandoffFile, Mode,
     VolumeConfig,
 };
-use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
+use enclava_init::safe_diagnostics::{INIT_STAGE_VOCABULARY, SafeBootstrapDiagnostic};
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
     dev_no_luks_override, env_override, log_relay, luks, luks2_seal, seeds, served_certificate,
@@ -50,6 +50,9 @@ const TLS_READINESS_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// accumulating longer unready spans.
 const TLS_READINESS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
+/// Largest stage file ever read. The producer writes one short phrase;
+/// anything larger is host-controlled and is omitted rather than buffered.
+const INIT_STAGE_MAX_BYTES: u64 = 256;
 const MANAGED_CONFIG_ROOT: &str = ".enclava";
 const MANAGED_CONFIG_DIR: &str = ".enclava/config";
 const MANAGED_CONFIG_DIR_MODE: u32 = 0o750;
@@ -114,7 +117,7 @@ fn main() -> ExitCode {
 /// paths, supplied values, or provider text — is never rendered here.
 fn report_failure(error: &anyhow::Error) {
     let diagnostic = SafeBootstrapDiagnostic::diagnose(error);
-    let safe_json = diagnostic.render_json();
+    let safe_json = diagnostic.render_json_with_stage(recorded_stage());
     record_failure_file(&safe_json);
     tracing::error!(
         error = diagnostic.code.as_str(),
@@ -448,11 +451,12 @@ fn clear_tls_unusable(path: &Path) {
 /// Write the safe failure JSON to the init-error file and the termination
 /// log.
 ///
-/// Both files carry exactly the bounded safe contract
-/// (`{"error","terminal","retry_after"}`) consumed by the attestation
-/// proxy worker and operators — never the anyhow chain, raw broker
-/// response text, or other supplied values. Stage markers stay in their
-/// own init-stage file.
+/// Both files carry the bounded safe contract
+/// (`{"error","terminal","retry_after"}`, plus an optional exact-vocabulary
+/// `stage`) consumed by the attestation proxy worker and operators — never
+/// the anyhow chain, raw broker response text, or other supplied values.
+/// The proxy ignores `stage`; the termination log keeps it after the
+/// restarted container overwrites the stage file.
 fn record_failure_file(safe_json: &str) {
     let body = format!("{safe_json}\n");
     let path = error_file_path();
@@ -490,6 +494,27 @@ fn record_stage(stage: &str) -> Result<()> {
     tracing::info!(stage, "enclava-init stage");
     writes::atomic_write(&stage_file_path(), format!("{stage}\n").as_bytes(), 0o644)
         .map_err(Into::into)
+}
+
+/// The last recorded stage, if it is exactly one vocabulary phrase.
+/// Anything else — missing file, extra text, a lookalike — is omitted so
+/// the diagnostic cannot become a channel for supplied values.
+fn recorded_stage() -> Option<&'static str> {
+    let file = std::fs::File::open(stage_file_path()).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 || len > INIT_STAGE_MAX_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(INIT_STAGE_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let stage = text.trim();
+    INIT_STAGE_VOCABULARY
+        .iter()
+        .copied()
+        .find(|known| *known == stage)
 }
 
 fn mark_ready_file(path: &Path) -> Result<()> {

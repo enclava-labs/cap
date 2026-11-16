@@ -341,7 +341,7 @@ async fn issue_dns01_certificate_attempt(
         )
         .await?;
 
-    let mut challenge_records = Vec::new();
+    let challenges = ChallengeCleanup::arm(http_client.clone(), dns_config.clone());
     {
         let mut authorizations = order.authorizations();
         loop {
@@ -370,11 +370,19 @@ async fn issue_dns01_certificate_attempt(
                     dns::create_txt_record(http_client, dns_config, &record_name, &record_value),
                 )
                 .await?;
-            challenge_records.push(record);
+            challenges.push(record.clone());
             await_propagation_then_ready(
-                wait_for_txt_record(&record_name, &record_value, acme_config, timing),
+                wait_for_txt_record(
+                    &record_name,
+                    &record_value,
+                    acme_config,
+                    timing,
+                    http_client,
+                    dns_config,
+                    &record,
+                ),
                 || async { challenge.set_ready().await },
-                || cleanup_challenges(http_client, dns_config, &challenge_records, timing),
+                || challenges.cleanup(timing),
                 timing,
             )
             .await?;
@@ -388,7 +396,7 @@ async fn issue_dns01_certificate_attempt(
         )
         .await?;
     if status != OrderStatus::Ready {
-        cleanup_challenges(http_client, dns_config, &challenge_records, timing).await;
+        challenges.cleanup(timing).await;
         return Err(AcmeError::OrderStatus(status));
     }
 
@@ -401,8 +409,43 @@ async fn issue_dns01_certificate_attempt(
             order.poll_certificate(&RetryPolicy::default()),
         )
         .await?;
-    cleanup_challenges(http_client, dns_config, &challenge_records, timing).await;
+    challenges.cleanup(timing).await;
     Ok(cert_chain)
+}
+
+/// After the Cloudflare API shows the TXT row this issuance created, wait
+/// before telling the CA to validate. An API read is not a public DNS
+/// view. Let's Encrypt checks authoritative servers from multiple vantage
+/// points and does not retry a failed authorization. 30s is longer than
+/// certbot's Cloudflare default (10s) and fits in the production 180s
+/// budget. The unset-env default budget is also 30s, and the confirming
+/// read follows the recursive lookups, so that settle is allowed to finish
+/// up to one settle past the budget. It is not added on top of a budget
+/// that already covers it.
+const PROVIDER_CONFIRM_SETTLE: Duration = Duration::from_secs(30);
+const PROPAGATION_POLL: Duration = Duration::from_secs(5);
+
+fn provider_confirm_settle(budget: Duration) -> Duration {
+    PROVIDER_CONFIRM_SETTLE.min(budget)
+}
+
+/// Finish a live provider settle that started after t=0.
+///
+/// `confirmed_at + settle` falls after a budget equal to the settle (the
+/// 30s default). Allow that finish, but never wait more than one settle
+/// past the propagation budget: a slow lookup must not stretch the wait
+/// without a bound.
+fn confirmed_settle_deadline(
+    propagation_deadline: tokio::time::Instant,
+    confirmed_at: Option<tokio::time::Instant>,
+    settle: Duration,
+) -> tokio::time::Instant {
+    match confirmed_at {
+        Some(seen) => propagation_deadline
+            .max(seen + settle)
+            .min(propagation_deadline + settle),
+        None => propagation_deadline,
+    }
 }
 
 async fn wait_for_txt_record(
@@ -410,25 +453,237 @@ async fn wait_for_txt_record(
     expected_value: &str,
     config: &AcmeConfig,
     timing: RequestTiming,
+    http_client: &reqwest::Client,
+    dns_config: &DnsConfig,
+    created: &dns::DnsRecordHandle,
 ) -> Result<(), AcmeError> {
+    // Zero is an explicit skip of the propagation wait (tests and an
+    // operator opt-out). It does not mean an API read counted as
+    // fulfillment. Production sets this to 180s.
     if config.dns_propagation_wait.is_zero() {
         return Ok(());
     }
 
+    wait_for_challenge_visibility(
+        record_name,
+        expected_value,
+        config,
+        timing,
+        &mut |system| async move {
+            if system {
+                lookup_txt_system(record_name).await
+            } else {
+                lookup_txt_external(record_name).await
+            }
+        },
+        &mut || dns::read_created_txt(http_client, dns_config, created, expected_value),
+    )
+    .await
+}
+
+/// Wait until a recursive resolver serves `expected_value`, or until a
+/// bounded settle has elapsed after the provider row matched.
+///
+/// A recursive hit is fulfillment: some resolver was served the current
+/// challenge, so `set_ready` may proceed. A provider match is not. It
+/// means a recursive denial is not absence (the deletion cache is not
+/// hiding a missing row). This still waits [`provider_confirm_settle`]
+/// before returning, and never on the same turn as the confirming read.
+/// A later mismatch, including a provider 404, clears that confirmation.
+/// An unreadable read (transport, non-404 HTTP, parse) does not: a blip
+/// must not restart the settle or look like absence.
+///
+/// A successful non-matching TXT is a previous challenge, not a denial.
+/// Its TTL is [`dns::ACME_TXT_TTL_SECONDS`]. The settle must not override
+/// that answer: the CA can consult the same cache and does not retry a
+/// failed check. The provider fallback applies only while both resolvers
+/// are negative or in error. While a stale positive is observed, the
+/// original propagation deadline still applies — a short budget fails
+/// closed instead of calling `set_ready`.
+async fn wait_for_challenge_visibility<F, Fut, P, PFut>(
+    record_name: &str,
+    expected_value: &str,
+    config: &AcmeConfig,
+    timing: RequestTiming,
+    recursive: &mut F,
+    provider: &mut P,
+) -> Result<(), AcmeError>
+where
+    F: FnMut(bool) -> Fut,
+    Fut: Future<Output = Result<Vec<String>, DnsLookupError>>,
+    P: FnMut() -> PFut,
+    PFut: Future<Output = dns::CreatedTxtRead>,
+{
     let deadline = tokio::time::Instant::now() + config.dns_propagation_wait;
+    let settle = provider_confirm_settle(config.dns_propagation_wait);
+    let mut confirmed_at: Option<tokio::time::Instant> = None;
+
     loop {
-        match lookup_txt(record_name, config, timing).await {
-            Ok(values) if values.iter().any(|value| value == expected_value) => return Ok(()),
-            Ok(_) => tracing::info!("waiting for ACME DNS-01 TXT propagation"),
-            Err(_) => tracing::info!("waiting for ACME DNS-01 TXT lookup"),
+        // Recursive resolvers first. A hit is fulfillment and does not
+        // start the provider read. A successful non-matching answer is a
+        // previous challenge; NODATA/NXDOMAIN is a lookup error. Only the
+        // latter is a cached deletion the provider read can outrank.
+        let observed = challenge_txt_visible(config, timing, recursive, expected_value).await;
+        if observed == RecursiveTxt::Current {
+            return Ok(());
         }
 
-        if tokio::time::Instant::now() >= deadline {
+        let read = provider().await;
+        match read {
+            dns::CreatedTxtRead::Match => {
+                confirmed_at.get_or_insert_with(tokio::time::Instant::now);
+            }
+            dns::CreatedTxtRead::Absent => {
+                confirmed_at = None;
+            }
+            dns::CreatedTxtRead::Unreadable(_) => {}
+        }
+        // Elapsed is zero on the confirming turn. Do not treat the API
+        // row as permission to call set_ready. A stale positive is not a
+        // denial: keep waiting for that answer to expire.
+        let settle_allowed = observed != RecursiveTxt::Stale;
+        if settle_allowed
+            && confirmed_at.is_some_and(|seen| {
+                tokio::time::Instant::now().saturating_duration_since(seen) >= settle
+            })
+        {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        let give_up = if settle_allowed {
+            confirmed_settle_deadline(deadline, confirmed_at, settle)
+        } else {
+            deadline
+        };
+        if now >= give_up {
             return Err(AcmeError::DnsPropagation {
                 record_name: record_name.to_string(),
             });
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        let provider_label = match read {
+            dns::CreatedTxtRead::Match => "settling",
+            dns::CreatedTxtRead::Absent => "absent",
+            dns::CreatedTxtRead::Unreadable(category) => category,
+        };
+        tracing::info!(
+            provider = provider_label,
+            recursive = recursive_txt_label(observed),
+            "waiting for ACME DNS-01 TXT propagation"
+        );
+        let settle_clock = if settle_allowed { confirmed_at } else { None };
+        tokio::time::sleep(propagation_sleep(now, give_up, settle_clock, settle)).await;
+    }
+}
+
+fn propagation_sleep(
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    confirmed_at: Option<tokio::time::Instant>,
+    settle: Duration,
+) -> Duration {
+    let until_deadline = deadline.saturating_duration_since(now);
+    let mut delay = PROPAGATION_POLL.min(until_deadline);
+    if let Some(seen) = confirmed_at {
+        let until_settle = settle.saturating_sub(now.saturating_duration_since(seen));
+        if !until_settle.is_zero() {
+            delay = delay.min(until_settle);
+        }
+    }
+    if delay.is_zero() {
+        // The deadline and settle checks above should have returned.
+        // A 1ms floor avoids a busy loop if they did not.
+        Duration::from_millis(1)
+    } else {
+        delay
+    }
+}
+
+/// What the configured recursive resolvers returned for this challenge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecursiveTxt {
+    /// A resolver returned the current challenge.
+    Current,
+    /// A resolver returned TXT data, and none of it was the current
+    /// challenge. That is a cached previous challenge, not absence. Its TTL
+    /// is [`dns::ACME_TXT_TTL_SECONDS`].
+    Stale,
+    /// Both resolvers missed: error, timeout, NODATA, or an empty answer.
+    Miss,
+}
+
+fn recursive_txt_label(observed: RecursiveTxt) -> &'static str {
+    match observed {
+        RecursiveTxt::Current => "current",
+        RecursiveTxt::Stale => "stale",
+        RecursiveTxt::Miss => "miss",
+    }
+}
+
+/// How the configured recursive resolvers answered `expected_value`.
+///
+/// Unlike [`lookup_txt_with_resolvers`], a successful but non-matching
+/// answer does not stop the search: that answer is a previous challenge's
+/// TXT, not evidence the current value is absent. A lookup error still
+/// continues to the other resolver. NODATA on both is [`RecursiveTxt::Miss`]
+/// — the caller then reads the provider row. That read is not fulfillment.
+/// A non-matching TXT on either resolver is [`RecursiveTxt::Stale`] even
+/// when the other resolver errors: the provider settle must not override it.
+async fn challenge_txt_visible<F, Fut>(
+    config: &AcmeConfig,
+    timing: RequestTiming,
+    lookup: &mut F,
+    expected_value: &str,
+) -> RecursiveTxt
+where
+    F: FnMut(bool) -> Fut,
+    Fut: Future<Output = Result<Vec<String>, DnsLookupError>>,
+{
+    let mut saw_stale = false;
+    for system in [
+        config.dns_lookup_prefer_system,
+        !config.dns_lookup_prefer_system,
+    ] {
+        let phase = if system {
+            Phase::DnsSystemLookup
+        } else {
+            Phase::DnsExternalLookup
+        };
+        let result = {
+            let mut stage = timing.start(phase);
+            let result = async {
+                let work = lookup(system);
+                match config.dns_lookup_timeout {
+                    Some(timeout) => {
+                        tokio::time::timeout(timeout, work)
+                            .await
+                            .map_err(|_| DnsLookupError {
+                                message: "DNS TXT lookup timed out".to_string(),
+                                category: DnsErrorCategory::Timeout,
+                            })?
+                    }
+                    None => work.await,
+                }
+            }
+            .await;
+            match &result {
+                Ok(_) => stage.finish(true),
+                Err(error) => stage.finish_dns_error(error.category),
+            }
+            result
+        };
+        if let Ok(values) = result {
+            if values.iter().any(|value| value == expected_value) {
+                return RecursiveTxt::Current;
+            }
+            if !values.is_empty() {
+                saw_stale = true;
+            }
+        }
+    }
+    if saw_stale {
+        RecursiveTxt::Stale
+    } else {
+        RecursiveTxt::Miss
     }
 }
 
@@ -455,23 +710,12 @@ where
         .map_err(Into::into)
 }
 
-async fn lookup_txt(
-    name: &str,
-    config: &AcmeConfig,
-    timing: RequestTiming,
-) -> Result<Vec<String>, String> {
-    lookup_txt_with_resolvers(config, timing, |system| async move {
-        if system {
-            lookup_txt_system(name).await
-        } else {
-            lookup_txt_external(name).await
-        }
-    })
-    .await
-}
-
 #[derive(Clone, Debug)]
 struct DnsLookupError {
+    /// Asserted by resolver tests. Production classifies by `category` only
+    /// and does not render this string (provider/resolver text stays out of
+    /// broker diagnostics).
+    #[cfg_attr(not(test), allow(dead_code))]
     message: String,
     category: DnsErrorCategory,
 }
@@ -514,6 +758,10 @@ impl From<&str> for DnsLookupError {
     }
 }
 
+/// Resolver-contract helper kept for the #104 tests: a successful answer,
+/// including a negative or non-matching one, does not fall back. Propagation
+/// visibility is [`challenge_txt_visible`], which must keep searching.
+#[cfg(test)]
 async fn lookup_txt_with_resolvers<
     F: std::future::Future<Output = Result<Vec<String>, DnsLookupError>>,
 >(
@@ -615,6 +863,112 @@ fn collect_txt_values(response: hickory_resolver::lookup::Lookup) -> Result<Vec<
         }
     }
     Ok(out)
+}
+
+/// TXT records created for one issuance. Explicit [`ChallengeCleanup::cleanup`]
+/// drains them. If the handler is cancelled first — the guest's broker
+/// client times out, or destroy drops the connection while the previous
+/// same-name issuance is still in flight — `Drop` still deletes them.
+/// Destroy does not know these records (they are not rows in `dns_records`),
+/// so a cancelled issuance is otherwise name-derived residue for the next
+/// recreate.
+struct ChallengeCleanup {
+    client: reqwest::Client,
+    dns_config: DnsConfig,
+    records: std::sync::Mutex<Vec<dns::DnsRecordHandle>>,
+}
+
+impl ChallengeCleanup {
+    fn arm(client: reqwest::Client, dns_config: DnsConfig) -> Self {
+        Self {
+            client,
+            dns_config,
+            records: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn push(&self, record: dns::DnsRecordHandle) {
+        if let Ok(mut records) = self.records.lock() {
+            records.push(record);
+        }
+    }
+
+    async fn cleanup(&self, timing: RequestTiming) {
+        let records = match self.records.lock() {
+            Ok(mut records) => std::mem::take(&mut *records),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        // The taken handles live in this guard for the await. Cancelling
+        // the handler here drops the guard, which still deletes them.
+        InflightChallengeDeletes::new(self.client.clone(), self.dns_config.clone(), records)
+            .finish(timing)
+            .await;
+    }
+}
+
+/// Deletes held TXT handles, including when the enclosing future is
+/// cancelled mid-request.
+struct InflightChallengeDeletes {
+    client: reqwest::Client,
+    dns_config: DnsConfig,
+    records: Vec<dns::DnsRecordHandle>,
+}
+
+impl InflightChallengeDeletes {
+    fn new(
+        client: reqwest::Client,
+        dns_config: DnsConfig,
+        records: Vec<dns::DnsRecordHandle>,
+    ) -> Self {
+        Self {
+            client,
+            dns_config,
+            records,
+        }
+    }
+
+    async fn finish(mut self, timing: RequestTiming) {
+        cleanup_challenges(&self.client, &self.dns_config, &self.records, timing).await;
+        // Clear only after the delete finishes. A cancel during the await
+        // drops `self` while it still holds the handles, so Drop deletes them.
+        self.records.clear();
+    }
+}
+
+impl Drop for InflightChallengeDeletes {
+    fn drop(&mut self) {
+        spawn_challenge_deletes(
+            self.client.clone(),
+            self.dns_config.clone(),
+            std::mem::take(&mut self.records),
+        );
+    }
+}
+
+impl Drop for ChallengeCleanup {
+    fn drop(&mut self) {
+        let records = match self.records.lock() {
+            Ok(mut records) => std::mem::take(&mut *records),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        spawn_challenge_deletes(self.client.clone(), self.dns_config.clone(), records);
+    }
+}
+
+fn spawn_challenge_deletes(
+    client: reqwest::Client,
+    dns_config: DnsConfig,
+    records: Vec<dns::DnsRecordHandle>,
+) {
+    if records.is_empty() {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        cleanup_challenges(&client, &dns_config, &records, RequestTiming::new()).await;
+    });
 }
 
 async fn cleanup_challenges(
@@ -997,6 +1351,595 @@ mod tests {
                 assert_eq!(calls, vec![system]);
             }
         }
+    }
+
+    /// cap#345: a reused hostname's preferred resolver can still answer with
+    /// the previous challenge's TXT. That is a successful non-matching
+    /// answer, which the #104 helper does not fall back from. Propagation
+    /// must keep looking.
+    #[tokio::test]
+    async fn stale_preferred_answer_does_not_hide_challenge_on_the_other_resolver() {
+        for prefer_system in [false, true] {
+            let mut calls = Vec::new();
+            let visible = challenge_txt_visible(
+                &config(prefer_system, None),
+                RequestTiming::new(),
+                &mut |system| {
+                    calls.push(system);
+                    let values = if system == prefer_system {
+                        vec!["previous-challenge".to_string()]
+                    } else {
+                        vec!["current-challenge".to_string()]
+                    };
+                    std::future::ready(Ok(values))
+                },
+                "current-challenge",
+            )
+            .await;
+            assert_eq!(
+                visible,
+                RecursiveTxt::Current,
+                "prefer_system={prefer_system}"
+            );
+            assert_eq!(calls, vec![prefer_system, !prefer_system]);
+        }
+    }
+
+    fn config_waiting(wait: Duration) -> AcmeConfig {
+        let mut cfg = config(true, Some(Duration::from_secs(2)));
+        cfg.dns_propagation_wait = wait;
+        cfg
+    }
+
+    fn recursive_miss() -> Result<Vec<String>, DnsLookupError> {
+        Err(DnsLookupError {
+            message: "nodata".into(),
+            category: DnsErrorCategory::NoData,
+        })
+    }
+
+    /// cap#345: a Cloudflare API match on the confirming turn is not
+    /// fulfillment. Let's Encrypt validates from public DNS and does not
+    /// retry a failed multi-perspective check. `set_ready` waits out the
+    /// settle, and does not wait out the whole propagation budget.
+    #[tokio::test(start_paused = true)]
+    async fn provider_match_does_not_fulfill_on_the_confirming_turn() {
+        let cfg = config_waiting(Duration::from_secs(180));
+        let handle = tokio::spawn(async move {
+            wait_for_challenge_visibility(
+                "_acme-challenge.app.enclava.dev",
+                "current-challenge",
+                &cfg,
+                RequestTiming::new(),
+                &mut |_| std::future::ready(recursive_miss()),
+                &mut || std::future::ready(dns::CreatedTxtRead::Match),
+            )
+            .await
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            !handle.is_finished(),
+            "API match must not set_ready on the confirming turn"
+        );
+        tokio::time::advance(PROVIDER_CONFIRM_SETTLE - Duration::from_secs(1)).await;
+        assert!(
+            !handle.is_finished(),
+            "settle is not finished one second early"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            handle.await.expect("settle task").is_ok(),
+            "set_ready after the settle, still inside the 180s budget"
+        );
+    }
+
+    /// A recursive hit is fulfillment. It must not wait for the provider
+    /// settle, and it must not start the provider read.
+    #[tokio::test(start_paused = true)]
+    async fn recursive_hit_fulfills_without_provider_settle() {
+        let cfg = config_waiting(Duration::from_secs(180));
+        let provider_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls = provider_calls.clone();
+        let handle = tokio::spawn(async move {
+            wait_for_challenge_visibility(
+                "_acme-challenge.app.enclava.dev",
+                "current-challenge",
+                &cfg,
+                RequestTiming::new(),
+                &mut |_| std::future::ready(Ok(vec!["current-challenge".to_string()])),
+                &mut || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(dns::CreatedTxtRead::Absent)
+                },
+            )
+            .await
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(handle.await.expect("recursive task").is_ok());
+        assert_eq!(
+            provider_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a recursive hit must not start the provider read"
+        );
+    }
+
+    /// No provider match and no recursive hit still fails at the budget.
+    /// The settle must not turn absence into success.
+    #[tokio::test(start_paused = true)]
+    async fn provider_absence_still_fails_at_the_propagation_budget() {
+        let cfg = config_waiting(Duration::from_secs(10));
+        let handle = tokio::spawn(async move {
+            wait_for_challenge_visibility(
+                "_acme-challenge.app.enclava.dev",
+                "current-challenge",
+                &cfg,
+                RequestTiming::new(),
+                &mut |_| std::future::ready(recursive_miss()),
+                &mut || std::future::ready(dns::CreatedTxtRead::Absent),
+            )
+            .await
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(!handle.is_finished());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let error = handle.await.expect("deadline task").expect_err("absent");
+        assert!(matches!(error, AcmeError::DnsPropagation { .. }));
+    }
+
+    /// A mismatch after a match is not the challenge. A provider 404 is
+    /// that mismatch (`CreatedTxtRead::Absent`). An unreadable blip does
+    /// not clear a confirmation or count as one.
+    #[tokio::test(start_paused = true)]
+    async fn provider_mismatch_clears_confirmation_and_blip_does_not() {
+        let cfg = config_waiting(Duration::from_secs(180));
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let mismatch = tokio::spawn(async move {
+            let calls = &calls;
+            wait_for_challenge_visibility(
+                "_acme-challenge.app.enclava.dev",
+                "current-challenge",
+                &cfg,
+                RequestTiming::new(),
+                &mut |_| std::future::ready(recursive_miss()),
+                &mut || {
+                    let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(if n == 0 {
+                        dns::CreatedTxtRead::Match
+                    } else {
+                        dns::CreatedTxtRead::Absent
+                    })
+                },
+            )
+            .await
+        });
+        tokio::time::advance(PROVIDER_CONFIRM_SETTLE + Duration::from_secs(1)).await;
+        assert!(
+            !mismatch.is_finished(),
+            "a later mismatch must not set_ready at the settle"
+        );
+        mismatch.abort();
+
+        let cfg = config_waiting(Duration::from_secs(180));
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let blip = tokio::spawn(async move {
+            let calls = &calls;
+            wait_for_challenge_visibility(
+                "_acme-challenge.app.enclava.dev",
+                "current-challenge",
+                &cfg,
+                RequestTiming::new(),
+                &mut |_| std::future::ready(recursive_miss()),
+                &mut || {
+                    let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(if n == 0 {
+                        dns::CreatedTxtRead::Match
+                    } else {
+                        dns::CreatedTxtRead::Unreadable("http")
+                    })
+                },
+            )
+            .await
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(!blip.is_finished());
+        tokio::time::advance(PROVIDER_CONFIRM_SETTLE).await;
+        assert!(blip.await.expect("blip task").is_ok());
+    }
+
+    /// cap#345 review: the unset-env budget is 30s, equal to the settle.
+    /// The confirming read follows the recursive lookups, so it is not at
+    /// t=0. A persistent miss plus a provider match must still finish the
+    /// settle instead of failing at the original deadline.
+    #[tokio::test(start_paused = true)]
+    async fn default_budget_finishes_provider_settle_after_a_late_read() {
+        let cfg = config_waiting(Duration::from_secs(30));
+        let handle = tokio::spawn(async move {
+            let first_lookup = std::sync::atomic::AtomicBool::new(true);
+            wait_for_challenge_visibility(
+                "_acme-challenge.app.enclava.dev",
+                "current-challenge",
+                &cfg,
+                RequestTiming::new(),
+                &mut move |_| {
+                    let delay = first_lookup.swap(false, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        if delay {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                        recursive_miss()
+                    }
+                },
+                &mut || std::future::ready(dns::CreatedTxtRead::Match),
+            )
+            .await
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(!handle.is_finished(), "first lookup is still in flight");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            !handle.is_finished(),
+            "API match must not set_ready on the confirming turn"
+        );
+        tokio::time::advance(Duration::from_secs(28)).await;
+        assert!(
+            !handle.is_finished(),
+            "the original 30s deadline must not beat a live settle"
+        );
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(
+            handle.await.expect("default-budget task").is_ok(),
+            "set_ready after the settle, past the 30s default budget"
+        );
+    }
+
+    /// A resolver still serving the previous challenge is not a denial.
+    /// The 30s provider settle must not override that positive answer.
+    #[tokio::test(start_paused = true)]
+    async fn stale_positive_is_not_overridden_by_provider_settle() {
+        let cfg = config_waiting(Duration::from_secs(180));
+        let handle = tokio::spawn(async move {
+            wait_for_challenge_visibility(
+                "_acme-challenge.app.enclava.dev",
+                "current-challenge",
+                &cfg,
+                RequestTiming::new(),
+                &mut |_| std::future::ready(Ok(vec!["previous-challenge".to_string()])),
+                &mut || std::future::ready(dns::CreatedTxtRead::Match),
+            )
+            .await
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(!handle.is_finished());
+        tokio::time::advance(PROVIDER_CONFIRM_SETTLE).await;
+        assert!(
+            !handle.is_finished(),
+            "a live stale TXT outranks the provider settle"
+        );
+        tokio::time::advance(Duration::from_secs(180)).await;
+        let error = handle.await.expect("stale task").expect_err("budget");
+        assert!(matches!(error, AcmeError::DnsPropagation { .. }));
+    }
+
+    /// Once the stale answer expires, the provider fallback applies. It
+    /// does not apply while the answer is still being served, and a short
+    /// budget must not extend in order to set_ready into that answer.
+    #[tokio::test(start_paused = true)]
+    async fn provider_settle_applies_once_the_stale_positive_expires() {
+        let cfg = config_waiting(Duration::from_secs(180));
+        let handle = tokio::spawn(async move {
+            let stale_until = tokio::time::Instant::now() + Duration::from_secs(45);
+            wait_for_challenge_visibility(
+                "_acme-challenge.app.enclava.dev",
+                "current-challenge",
+                &cfg,
+                RequestTiming::new(),
+                &mut move |_| {
+                    let stale = tokio::time::Instant::now() < stale_until;
+                    std::future::ready(if stale {
+                        Ok(vec!["previous-challenge".to_string()])
+                    } else {
+                        recursive_miss()
+                    })
+                },
+                &mut || std::future::ready(dns::CreatedTxtRead::Match),
+            )
+            .await
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(!handle.is_finished());
+        tokio::time::advance(PROVIDER_CONFIRM_SETTLE).await;
+        assert!(
+            !handle.is_finished(),
+            "still serving the previous challenge at the settle"
+        );
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert!(
+            handle.await.expect("stale-expiry task").is_ok(),
+            "settle applies once resolvers stop serving the previous challenge"
+        );
+    }
+
+    /// The default 30s budget must not be extended into a set_ready while
+    /// resolvers are still serving the previous challenge.
+    #[tokio::test(start_paused = true)]
+    async fn stale_positive_fails_closed_inside_the_default_budget() {
+        let cfg = config_waiting(Duration::from_secs(30));
+        let handle = tokio::spawn(async move {
+            wait_for_challenge_visibility(
+                "_acme-challenge.app.enclava.dev",
+                "current-challenge",
+                &cfg,
+                RequestTiming::new(),
+                &mut |_| std::future::ready(Ok(vec!["previous-challenge".to_string()])),
+                &mut || std::future::ready(dns::CreatedTxtRead::Match),
+            )
+            .await
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(30) + PROVIDER_CONFIRM_SETTLE).await;
+        let error = handle
+            .await
+            .expect("default stale task")
+            .expect_err("stale must not set_ready");
+        assert!(matches!(error, AcmeError::DnsPropagation { .. }));
+    }
+
+    #[tokio::test]
+    async fn one_stale_resolver_is_not_a_miss() {
+        let observed = challenge_txt_visible(
+            &config(true, None),
+            RequestTiming::new(),
+            &mut |system| {
+                std::future::ready(if system {
+                    Ok(vec!["previous-challenge".to_string()])
+                } else {
+                    Err(DnsLookupError {
+                        message: "nodata".into(),
+                        category: DnsErrorCategory::NoData,
+                    })
+                })
+            },
+            "current-challenge",
+        )
+        .await;
+        assert_eq!(observed, RecursiveTxt::Stale);
+
+        let missed = challenge_txt_visible(
+            &config(true, None),
+            RequestTiming::new(),
+            &mut |_| std::future::ready(recursive_miss()),
+            "current-challenge",
+        )
+        .await;
+        assert_eq!(missed, RecursiveTxt::Miss);
+    }
+
+    /// The provider read is an HTTPS GET of the row this issuance created.
+    /// A match is the row's type, name, and content — including one pair of
+    /// Cloudflare TXT quotes — not permission to skip the settle.
+    #[tokio::test]
+    async fn provider_https_read_matches_the_created_txt_row() {
+        let name = "_acme-challenge.app.enclava.dev";
+        let app = axum::Router::new().route(
+            "/zones/{zone_id}/dns_records/{record_id}",
+            axum::routing::get(
+                move |axum::extract::Path((zone, id)): axum::extract::Path<(String, String)>,
+                      headers: axum::http::HeaderMap| {
+                    assert_eq!(zone, "zone-1");
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("");
+                    assert!(
+                        authorization.starts_with("Bearer "),
+                        "provider read must send the bearer"
+                    );
+                    let ok = |content: &str, record_type: &str, record_name: &str| {
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "success": true,
+                                "errors": [],
+                                "result": {
+                                    "type": record_type,
+                                    "name": record_name,
+                                    "content": content
+                                }
+                            })),
+                        )
+                    };
+                    async move {
+                        match id.as_str() {
+                            "rec-plain" => ok("current-challenge", "TXT", name),
+                            "rec-quoted" => ok("\"current-challenge\"", "TXT", name),
+                            "rec-dot" => ok("current-challenge", "txt", &format!("{name}.")),
+                            "rec-type" => ok("current-challenge", "A", name),
+                            "rec-name" => ok("current-challenge", "TXT", "other.enclava.dev"),
+                            "rec-rejected" => (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({
+                                    "success": false,
+                                    "errors": [{"code": 1000, "message": "nope"}],
+                                    "result": null
+                                })),
+                            ),
+                            "rec-http" => (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                axum::Json(serde_json::json!({"success": false, "errors": []})),
+                            ),
+                            "rec-parse" => (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({
+                                    "success": true,
+                                    "errors": [],
+                                    "result": "not-a-record"
+                                })),
+                            ),
+                            "rec-gone" => (
+                                axum::http::StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({"success": false, "errors": []})),
+                            ),
+                            _ => (
+                                axum::http::StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({"success": false, "errors": []})),
+                            ),
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake dns");
+        let address = listener.local_addr().expect("fake dns address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake dns");
+        });
+        let dns = crate::dns::DnsConfig {
+            cloudflare_api_token: "token".to_string(),
+            cloudflare_api_base_url: format!("http://{address}"),
+            cloudflare_zone_id: Some("zone-1".to_string()),
+            cloudflare_zone_name: "enclava.dev".to_string(),
+            target: "192.0.2.1".to_string(),
+            required: true,
+        };
+        let client = reqwest::Client::new();
+        let read = |id: &str| {
+            let client = client.clone();
+            let dns = dns.clone();
+            let id = id.to_string();
+            async move {
+                dns::read_created_txt(
+                    &client,
+                    &dns,
+                    &crate::dns::DnsRecordHandle::for_test("zone-1", &id, name),
+                    "current-challenge",
+                )
+                .await
+            }
+        };
+        assert_eq!(read("rec-plain").await, dns::CreatedTxtRead::Match);
+        assert_eq!(
+            dns::read_created_txt(
+                &client,
+                &dns,
+                &crate::dns::DnsRecordHandle::for_test("zone-1", "rec-plain", name),
+                "other-challenge",
+            )
+            .await,
+            dns::CreatedTxtRead::Absent
+        );
+        assert_eq!(read("rec-quoted").await, dns::CreatedTxtRead::Match);
+        assert_eq!(read("rec-dot").await, dns::CreatedTxtRead::Match);
+        assert_eq!(read("rec-type").await, dns::CreatedTxtRead::Absent);
+        assert_eq!(read("rec-name").await, dns::CreatedTxtRead::Absent);
+        assert_eq!(
+            read("rec-rejected").await,
+            dns::CreatedTxtRead::Unreadable("rejected")
+        );
+        assert_eq!(
+            read("rec-http").await,
+            dns::CreatedTxtRead::Unreadable("http")
+        );
+        assert_eq!(
+            read("rec-parse").await,
+            dns::CreatedTxtRead::Unreadable("parse")
+        );
+        assert_eq!(read("rec-gone").await, dns::CreatedTxtRead::Absent);
+        let outside =
+            crate::dns::DnsRecordHandle::for_test("zone-1", "rec-plain", "app.example.com");
+        assert_eq!(
+            dns::read_created_txt(&client, &dns, &outside, "current-challenge").await,
+            dns::CreatedTxtRead::Absent
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn preferred_challenge_hit_does_not_consult_the_other_resolver() {
+        for prefer_system in [false, true] {
+            let mut calls = Vec::new();
+            let visible = challenge_txt_visible(
+                &config(prefer_system, None),
+                RequestTiming::new(),
+                &mut |system| {
+                    calls.push(system);
+                    std::future::ready(Ok(vec!["current-challenge".to_string()]))
+                },
+                "current-challenge",
+            )
+            .await;
+            assert_eq!(visible, RecursiveTxt::Current);
+            assert_eq!(calls, vec![prefer_system]);
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_is_not_visible_when_neither_resolver_has_the_value() {
+        let visible = challenge_txt_visible(
+            &config(true, None),
+            RequestTiming::new(),
+            &mut |_| std::future::ready(Ok(vec!["previous-challenge".to_string()])),
+            "current-challenge",
+        )
+        .await;
+        assert_eq!(visible, RecursiveTxt::Stale);
+    }
+
+    #[tokio::test]
+    async fn dropped_challenge_guard_deletes_the_txt_record() {
+        use std::sync::{Arc, Mutex};
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let deleted_route = deleted.clone();
+        let app = axum::Router::new().route(
+            "/zones/{zone_id}/dns_records/{record_id}",
+            axum::routing::delete(
+                move |axum::extract::Path((zone, id)): axum::extract::Path<(String, String)>| {
+                    let deleted_route = deleted_route.clone();
+                    async move {
+                        deleted_route.lock().unwrap().push((zone, id));
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(serde_json::json!({"success": true, "errors": []})),
+                        )
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake dns");
+        let address = listener.local_addr().expect("fake dns address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake dns");
+        });
+        let dns = crate::dns::DnsConfig {
+            cloudflare_api_token: "token".to_string(),
+            cloudflare_api_base_url: format!("http://{address}"),
+            cloudflare_zone_id: Some("zone-1".to_string()),
+            cloudflare_zone_name: "enclava.dev".to_string(),
+            target: "192.0.2.1".to_string(),
+            required: true,
+        };
+        let guard = ChallengeCleanup::arm(reqwest::Client::new(), dns);
+        guard.push(crate::dns::DnsRecordHandle::for_test(
+            "zone-1",
+            "rec-9",
+            "_acme-challenge.app.enclava.dev",
+        ));
+        drop(guard);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !deleted.lock().unwrap().is_empty() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            deleted.lock().unwrap().as_slice(),
+            [("zone-1".to_string(), "rec-9".to_string())]
+        );
+        server.abort();
     }
 
     #[tokio::test]

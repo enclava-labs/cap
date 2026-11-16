@@ -108,6 +108,20 @@ const TLS_KEY_BINDING_PROBE: &[u8] = b"enclava-init tls certificate key binding 
 /// treated as an unbounded (malformed) body and never read into memory.
 const MAX_BROKER_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Broker HTTP budget. Production sets `ACME_DNS_PROPAGATION_SECONDS=180`.
+/// Hostnames are ordered platform name, then any custom name. The platform
+/// name can spend that propagation window. A custom name is outside the
+/// managed zone and fails at TXT create, which is fast, but that failure
+/// comes after the platform wait — not before it. The order then has two
+/// 30s ACME polls. A client timeout equal to the window fires while the
+/// broker is still working; that transport timeout is not a typed broker
+/// failure, so it collapses to generic `enclava_init_failed` (cap#345).
+/// 360s covers one window plus the polls and setup, and stays under the
+/// attestation-proxy ready-watch (900s). A provider confirmation near the
+/// end of the window may finish its 30s settle up to one settle past that
+/// window; 360s still covers the production 180s window plus that extension.
+const TLS_BROKER_CLIENT_TIMEOUT: Duration = Duration::from_secs(360);
+
 /// Farthest a single honored ACME `retry_after` deadline may lie in the
 /// future. A broker deadline beyond this is not waited on: provisioning
 /// fails terminally with the preserved diagnostic instead of parking the
@@ -715,7 +729,7 @@ fn issue_via_broker(
     }
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(180))
+        .timeout(TLS_BROKER_CLIENT_TIMEOUT)
         .build()
         .context("building TLS certificate broker client")?;
     let request = CertificateRequest {
@@ -1149,6 +1163,26 @@ mod tests {
     use tempfile::tempdir;
 
     const TEST_HOSTNAMES: &[&str] = &["app.example.test", "www.example.test"];
+
+    #[test]
+    fn broker_client_timeout_exceeds_the_production_propagation_budget() {
+        // One production propagation window is the budget. A custom name
+        // fails fast at TXT create, after any platform-name wait, plus the
+        // two 30s order polls and setup.
+        const PRODUCTION_PROPAGATION_SECS: u64 = 180;
+        const POLL_BUDGET_SECS: u64 = 30 + 30;
+        const SETUP_MARGIN_SECS: u64 = 60;
+        assert!(
+            TLS_BROKER_CLIENT_TIMEOUT
+                >= Duration::from_secs(
+                    PRODUCTION_PROPAGATION_SECS + POLL_BUDGET_SECS + SETUP_MARGIN_SECS
+                )
+        );
+        // Stay under the attestation-proxy ready-watch so a slow issuance
+        // is still a broker result, not an unlock timeout.
+        assert!(TLS_BROKER_CLIENT_TIMEOUT < Duration::from_secs(900));
+    }
+
     /// RSA-PSS fixture root (openssl-minted 2026-11; rcgen cannot sign PSS).
     const PSS_ROOT_PEM: &str = concat!(
         "-----BEGIN CERTIFICATE-----\n",
