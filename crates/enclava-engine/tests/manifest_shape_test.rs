@@ -465,3 +465,26 @@ fn fractional_millicore_limits_keep_request_within_limit_and_quota() {
         }
     }
 }
+
+/// The signing service (enclava-labs/policy-templates) renders its own copy
+/// of the pod and must produce the same `default_vcpus` annotation, or the
+/// agent policy refuses the padded pod. Both repositories check their
+/// implementation against this mirrored vector file, so a one-sided change
+/// to the arithmetic fails here instead of at deploy time.
+#[test]
+fn vcpu_baseline_annotation_matches_mirrored_golden_vectors() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/cap-vm-vcpu-baseline-vectors.json"))
+            .expect("golden vector fixture is valid JSON");
+    let vectors = fixture["vectors"].as_array().expect("vectors array");
+    assert!(!vectors.is_empty());
+    for vector in vectors {
+        let cpu_limit = vector["cpu_limit"].as_str().expect("cpu_limit string");
+        let expected = vector["default_vcpus"].as_str();
+        assert_eq!(
+            shape::vm_vcpu_baseline_annotation(cpu_limit, false).as_deref(),
+            expected,
+            "cpu_limit={cpu_limit}"
+        );
+    }
+}

@@ -127,10 +127,15 @@ fn split_quantity(q: &str) -> (&str, &str) {
 /// must never admit less than the pod asks for: float parsing truncated
 /// values such as `0.57` to `569m` and dropped sub-millicore remainders,
 /// leaving the quota below the pod's own total.
+///
+/// A quantity that cannot be represented saturates the total instead of
+/// counting as zero, for the same reason: `validate_app` rejects malformed
+/// quantities before generation, and if one slips through anyway the pod's
+/// own limit is what fails, not a quota that silently came out too small.
 fn sum_cpu_quantities(values: &[&str]) -> String {
     let total_millis: u64 = values
         .iter()
-        .map(|value| crate::manifest::shape::cpu_quantity_millis(value).unwrap_or(0))
+        .map(|value| crate::manifest::shape::cpu_quantity_millis(value).unwrap_or(u64::MAX))
         .fold(0u64, u64::saturating_add);
 
     if total_millis.is_multiple_of(1000) {

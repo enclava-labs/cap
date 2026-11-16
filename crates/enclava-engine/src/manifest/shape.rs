@@ -571,6 +571,21 @@ mod tests {
                 assert_eq!(snp_vm_vcpus(&cpu, legacy), Some(4));
             }
         }
+
+        // Sub-millicore limits: the kubelet rounds the pod's summed limit up
+        // to a whole millicore before deriving the quota Kata reads.
+        for cpu in ["0.0001", "0.1005", "249.5m", "499.5m", "500.5m", "1.0005"] {
+            let pod_millis =
+                platform_container_cpu_limit_millis(false) + cpu_quantity_millis(cpu).unwrap();
+            let baseline: f32 = match vm_vcpu_baseline_annotation(cpu, false) {
+                Some(value) => value.parse().unwrap(),
+                None => 1.0,
+            };
+            let quota = (pod_millis * 100) as f32;
+            let kata_vcpus = (baseline + quota / 100_000.0_f32).ceil() as u64;
+            assert_eq!(kata_vcpus, 4, "cpu={cpu}");
+            assert_eq!(snp_vm_vcpus(cpu, false), Some(4), "cpu={cpu}");
+        }
     }
 
     #[test]
