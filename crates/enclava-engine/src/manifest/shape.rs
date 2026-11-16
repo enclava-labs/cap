@@ -230,6 +230,11 @@ pub const APPROVED_SNP_VM_VCPUS: u64 = 4;
 /// A CPU quantity (`250m`, `1`, `1.5`) in millicores, rounded up to the next
 /// whole millicore exactly as Kubernetes rounds a container limit. `None` for
 /// values outside the admission grammar or too large to represent.
+///
+/// This is arithmetic, not validation: it is more lenient than the admission
+/// grammar (it accepts `1.`, for instance). Callers rely on the API's
+/// `validate_resource_limits` having run first and must treat `None` as a
+/// rejection, never as "no limit".
 pub fn cpu_quantity_millis(value: &str) -> Option<u64> {
     if value.is_empty() || value.trim() != value {
         return None;
@@ -341,12 +346,16 @@ impl std::fmt::Display for UnapprovedVmCpuShape {
 /// Reject an application CPU limit that boots a vCPU count other than
 /// [`APPROVED_SNP_VM_VCPUS`]. Applies only to SNP runtime classes: the
 /// simulated CoCo dev class has no launch measurement to appraise.
+///
+/// `runtime_class` is the class the pod binds ([`runtime_class_for`]), not the
+/// deployment default: small-memory apps bind the measured small SNP class
+/// whatever the default is.
 pub fn check_vm_cpu_shape(
     app_cpu_limit: &str,
-    deployment_runtime_class: &str,
+    runtime_class: &str,
     legacy_bootstrap: bool,
 ) -> Result<(), UnapprovedVmCpuShape> {
-    if deployment_runtime_class == crate::manifest::cc_init_data::COCO_DEV_RUNTIME_CLASS {
+    if runtime_class == crate::manifest::cc_init_data::COCO_DEV_RUNTIME_CLASS {
         return Ok(());
     }
     let vm_vcpus = snp_vm_vcpus(app_cpu_limit, legacy_bootstrap);
