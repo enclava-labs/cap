@@ -2037,6 +2037,48 @@ pub(crate) async fn reconcile_success_with_deployment_history(
     wait_deadline: Instant,
     history: &mut DeploymentHistoryProbe,
 ) -> Result<SuccessGate, Box<dyn std::error::Error>> {
+    reconcile_with_deployment_history(api, app_name, deployment_id, wait_deadline, history, false)
+        .await
+}
+
+/// A deployment CAP has accepted but whose workload roll has not finished:
+/// the previous pod may still be the one answering for the app.
+///
+/// `healthy`, `failed` and `rolled_back` are settled. `rolled_back`
+/// intentionally confirms, as in the non-rollout gate: CAP has finished
+/// with this deployment and the workload it restored is the one serving, so
+/// it will not roll (or relock) behind the user after the wait exits.
+pub(crate) fn deployment_rollout_in_flight(status: &str) -> bool {
+    matches!(status, "pending" | "applying" | "watching")
+}
+
+/// [`reconcile_success_with_deployment_history`] for readiness signals the
+/// *previous* workload can also produce (the stable SSH endpoint): the fresh
+/// observation must additionally show the deployment's roll settled.
+/// Without that, a redeploy reads the old pod's readiness as its own while
+/// CAP has not applied the new StatefulSet yet, exits 0, and the app then
+/// rolls (and, in password mode, relocks) behind the user's back. An
+/// in-flight status is [`SuccessGate::Inconclusive`]: the wait keeps running
+/// and observes the roll, its relock stop, or its deadline.
+pub(crate) async fn reconcile_rollout_with_deployment_history(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+    wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
+) -> Result<SuccessGate, Box<dyn std::error::Error>> {
+    reconcile_with_deployment_history(api, app_name, deployment_id, wait_deadline, history, true)
+        .await
+}
+
+async fn reconcile_with_deployment_history(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+    wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
+    require_settled_rollout: bool,
+) -> Result<SuccessGate, Box<dyn std::error::Error>> {
     if deployment_id == "pending" {
         return Ok(SuccessGate::Confirmed);
     }
@@ -2055,10 +2097,12 @@ pub(crate) async fn reconcile_success_with_deployment_history(
                         );
                         false
                     }
-                    Some(_) => {
+                    Some(deployment) => {
                         // Only the fresh request's non-failure is authority;
                         // a stale one may predate the failure.
-                        fresh_confirmed |= current;
+                        fresh_confirmed |= current
+                            && !(require_settled_rollout
+                                && deployment_rollout_in_flight(&deployment.status));
                         true
                     }
                     // A missing row is never authority (cap#220 review

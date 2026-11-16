@@ -744,6 +744,117 @@ pub async fn claim_resources(
     })
 }
 
+/// Minimum spacing between busy-claim WARN lines, process-wide. Waiters
+/// requeue every few seconds; one line per window is enough to name a holder.
+const BUSY_CLAIM_LOG_INTERVAL: Duration = Duration::from_secs(30);
+static BUSY_CLAIM_LOGGED_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// One live or quarantined owner blocking a claim.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct BusyFenceHolder {
+    pub(crate) fence_scope: String,
+    pub(crate) fence_key: String,
+    pub(crate) operation_kind: Option<String>,
+    pub(crate) operation_id: Option<Uuid>,
+    pub(crate) generation: i64,
+    /// False once renewal stopped: the owner is gone (or lost its lease) and
+    /// only the reclaim quarantine still holds the row.
+    pub(crate) heartbeat_live: bool,
+    pub(crate) seconds_since_renewal: f64,
+    /// `None` for a fence retained until explicit reconciliation.
+    pub(crate) reclaimable_in_seconds: Option<f64>,
+}
+
+pub(crate) async fn busy_fence_holders(
+    pool: &PgPool,
+    app_id: Option<Uuid>,
+    resources: &[ResourceFence],
+) -> Result<Vec<BusyFenceHolder>, sqlx::Error> {
+    let scopes: Vec<&str> = resources.iter().map(|fence| fence.scope.as_str()).collect();
+    let keys: Vec<&str> = resources.iter().map(|fence| fence.key.as_str()).collect();
+    sqlx::query_as(
+        "SELECT resource_scope AS fence_scope,
+                resource_key AS fence_key,
+                operation_kind, operation_id, generation,
+                COALESCE(locked_until > clock_timestamp(), false) AS heartbeat_live,
+                EXTRACT(EPOCH FROM clock_timestamp() - updated_at)::float8
+                    AS seconds_since_renewal,
+                CASE WHEN reclaim_after = 'infinity'::timestamptz THEN NULL
+                     ELSE EXTRACT(EPOCH FROM reclaim_after - clock_timestamp())::float8
+                END AS reclaimable_in_seconds
+           FROM external_resource_mutation_leases
+          WHERE owner_token IS NOT NULL
+            AND reclaim_after > clock_timestamp()
+            AND (resource_scope, resource_key) IN (
+                SELECT * FROM UNNEST($1::text[], $2::text[])
+            )
+         UNION ALL
+         SELECT 'app' AS fence_scope,
+                app_id::text AS fence_key,
+                operation_kind, operation_id, generation,
+                COALESCE(locked_until > clock_timestamp(), false) AS heartbeat_live,
+                EXTRACT(EPOCH FROM clock_timestamp() - updated_at)::float8
+                    AS seconds_since_renewal,
+                CASE WHEN reclaim_after = 'infinity'::timestamptz THEN NULL
+                     ELSE EXTRACT(EPOCH FROM reclaim_after - clock_timestamp())::float8
+                END AS reclaimable_in_seconds
+           FROM app_mutation_leases
+          WHERE app_id = $3
+            AND owner_token IS NOT NULL
+            AND reclaim_after > clock_timestamp()",
+    )
+    .bind(scopes)
+    .bind(keys)
+    .bind(app_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Name the owners a `Busy` claim ran into, at WARN, at most once per
+/// [`BUSY_CLAIM_LOG_INTERVAL`]. Diagnostic only: a failed lookup is ignored
+/// and nothing here changes what the caller does with the `Busy` result.
+pub(crate) async fn warn_claim_busy(
+    pool: &PgPool,
+    waiter: &'static str,
+    waiting_operation_id: Uuid,
+    app_id: Option<Uuid>,
+    resources: &[ResourceFence],
+) {
+    let due = |logged_at: &Option<std::time::Instant>| {
+        logged_at.is_none_or(|at| at.elapsed() >= BUSY_CLAIM_LOG_INTERVAL)
+    };
+    if !BUSY_CLAIM_LOGGED_AT.lock().is_ok_and(|at| due(&at)) {
+        return;
+    }
+    let Ok(holders) = busy_fence_holders(pool, app_id, resources).await else {
+        return;
+    };
+    if holders.is_empty() {
+        return;
+    }
+    match BUSY_CLAIM_LOGGED_AT.lock() {
+        Ok(mut logged_at) if due(&logged_at) => *logged_at = Some(std::time::Instant::now()),
+        _ => return,
+    }
+    for holder in holders {
+        tracing::warn!(
+            waiter,
+            %waiting_operation_id,
+            fence_scope = %holder.fence_scope,
+            fence_key = %holder.fence_key,
+            holder_operation_kind = holder.operation_kind.as_deref().unwrap_or("unknown"),
+            holder_operation_id = ?holder.operation_id,
+            holder_generation = holder.generation,
+            holder_heartbeat_live = holder.heartbeat_live,
+            holder_seconds_since_renewal = holder.seconds_since_renewal,
+            reclaimable_in_seconds = ?holder.reclaimable_in_seconds,
+            error_code = "mutation_fence_busy",
+            "mutation claim is waiting on an owned fence; the waiter requeues until it is released or reclaimable"
+        );
+    }
+}
+
 /// Sweep snapshot of every `kubernetes_namespace` lease.
 ///
 /// Returns `(resource_key, generation, lease_held)`. `lease_held` is retained

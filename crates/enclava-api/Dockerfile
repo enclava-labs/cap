@@ -29,9 +29,12 @@ RUN printf "%s  crates/enclava-api/trust-roots/sigstore-public-good-1.root.json\
       6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66 \
       | sha256sum -c >/dev/null
 
+# Binaries only in the layer diff: deleting target/ in the same RUN keeps
+# the gha cache export off the per-commit compile tree.
 RUN cargo build --locked --bin enclava-api --bin cap-migrate && \
     cp /build/target/debug/enclava-api /usr/local/bin/enclava-api && \
-    cp /build/target/debug/cap-migrate /usr/local/bin/cap-migrate
+    cp /build/target/debug/cap-migrate /usr/local/bin/cap-migrate && \
+    rm -rf /build/target
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime-debug
 
@@ -87,7 +90,8 @@ RUN cargo run --locked --release -p enclava-cli --example platform-release -- ve
 RUN cargo build --locked --release --bin enclava-api --bin cap-migrate --features prod-strict && \
     cp /build/target/release/enclava-api /usr/local/bin/enclava-api && \
     cp /build/target/release/cap-migrate /usr/local/bin/cap-migrate && \
-    strip /usr/local/bin/enclava-api /usr/local/bin/cap-migrate
+    strip /usr/local/bin/enclava-api /usr/local/bin/cap-migrate && \
+    rm -rf /build/target
 
 FROM alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c1e2d1cc7d4 AS runtime-release
 

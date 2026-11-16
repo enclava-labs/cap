@@ -41,10 +41,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
           targets: ${{ matrix.target }}
 
+      # Restore-only on PRs: PR cache writes land on refs/pull/* and evict
+      # main's rust-cache from the shared 10 GB pool.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ startsWith(github.ref, 'refs/heads/') }}
 
       # Full build (not check) so linking and all target triples are exercised
       # before a tag starts the release workflow. Mirrors the release targets,
@@ -94,10 +98,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ startsWith(github.ref, 'refs/heads/') }}
 
       - name: Run fmt check
         run: cargo fmt --all -- --check
@@ -147,6 +153,14 @@ jobs:
           done
           python3 scripts/appraiser-conformance.py http://127.0.0.1:18080
 
+      - name: Verify strict builds reject the committed fixture bundle
+        run: |
+          if cargo check --locked -p enclava-common --features release-profiles,prod-strict > /tmp/profile-fixture.log 2>&1; then
+            cat /tmp/profile-fixture.log
+            exit 1
+          fi
+          grep -q "prod-strict must not trust the committed fixture root" /tmp/profile-fixture.log
+
   dependency-gates:
     name: Audit Rust dependencies
     runs-on: ubuntu-latest
@@ -156,7 +170,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
 
       - name: Install cargo audit and cargo deny
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
@@ -192,6 +206,10 @@ jobs:
 
   build:
     name: Build all crates
+    # The PR/main gate is the test job: `cargo test --workspace` builds every
+    # crate and binary. This job now covers only the tag/dispatch-only release
+    # build paths that need a standalone `cargo build` surface.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
 
     steps:
@@ -204,29 +222,18 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-
-      - name: Build workspace
-        run: cargo build --workspace
+        with:
+          save-if: ${{ startsWith(github.ref, 'refs/heads/') }}
 
       - name: Build release bins
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         run: |
           cargo build --release --bin enclava-api
           cargo build --release --bin enclava
 
-      - name: Verify strict builds reject the committed fixture bundle
-        run: |
-          if cargo check --locked -p enclava-common --features release-profiles,prod-strict > /tmp/profile-fixture.log 2>&1; then
-            cat /tmp/profile-fixture.log
-            exit 1
-          fi
-          grep -q "prod-strict must not trust the committed fixture root" /tmp/profile-fixture.log
-
       - name: Materialize and verify approved common profiles
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         env:
           ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON }}
         run: |
@@ -236,7 +243,6 @@ jobs:
             crates/enclava-common/platform-release-profiles.json
 
       - name: Build prod-strict release path
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         run: |
           cargo build --release -p enclava-common --features prod-strict
           cargo build --release -p enclava-engine --features prod-strict
@@ -245,7 +251,6 @@ jobs:
           cargo build --release -p enclava-init --features prod-strict
 
       - name: Verify prod-strict rejects debug-only features
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         run: |
           if cargo check --release -p enclava-engine --features prod-strict,testutil; then
             echo "enclava-engine prod-strict unexpectedly accepted testutil"
@@ -283,7 +288,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
           targets: wasm32-unknown-unknown
 
       - name: Install matching wasm-bindgen CLI
@@ -333,7 +338,7 @@ jobs:
         # usable — using a test-only probe feature, never in the release
         # build.
         run: |
-          rustup run stable cargo build -p enclava-verifier-wasm --release --target wasm32-unknown-unknown \
+          cargo build -p enclava-verifier-wasm --release --target wasm32-unknown-unknown \
             --features debug-panic-probe
           wasm-bindgen --target web --out-dir web/verifier/pkg \
             target/wasm32-unknown-unknown/release/enclava_verifier_wasm.wasm

@@ -289,6 +289,17 @@ const CLEANUP_RETRY_INTERVAL_SQL: &str = "30 seconds";
 const APPLY_RETRY_BASE_SECS: i64 = 5;
 /// Base retry interval (seconds) for nonterminal rollout observations.
 const ROLLOUT_OBSERVATION_RETRY_BASE_SECS: i64 = 30;
+/// Ceiling (seconds) for the nonterminal observation retry above. Both
+/// nonterminal observation reasons (password owner wait and a bounded slice
+/// elapsing with rollout budget remaining) wait on external progress that can
+/// finish right after a requeue, so unlike contention the cadence stays near
+/// the base: an owner unlock must reach status within about a minute instead
+/// of waiting out an exponential delay. Extended owner-wait observations
+/// probe with a short slice (`EXTENDED_OWNER_WAIT_PROBE_SLICE` in deploy.rs),
+/// so this cadence costs ~10 s of apply-worker time per ~70 s per
+/// never-unlocking owner instead of pinning one of the bounded slots (#231).
+/// The 24 h grace still bounds the loop.
+const ROLLOUT_OBSERVATION_RETRY_MAX_SECS: i64 = 60;
 /// Retry backoff grows exponentially with the job's attempt count so a job
 /// that keeps requeueing without reaching a terminal observation releases
 /// its apply worker instead of pinning one of the bounded worker slots at a
@@ -607,6 +618,19 @@ impl DeploymentJobError {
                 crate::mutation_leases::MutationLeaseError::Database(_) => "database_error",
             },
         }
+    }
+
+    /// Trustee did not report Ready within the publication wait. Every KBS
+    /// write in that attempt was awaited to a known outcome and the next
+    /// attempt re-converges from the ConfigMap annotations, so this is a
+    /// retryable platform condition, never a verdict on the deployment.
+    fn is_trustee_rollout_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::Apply(crate::deploy::DeployError::KbsPolicy(
+                crate::kbs::KbsPolicyError::RolloutTimedOut
+            )) | Self::Kbs(crate::kbs::KbsPolicyError::RolloutTimedOut)
+        )
     }
 
     fn should_requeue_without_terminal_failure(&self) -> bool {
@@ -1146,12 +1170,25 @@ async fn process_claimed_setup_job(
         "deployment_setup",
         job.deployment_id,
         false,
-        resources,
+        resources.clone(),
     )
     .await
     {
         Ok(mutation) => mutation,
         Err(error) => {
+            if matches!(error, crate::mutation_leases::MutationLeaseError::Busy) {
+                // The requeue below is silent by design (it repeats every
+                // few seconds); name the holder so a deploy stuck behind a
+                // quarantined global fence is visible in the logs.
+                crate::mutation_leases::warn_claim_busy(
+                    &state.db,
+                    "deployment_setup",
+                    job.deployment_id,
+                    Some(job.app_id),
+                    &resources,
+                )
+                .await;
+            }
             requeue_setup_job(&state.db, &job, DeploymentJobError::from(error).code()).await?;
             return Ok(());
         }
@@ -1216,10 +1253,8 @@ async fn process_claimed_setup_job(
             mutation.assert_current_in_tx(&mut side_effect_lane).await?;
             mark_setup_failed_in_tx(&mut side_effect_lane, &job).await?;
             side_effect_lane.commit().await?;
-            if reconcile_pending_kbs_with_mutation(state, &mutation)
-                .await
-                .is_ok()
-            {
+            let kbs = reconcile_pending_kbs_with_mutation(state, &mutation).await;
+            if kbs_fence_is_releasable(&kbs) {
                 // DNS may have accepted the failed request, so retain its
                 // app/hostname quarantine while unblocking KBS revocation.
                 release_kbs_resource(&state.db, &mut mutation).await?;
@@ -2051,6 +2086,12 @@ async fn process_apply_job(
             }
         }
         Ok(Ok(JobApplyOutcome::ApplyFailed(error, mutation)))
+            if error.is_trustee_rollout_timeout() =>
+        {
+            requeue_after_trustee_rollout_timeout(&state, &job, &payload.app, &error, mutation)
+                .await;
+        }
+        Ok(Ok(JobApplyOutcome::ApplyFailed(error, mutation)))
             if error.should_requeue_without_terminal_failure() =>
         {
             // The reconciliation timed out or encountered a newer rollout.
@@ -2073,6 +2114,19 @@ async fn process_apply_job(
                 .await;
         }
         Ok(Err(error)) if error.should_requeue_without_terminal_failure() => {
+            if matches!(
+                error,
+                DeploymentJobError::Mutation(crate::mutation_leases::MutationLeaseError::Busy)
+            ) {
+                crate::mutation_leases::warn_claim_busy(
+                    &state.db,
+                    "deployment_apply",
+                    deployment_id,
+                    Some(job.app_id),
+                    &deployment_apply_resource_fences(&payload.app),
+                )
+                .await;
+            }
             match requeue_or_exhaust_apply_job(&state.db, &job).await {
                 Ok(true) => {
                     tracing::warn!(
@@ -2111,6 +2165,50 @@ async fn process_apply_job(
                 "durable deployment job lost its lease"
             );
         }
+    }
+}
+
+/// Requeue an apply whose signed-policy publication timed out waiting for
+/// Trustee, releasing this attempt's fences immediately.
+///
+/// `apply_deployment_manifests` converges KBS before it arms the namespace
+/// fence or sends any namespace/edge write, and `RolloutTimedOut` is returned
+/// only after every KBS write was awaited to a known outcome. Nothing of this
+/// attempt can therefore still land, so the lease is finished instead of
+/// being left to the reclaim quarantine — which would hold the global
+/// `kbs_policy` fence against every other deployment for up to 540 s.
+async fn requeue_after_trustee_rollout_timeout(
+    state: &AppState,
+    job: &ClaimedJob,
+    app: &App,
+    error: &DeploymentJobError,
+    mutation: crate::mutation_leases::AppMutationLease,
+) {
+    if matches!(
+        apply_job_retries_exhausted(&state.db, job.deployment_id).await,
+        Ok(true)
+    ) {
+        fail_apply_job_with_mutation(state, job, error, Some(mutation), Some(app)).await;
+        return;
+    }
+    tracing::warn!(
+        deployment_id = %job.deployment_id,
+        error_code = "kbs_trustee_rollout_timeout",
+        "Trustee was not Ready within the signed-policy publication wait; requeueing the deployment apply"
+    );
+    if let Err(requeue_error) = requeue_apply_job(&state.db, job, error.code()).await {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = requeue_error.code(),
+            "failed to requeue deployment apply after a Trustee rollout timeout"
+        );
+    }
+    if let Err(release_error) = mutation.finish().await {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = DeploymentJobError::from(release_error).code(),
+            "failed to release deployment mutation fences after a Trustee rollout timeout; they stay owned through the reclaim quarantine"
+        );
     }
 }
 
@@ -2642,7 +2740,7 @@ async fn compensate_after_retry_exhaustion(state: &AppState, job: &ClaimedJob, a
                 error_code = "exhaustion_provenance_lookup_failed",
                 "retry-exhaustion compensation skipped: cannot load the attempts' provenance; the durable sweep marker stays armed"
             );
-            if let Ok(()) = reconcile_pending_kbs_with_mutation(state, &mutation).await
+            if kbs_fence_is_releasable(&reconcile_pending_kbs_with_mutation(state, &mutation).await)
                 && let Err(release_error) = release_kbs_resource(&state.db, &mut mutation).await
             {
                 tracing::error!(
@@ -2672,22 +2770,21 @@ async fn compensate_after_retry_exhaustion(state: &AppState, job: &ClaimedJob, a
     .await;
     // The terminal publisher enqueued signed-policy revocation; converge it
     // under the same lease rather than waiting for the poller.
-    if reconcile_pending_kbs_with_mutation(state, &mutation)
-        .await
-        .is_ok()
-    {
-        if let Err(release_error) = release_kbs_resource(&state.db, &mut mutation).await {
-            tracing::error!(
-                deployment_id = %job.deployment_id,
-                error_code = release_error.code(),
-                "failed to release reconciled global KBS mutation fence"
-            );
-        }
-    } else {
+    let kbs = reconcile_pending_kbs_with_mutation(state, &mutation).await;
+    if kbs.is_err() {
         tracing::error!(
             deployment_id = %job.deployment_id,
             error_code = "kbs_policy_reconciliation_failed",
             "retry-exhaustion revocation remains durably pending"
+        );
+    }
+    if kbs_fence_is_releasable(&kbs)
+        && let Err(release_error) = release_kbs_resource(&state.db, &mut mutation).await
+    {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = release_error.code(),
+            "failed to release the global KBS mutation fence"
         );
     }
     // RetainNamespaceFence implies the retained-namespace marker was already
@@ -3658,15 +3755,29 @@ async fn reconcile_pending_kbs_for_apply(
         vec![crate::mutation_leases::ResourceFence::kbs_policy()],
     )
     .await?;
-    lease
-        .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
-            &state.db,
-            state.kbs_policy.as_ref(),
-            &state.kube_client,
-        ))
-        .await??;
-    lease.finish().await?;
-    Ok(())
+    crate::kbs::reconcile_pending_under_resource_lease(state, lease)
+        .await
+        .map_err(|error| match error {
+            crate::kbs::KbsPolicyReconciliationError::Mutation(error) => {
+                DeploymentJobError::Mutation(error)
+            }
+            crate::kbs::KbsPolicyReconciliationError::Policy(error) => {
+                DeploymentJobError::Kbs(error)
+            }
+        })
+}
+
+/// Whether the global `kbs_policy` fence may be released after a
+/// reconciliation under an app mutation lease: on success, and on a failure
+/// that provably left no KBS write in flight (see
+/// `KbsPolicyError::provider_write_may_be_in_flight`). A lost lease or an
+/// uncertain write keeps the fence owned through the reclaim quarantine.
+fn kbs_fence_is_releasable(result: &Result<(), DeploymentJobError>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(DeploymentJobError::Kbs(error)) => !error.provider_write_may_be_in_flight(),
+        Err(_) => false,
+    }
 }
 
 async fn release_kbs_resource(
@@ -3777,22 +3888,21 @@ async fn fail_apply_job_with_mutation(
     // deletion was still unresolved). RetainNamespaceFence now always
     // implies the marker is already durable.
     if published && let Some(mutation) = mutation.as_mut() {
-        if reconcile_pending_kbs_with_mutation(state, mutation)
-            .await
-            .is_ok()
-        {
-            if let Err(release_error) = release_kbs_resource(&state.db, mutation).await {
-                tracing::error!(
-                    deployment_id = %job.deployment_id,
-                    error_code = release_error.code(),
-                    "failed to release reconciled global KBS mutation fence"
-                );
-            }
-        } else {
+        let kbs = reconcile_pending_kbs_with_mutation(state, mutation).await;
+        if kbs.is_err() {
             tracing::error!(
                 deployment_id = %job.deployment_id,
                 error_code = "kbs_policy_reconciliation_failed",
                 "terminal deployment revocation remains durably pending"
+            );
+        }
+        if kbs_fence_is_releasable(&kbs)
+            && let Err(release_error) = release_kbs_resource(&state.db, mutation).await
+        {
+            tracing::error!(
+                deployment_id = %job.deployment_id,
+                error_code = release_error.code(),
+                "failed to release the global KBS mutation fence"
             );
         }
     }
@@ -4024,7 +4134,7 @@ async fn publish_rollout_outcome_with_mutation(
     .bind(job.deployment_id)
     .bind(job.lock_token)
     .bind(APPLY_RETRY_BACKOFF_SHIFT_CAP)
-    .bind(APPLY_RETRY_BACKOFF_CEILING_SECS)
+    .bind(ROLLOUT_OBSERVATION_RETRY_MAX_SECS)
     .bind(exhausted)
     .bind(DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE)
     .execute(&mut *tx)
@@ -4351,6 +4461,154 @@ pub(crate) mod tests {
             ));
         assert!(deferred.should_requeue_without_terminal_failure());
         assert_eq!(deferred.code(), "pull_secret_reconcile_deferred");
+    }
+
+    #[test]
+    fn trustee_rollout_timeout_is_retryable_and_kbs_failures_classify_the_fence() {
+        use crate::kbs::KbsPolicyError;
+        let from_apply = DeploymentJobError::Apply(crate::deploy::DeployError::KbsPolicy(
+            KbsPolicyError::RolloutTimedOut,
+        ));
+        assert!(from_apply.is_trustee_rollout_timeout());
+        assert!(
+            DeploymentJobError::Kbs(KbsPolicyError::RolloutTimedOut).is_trustee_rollout_timeout()
+        );
+        // Every other KBS failure keeps failing the deployment terminally.
+        for terminal in [
+            KbsPolicyError::ArtifactNotCurrent,
+            KbsPolicyError::ProviderWriteTimeout,
+            KbsPolicyError::PolicyCasExhausted,
+            KbsPolicyError::InvalidPolicyGeneration,
+        ] {
+            let error = DeploymentJobError::Apply(crate::deploy::DeployError::KbsPolicy(terminal));
+            assert!(!error.is_trustee_rollout_timeout());
+            assert!(!error.should_requeue_without_terminal_failure());
+        }
+
+        // The global fence is released on success and on a failure that
+        // provably left no KBS write in flight; an uncertain write or a lost
+        // lease keeps the reclaim quarantine.
+        assert!(kbs_fence_is_releasable(&Ok(())));
+        assert!(kbs_fence_is_releasable(&Err(DeploymentJobError::Kbs(
+            KbsPolicyError::RolloutTimedOut
+        ))));
+        assert!(kbs_fence_is_releasable(&Err(DeploymentJobError::Kbs(
+            KbsPolicyError::PublicationDeferredByHold
+        ))));
+        assert!(!kbs_fence_is_releasable(&Err(DeploymentJobError::Kbs(
+            KbsPolicyError::ProviderWriteTimeout
+        ))));
+        assert!(!kbs_fence_is_releasable(&Err(DeploymentJobError::Kbs(
+            KbsPolicyError::ProviderWriteFailed(api_error(500))
+        ))));
+        assert!(!kbs_fence_is_releasable(&Err(
+            DeploymentJobError::Mutation(crate::mutation_leases::MutationLeaseError::Lost)
+        )));
+    }
+
+    /// Production 2026-11-10: Trustee not Ready within 180 s during an apply
+    /// failed the deployment terminally and left the global KBS fence owned
+    /// for 540 s. The apply is requeued with back-off instead, and its
+    /// fences are free for the next deployment at once.
+    #[tokio::test]
+    async fn trustee_rollout_timeout_requeues_the_apply_and_frees_its_fences() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+        let fences = deployment_apply_resource_fences(&app);
+        let mutation = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            fences.clone(),
+        )
+        .await
+        .expect("claim apply fences");
+
+        // While the attempt owns its fences a contending claim can name it.
+        let holders = crate::mutation_leases::busy_fence_holders(&pool, Some(app.id), &fences)
+            .await
+            .expect("inspect holders");
+        assert_eq!(
+            holders.len(),
+            fences.len() + 1,
+            "every fence plus the app lane"
+        );
+        let kbs_holder = holders
+            .iter()
+            .find(|holder| holder.fence_scope == "kbs_policy")
+            .expect("the global KBS fence is owned");
+        assert_eq!(
+            kbs_holder.operation_kind.as_deref(),
+            Some("deployment_apply")
+        );
+        assert_eq!(kbs_holder.operation_id, Some(deployment_id));
+        assert!(kbs_holder.heartbeat_live);
+        assert!(
+            kbs_holder
+                .reclaimable_in_seconds
+                .is_some_and(|secs| secs > 0.0)
+        );
+
+        let error = DeploymentJobError::Apply(crate::deploy::DeployError::KbsPolicy(
+            crate::kbs::KbsPolicyError::RolloutTimedOut,
+        ));
+        requeue_after_trustee_rollout_timeout(&state, &apply, &app, &error, mutation).await;
+
+        let (job_state, next_attempt_in_future): (String, bool) = sqlx::query_as(
+            "SELECT state, next_attempt_at > clock_timestamp()
+               FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load job");
+        assert_eq!(job_state, "pending", "the apply is requeued, not terminal");
+        assert!(next_attempt_in_future, "the retry backs off");
+        assert!(
+            !deployment_is_terminal(&pool, deployment_id).await.unwrap(),
+            "a Trustee rollout timeout must not fail the deployment"
+        );
+        assert!(
+            crate::mutation_leases::busy_fence_holders(&pool, Some(app.id), &fences)
+                .await
+                .expect("inspect holders")
+                .is_empty(),
+            "no fence of the timed-out attempt stays owned through quarantine"
+        );
+        let retry = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            fences,
+        )
+        .await
+        .expect("the requeued apply can claim its fences immediately");
+        retry.finish().await.expect("release retry claim");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean fixture");
     }
 
     /// Preflight volume-evidence lookups classify Kubernetes failures
@@ -6330,8 +6588,12 @@ pub(crate) mod tests {
             sweep_armed,
             "the compensating cleanup ran: an unreachable cluster keeps the retryable-sweep marker armed"
         );
+        // The revocation reconcile fails without sending a KBS write (no
+        // provider is configured), so the compensation now releases the
+        // global fence outright: an unowned row (NULL horizon) is as bounded
+        // as a finite quarantine, and never the infinite retained marker.
         let (kbs_generation, kbs_bounded): (i64, bool) = sqlx::query_as(
-            "SELECT generation, reclaim_after < 'infinity'::timestamptz
+            "SELECT generation, COALESCE(reclaim_after < 'infinity'::timestamptz, true)
                FROM external_resource_mutation_leases
               WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
         )
@@ -7581,6 +7843,108 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("delete aged observation fixture");
+    }
+
+    #[tokio::test]
+    async fn owner_wait_observation_requeue_caps_backoff_at_sixty_seconds() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let manifest_hash = "capped-observation-manifest";
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = $2,
+                    observing_since = clock_timestamp(),
+                    rollout_timeout_millis = 600000
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(manifest_hash)
+        .execute(&pool)
+        .await
+        .expect("stage watching anchor");
+
+        // A first observation attempt keeps the 30 s base delay.
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim first observation")
+            .expect("first observation exists");
+        publish_rollout_outcome(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect("publish first nonterminal observation");
+        let fresh_delay_secs: i64 = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (next_attempt_at - clock_timestamp()))::bigint
+               FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load first observation delay");
+        assert!(
+            (29..=30).contains(&fresh_delay_secs),
+            "first observation must keep the 30 s base delay, got {fresh_delay_secs}"
+        );
+
+        // The owner can unlock right after any attempt; a repeatedly
+        // requeued owner wait must not drift past a minute or CAP's status
+        // stays stale long after the TEE unlocked (2026-11-12: +480 s).
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("reclaim aged observation")
+            .expect("aged observation exists");
+        sqlx::query("UPDATE deployment_apply_jobs SET attempts = 20 WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("age observation attempts");
+        publish_rollout_outcome(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect("publish aged nonterminal observation");
+        let aged_delay_secs: i64 = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (next_attempt_at - clock_timestamp()))::bigint
+               FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load aged observation delay");
+        assert!(
+            (59..=60).contains(&aged_delay_secs),
+            "aged observation must cap at 60 s, got {aged_delay_secs}"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete capped observation fixture");
     }
 
     #[tokio::test]

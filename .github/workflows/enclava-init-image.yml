@@ -97,8 +97,13 @@ jobs:
             org.enclava.build-profile=${{ steps.build_profile.outputs.profile }}
           build-args: |
             BUILD_PROFILE=${{ steps.build_profile.outputs.profile }}
-          cache-from: type=gha,scope=init-${{ steps.build_profile.outputs.profile }}
-          cache-to: type=gha,mode=max,scope=init-${{ steps.build_profile.outputs.profile }}
+          # PR builds restore (including main's release-profile layers for the
+          # shared base/recipe stages) but never export: PR cache writes evict
+          # main's layers from the shared 10 GB Actions cache pool.
+          cache-from: |
+            type=gha,scope=init-${{ steps.build_profile.outputs.profile }}
+            type=gha,scope=init-release
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope=init-{0}', steps.build_profile.outputs.profile) || '' }}
           provenance: true
 
       - name: Install cosign
