@@ -34,6 +34,9 @@ impl FailureEnvGuard {
             ("ENCLAVA_INIT_TERMINATION_LOG", termination.clone()),
             ("ENCLAVA_INIT_STAGE_FILE", stage.clone()),
         ]);
+        // The in-run stage tracker is process-global; reset it so each
+        // failure-path test starts from a clean run (no stage recorded).
+        set_last_stage(None);
         Self {
             _dir: dir,
             _surface_overrides,
@@ -116,6 +119,7 @@ fn failure_surfaces_render_safe_json_and_stage_markers_stay_in_stage_file() {
         diagnostic: SafeBootstrapDiagnostic {
             code: SafeDiagnosticCode::AcmeRateLimited,
             retry_after: Some(deadline),
+            stage: None,
         },
     })
     .context("provisioning static TLS certificate")
@@ -126,6 +130,7 @@ fn failure_surfaces_render_safe_json_and_stage_markers_stay_in_stage_file() {
         "error": "acme_rate_limited",
         "terminal": true,
         "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "failed_stage": "provisioning static tls certificate",
     });
     let error_body = std::fs::read_to_string(&env.error).unwrap();
     let termination_body = std::fs::read_to_string(&env.termination).unwrap();
@@ -161,6 +166,7 @@ fn generic_bootstrap_failures_render_generic_safe_code() {
     let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
     let env = FailureEnvGuard::install();
 
+    record_stage("opening luks volumes").unwrap();
     let error =
         anyhow!("opening supplied device /supplied/raw-device failed: SYNTHETIC-IO-SENTINEL")
             .context("opening luks volumes");
@@ -173,11 +179,138 @@ fn generic_bootstrap_failures_render_generic_safe_code() {
             "error": "enclava_init_failed",
             "terminal": true,
             "retry_after": null,
+            "failed_stage": "opening luks volumes",
         }),
         "unknown failures must degrade to the generic safe code: {error_body}"
     );
     assert!(!error_body.contains("SYNTHETIC-IO-SENTINEL"));
     assert!(!error_body.contains("/supplied/raw-device"));
+    assert_eq!(
+        std::fs::read_to_string(&env.termination).unwrap(),
+        error_body
+    );
+}
+
+#[test]
+fn restart_boot_never_clobbers_the_latched_failure_stage() {
+    // cap#397: after a terminal failure, the next container instance's
+    // boot markers used to overwrite the stage file within seconds while
+    // the error file persisted — the surfaced pair then named a stage the
+    // failure never reached. While the failure is latched, the stage file
+    // must keep naming the latched failure's stage.
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
+
+    // v1 runs through boot and dies at the bind-mount stage.
+    record_stage("binding workload mount namespaces").unwrap();
+    report_failure(&anyhow!("bind mounts failed"));
+    let latched_error = std::fs::read_to_string(&env.error).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&env.stage).unwrap(),
+        "binding workload mount namespaces\n"
+    );
+
+    // v2 restarts and re-records its early boot stages: the latched pair
+    // must stay put, not regress to v2's early progress.
+    for stage in [
+        "loading config",
+        "validating signed config",
+        "verifying trustee policy",
+        "waiting for owner seed",
+    ] {
+        record_stage(stage).unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(&env.stage).unwrap(),
+        "binding workload mount namespaces\n",
+        "a restarted instance must not clobber the latched failure's stage"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&env.error).unwrap(),
+        latched_error,
+        "the latched error file must survive the restart's boot markers"
+    );
+
+    // Recovery past the owner-seed handoff clears the latch and live
+    // stage markers resume.
+    clear_error_file(&error_file_path());
+    record_stage("opening luks volumes").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&env.stage).unwrap(),
+        "opening luks volumes\n"
+    );
+}
+
+#[test]
+fn re_latched_failure_re_pairs_stage_and_error_files() {
+    // cap#397 class fix: a restarted instance that fails BEFORE the seed
+    // handoff (while the previous failure is still latched) must re-pair
+    // both surfaces to its own failure — the stage file names the stage
+    // this run actually failed at, not the frozen earlier one.
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
+
+    record_stage("binding workload mount namespaces").unwrap();
+    report_failure(&anyhow!("bind mounts failed"));
+
+    // v2 restarts (frozen), then fails earlier than the frozen stage.
+    record_stage("loading config").unwrap();
+    record_stage("verifying trustee policy").unwrap();
+    report_failure(&anyhow!("trustee policy rejected"));
+
+    assert_eq!(
+        std::fs::read_to_string(&env.stage).unwrap(),
+        "verifying trustee policy\n",
+        "the latch must re-write the stage marker to the failing stage"
+    );
+    let error_body = std::fs::read_to_string(&env.error).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(error_body.trim()).unwrap(),
+        json!({
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+            "failed_stage": "verifying trustee policy",
+        }),
+        "the error payload must name the stage this failure occurred at: {error_body}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&env.termination).unwrap(),
+        error_body
+    );
+}
+
+#[test]
+fn stage_less_latch_drops_the_marker_instead_of_naming_a_stage_it_never_reached() {
+    // cap#397 class invariant: the stage file never names a stage other
+    // than the latched failure's. A failure latched without any recorded
+    // stage (defensive: pre-first-marker failure) must drop the marker —
+    // a stale one would name a stage this failure never reached.
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
+
+    record_stage("binding workload mount namespaces").unwrap();
+    report_failure(&anyhow!("bind mounts failed"));
+    assert!(env.stage.exists());
+
+    set_last_stage(None);
+    report_failure(&anyhow!("failed before the first stage marker"));
+
+    assert!(
+        !env.stage.exists(),
+        "a stage-less failure must not leave a stale stage marker"
+    );
+    let error_body = std::fs::read_to_string(&env.error).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(error_body.trim()).unwrap(),
+        json!({
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+            "failed_stage": null,
+        }),
+        "an unrecorded stage renders as null: {error_body}"
+    );
     assert_eq!(
         std::fs::read_to_string(&env.termination).unwrap(),
         error_body

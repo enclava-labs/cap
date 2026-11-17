@@ -113,13 +113,16 @@ fn main() -> ExitCode {
 /// `enclava_init_failed` code. The raw anyhow chain — which may carry
 /// paths, supplied values, or provider text — is never rendered here.
 fn report_failure(error: &anyhow::Error) {
-    let diagnostic = SafeBootstrapDiagnostic::diagnose(error);
+    let stage = last_stage();
+    let mut diagnostic = SafeBootstrapDiagnostic::diagnose(error);
+    diagnostic.stage = stage;
     let safe_json = diagnostic.render_json();
-    record_failure_file(&safe_json);
+    record_failure_file(&safe_json, stage);
     tracing::error!(
         error = diagnostic.code.as_str(),
         terminal = true,
         retry_after = diagnostic.retry_after_rfc3339().as_deref(),
+        failed_stage = stage,
         "enclava-init failed"
     );
     eprintln!("enclava-init: {safe_json}");
@@ -404,6 +407,16 @@ fn clear_error_file(path: &Path) {
     }
 }
 
+/// Drop the stage marker (a stage-less failure latched, so no marker may
+/// name a stage that failure never reached). Missing is fine.
+fn clear_stage_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(path = %path.display(), error = %e, "failed to clear stage file"),
+    }
+}
+
 /// Pure readiness gate: `--probe-ready` reports ready only when the
 /// init-ready file carries `ready` and no `tls-unusable` marker exists.
 /// The TLS tick never writes init-ready itself — that file is also the
@@ -445,15 +458,31 @@ fn clear_tls_unusable(path: &Path) {
     }
 }
 
-/// Write the safe failure JSON to the init-error file and the termination
-/// log.
+/// Write the failure pair — the failing stage marker first, then the safe
+/// failure JSON to the init-error file, and the termination log.
 ///
-/// Both files carry exactly the bounded safe contract
-/// (`{"error","terminal","retry_after"}`) consumed by the attestation
-/// proxy worker and operators — never the anyhow chain, raw broker
-/// response text, or other supplied values. Stage markers stay in their
-/// own init-stage file.
-fn record_failure_file(safe_json: &str) {
+/// The init-error file and termination log carry exactly the bounded safe
+/// contract (`{"error","terminal","retry_after","failed_stage"}`) consumed
+/// by the attestation proxy worker and operators — never the anyhow chain,
+/// raw broker response text, or other supplied values.
+///
+/// The stage file is written first and paired with this failure so it
+/// names the stage THIS run failed at (#397): while the error file is
+/// latched, [`record_stage`] freezes the stage file against a restarted
+/// instance's boot markers, and every latch re-writes both surfaces
+/// together. A latch without a recorded stage drops the marker instead of
+/// leaving one naming a stage this failure never reached. Stage markers
+/// otherwise stay in their own init-stage file.
+fn record_failure_file(safe_json: &str, stage: Option<&'static str>) {
+    match stage {
+        Some(stage) => {
+            let marker = format!("{stage}\n");
+            if let Err(err) = writes::atomic_write(&stage_file_path(), marker.as_bytes(), 0o644) {
+                eprintln!("enclava-init: failed to write init stage file: {err}");
+            }
+        }
+        None => clear_stage_file(&stage_file_path()),
+    }
     let body = format!("{safe_json}\n");
     let path = error_file_path();
     if let Err(err) = writes::atomic_write(&path, body.as_bytes(), 0o644) {
@@ -486,8 +515,39 @@ fn write_termination_log_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<
     file.sync_all()
 }
 
-fn record_stage(stage: &str) -> Result<()> {
+/// The fixed-vocabulary stage this run last reached ([`record_stage`]),
+/// shared with failure reporting so every latched failure can name the
+/// exact stage it occurred at (#397). Only `record_stage` literals ever
+/// land here, so the value is safe for the bounded failure payload.
+static LAST_STAGE: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+fn set_last_stage(stage: Option<&'static str>) {
+    *LAST_STAGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = stage;
+}
+
+fn last_stage() -> Option<&'static str> {
+    *LAST_STAGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Record the fixed-vocabulary bootstrap stage this run has reached.
+///
+/// The in-run stage is tracked regardless of the file write. While a
+/// terminal failure is latched (the init-error file exists), the stage
+/// file is frozen: it must keep naming the latched failure's stage, so a
+/// restarted instance's boot markers can never make the stage and error
+/// files disagree — the terminal status would name a stage the failure
+/// never reached (#397). The freeze lifts with [`clear_error_file`]
+/// (owner seed acquired), when live stage markers resume.
+fn record_stage(stage: &'static str) -> Result<()> {
+    set_last_stage(Some(stage));
     tracing::info!(stage, "enclava-init stage");
+    if error_file_path().exists() {
+        return Ok(());
+    }
     writes::atomic_write(&stage_file_path(), format!("{stage}\n").as_bytes(), 0o644)
         .map_err(Into::into)
 }
