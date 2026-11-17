@@ -98,3 +98,10 @@ fn parse_tag_and_digest_ref_rejects_invalid_tag() {
     let digest = format!("sha256:{}", "a".repeat(64));
     assert!(ImageRef::parse(&format!("ghcr.io/acme/app:v$1@{digest}")).is_err());
 }
+
+#[test]
+fn parse_rejects_extra_colon_in_repository() {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    assert!(ImageRef::parse(&format!("ghcr.io/acme/app:tag:extra@{digest}")).is_err());
+    assert!(ImageRef::parse("ghcr.io/acme/app:tag:extra").is_err());
+}

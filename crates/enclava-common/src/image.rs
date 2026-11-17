@@ -89,11 +89,11 @@ impl ImageRef {
     }
 }
 
-/// Splits an optional `:tag` off a `registry/repository[:tag]` name. Only a
+/// Splits an optional `:tag` off a `registry/repository[:tag]` name. The first
 /// colon after the first `/` starts a tag; one before it is a registry port.
 fn split_tag(name: &str) -> (&str, Option<&str>) {
     let tag_search_start = name.find('/').unwrap_or(0);
-    match name[tag_search_start..].rfind(':') {
+    match name[tag_search_start..].find(':') {
         Some(pos) => {
             let colon = tag_search_start + pos;
             (&name[..colon], Some(&name[colon + 1..]))
