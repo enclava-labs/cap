@@ -709,6 +709,27 @@ fn tenant_image_pull_secret_scope_requires_every_container_to_match() {
 }
 
 #[test]
+fn tenant_image_pull_secret_scope_matches_tag_and_digest_images() {
+    let config = pull_secret_config(vec![
+        parse_image_pull_repository_scope("ghcr.io/enclava-ai/private-template").unwrap(),
+        parse_image_pull_repository_scope("ghcr.io/enclava-ai/templates/*").unwrap(),
+    ]);
+    let containers = vec![
+        test_container(
+            "ghcr.io/enclava-ai/private-template:v1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        test_container(
+            "ghcr.io/enclava-ai/templates/ssh:2.0@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+    ];
+
+    assert!(tenant_image_pull_secret_applies_to_containers(
+        &containers,
+        &config
+    ));
+}
+
+#[test]
 fn signed_deploy_with_local_artifacts_still_reconciles_global_kbs_policy() {
     let mut attestation = test_attestation_config();
     assert!(should_reconcile_global_signed_policy_artifacts(
