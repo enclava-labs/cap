@@ -2290,18 +2290,25 @@ pub(crate) mod test_support {
     }
 
     /// The write guard restores the mutated variables it snapshot on drop.
+    /// Both observations are taken while holding the write guard (Devin
+    /// review on #399: unguarded reads could flake under parallel
+    /// execution). The baseline, because a concurrently running mutating
+    /// test can park a scratch value in the variable; the verification,
+    /// because every guard restores before releasing the lock, so a newly
+    /// acquired write guard always observes the fully restored value even
+    /// if another mutating test ran in between.
     #[test]
     fn env_write_guard_restores_mutated_variables() {
         let name = "TENANT_IMAGE_PULL_SCOPE_GENERATION";
+        let write = env_write_guard();
         let prior = std::env::var_os(name);
-        {
-            let _write = env_write_guard();
-            unsafe { std::env::set_var(name, "987654321") };
-            assert_eq!(
-                std::env::var_os(name).as_deref(),
-                Some("987654321".as_ref())
-            );
-        }
+        unsafe { std::env::set_var(name, "987654321") };
+        assert_eq!(
+            std::env::var_os(name).as_deref(),
+            Some("987654321".as_ref())
+        );
+        drop(write);
+        let _verify = env_write_guard();
         assert_eq!(
             std::env::var_os(name),
             prior,
