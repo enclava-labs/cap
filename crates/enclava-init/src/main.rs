@@ -473,6 +473,13 @@ fn clear_tls_unusable(path: &Path) {
 /// together. A latch without a recorded stage drops the marker instead of
 /// leaving one naming a stage this failure never reached. Stage markers
 /// otherwise stay in their own init-stage file.
+///
+/// The two writes are separate atomics, so a container death between
+/// them can leave the stage file naming the half-latched failure while
+/// the error file still carries the previous one. That crash window is
+/// healed at the next boot: the freeze in [`record_stage`] reconciles
+/// the stage file back to the latched error's `failed_stage`, so the
+/// last durably-latched failure is the pair that survives.
 fn record_failure_file(safe_json: &str, stage: Option<&'static str>) {
     match stage {
         Some(stage) => {
@@ -540,16 +547,66 @@ fn last_stage() -> Option<&'static str> {
 /// file is frozen: it must keep naming the latched failure's stage, so a
 /// restarted instance's boot markers can never make the stage and error
 /// files disagree — the terminal status would name a stage the failure
-/// never reached (#397). The freeze lifts with [`clear_error_file`]
-/// (owner seed acquired), when live stage markers resume.
+/// never reached (#397). Engaging the freeze also repairs a pair left
+/// mismatched by the crash window in [`record_failure_file`]
+/// ([`reconcile_stage_file_with_latched_error`]). The freeze lifts with
+/// [`clear_error_file`] (owner seed acquired), when live stage markers
+/// resume.
 fn record_stage(stage: &'static str) -> Result<()> {
     set_last_stage(Some(stage));
     tracing::info!(stage, "enclava-init stage");
     if error_file_path().exists() {
+        reconcile_stage_file_with_latched_error();
         return Ok(());
     }
     writes::atomic_write(&stage_file_path(), format!("{stage}\n").as_bytes(), 0o644)
         .map_err(Into::into)
+}
+
+/// Crash-window recovery for the failure pair: repair the stage file to
+/// match the latched error, whose `failed_stage` is the authority.
+///
+/// [`record_failure_file`] writes the stage file and the error file as
+/// two separate atomic writes; a container death between them leaves the
+/// stage file naming the half-latched failure while the error file still
+/// carries the previous one, and the freeze alone would preserve that
+/// mismatched pair forever. Reconciling against the latched error JSON
+/// heals every half-written combination — a marker from the new failure,
+/// a marker lost entirely, or a stale marker beside a stage-less latch —
+/// so the last durably-latched failure is the pair that survives. An
+/// unreadable or `failed_stage`-less error file (legacy payload) leaves
+/// the marker untouched: the freeze still holds, there is just nothing
+/// better to repair towards. The value is echoed into the marker file
+/// only — it is not trusted input, and consumers exact-match the fixed
+/// stage vocabulary at the TEE probe trust boundary and drop anything
+/// else.
+fn reconcile_stage_file_with_latched_error() {
+    let Ok(body) = std::fs::read_to_string(error_file_path()) else {
+        return;
+    };
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+        return;
+    };
+    match payload.get("failed_stage") {
+        Some(serde_json::Value::String(stage)) => {
+            let marker = format!("{stage}\n");
+            if std::fs::read_to_string(stage_file_path()).unwrap_or_default() != marker
+                && let Err(err) = writes::atomic_write(&stage_file_path(), marker.as_bytes(), 0o644)
+            {
+                tracing::warn!(
+                    path = %stage_file_path().display(),
+                    error = %err,
+                    "reconciling the latched stage marker failed"
+                );
+            }
+        }
+        // A stage-less latch must not keep a marker naming a stage the
+        // latched failure never reached.
+        Some(serde_json::Value::Null) => clear_stage_file(&stage_file_path()),
+        // Legacy latches without the field, or non-string garbage: keep
+        // the frozen marker as-is.
+        _ => {}
+    }
 }
 
 fn mark_ready_file(path: &Path) -> Result<()> {

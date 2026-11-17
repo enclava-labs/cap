@@ -318,6 +318,106 @@ fn stage_less_latch_drops_the_marker_instead_of_naming_a_stage_it_never_reached(
 }
 
 #[test]
+fn crash_between_the_pair_writes_is_healed_at_the_next_boot() {
+    // cap#400 review (crash window): record_failure_file writes the stage
+    // file and the error file as two separate atomic writes. If the
+    // container dies between them, the stage file names the half-latched
+    // failure while the error file still carries the previous one — and
+    // the freeze alone would preserve that mismatched pair forever. The
+    // next boot must reconcile the pair back to the last durably-latched
+    // failure.
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
+
+    // v1 dies at the bind-mount stage: the pair latches coherently.
+    record_stage("binding workload mount namespaces").unwrap();
+    report_failure(&anyhow!("bind mounts failed"));
+    let latched_error = std::fs::read_to_string(&env.error).unwrap();
+
+    // v2 restarts and fails at trustee policy, but the container dies
+    // after the stage write landed and before the error write did: the
+    // stage file moved on, the error file never got v2's payload.
+    std::fs::write(&env.stage, "verifying trustee policy\n").unwrap();
+
+    // v3 boots: engaging the freeze must repair the stage file back to
+    // the latched error's failed_stage and then keep it frozen.
+    record_stage("loading config").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&env.stage).unwrap(),
+        "binding workload mount namespaces\n",
+        "the next boot must heal the crash-window mismatch back to the latched failure's stage"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&env.error).unwrap(),
+        latched_error,
+        "the latched error file is the authority and must stay untouched"
+    );
+    record_stage("waiting for owner seed").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&env.stage).unwrap(),
+        "binding workload mount namespaces\n",
+        "the healed pair must stay frozen against later boot markers"
+    );
+
+    // The other half of the window — the stage write lost entirely —
+    // heals the same way: the latch re-pairs its own marker.
+    std::fs::remove_file(&env.stage).unwrap();
+    record_stage("validating signed config").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&env.stage).unwrap(),
+        "binding workload mount namespaces\n",
+        "a lost marker must be re-paired from the latched error's failed_stage"
+    );
+}
+
+#[test]
+fn freeze_reconciles_a_stray_marker_against_a_stage_less_latched_error() {
+    // cap#400 review (crash window): a stage-less re-latch clears the
+    // marker before writing the error file; a crash in between leaves a
+    // stray marker beside a `failed_stage: null` latch. The freeze must
+    // drop it — the latched failure never reached that stage.
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
+
+    std::fs::write(
+        &env.error,
+        "{\"error\":\"enclava_init_failed\",\"terminal\":true,\"retry_after\":null,\"failed_stage\":null}\n",
+    )
+    .unwrap();
+    std::fs::write(&env.stage, "binding workload mount namespaces\n").unwrap();
+
+    record_stage("loading config").unwrap();
+    assert!(
+        !env.stage.exists(),
+        "a stray marker beside a stage-less latch must be dropped at the freeze"
+    );
+}
+
+#[test]
+fn freeze_leaves_the_marker_alone_for_a_legacy_latched_error() {
+    // Pre-#397 latches carry no failed_stage field; the freeze cannot
+    // know a better marker, so it must hold the existing one unchanged
+    // rather than guess or clear it.
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
+
+    std::fs::write(
+        &env.error,
+        "{\"error\":\"enclava_init_failed\",\"terminal\":true,\"retry_after\":null}\n",
+    )
+    .unwrap();
+    std::fs::write(&env.stage, "opening luks volumes\n").unwrap();
+
+    record_stage("loading config").unwrap();
+    record_stage("waiting for owner seed").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&env.stage).unwrap(),
+        "opening luks volumes\n",
+        "a legacy latch without failed_stage must keep its marker frozen as-is"
+    );
+}
+
+#[test]
 fn recovery_clears_stale_failure_file() {
     let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
     let env = FailureEnvGuard::install();
