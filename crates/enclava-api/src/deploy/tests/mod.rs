@@ -1273,13 +1273,17 @@ async fn rollout_watch_password_timeout_stays_nonterminal_for_failed_app_redeplo
 }
 
 #[test]
-fn extended_owner_wait_probe_slice_spans_two_poll_intervals() {
-    // Two poll intervals give a late unlock a fresh observation before the
-    // probe ends; anything larger creeps the per-app apply-worker duty cycle
-    // back toward the full slice's (#231).
-    assert_eq!(
-        EXTENDED_OWNER_WAIT_PROBE_SLICE,
-        2 * enclava_engine::apply::types::ApplyConfig::default().poll_interval
+fn extended_owner_wait_probe_slice_covers_a_single_poll() {
+    // `watch_rollout` polls at the start of a slice, so one completed poll
+    // reports a late unlock at the next probe cycle; a second poll inside
+    // the slice buys at most one poll interval of latency against the 60 s
+    // observation requeue cap. Staying below one poll interval keeps each
+    // probe to a single Kubernetes poll round trip, however many apps wait
+    // (#231, #387).
+    assert!(
+        EXTENDED_OWNER_WAIT_PROBE_SLICE
+            < enclava_engine::apply::types::ApplyConfig::default().poll_interval,
+        "the probe must cost one poll round trip, not a full poll interval"
     );
     assert!(EXTENDED_OWNER_WAIT_PROBE_SLICE < ROLLOUT_OBSERVATION_SLICE);
 }
@@ -1287,9 +1291,9 @@ fn extended_owner_wait_probe_slice_spans_two_poll_intervals() {
 #[tokio::test(start_paused = true)]
 async fn extended_owner_wait_releases_the_worker_after_the_probe_slice() {
     // With the production 90 s slice configured, an abandoned locked app
-    // must end its observation after the 10 s probe instead of holding one
-    // of the bounded apply-worker slots for the full slice, while the owner
-    // wait itself stays nonterminal (#231).
+    // must end its observation after the short probe instead of holding its
+    // dispatch worker for the full slice, while the owner wait itself stays
+    // nonterminal (#231).
     let budget = fresh_initialization_budget("32Mi", "32Mi");
     let started = tokio::time::Instant::now();
     let outcome = DeploymentRollout::observe_only(

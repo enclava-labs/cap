@@ -7103,13 +7103,15 @@ async fn restart_statefulset_for_ingress(
 const ROLLOUT_OBSERVATION_SLICE: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Probe slice for an extended owner wait (password mode, rollout budget
-/// exhausted, observing only for a late unlock): two `watch_rollout` poll
-/// intervals. The 60 s observation requeue cap
-/// (`ROLLOUT_OBSERVATION_RETRY_MAX_SECS`) would otherwise pair this branch's
-/// 90 s slice with a 60 s delay and pin ~60% of an apply worker per abandoned
-/// locked app; the probe bounds that to ~10 s of worker time per ~70 s cycle
-/// (~14%) while still reporting an unlock within about a minute (#231).
-const EXTENDED_OWNER_WAIT_PROBE_SLICE: std::time::Duration = std::time::Duration::from_secs(10);
+/// exhausted, observing only for a late unlock). `watch_rollout` polls at the
+/// start of a slice, so one completed poll is all a probe needs to report a
+/// late unlock at the next cycle; a second poll buys at most one
+/// `poll_interval` of latency against a 60 s requeue cadence. The slice stays
+/// below one poll interval so each probe costs one Kubernetes poll round
+/// trip, and probes run on their own bounded dispatch lane
+/// (`MAX_OWNER_WAIT_PROBE_WORKERS` in deployment_jobs.rs), never on a shared
+/// apply-worker slot (#231, #387).
+const EXTENDED_OWNER_WAIT_PROBE_SLICE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// A rollout handle returned after Kubernetes accepted the rendered manifests.
 ///
@@ -7205,7 +7207,7 @@ impl DeploymentRollout {
             && previous_app_status == AppStatus::Creating;
         let slice = if owner_wait && remaining.is_zero() {
             // min keeps a deliberately smaller configured slice (tests) in
-            // charge; production always runs the 10 s probe here.
+            // charge; production always runs the short probe here.
             self.observation_slice.min(EXTENDED_OWNER_WAIT_PROBE_SLICE)
         } else {
             remaining.min(self.observation_slice)
