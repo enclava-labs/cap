@@ -44,7 +44,10 @@ use enclava_engine::types::{
 use std::collections::{HashMap, VecDeque};
 use uuid::Uuid;
 
-use crate::commands::template::{normalize_ngrok_tcp_url, should_retry_api_transport_error};
+use crate::commands::template::{
+    is_supported_stable_ssh_template, normalize_stable_ssh_endpoint,
+    should_retry_api_transport_error,
+};
 
 const DEPLOY_HEALTH_TIMEOUT_SECONDS: u64 = 900;
 
@@ -3077,7 +3080,13 @@ fn missing_required_config_keys(
 }
 
 fn stable_ssh_endpoint_state_from_app(app: &AppResponse) -> StableSshEndpointState {
-    if app.template_slug.as_deref() != Some("debian-ssh-ngrok") {
+    // Same slug allowlist and host shapes as `enclava template ssh-command`.
+    // A ngrok-only check reports a reserved FRP endpoint as not_stable_template.
+    if app
+        .template_slug
+        .as_deref()
+        .is_none_or(|slug| !is_supported_stable_ssh_template(slug))
+    {
         return StableSshEndpointState::NotStableTemplate;
     }
     let Some(endpoint) = app.template_expected.stable_ssh_endpoint.as_deref() else {
@@ -3086,7 +3095,7 @@ fn stable_ssh_endpoint_state_from_app(app: &AppResponse) -> StableSshEndpointSta
     if endpoint.trim().is_empty() {
         return StableSshEndpointState::Missing;
     }
-    match normalize_ngrok_tcp_url(endpoint) {
+    match normalize_stable_ssh_endpoint(endpoint) {
         Ok(normalized) if endpoint == normalized => StableSshEndpointState::Ready(normalized),
         _ => StableSshEndpointState::Invalid,
     }

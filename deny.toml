@@ -10,6 +10,7 @@ ignore = [
     { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained; transitive via nostr (enclava-api, enclava-cli). No fixed nostr release; revisit on nostr upgrade." },
     { id = "RUSTSEC-2025-0119", reason = "`number_prefix` unmaintained; transitive via indicatif (enclava-cli progress bars). Cosmetic dependency; revisit when indicatif drops it." },
     { id = "RUSTSEC-2026-0173", reason = "`proc-macro-error2` unmaintained; transitive via getset/oci-spec/oci-client. Revisit when oci-spec moves off getset." },
+    { id = "RUSTSEC-2026-0459", reason = "`libsqlite3-sys` 0.30.1 via optional sqlx-sqlite (sqlite feature off; not in the build graph). CVE-2026-119375 is bundled-SQLite WAL page-size confusion and needs a process to open a crafted db+WAL; CAP never links or opens SQLite. sqlx 0.8 pins ^0.30.1 and sqlx 0.9.0 still requires <0.38.0, so no release reaches patched >=0.39.0. Revisit when sqlx depends on libsqlite3-sys >=0.39." },
 ]
 
 [sources]
