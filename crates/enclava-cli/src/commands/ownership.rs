@@ -2,12 +2,18 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand};
 use dialoguer::{Confirm, Input, Password};
 use ed25519_dalek::{Signer, SigningKey};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use enclava_cli::api_client::{ApiClient, ApiError};
-use enclava_cli::api_types::{UnlockEndpointResponse, UpdateUnlockModeRequest};
-use enclava_cli::app_config::AppConfig;
+use enclava_cli::api_types::{
+    UnlockEndpointResponse, UnlockLockedGeneration, UnlockStatusResponse, UpdateUnlockModeRequest,
+    UpdateUnlockModeResponse,
+};
+use enclava_cli::app_config::{
+    AppConfig, AppConfigError, AppSection, ResourcesSection, StorageSection, UnlockSection,
+};
 use enclava_cli::config::{self, CliPaths};
 use enclava_cli::keys;
 use enclava_cli::tee_client::{TeeClient, TeeError};
@@ -80,7 +86,11 @@ pub enum AutoUnlockCommand {
         #[arg(long)]
         password_file: Option<PathBuf>,
     },
-    /// Remove the KBS-gated seed wrap, require password on restart
+    /// Remove the KBS-gated seed wrap and require a password on restart.
+    /// Signs the stored primary from unlock status `locked_generation`
+    /// (`source = apply_job_generation`), which hosted platforms proxy.
+    /// A local enclava.toml is not required and is not signed. A deployment
+    /// list is not that generation. Enable stays refused.
     Disable {
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
@@ -149,6 +159,7 @@ async fn ensure_unlock_mode_change_supported(
         customer_descriptor_blob: None,
         org_keyring_blob: None,
         signed_policy_artifact: None,
+        validate_only: false,
     };
     println!("Checking unlock-mode support for {app_name}...");
     match api.update_unlock_mode(app_name, &probe).await {
@@ -717,6 +728,287 @@ pub async fn change_password(args: ChangePasswordArgs) -> Result<(), Box<dyn std
     Ok(())
 }
 
+const LOCKED_GENERATION_SOURCE: &str = "apply_job_generation";
+
+#[derive(Debug)]
+struct SignedDisableShape {
+    app_config: AppConfig,
+    workload_security_profile: WorkloadSecurityProfile,
+    container_name: String,
+    image_ref: String,
+    generation: UnlockLockedGeneration,
+    log_encryption: Option<enclava_engine::types::LogEncryptionConfig>,
+}
+
+/// A local project file is not the signed shape. A name mismatch or an
+/// unreadable file refuses; a missing file is the hosted path.
+fn guard_local_project_file(
+    app_name: &str,
+    local: Result<AppConfig, AppConfigError>,
+) -> Result<(), String> {
+    match local {
+        Ok(config) if config.app.name != app_name => Err(format!(
+            "enclava.toml app name '{}' does not match {app_name}; refusing to sign that \
+             project file. Run from a directory without an enclava.toml",
+            config.app.name
+        )),
+        Ok(_) => Ok(()),
+        Err(AppConfigError::ReadFile { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn image_ref_pinned_to(image_ref: &str, digest: &str) -> bool {
+    let Some(repository) = image_ref.strip_suffix(&format!("@{digest}")) else {
+        return false;
+    };
+    !repository.is_empty()
+        && !repository.ends_with('@')
+        && enclava_common::validate::validate_image_digest(digest).is_ok()
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|item| !item.trim().is_empty())
+}
+
+/// Accept only the generation the unlock handler locks.
+///
+/// A missing field is the old server, or a proxy that did not forward it.
+/// `GET /apps/{name}/deployments` is not consulted: for a hosted app that
+/// list is not this generation.
+fn require_signable_generation(
+    status: &UnlockStatusResponse,
+    image: &str,
+) -> Result<SignedDisableShape, String> {
+    let Some(generation) = status.locked_generation.clone() else {
+        return Err(
+            "unlock status did not include locked_generation (source apply_job_generation). \
+             A hosted deployment list is not the generation the unlock handler locks, so \
+             auto-unlock disable will not remove the guest wrap"
+                .into(),
+        );
+    };
+    if generation.source != LOCKED_GENERATION_SOURCE {
+        return Err(format!(
+            "unlock status locked_generation.source is {:?}, not {LOCKED_GENERATION_SOURCE}; \
+             refusing to treat another deployment list as the locked generation",
+            generation.source
+        ));
+    }
+    if !generation.acceptable {
+        let reason = generation
+            .refusal
+            .as_deref()
+            .unwrap_or("generation is not acceptable");
+        return Err(format!(
+            "the CAP apply generation the unlock handler locks is not signable ({reason}); \
+             the guest wrap was not removed"
+        ));
+    }
+    let image_ref = generation.image_ref.clone().ok_or_else(|| {
+        "locked generation omitted image_ref; refusing to sign a different reference".to_string()
+    })?;
+    let digest = generation.image_digest.clone().ok_or_else(|| {
+        "locked generation omitted image_digest; refusing to remove the guest wrap".to_string()
+    })?;
+    let requested = enclava_common::image::ImageRef::parse(image).map_err(|err| {
+        format!(
+            "auto-unlock disable requires a digest-pinned --image (<registry>/<repo>@sha256:<hex>); {err}"
+        )
+    })?;
+    if !requested.has_digest() {
+        return Err(
+            "auto-unlock disable requires a digest-pinned --image; a tag is not checked against \
+             the locked generation before the guest mutation"
+                .into(),
+        );
+    }
+    if requested.digest() != digest {
+        return Err(format!(
+            "--image digest {} does not match locked generation digest {digest}; refusing to \
+             remove the guest wrap for an image the control plane will reject",
+            requested.digest()
+        ));
+    }
+    if !image_ref_pinned_to(&image_ref, &digest) {
+        return Err(
+            "locked generation image_ref is not digest-pinned to image_digest; refusing to sign \
+             a substituted reference"
+                .into(),
+        );
+    }
+    let port = generation
+        .port
+        .filter(|port| *port > 0)
+        .ok_or_else(|| "locked generation omitted port; refusing to assume 8080".to_string())?;
+    let command = generation
+        .command
+        .clone()
+        .filter(|argv| !argv.is_empty() && argv.iter().all(|arg| !arg.is_empty()))
+        .ok_or_else(|| "locked generation omitted command".to_string())?;
+    let Some(paths) = generation.storage_paths.clone() else {
+        return Err("locked generation omitted storage paths".into());
+    };
+    if paths.iter().any(|path| path.is_empty()) {
+        return Err("locked generation storage paths contain an empty path".into());
+    }
+    // Match the server: /state is the platform mount, and an empty remainder
+    // is a valid no-extra-mount workload.
+    let storage_paths: Vec<String> = paths.into_iter().filter(|path| path != "/state").collect();
+    let resources = generation
+        .resources
+        .clone()
+        .ok_or_else(|| "locked generation omitted resources".to_string())?;
+    for (name, value) in [
+        ("cpu", &resources.cpu),
+        ("memory", &resources.memory),
+        ("storage", &resources.storage),
+        ("tls_storage", &resources.tls_storage),
+    ] {
+        if value.is_empty() {
+            return Err(format!("locked generation resources.{name} is empty"));
+        }
+    }
+    let profile_raw = generation
+        .workload_security_profile
+        .clone()
+        .ok_or_else(|| "locked generation omitted workload_security_profile".to_string())?;
+    let workload_security_profile = profile_raw.parse().map_err(|err: String| {
+        format!("locked generation workload_security_profile is unsupported: {err}")
+    })?;
+    let container_name = non_empty(generation.container_name.clone())
+        .ok_or_else(|| "locked generation omitted container_name".to_string())?;
+    if generation.deployment_id.as_deref().unwrap_or("").is_empty() {
+        return Err("locked generation omitted deployment_id".into());
+    }
+    let app_identity = generation.app.clone().ok_or_else(|| {
+        "locked generation omitted the CAP app identity; refusing to sign a hosted projection"
+            .to_string()
+    })?;
+    if app_identity.id.trim().is_empty()
+        || app_identity.name.trim().is_empty()
+        || app_identity.namespace.trim().is_empty()
+        || app_identity.service_account.trim().is_empty()
+        || app_identity.domain.trim().is_empty()
+        || app_identity.tee_domain.trim().is_empty()
+        || app_identity.tenant_instance_identity_hash.trim().is_empty()
+        || app_identity.bootstrap_owner_pubkey_hash.trim().is_empty()
+        || app_identity.signer_identity_subject.trim().is_empty()
+        || app_identity.signer_identity_issuer.trim().is_empty()
+    {
+        return Err(
+            "locked generation CAP app identity is incomplete; refusing to sign a hosted projection"
+                .into(),
+        );
+    }
+    let log_encryption = generation.log_encryption.clone().ok_or_else(|| {
+        "locked generation omitted log_encryption; refusing to sign a pre-claim descriptor that \
+         would drop a stored log recipient"
+            .to_string()
+    })?;
+    Ok(SignedDisableShape {
+        app_config: AppConfig {
+            app: AppSection {
+                name: String::new(),
+                port,
+                command,
+            },
+            storage: StorageSection {
+                paths: storage_paths,
+                size: resources.storage,
+                tls_size: resources.tls_storage,
+            },
+            unlock: UnlockSection {
+                mode: "password".to_string(),
+            },
+            services: HashMap::new(),
+            resources: ResourcesSection {
+                cpu: resources.cpu,
+                memory: resources.memory,
+            },
+            health: None,
+        },
+        workload_security_profile,
+        container_name,
+        image_ref,
+        generation,
+        log_encryption,
+    })
+}
+
+/// Replace a hosted app projection with the CAP identity the unlock handler
+/// compares. The projection is not signed.
+fn apply_locked_app_identity(
+    app: &mut enclava_cli::api_types::AppResponse,
+    generation: &UnlockLockedGeneration,
+    unlock_mode: &str,
+) -> Result<(), String> {
+    let identity = generation.app.as_ref().ok_or_else(|| {
+        "locked generation omitted the CAP app identity; refusing to sign a hosted projection"
+            .to_string()
+    })?;
+    app.id = identity.id.clone();
+    app.name = identity.name.clone();
+    app.namespace = identity.namespace.clone();
+    app.service_account = Some(identity.service_account.clone());
+    app.domain = identity.domain.clone();
+    app.tee_domain = Some(identity.tee_domain.clone());
+    app.app_domain = Some(identity.domain.clone());
+    app.custom_domain = identity.custom_domain.clone();
+    app.tenant_instance_identity_hash = Some(identity.tenant_instance_identity_hash.clone());
+    app.bootstrap_owner_pubkey_hash = Some(identity.bootstrap_owner_pubkey_hash.clone());
+    app.signer_identity_subject = Some(identity.signer_identity_subject.clone());
+    app.signer_identity_issuer = Some(identity.signer_identity_issuer.clone());
+    app.unlock_mode = unlock_mode.to_string();
+    Ok(())
+}
+
+/// Preview must confirm CAP still has the app in auto mode. The status
+/// field is not part of locked_generation, so a proxy can rewrite it and
+/// the receipt from_mode would not match the stored mode after the wrap
+/// is gone.
+fn require_auto_preview(preview: &UpdateUnlockModeResponse, app_name: &str) -> Result<(), String> {
+    if preview.status != "validated" || preview.app_name != app_name {
+        return Err(format!(
+            "CAP did not accept the signed unlock descriptor (status {}); the guest wrap was not removed",
+            preview.status
+        ));
+    }
+    if preview.unlock_mode != "auto" {
+        return Err(format!(
+            "CAP unlock mode is {:?}, not auto; the guest wrap was not removed",
+            preview.unlock_mode
+        ));
+    }
+    Ok(())
+}
+
+/// The password prompt and descriptor signing are not a safe window. The
+/// generation read immediately before `tee.disable_auto_unlock` must still
+/// be the one that was signed.
+fn require_same_locked_generation(
+    signed: &UnlockLockedGeneration,
+    latest: &UnlockStatusResponse,
+) -> Result<(), String> {
+    match latest.locked_generation.as_ref() {
+        Some(current) if current == signed => Ok(()),
+        Some(_) => Err(
+            "the locked CAP apply generation changed before the guest wrap could be removed; \
+             refusing"
+                .into(),
+        ),
+        None => Err(
+            "unlock status dropped locked_generation before the guest wrap could be removed; \
+             refusing"
+                .into(),
+        ),
+    }
+}
+
 pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         AutoUnlockCommand::Enable { .. } => Err(
@@ -733,10 +1025,53 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             let app_name = resolve_app_name(&app)?;
             let (api, paths) = build_api_client()?;
             ensure_unlock_mode_change_supported(&api, &app_name).await?;
+            // Probe first. A missing project file is the hosted path; a
+            // mismatched or unreadable one still refuses, and is never signed.
+            guard_local_project_file(&app_name, AppConfig::find_and_load())?;
+            if let Ok(config) = AppConfig::find_and_load()
+                && config.app.name == app_name
+            {
+                eprintln!(
+                    "Found enclava.toml for {app_name}; it is not signed. The stored CAP \
+                     generation is the workload that will be signed."
+                );
+            }
             let cli_config = config::load_config(&paths)?;
             let creds = config::load_credentials(&paths)?;
-            let app_config = AppConfig::find_and_load()?;
-            let app_meta = api.get_app(&app_name).await?;
+            let mut app_meta = api.get_app(&app_name).await?;
+            let status = api.get_unlock_status(&app_name).await?;
+            let signed = require_signable_generation(&status, &image)?;
+            let identity_name = signed
+                .generation
+                .app
+                .as_ref()
+                .map(|identity| identity.name.clone())
+                .unwrap_or_default();
+            if identity_name != app_name {
+                return Err(format!(
+                    "locked generation app name '{identity_name}' does not match {app_name}; \
+                     refusing to sign a different app"
+                )
+                .into());
+            }
+            apply_locked_app_identity(&mut app_meta, &signed.generation, &status.unlock_mode)?;
+            let mut app_config = signed.app_config;
+            app_config.app.name = identity_name;
+            eprintln!(
+                "Signing password-mode redeploy for {app_name}: image={}, container={}, \
+                 port={}, command={:?}, storage_paths={:?}, profile={}, cpu={}, memory={}, \
+                 storage={}, tls_storage={}",
+                signed.image_ref,
+                signed.container_name,
+                app_config.app.port,
+                app_config.app.command,
+                app_config.storage.paths,
+                signed.workload_security_profile.as_str(),
+                app_config.resources.cpu,
+                app_config.resources.memory,
+                app_config.storage.size,
+                app_config.storage.tls_size,
+            );
             // Resolve the local password source before any remote mutation:
             // blob signing bootstraps the org keyring/signing authority, and a
             // missing or unreadable --password-file must not leave that
@@ -757,9 +1092,12 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                     creds: &creds,
                     app: &app_meta,
                     app_config: &app_config,
-                    image: &image,
+                    image: &signed.image_ref,
                     target_unlock_mode: Some("password"),
-                    workload_security_profile: WorkloadSecurityProfile::Restricted,
+                    workload_security_profile: signed.workload_security_profile,
+                    container_name: signed.container_name.as_str(),
+                    log_encryption: signed.log_encryption.clone(),
+                    pin_log_encryption: true,
                 })
                 .await?;
             let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
@@ -770,6 +1108,37 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             // working through a KDS outage.
             tee.complete_transition_quote_crl(&mut transition_attestation)
                 .await?;
+            // Re-read after the password prompt and signing. The CAP preview below
+            // is what must pass before the guest wrap is removed.
+            let latest = api.get_unlock_status(&app_name).await?;
+            require_same_locked_generation(&signed.generation, &latest)?;
+
+            // CAP must accept the signed descriptor before the wrap is removed.
+            // A proxy that rewrote both status reads fails here, with the guest
+            // wrap still in place.
+            let preview = api
+                .update_unlock_mode(
+                    &app_name,
+                    &UpdateUnlockModeRequest {
+                        mode: "password".to_string(),
+                        transition_receipt: None,
+                        transition_attestation: None,
+                        customer_descriptor_blob: Some(
+                            signed_blobs.customer_descriptor_blob.clone(),
+                        ),
+                        org_keyring_blob: Some(signed_blobs.org_keyring_blob.clone()),
+                        signed_policy_artifact: Some(signed_blobs.signed_policy_artifact.clone()),
+                        validate_only: true,
+                    },
+                )
+                .await?;
+            if let Err(reason) = require_auto_preview(&preview, &app_name) {
+                return Err(reason.into());
+            }
+            // The receipt from_mode must be the mode CAP just confirmed, not
+            // the earlier status read. A proxy can rewrite that field without
+            // touching locked_generation or this PUT response.
+            app_meta.unlock_mode = preview.unlock_mode;
 
             println!("Disabling auto-unlock for {app_name}...");
             tee.disable_auto_unlock(&password).await?;
@@ -793,6 +1162,7 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                         customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
                         org_keyring_blob: Some(signed_blobs.org_keyring_blob),
                         signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
+                        validate_only: false,
                     },
                 )
                 .await?;
@@ -853,6 +1223,299 @@ mod tests {
             error.to_string().starts_with("auto_unlock_disabled"),
             "refusal must carry the stable code: {error}"
         );
+    }
+
+    fn digest() -> String {
+        format!("sha256:{}", "a".repeat(64))
+    }
+
+    fn acceptable_status(port: u16) -> UnlockStatusResponse {
+        let digest = digest();
+        UnlockStatusResponse {
+            unlock_mode: "auto".to_string(),
+            tee_url: "https://app.example/.well-known/confidential".to_string(),
+            ownership_state: Some("unlocked".to_string()),
+            locked_generation: Some(UnlockLockedGeneration {
+                source: LOCKED_GENERATION_SOURCE.to_string(),
+                acceptable: true,
+                refusal: None,
+                deployment_id: Some("33333333-3333-3333-3333-333333333333".to_string()),
+                status: Some("healthy".to_string()),
+                image_digest: Some(digest.clone()),
+                image_ref: Some(format!("ghcr.io/acme/app@{digest}")),
+                container_name: Some("app".to_string()),
+                port: Some(port),
+                command: Some(vec!["/bin/app".to_string()]),
+                storage_paths: Some(vec!["/data".to_string()]),
+                workload_security_profile: Some("rootful-sudo".to_string()),
+                resources: Some(enclava_cli::api_types::UnlockLockedGenerationResources {
+                    cpu: "1".to_string(),
+                    memory: "1Gi".to_string(),
+                    storage: "5Gi".to_string(),
+                    tls_storage: "2Gi".to_string(),
+                }),
+                app: Some(enclava_cli::api_types::UnlockLockedGenerationApp {
+                    id: "11111111-1111-1111-1111-111111111111".to_string(),
+                    name: "hosted-app".to_string(),
+                    namespace: "cap-hosted-app".to_string(),
+                    service_account: "cap-hosted-app-sa".to_string(),
+                    domain: "hosted-app.example".to_string(),
+                    tee_domain: "hosted-app.tee.example".to_string(),
+                    custom_domain: None,
+                    tenant_instance_identity_hash: "22".repeat(32),
+                    bootstrap_owner_pubkey_hash: "33".repeat(32),
+                    signer_identity_subject: "cosign-subject".to_string(),
+                    signer_identity_issuer: "https://token.actions.githubusercontent.com"
+                        .to_string(),
+                }),
+                log_encryption: Some(None),
+            }),
+        }
+    }
+
+    #[test]
+    fn hosted_deployment_list_does_not_authorize_disable() {
+        let digest = digest();
+        let old_status = serde_json::json!({
+            "unlock_mode": "auto",
+            "tee_url": "https://app.example/.well-known/confidential",
+            "ownership_state": "unlocked"
+        });
+        let parsed: UnlockStatusResponse = serde_json::from_value(old_status).unwrap();
+        let image = format!("ghcr.io/acme/app@{digest}");
+        let missing = require_signable_generation(&parsed, &image).unwrap_err();
+        assert!(
+            missing.contains("apply_job_generation"),
+            "a status without the locked generation must refuse: {missing}"
+        );
+        assert!(
+            missing.contains("hosted deployment list"),
+            "the refusal must say the deployment list is not the lock: {missing}"
+        );
+
+        let hosted_row = serde_json::json!({
+            "id": "hosted-1",
+            "status": "healthy",
+            "image_digest": digest,
+            "created_at": "2026-01-01T00:00:00Z",
+            "source": "hosted_deployments"
+        });
+        let as_generation = serde_json::from_value::<UnlockLockedGeneration>(hosted_row);
+        assert!(
+            as_generation.is_err(),
+            "a hosted deployment row must not deserialize as the locked generation"
+        );
+
+        let mut wrong_source = acceptable_status(8080);
+        wrong_source.locked_generation.as_mut().unwrap().source = "hosted_deployments".to_string();
+        let wrong = require_signable_generation(&wrong_source, &image).unwrap_err();
+        assert!(wrong.contains("hosted_deployments"), "{wrong}");
+    }
+
+    #[test]
+    fn disable_signs_locked_generation_port_and_refuses_a_changed_reread() {
+        let digest = digest();
+        let image = format!("ghcr.io/other/app@{digest}");
+        let status = acceptable_status(9090);
+        let signed = require_signable_generation(&status, &image).unwrap();
+        assert_eq!(signed.app_config.app.port, 9090);
+        assert_eq!(signed.image_ref, format!("ghcr.io/acme/app@{digest}"));
+        assert_eq!(
+            signed.workload_security_profile,
+            WorkloadSecurityProfile::RootfulSudo
+        );
+        assert_eq!(signed.container_name, "app");
+        assert_eq!(signed.app_config.resources.cpu, "1");
+        assert_eq!(
+            signed
+                .generation
+                .app
+                .as_ref()
+                .map(|identity| identity.id.as_str()),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        require_same_locked_generation(&signed.generation, &status).unwrap();
+
+        let mut changed = status;
+        changed.locked_generation.as_mut().unwrap().status = Some("pending".to_string());
+        let drifted = require_same_locked_generation(&signed.generation, &changed).unwrap_err();
+        assert!(drifted.contains("changed"), "{drifted}");
+
+        let mut omitted_port = acceptable_status(9090);
+        omitted_port.locked_generation.as_mut().unwrap().port = None;
+        let omitted = require_signable_generation(&omitted_port, &image).unwrap_err();
+        assert!(omitted.contains("8080"), "{omitted}");
+
+        let tag = require_signable_generation(&acceptable_status(9090), "ghcr.io/acme/app:latest")
+            .unwrap_err();
+        assert!(tag.contains("digest-pinned"), "{tag}");
+
+        let mut no_identity = acceptable_status(9090);
+        no_identity.locked_generation.as_mut().unwrap().app = None;
+        let missing_identity = require_signable_generation(&no_identity, &image).unwrap_err();
+        assert!(
+            missing_identity.contains("hosted projection"),
+            "{missing_identity}"
+        );
+
+        let mut unpinned = acceptable_status(9090);
+        unpinned.locked_generation.as_mut().unwrap().image_ref =
+            Some("ghcr.io/acme/app:latest".to_string());
+        let substituted = require_signable_generation(&unpinned, &image).unwrap_err();
+        assert!(substituted.contains("digest-pinned"), "{substituted}");
+
+        let mut omitted_log = acceptable_status(9090);
+        omitted_log
+            .locked_generation
+            .as_mut()
+            .unwrap()
+            .log_encryption = None;
+        let dropped = require_signable_generation(&omitted_log, &image).unwrap_err();
+        assert!(dropped.contains("log_encryption"), "{dropped}");
+
+        require_auto_preview(
+            &UpdateUnlockModeResponse {
+                app_name: "hosted-app".to_string(),
+                unlock_mode: "auto".to_string(),
+                deployment_id: None,
+                status: "validated".to_string(),
+            },
+            "hosted-app",
+        )
+        .unwrap();
+        let refused = require_auto_preview(
+            &UpdateUnlockModeResponse {
+                app_name: "hosted-app".to_string(),
+                unlock_mode: "password".to_string(),
+                deployment_id: None,
+                status: "validated".to_string(),
+            },
+            "hosted-app",
+        )
+        .unwrap_err();
+        assert!(refused.contains("not auto"), "{refused}");
+
+        let mut empty_paths = acceptable_status(9090);
+        empty_paths
+            .locked_generation
+            .as_mut()
+            .unwrap()
+            .storage_paths = Some(Vec::new());
+        let empty = require_signable_generation(&empty_paths, &image).unwrap();
+        assert!(empty.app_config.storage.paths.is_empty());
+    }
+
+    fn acceptable_generation_json(log_encryption: Option<serde_json::Value>) -> serde_json::Value {
+        let digest = digest();
+        let mut generation = serde_json::json!({
+            "source": LOCKED_GENERATION_SOURCE,
+            "acceptable": true,
+            "deployment_id": "33333333-3333-3333-3333-333333333333",
+            "status": "healthy",
+            "image_digest": digest,
+            "image_ref": format!("ghcr.io/acme/app@{digest}"),
+            "container_name": "app",
+            "port": 9090,
+            "command": ["/bin/app"],
+            "storage_paths": ["/data"],
+            "workload_security_profile": "rootful-sudo",
+            "resources": {
+                "cpu": "1",
+                "memory": "1Gi",
+                "storage": "5Gi",
+                "tls_storage": "2Gi"
+            },
+            "app": {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "name": "hosted-app",
+                "namespace": "cap-hosted-app",
+                "service_account": "cap-hosted-app-sa",
+                "domain": "hosted-app.example",
+                "tee_domain": "hosted-app.tee.example",
+                "custom_domain": null,
+                "tenant_instance_identity_hash": "22".repeat(32),
+                "bootstrap_owner_pubkey_hash": "33".repeat(32),
+                "signer_identity_subject": "cosign-subject",
+                "signer_identity_issuer": "https://token.actions.githubusercontent.com"
+            }
+        });
+        if let Some(value) = log_encryption {
+            generation["log_encryption"] = value;
+        }
+        serde_json::json!({
+            "unlock_mode": "auto",
+            "tee_url": "https://app.example/.well-known/confidential",
+            "ownership_state": "unlocked",
+            "locked_generation": generation
+        })
+    }
+
+    #[test]
+    fn null_log_encryption_is_a_signable_no_recipient_generation() {
+        let digest = digest();
+        let image = format!("ghcr.io/acme/app@{digest}");
+        let absent: UnlockStatusResponse =
+            serde_json::from_value(acceptable_generation_json(None)).unwrap();
+        let omitted = require_signable_generation(&absent, &image).unwrap_err();
+        assert!(
+            omitted.contains("omitted log_encryption"),
+            "a missing field must stay a refusal: {omitted}"
+        );
+
+        let null: UnlockStatusResponse =
+            serde_json::from_value(acceptable_generation_json(Some(serde_json::Value::Null)))
+                .unwrap();
+        assert_eq!(
+            null.locked_generation
+                .as_ref()
+                .and_then(|generation| generation.log_encryption.clone()),
+            Some(None)
+        );
+        let signed = require_signable_generation(&null, &image).unwrap();
+        assert!(
+            signed.log_encryption.is_none(),
+            "explicit null is a no-recipient generation, not an omit"
+        );
+
+        let recipient = serde_json::json!({
+            "algorithm": "x25519-hpke-v1",
+            "key_id": "logs",
+            "public_key_base64url": "abc",
+            "public_key_sha256": "sha256:abc"
+        });
+        let present: UnlockStatusResponse =
+            serde_json::from_value(acceptable_generation_json(Some(recipient))).unwrap();
+        let signed = require_signable_generation(&present, &image).unwrap();
+        assert_eq!(
+            signed
+                .log_encryption
+                .as_ref()
+                .map(|config| config.key_id.as_str()),
+            Some("logs")
+        );
+    }
+
+    #[test]
+    fn stray_project_file_is_not_signed_over_a_hosted_app() {
+        let mismatch = AppConfig {
+            app: AppSection {
+                name: "other-app".to_string(),
+                port: 8080,
+                command: Vec::new(),
+            },
+            storage: StorageSection::default(),
+            unlock: UnlockSection::default(),
+            services: HashMap::new(),
+            resources: ResourcesSection::default(),
+            health: None,
+        };
+        let err = guard_local_project_file("hosted-app", Ok(mismatch)).unwrap_err();
+        assert!(err.contains("does not match"), "{err}");
+        let missing = AppConfigError::ReadFile {
+            path: "enclava.toml".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+        };
+        guard_local_project_file("hosted-app", Err(missing)).unwrap();
     }
 
     #[test]

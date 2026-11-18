@@ -256,6 +256,7 @@ fn unlock_mode_transition_request_contains_only_mode() {
         customer_descriptor_blob: None,
         org_keyring_blob: None,
         signed_policy_artifact: None,
+        validate_only: false,
     };
     let v: serde_json::Value = serde_json::to_value(&req).unwrap();
     assert_eq!(v, serde_json::json!({ "mode": "auto-unlock" }));

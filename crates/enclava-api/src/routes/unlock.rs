@@ -29,6 +29,539 @@ pub struct UnlockStatusResponse {
     pub unlock_mode: String,
     pub tee_url: String,
     pub ownership_state: Option<String>,
+    /// The generation `update_unlock_mode` locks, plus the stored primary
+    /// shape that may be signed. Hosted `GET /apps/{name}/deployments` is a
+    /// different table and must not be substituted for this object.
+    pub locked_generation: UnlockLockedGeneration,
+}
+
+/// Wire marker. A hosted deployment row does not carry this source.
+pub const LOCKED_GENERATION_SOURCE: &str = "apply_job_generation";
+
+const LATEST_APPLY_GENERATION_SQL: &str = "SELECT deployment.id, deployment.status::text, \
+     deployment.image_digest, deployment.spec_snapshot \
+     FROM deployments AS deployment \
+     JOIN deployment_apply_jobs AS apply_job \
+       ON apply_job.deployment_id = deployment.id \
+     WHERE deployment.app_id = $1 \
+     ORDER BY apply_job.generation DESC \
+     LIMIT 1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnlockLockedGenerationResources {
+    pub cpu: String,
+    pub memory: String,
+    pub storage: String,
+    pub tls_storage: String,
+}
+
+/// CAP app identity `validate_deployment_inputs` compares. A hosted app
+/// projection is not this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnlockLockedGenerationApp {
+    pub id: Uuid,
+    pub name: String,
+    pub namespace: String,
+    pub service_account: String,
+    pub domain: String,
+    pub tee_domain: String,
+    pub custom_domain: Option<String>,
+    pub tenant_instance_identity_hash: String,
+    pub bootstrap_owner_pubkey_hash: String,
+    pub signer_identity_subject: String,
+    pub signer_identity_issuer: String,
+}
+
+/// Signable view of the row the unlock handler locks.
+///
+/// `acceptable` is true only when that handler's generation predicate passes
+/// and the stored primary can be signed without inventing port, command,
+/// storage paths, or a digest. Refused generations omit the signable fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnlockLockedGeneration {
+    pub source: String,
+    pub acceptable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload_security_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<UnlockLockedGenerationResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<UnlockLockedGenerationApp>,
+    /// Generation `spec_snapshot.log_encryption`. Null is an explicit
+    /// no-recipient generation. A refused snapshot also serializes null; clients
+    /// must use `acceptable`, not this field, to decide whether to sign.
+    pub log_encryption: Option<enclava_engine::types::LogEncryptionConfig>,
+}
+
+type ApplyGenerationRow = (Uuid, String, Option<String>, serde_json::Value);
+
+fn refused_generation(
+    deployment_id: Option<Uuid>,
+    status: Option<String>,
+    reason: &str,
+) -> UnlockLockedGeneration {
+    UnlockLockedGeneration {
+        source: LOCKED_GENERATION_SOURCE.to_string(),
+        acceptable: false,
+        refusal: Some(reason.to_string()),
+        deployment_id,
+        status,
+        image_digest: None,
+        image_ref: None,
+        container_name: None,
+        port: None,
+        command: None,
+        storage_paths: None,
+        workload_security_profile: None,
+        resources: None,
+        app: None,
+        log_encryption: None,
+    }
+}
+
+/// An unlock-mode redeploy must not pin the legacy omit-claim render when the
+/// locked generation has a log recipient. A proxy that rewrites that field to
+/// null would otherwise commit encrypted logging off after the wrap is gone.
+fn reject_omitted_log_recipient(
+    omit_log_encryption_claim: bool,
+    log_encryption: Option<&enclava_engine::types::LogEncryptionConfig>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if log_encryption.is_some() && omit_log_encryption_claim {
+        return Err(unlock_transition_conflict(
+            "signed descriptor omitted the locked generation log recipient",
+        ));
+    }
+    Ok(())
+}
+
+/// The predicate `update_unlock_mode` enforces after it has a primary and a
+/// latest apply-job generation. `None` means that handler will not reject
+/// the generation itself.
+#[allow(clippy::too_many_arguments)]
+fn generation_conflict_reason(
+    status: &str,
+    generation_digest: Option<&str>,
+    primary_digest: Option<&str>,
+    spec_snapshot: &serde_json::Value,
+    cpu: &str,
+    memory: &str,
+    storage: &str,
+    tls_storage: &str,
+    primary_profile: &str,
+) -> Option<&'static str> {
+    if matches!(status, "pending" | "applying" | "watching") {
+        return Some("current deployment generation is still in progress");
+    }
+    if generation_digest != primary_digest {
+        return Some("current runtime does not match its deployment generation");
+    }
+    let Some(resolved) = spec_snapshot.get("resolved_resources") else {
+        return Some(
+            "current deployment predates exact resource snapshots; deploy a current generation first",
+        );
+    };
+    let exact = |field: &str, expected: &str| {
+        resolved.get(field).and_then(serde_json::Value::as_str) == Some(expected)
+    };
+    if !exact("cpu", cpu)
+        || !exact("memory", memory)
+        || !exact("storage", storage)
+        || !exact("tls_storage", tls_storage)
+    {
+        return Some("current resource authority does not match its deployment generation");
+    }
+    if spec_snapshot
+        .get("workload_security_profile")
+        .and_then(serde_json::Value::as_str)
+        != Some(primary_profile)
+    {
+        return Some("current workload security profile does not match its deployment generation");
+    }
+    None
+}
+
+fn signable_port(port: Option<i32>) -> Option<u16> {
+    u16::try_from(port?).ok().filter(|port| *port > 0)
+}
+
+fn signable_command(raw: Option<&str>) -> Option<Vec<String>> {
+    let argv = serde_json::from_str::<Vec<String>>(raw?.trim()).ok()?;
+    if argv.is_empty() || argv.iter().any(|arg| arg.is_empty()) {
+        return None;
+    }
+    Some(argv)
+}
+
+fn signable_storage_paths(paths: Option<&[String]>) -> Result<Vec<String>, &'static str> {
+    let Some(paths) = paths else {
+        return Err("stored primary storage paths are missing");
+    };
+    if paths.iter().any(|path| path.is_empty()) {
+        return Err("stored primary storage paths contain an empty path");
+    }
+    // Match descriptor_storage_paths: the platform /state mount is not a
+    // user path, and an empty remainder is a valid no-extra-mount workload.
+    Ok(paths
+        .iter()
+        .filter(|path| path.as_str() != "/state")
+        .cloned()
+        .collect())
+}
+
+/// The locked primary in the form a signed unlock render uses: JSON argv,
+/// port > 0, and user storage paths with `/state` removed. Persisting this
+/// form, not the raw column and not the raw descriptor, is what keeps the
+/// apply job's cc_init hash equal to the commit-time pin.
+fn normalized_locked_workload(
+    primary: &crate::models::AppContainer,
+) -> Result<(String, i32, Vec<String>), &'static str> {
+    let command = signable_command(primary.command.as_deref())
+        .ok_or("stored primary command is missing or not a JSON argv")?;
+    let command_json = serde_json::to_string(&command)
+        .map_err(|_| "stored primary command is missing or not a JSON argv")?;
+    let port = i32::from(
+        signable_port(primary.port)
+            .ok_or("stored primary omitted port; refusing to assume 8080")?,
+    );
+    let storage_paths = signable_storage_paths(primary.storage_paths.as_deref())?;
+    Ok((command_json, port, storage_paths))
+}
+
+/// The signed OCI spec also carries the primary name and CPU/memory limits.
+/// Command, port, and storage paths are checked separately. A proxy that
+/// rewrites the name or limits in both status reads would otherwise pass
+/// this preview, then have the apply job render the locked rows under a
+/// policy that describes the rewritten shape.
+fn signed_identity_matches_locked_runtime(
+    primary: &crate::models::AppContainer,
+    resources: &crate::models::AppResources,
+    env: &[enclava_common::descriptor::EnvVar],
+    limits: &[enclava_common::descriptor::EnvVar],
+) -> Result<(), &'static str> {
+    let signed_name = env
+        .iter()
+        .find(|var| var.name == "ENCLAVA_CONTAINER_NAME")
+        .map(|var| var.value.as_str())
+        .filter(|value| !value.is_empty());
+    let Some(signed_name) = signed_name else {
+        return Err("signed descriptor omitted ENCLAVA_CONTAINER_NAME");
+    };
+    if signed_name != primary.name {
+        return Err("signed descriptor container name does not match the locked primary");
+    }
+    let limit = |name: &str| {
+        limits
+            .iter()
+            .find(|var| var.name == name)
+            .map(|var| var.value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    let Some(cpu) = limit("cpu") else {
+        return Err("signed descriptor omitted cpu limit");
+    };
+    let Some(memory) = limit("memory") else {
+        return Err("signed descriptor omitted memory limit");
+    };
+    if cpu != resources.cpu_limit {
+        return Err("signed descriptor cpu limit does not match the locked resources");
+    }
+    if memory != resources.memory_limit {
+        return Err("signed descriptor memory limit does not match the locked resources");
+    }
+    Ok(())
+}
+
+/// The CLI signs the status object's command, port, and storage paths. A
+/// proxy that rewrites both status reads can still present a different
+/// descriptor at PUT, and `require_same_locked_generation` will not catch
+/// it. Compare those fields to the locked primary before any container
+/// write, using [`normalized_locked_workload`]. A raw equality check against
+/// a `/state`-only column would refuse the honest empty list. A match is
+/// then stored in that normalized form so the apply job does not render a
+/// different cc_init than the one the commit pin checked.
+fn signed_workload_matches_locked_primary(
+    primary: &crate::models::AppContainer,
+    signed_command: Option<&str>,
+    signed_port: Option<i32>,
+    signed_paths: Option<&[String]>,
+) -> Result<(), &'static str> {
+    if signed_command.is_none() && signed_port.is_none() && signed_paths.is_none() {
+        return Ok(());
+    }
+    let (Some(signed_command), Some(signed_port), Some(signed_paths)) =
+        (signed_command, signed_port, signed_paths)
+    else {
+        return Err("signed descriptor omitted command, port, or storage paths");
+    };
+    let (locked_command_json, locked_port, locked_paths) = normalized_locked_workload(primary)?;
+    let locked_command = signable_command(Some(&locked_command_json))
+        .ok_or("stored primary command is missing or not a JSON argv")?;
+    let signed_argv = signable_command(Some(signed_command))
+        .ok_or("signed descriptor command is missing or not a JSON argv")?;
+    if signed_argv != locked_command {
+        return Err("signed descriptor command does not match the locked primary");
+    }
+    let Some(normalized_signed_port) = signable_port(Some(signed_port)) else {
+        return Err("signed descriptor port does not match the locked primary");
+    };
+    if i32::from(normalized_signed_port) != locked_port {
+        return Err("signed descriptor port does not match the locked primary");
+    }
+    let signed_normalized = signable_storage_paths(Some(signed_paths))?;
+    if signed_normalized != locked_paths {
+        return Err("signed descriptor storage paths do not match the locked primary");
+    }
+    Ok(())
+}
+
+fn signable_image_ref(image_ref: &str, digest: &str) -> bool {
+    let Some(repository) = image_ref.strip_suffix(&format!("@{digest}")) else {
+        return false;
+    };
+    !repository.is_empty()
+        && !repository.ends_with('@')
+        && enclava_common::validate::validate_image_digest(digest).is_ok()
+}
+
+/// Build the status object from the same rows the handler locks.
+///
+/// A missing generation is not filled in from the primary container. Callers
+/// that cannot see this object must not remove the guest wrap.
+fn locked_generation_snapshot(
+    generation: Option<&ApplyGenerationRow>,
+    primary: Option<&crate::models::AppContainer>,
+    resources: Option<&crate::models::AppResources>,
+    app: &crate::models::App,
+) -> UnlockLockedGeneration {
+    let Some(primary) = primary else {
+        return refused_generation(None, None, "app has no primary container");
+    };
+    let Some(resources) = resources else {
+        return refused_generation(None, None, "app has no resource record");
+    };
+    let Some(generation) = generation else {
+        return refused_generation(None, None, "app has no deployment generation");
+    };
+    let profile = primary
+        .workload_security_profile
+        .clone()
+        .unwrap_or_else(|| "restricted".to_string());
+    if let Some(reason) = generation_conflict_reason(
+        &generation.1,
+        generation.2.as_deref(),
+        primary.image_digest.as_deref(),
+        &generation.3,
+        &resources.cpu_limit,
+        &resources.memory_limit,
+        &resources.app_data_size,
+        &resources.tls_data_size,
+        &profile,
+    ) {
+        return refused_generation(Some(generation.0), Some(generation.1.clone()), reason);
+    }
+    let Some(digest) = primary.image_digest.clone() else {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored primary has no image digest",
+        );
+    };
+    if !signable_image_ref(&primary.image_ref, &digest) {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored primary image is not digest-pinned to the locked generation",
+        );
+    }
+    let Some(port) = signable_port(primary.port) else {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored primary omitted port; refusing to assume 8080",
+        );
+    };
+    let Some(command) = signable_command(primary.command.as_deref()) else {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored primary command is missing or not a JSON argv",
+        );
+    };
+    let storage_paths = match signable_storage_paths(primary.storage_paths.as_deref()) {
+        Ok(paths) => paths,
+        Err(reason) => {
+            return refused_generation(Some(generation.0), Some(generation.1.clone()), reason);
+        }
+    };
+    if profile
+        .parse::<enclava_engine::types::WorkloadSecurityProfile>()
+        .is_err()
+    {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored workload security profile is invalid",
+        );
+    }
+    if primary.name.trim().is_empty() {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored primary container name is empty",
+        );
+    }
+    let Some(subject) = app
+        .signer_identity_subject
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored app has no signer subject",
+        );
+    };
+    let Some(issuer) = app
+        .signer_identity_issuer
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored app has no signer issuer",
+        );
+    };
+    if app.name.is_empty()
+        || app.namespace.is_empty()
+        || app.service_account.is_empty()
+        || app.domain.is_empty()
+        || app.tenant_instance_identity_hash.is_empty()
+        || app.bootstrap_owner_pubkey_hash.is_empty()
+    {
+        return refused_generation(
+            Some(generation.0),
+            Some(generation.1.clone()),
+            "stored app identity is incomplete",
+        );
+    }
+    if let Some(reason) = crate::routes::deployments::runtime_reapply_status_error(app.status) {
+        return refused_generation(Some(generation.0), Some(generation.1.clone()), reason);
+    }
+    let log_encryption =
+        match serde_json::from_value::<Option<enclava_engine::types::LogEncryptionConfig>>(
+            generation
+                .3
+                .get("log_encryption")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                return refused_generation(
+                    Some(generation.0),
+                    Some(generation.1.clone()),
+                    "stored log encryption metadata is invalid",
+                );
+            }
+        };
+    UnlockLockedGeneration {
+        source: LOCKED_GENERATION_SOURCE.to_string(),
+        acceptable: true,
+        refusal: None,
+        deployment_id: Some(generation.0),
+        status: Some(generation.1.clone()),
+        image_digest: Some(digest),
+        image_ref: Some(primary.image_ref.clone()),
+        container_name: Some(primary.name.clone()),
+        port: Some(port),
+        command: Some(command),
+        storage_paths: Some(storage_paths),
+        workload_security_profile: Some(profile),
+        resources: Some(UnlockLockedGenerationResources {
+            cpu: resources.cpu_limit.clone(),
+            memory: resources.memory_limit.clone(),
+            storage: resources.app_data_size.clone(),
+            tls_storage: resources.tls_data_size.clone(),
+        }),
+        app: Some(UnlockLockedGenerationApp {
+            id: app.id,
+            name: app.name.clone(),
+            namespace: app.namespace.clone(),
+            service_account: app.service_account.clone(),
+            domain: app.domain.clone(),
+            tee_domain: app.tee_domain.clone().unwrap_or_else(|| app.domain.clone()),
+            custom_domain: app.custom_domain.clone(),
+            tenant_instance_identity_hash: app.tenant_instance_identity_hash.clone(),
+            bootstrap_owner_pubkey_hash: app.bootstrap_owner_pubkey_hash.clone(),
+            signer_identity_subject: subject.to_string(),
+            signer_identity_issuer: issuer.to_string(),
+        }),
+        log_encryption,
+    }
+}
+
+async fn load_unlock_locked_generation(
+    db: &sqlx::PgPool,
+    app: &crate::models::App,
+) -> Result<UnlockLockedGeneration, (StatusCode, Json<serde_json::Value>)> {
+    let primary: Option<crate::models::AppContainer> = sqlx::query_as(
+        "SELECT * FROM app_containers WHERE app_id = $1 AND is_primary = true ORDER BY id LIMIT 1",
+    )
+    .bind(app.id)
+    .fetch_optional(db)
+    .await
+    .map_err(|_| unlock_database_error())?;
+    let resources: Option<crate::models::AppResources> =
+        sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+            .bind(app.id)
+            .fetch_optional(db)
+            .await
+            .map_err(|_| unlock_database_error())?;
+    let generation: Option<ApplyGenerationRow> = sqlx::query_as(LATEST_APPLY_GENERATION_SQL)
+        .bind(app.id)
+        .fetch_optional(db)
+        .await
+        .map_err(|_| unlock_database_error())?;
+    let mut snapshot = locked_generation_snapshot(
+        generation.as_ref(),
+        primary.as_ref(),
+        resources.as_ref(),
+        app,
+    );
+    if snapshot.acceptable {
+        let mut tx = db.begin().await.map_err(|_| unlock_database_error())?;
+        let busy = crate::mutation_leases::desired_state_mutation_in_progress(&mut tx, app.id)
+            .await
+            .map_err(|_| unlock_database_error())?;
+        tx.rollback().await.map_err(|_| unlock_database_error())?;
+        if busy {
+            snapshot = refused_generation(
+                snapshot.deployment_id,
+                snapshot.status,
+                "app mutation already in progress",
+            );
+        }
+    }
+    Ok(snapshot)
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +575,11 @@ pub struct UpdateUnlockModeRequest {
     pub org_keyring_blob: Option<String>,
     #[serde(default)]
     pub signed_policy_artifact: Option<String>,
+    /// Compare the signed descriptor to the locked primary and return without
+    /// a receipt or a commit. The CLI calls this before it removes the guest
+    /// wrap, so a rewritten status cannot strand the TEE.
+    #[serde(default)]
+    pub validate_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -773,6 +1311,26 @@ async fn commit_unlock_mode_transition(
             "app runtime changed while unlock mode transition was validating; retry",
         ));
     }
+    // Reject a rewritten command, port, or mount list before either UPDATE.
+    // Artifacts without these fields would still pin via the descriptor
+    // overlay and then apply the raw column.
+    if request.signing_artifacts.is_some()
+        && (request.signed_workload_command.is_none()
+            || request.signed_container_port.is_none()
+            || request.signed_storage_paths.is_none())
+    {
+        return Err(unlock_transition_conflict(
+            "signed descriptor omitted command, port, or storage paths",
+        ));
+    }
+    if let Err(reason) = signed_workload_matches_locked_primary(
+        locked_primary,
+        request.signed_workload_command,
+        request.signed_container_port,
+        request.signed_storage_paths.map(Vec::as_slice),
+    ) {
+        return Err(unlock_transition_conflict(reason));
+    }
 
     // Lock resources too so the apply snapshot is exactly the state accepted
     // by this transaction rather than a later concurrent edit.
@@ -782,6 +1340,16 @@ async fn commit_unlock_mode_transition(
             .fetch_one(&mut *tx)
             .await
             .map_err(|_| unlock_database_error())?;
+    if let Some(artifacts) = request.signing_artifacts
+        && let Err(reason) = signed_identity_matches_locked_runtime(
+            locked_primary,
+            &resources,
+            &artifacts.descriptor.oci_runtime_spec.env,
+            &artifacts.descriptor.oci_runtime_spec.resources.limits,
+        )
+    {
+        return Err(unlock_transition_conflict(reason));
+    }
     crate::routes::deployments::enforce_authoritative_entitlement(
         &mut tx,
         request.org_id,
@@ -795,21 +1363,12 @@ async fn commit_unlock_mode_transition(
     )
     .await?;
 
-    let source: (Uuid, String, Option<String>, serde_json::Value) = sqlx::query_as(
-        "SELECT deployment.id, deployment.status::text,
-                deployment.image_digest, deployment.spec_snapshot
-           FROM deployments AS deployment
-           JOIN deployment_apply_jobs AS apply_job
-             ON apply_job.deployment_id = deployment.id
-          WHERE deployment.app_id = $1
-          ORDER BY apply_job.generation DESC
-          LIMIT 1",
-    )
-    .bind(locked_app.id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|_| unlock_database_error())?
-    .ok_or_else(|| unlock_transition_conflict("app has no deployment generation"))?;
+    let source: ApplyGenerationRow = sqlx::query_as(LATEST_APPLY_GENERATION_SQL)
+        .bind(locked_app.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| unlock_database_error())?
+        .ok_or_else(|| unlock_transition_conflict("app has no deployment generation"))?;
     if source.0 != request.source_deployment_id
         || matches!(source.1.as_str(), "pending" | "applying" | "watching")
         || source.2.as_deref() != request.image_digest
@@ -910,20 +1469,23 @@ async fn commit_unlock_mode_transition(
         return Err(unlock_database_error());
     }
 
-    if request.signed_workload_command.is_some()
-        || request.signed_container_port.is_some()
-        || request.signed_storage_paths.is_some()
-    {
+    // Store the normalized locked workload, not the raw descriptor and not
+    // the raw column. `set_primary_descriptor_runtime` drops `/state` before
+    // the commit pin; `validate_signed_render` and `apply_deployment_manifests`
+    // rebuild cc_init from this snapshot and do not overlay the descriptor.
+    // Leaving `/state` in the column makes those renders hash differently
+    // and the job fails Artifact after the guest wrap is already gone.
+    if request.signed_workload_command.is_some() {
+        let (command_json, port, storage_paths) =
+            normalized_locked_workload(locked_primary).map_err(unlock_transition_conflict)?;
         let result = sqlx::query(
             "UPDATE app_containers
-             SET command = COALESCE($1, command),
-                 port = COALESCE($2, port),
-                 storage_paths = COALESCE($3, storage_paths)
+             SET command = $1, port = $2, storage_paths = $3
              WHERE app_id = $4 AND is_primary = true",
         )
-        .bind(request.signed_workload_command)
-        .bind(request.signed_container_port)
-        .bind(request.signed_storage_paths)
+        .bind(command_json)
+        .bind(port)
+        .bind(&storage_paths)
         .bind(locked_app.id)
         .execute(&mut *tx)
         .await
@@ -985,6 +1547,13 @@ async fn commit_unlock_mode_transition(
         artifacts
             .validate_and_pin_cc_init_data_render(&mut app_spec)
             .map_err(crate::routes::deployments::signing_error_response)?;
+        reject_omitted_log_recipient(
+            app_spec
+                .workload_artifact_binding
+                .as_ref()
+                .is_some_and(|binding| binding.omit_log_encryption_claim),
+            request.log_encryption,
+        )?;
     }
 
     let primary = containers
@@ -1192,11 +1761,13 @@ pub async fn unlock_status(
         Some(client) => tee_ownership_state(&client, domain).await,
         None => None,
     };
+    let locked_generation = load_unlock_locked_generation(&state.db, &app).await?;
 
     Ok(Json(UnlockStatusResponse {
         unlock_mode: format!("{:?}", app.unlock_mode).to_lowercase(),
         tee_url,
         ownership_state,
+        locked_generation,
     }))
 }
 
@@ -1282,6 +1853,48 @@ pub async fn unlock_endpoint(
     }))
 }
 
+/// Entitlement and fresh-claim gates `commit_unlock_mode_transition` enforces
+/// after the guest wrap is gone. Preview must fail the same way, without
+/// writing mode or deployment rows, or the CLI removes the wrap and the
+/// commit leaves CAP in auto mode. The commit repeats the checks under its
+/// own locks for changes between the two requests.
+async fn preview_unlock_commit_gates(
+    state: &AppState,
+    org_id: Uuid,
+    app: &crate::models::App,
+    resources: &crate::models::AppResources,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let fresh_volume_claims =
+        crate::routes::deployments::fresh_volume_claims(&state.kube_client, app, resources)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "volume provisioning state could not be verified; retry"
+                    })),
+                )
+            })?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| unlock_database_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, org_id)
+        .await
+        .map_err(|_| unlock_database_error())?;
+    crate::routes::deployments::enforce_authoritative_entitlement(
+        &mut tx,
+        org_id,
+        resources,
+        false,
+        fresh_volume_claims,
+    )
+    .await?;
+    tx.rollback().await.map_err(|_| unlock_database_error())?;
+    Ok(())
+}
+
 /// PUT /apps/{name}/unlock/mode -- update CAP-owned unlock mode and re-apply manifests.
 ///
 /// The owner password must never pass through this route. The CLI calls the
@@ -1337,7 +1950,7 @@ pub async fn update_unlock_mode(
         ));
     }
 
-    if current == requested {
+    if current == requested && !body.validate_only {
         return Ok(Json(UpdateUnlockModeResponse {
             app_name: app.name,
             unlock_mode: requested.api_value().to_string(),
@@ -1346,63 +1959,70 @@ pub async fn update_unlock_mode(
         }));
     }
 
-    let receipt = body.transition_receipt.as_ref().ok_or((
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({
-            "error": "transition_receipt required for unlock mode change"
-        })),
-    ))?;
-    let verified_receipt =
-        verify_transition_receipt(receipt, &app, current, requested).map_err(|field| {
-            (
+    // A preview has no TEE receipt yet. It exists so the CLI can learn that
+    // CAP will reject the signed descriptor before the guest wrap is removed.
+    let receipt_gate = if body.validate_only {
+        None
+    } else {
+        let receipt = body.transition_receipt.as_ref().ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "transition_receipt required for unlock mode change"
+            })),
+        ))?;
+        let verified_receipt = verify_transition_receipt(receipt, &app, current, requested)
+            .map_err(|field| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid transition_receipt",
+                        "field": field,
+                    })),
+                )
+            })?;
+        let transition_attestation = body.transition_attestation.as_ref().ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "transition_attestation required for unlock mode change"
+            })),
+        ))?;
+        verify_transition_attestation(transition_attestation, &app, &verified_receipt).map_err(
+            |field| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid transition_attestation",
+                        "field": field,
+                    })),
+                )
+            },
+        )?;
+        verify_transition_snp_quote(transition_attestation, receipt, quote_verification_now())
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid transition_attestation",
+                        "field": "transition_attestation.quote",
+                        "reason": error.reason(),
+                    })),
+                )
+            })?;
+        // Server-side freshness window: without it, captured quote/receipt
+        // pairs can be replayed once (monotonicity and the unique receipt
+        // index only block reuse after the first consumption).
+        if !transition_receipt_is_fresh(verified_receipt.receipt_timestamp, Utc::now()) {
+            return Err((
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": "invalid transition_receipt",
-                    "field": field,
+                    "field": "transition_receipt.payload.timestamp",
+                    "reason": "transition receipt outside freshness window",
                 })),
-            )
-        })?;
-    let transition_attestation = body.transition_attestation.as_ref().ok_or((
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({
-            "error": "transition_attestation required for unlock mode change"
-        })),
-    ))?;
-    verify_transition_attestation(transition_attestation, &app, &verified_receipt).map_err(
-        |field| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid transition_attestation",
-                    "field": field,
-                })),
-            )
-        },
-    )?;
-    verify_transition_snp_quote(transition_attestation, receipt, quote_verification_now())
-        .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid transition_attestation",
-                    "field": "transition_attestation.quote",
-                    "reason": error.reason(),
-                })),
-            )
-        })?;
-    // Server-side freshness window: without it, captured quote/receipt
-    // pairs can be replayed once (monotonicity and the unique receipt
-    // index only block reuse after the first consumption).
-    if !transition_receipt_is_fresh(verified_receipt.receipt_timestamp, Utc::now()) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "invalid transition_receipt",
-                "field": "transition_receipt.payload.timestamp",
-                "reason": "transition receipt outside freshness window",
-            })),
-        ));
-    }
+            ));
+        }
+        Some((receipt, verified_receipt, transition_attestation))
+    };
 
     let signing_artifacts = crate::signing_service::decode_optional_blobs(
         body.customer_descriptor_blob.clone(),
@@ -1437,7 +2057,8 @@ pub async fn update_unlock_mode(
     let primary = observed_containers
         .iter()
         .find(|container| container.is_primary)
-        .ok_or_else(|| unlock_transition_conflict("app has no primary container"))?;
+        .ok_or_else(|| unlock_transition_conflict("app has no primary container"))?
+        .clone();
     let image_digest = primary.image_digest.clone();
     let current_profile = primary
         .workload_security_profile
@@ -1454,57 +2075,24 @@ pub async fn update_unlock_mode(
         observed_containers,
         observed_resources.clone(),
     );
-    let source: (Uuid, String, Option<String>, serde_json::Value) = sqlx::query_as(
-        "SELECT deployment.id, deployment.status::text,
-                deployment.image_digest, deployment.spec_snapshot
-           FROM deployments AS deployment
-           JOIN deployment_apply_jobs AS apply_job
-             ON apply_job.deployment_id = deployment.id
-          WHERE deployment.app_id = $1
-          ORDER BY apply_job.generation DESC
-          LIMIT 1",
-    )
-    .bind(app.id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|_| unlock_database_error())?
-    .ok_or_else(|| unlock_transition_conflict("app has no deployment generation"))?;
-    if matches!(source.1.as_str(), "pending" | "applying" | "watching") {
-        return Err(unlock_transition_conflict(
-            "current deployment generation is still in progress",
-        ));
-    }
-    if source.2.as_deref() != image_digest.as_deref() {
-        return Err(unlock_transition_conflict(
-            "current runtime does not match its deployment generation",
-        ));
-    }
-    let resolved = source.3.get("resolved_resources").ok_or_else(|| {
-        unlock_transition_conflict(
-            "current deployment predates exact resource snapshots; deploy a current generation first",
-        )
-    })?;
-    let exact_resource = |field: &str, expected: &str| {
-        resolved.get(field).and_then(serde_json::Value::as_str) == Some(expected)
-    };
-    if !exact_resource("cpu", &observed_resources.cpu_limit)
-        || !exact_resource("memory", &observed_resources.memory_limit)
-        || !exact_resource("storage", &observed_resources.app_data_size)
-        || !exact_resource("tls_storage", &observed_resources.tls_data_size)
-    {
-        return Err(unlock_transition_conflict(
-            "current resource authority does not match its deployment generation",
-        ));
-    }
-    if source
-        .3
-        .get("workload_security_profile")
-        .and_then(serde_json::Value::as_str)
-        != Some(current_profile.as_str())
-    {
-        return Err(unlock_transition_conflict(
-            "current workload security profile does not match its deployment generation",
-        ));
+    let source: ApplyGenerationRow = sqlx::query_as(LATEST_APPLY_GENERATION_SQL)
+        .bind(app.id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| unlock_database_error())?
+        .ok_or_else(|| unlock_transition_conflict("app has no deployment generation"))?;
+    if let Some(reason) = generation_conflict_reason(
+        &source.1,
+        source.2.as_deref(),
+        image_digest.as_deref(),
+        &source.3,
+        &observed_resources.cpu_limit,
+        &observed_resources.memory_limit,
+        &observed_resources.app_data_size,
+        &observed_resources.tls_data_size,
+        current_profile.as_str(),
+    ) {
+        return Err(unlock_transition_conflict(reason));
     }
     let log_encryption: Option<LogEncryptionConfig> = serde_json::from_value(
         source
@@ -1558,6 +2146,48 @@ pub async fn update_unlock_mode(
         signed_storage_paths = Some(crate::deploy::descriptor_storage_paths(
             &artifacts.descriptor,
         ));
+        // Fail before the signing service sees a descriptor that would change
+        // the stored primary. The commit re-checks the locked row.
+        if let Err(reason) = signed_workload_matches_locked_primary(
+            &primary,
+            signed_workload_command.as_deref(),
+            signed_container_port,
+            signed_storage_paths.as_deref(),
+        ) {
+            return Err(unlock_transition_conflict(reason));
+        }
+        if let Err(reason) = signed_identity_matches_locked_runtime(
+            &primary,
+            &observed_resources,
+            &artifacts.descriptor.oci_runtime_spec.env,
+            &artifacts.descriptor.oci_runtime_spec.resources.limits,
+        ) {
+            return Err(unlock_transition_conflict(reason));
+        }
+        // The cc_init pin does not separate the two uid-0 profiles. The commit
+        // rejects that swap; the preview must too, or the wrap is removed and
+        // the mode stays auto.
+        let signed_profile =
+            crate::routes::deployments::signed_descriptor_profile(&artifacts.descriptor)
+                .ok_or_else(|| {
+                    crate::routes::deployments::signing_error_response(
+                        crate::signing_service::SigningServiceError::Mismatch(
+                            "workload_security_profile".to_string(),
+                        ),
+                    )
+                })?;
+        let locked_profile = current_profile
+            .parse::<enclava_engine::types::WorkloadSecurityProfile>()
+            .map_err(|_| {
+                unlock_transition_conflict("stored workload security profile is invalid")
+            })?;
+        if signed_profile != locked_profile {
+            return Err(crate::routes::deployments::signing_error_response(
+                crate::signing_service::SigningServiceError::Mismatch(
+                    "workload_security_profile".to_string(),
+                ),
+            ));
+        }
         let attestation = state.attestation.as_ref().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -1591,6 +2221,7 @@ pub async fn update_unlock_mode(
             body.signed_policy_artifact.clone(),
             signing_service_pubkey_hex,
             log_encryption.clone(),
+            true,
         )
         .await?;
         app_spec.generated_agent_policy = Some(
@@ -1607,8 +2238,32 @@ pub async fn update_unlock_mode(
         artifacts
             .validate_and_pin_cc_init_data_render(&mut app_spec)
             .map_err(crate::routes::deployments::signing_error_response)?;
+        reject_omitted_log_recipient(
+            app_spec
+                .workload_artifact_binding
+                .as_ref()
+                .is_some_and(|binding| binding.omit_log_encryption_claim),
+            log_encryption.as_ref(),
+        )?;
         signed_policy_artifact = Some(signed);
     }
+
+    if body.validate_only {
+        // An already-applied mode returns unchanged and never reaches the
+        // commit gates. Only a real transition can remove the wrap and then
+        // be rejected, so only that preview is refused here.
+        if current != requested {
+            preview_unlock_commit_gates(&state, auth.org_id, &app, &observed_resources).await?;
+        }
+        return Ok(Json(UpdateUnlockModeResponse {
+            app_name: app.name,
+            unlock_mode: current.api_value().to_string(),
+            deployment_id: None,
+            status: "validated".to_string(),
+        }));
+    }
+    let (receipt, verified_receipt, transition_attestation) =
+        receipt_gate.expect("unlock mode change without validate_only has a verified receipt");
 
     let descriptor_platform_binding = crate::signing_service::descriptor_platform_binding_for(
         &state,
@@ -1702,13 +2357,13 @@ mod tests {
         crate::signing_service::DescriptorPlatformBinding::EMPTY;
 
     use super::{
-        BUILTIN_AMD_ARK_SHA256_PINS, ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode,
-        SignedReceiptResponse, TransitionQuoteError, TransitionReceiptAttestation,
-        TransitionSnpQuote, UnlockModeCommitRequest, auto_unlock_disabled_error,
-        commit_unlock_mode_transition, snp_guest_policy_allows_debug,
-        tee_ownership_state_from_value, transition_receipt_is_fresh, unlock_status,
-        validate_transition, verify_transition_attestation, verify_transition_receipt,
-        verify_transition_snp_quote,
+        BUILTIN_AMD_ARK_SHA256_PINS, LOCKED_GENERATION_SOURCE, ReceiptEnvelope, ReceiptPayloadView,
+        RequestedUnlockMode, SignedReceiptResponse, TransitionQuoteError,
+        TransitionReceiptAttestation, TransitionSnpQuote, UnlockModeCommitRequest,
+        auto_unlock_disabled_error, commit_unlock_mode_transition, locked_generation_snapshot,
+        snp_guest_policy_allows_debug, tee_ownership_state_from_value, transition_receipt_is_fresh,
+        unlock_status, validate_transition, verify_transition_attestation,
+        verify_transition_receipt, verify_transition_snp_quote,
     };
     use crate::models::{App, AppContainer, AppStatus, UnlockMode};
 
@@ -2067,7 +2722,11 @@ mod tests {
             "oci_runtime_spec": {
                 "command": [enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH],
                 "args": ["/usr/local/bin/test"],
-                "env": [],
+                // Must match insert_unlock_test_app's primary name and the
+                // app_resources defaults. commit_unlock_mode_transition
+                // rejects a missing name or limit as 409 before it reaches
+                // customer-authority validation.
+                "env": [{"name": "ENCLAVA_CONTAINER_NAME", "value": "web"}],
                 "ports": [{"container_port": 8080, "protocol": "TCP"}],
                 "mounts": [],
                 "capabilities": {"add": [], "drop": []},
@@ -2078,7 +2737,13 @@ mod tests {
                     "allow_privilege_escalation": false,
                     "privileged": false,
                 },
-                "resources": {"requests": [], "limits": []},
+                "resources": {
+                    "requests": [],
+                    "limits": [
+                        {"name": "cpu", "value": "1"},
+                        {"name": "memory", "value": "1Gi"},
+                    ],
+                },
             },
             "sidecars": {
                 "attestation_proxy_digest": format!("sha256:{}", "11".repeat(32)),
@@ -2759,6 +3424,196 @@ mod tests {
         );
     }
 
+    async fn commit_signed_workload<'a>(
+        pool: &sqlx::PgPool,
+        fixture: &'a UnlockTestFixture,
+        command: Option<&'a str>,
+        port: Option<i32>,
+        paths: Option<&'a Vec<String>>,
+        timestamp: &str,
+        key_byte: u8,
+    ) -> Result<super::CommittedUnlockModeTransition, (StatusCode, Json<serde_json::Value>)> {
+        let signing_key = SigningKey::from_bytes(&[key_byte; 32]);
+        let quote_hash = hex::encode([key_byte; 32]);
+        let receipt = signed_transition_receipt_for_app(
+            fixture.app.id,
+            timestamp,
+            "auto",
+            "password",
+            &quote_hash,
+            &signing_key,
+        );
+        let verified_receipt = verify_transition_receipt(
+            &receipt,
+            &fixture.app,
+            RequestedUnlockMode::Auto,
+            RequestedUnlockMode::Password,
+        )
+        .expect("verify signed-workload receipt");
+        let attestation = transition_attestation_for_domain(
+            fixture.app.tee_domain.as_deref().expect("test TEE domain"),
+            &signing_key,
+            &quote_hash,
+        );
+        let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+        let image_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        commit_unlock_mode_transition(
+            pool,
+            UnlockModeCommitRequest {
+                org_id: fixture.app.org_id,
+                user_id: fixture.user_id,
+                app_name: &fixture.app.name,
+                observed_authority: &fixture.authority,
+                source_deployment_id: fixture.source_deployment_id,
+                requested: RequestedUnlockMode::Password,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id: Uuid::new_v4(),
+                image_digest: Some(image_digest),
+                signed_workload_command: command,
+                signed_container_port: port,
+                signed_storage_paths: paths,
+                signing_artifacts: None,
+                signed_policy_artifact: None,
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
+                log_encryption: None,
+                api_signing_pubkey: "unused-without-signing-artifacts",
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn rewritten_signed_command_is_rejected_before_primary_update() {
+        let pool = database_test_pool().await;
+        let fixture = insert_unlock_test_app(&pool).await;
+        let paths = vec!["/data".to_string()];
+        let result = commit_signed_workload(
+            &pool,
+            &fixture,
+            Some("[\"/bin/rewritten\"]"),
+            Some(8080),
+            Some(&paths),
+            "2026-07-17T11:10:00Z",
+            23,
+        )
+        .await;
+        let (status, body) = result.expect_err("rewritten command must not commit");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.0["error"],
+            "signed descriptor command does not match the locked primary"
+        );
+
+        let persisted_mode: String =
+            sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+                .bind(fixture.app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load mode after rewritten command");
+        assert_eq!(persisted_mode, "auto");
+        let persisted: AppContainer =
+            sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 AND is_primary = true")
+                .bind(fixture.app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load primary after rewritten command");
+        assert_eq!(persisted.command.as_deref(), Some("[\"/bin/old\"]"));
+        assert_eq!(persisted.port, Some(8080));
+        assert_eq!(persisted.storage_paths, Some(vec!["/data".to_string()]));
+        delete_unlock_test_org(&pool, fixture.app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn state_only_primary_is_stored_as_the_normalized_signed_paths() {
+        let pool = database_test_pool().await;
+        let mut fixture = insert_unlock_test_app(&pool).await;
+        sqlx::query(
+            "UPDATE app_containers SET storage_paths = $1 WHERE app_id = $2 AND is_primary = true",
+        )
+        .bind(vec!["/state".to_string()])
+        .bind(fixture.app.id)
+        .execute(&pool)
+        .await
+        .expect("set state-only storage paths");
+        let containers: Vec<AppContainer> = sqlx::query_as(
+            "SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC, id",
+        )
+        .bind(fixture.app.id)
+        .fetch_all(&pool)
+        .await
+        .expect("reload state-only containers");
+        let resources: crate::models::AppResources =
+            sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+                .bind(fixture.app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("reload state-only resources");
+        fixture.authority = crate::deploy::ExistingAppAuthoritySnapshot::new(
+            fixture.app.updated_at,
+            containers,
+            resources,
+        );
+        let paths = Vec::<String>::new();
+        let result = commit_signed_workload(
+            &pool,
+            &fixture,
+            Some("[\"/bin/old\"]"),
+            Some(8080),
+            Some(&paths),
+            "2026-07-17T11:20:00Z",
+            24,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "empty signed paths must match a /state-only column, got {result:?}"
+        );
+
+        let persisted_mode: String =
+            sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+                .bind(fixture.app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load mode after empty-path transition");
+        assert_eq!(persisted_mode, "password");
+        let persisted: AppContainer =
+            sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 AND is_primary = true")
+                .bind(fixture.app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load primary after empty-path transition");
+        assert_eq!(persisted.command.as_deref(), Some("[\"/bin/old\"]"));
+        assert_eq!(persisted.port, Some(8080));
+        assert_eq!(
+            persisted.storage_paths,
+            Some(Vec::<String>::new()),
+            "the stored primary must drop /state so the apply snapshot matches the signed render"
+        );
+        let payload: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM deployment_apply_jobs WHERE app_id = $1 AND deployment_id <> $2",
+        )
+        .bind(fixture.app.id)
+        .bind(fixture.source_deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load apply payload");
+        assert_eq!(
+            payload["snapshot"]["containers"][0]["storage_paths"],
+            serde_json::json!([]),
+            "validate_signed_render and apply_deployment_manifests render this snapshot, not the raw column"
+        );
+        delete_unlock_test_org(&pool, fixture.app.org_id).await;
+    }
+
     #[tokio::test]
     async fn audit_failure_rolls_back_unlock_mode_runtime_receipt_and_deployment() {
         let pool = database_test_pool().await;
@@ -2794,8 +3649,11 @@ mod tests {
         let deploy_id = Uuid::new_v4();
         let image_digest =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let new_command = "[\"/bin/new\"]";
-        let new_storage_paths = vec!["/new-data".to_string()];
+        // The stored primary. A rewritten command is rejected before this
+        // transaction reaches the audit insert, so the rollback fixture has
+        // to present the workload the handler locks.
+        let new_command = "[\"/bin/old\"]";
+        let new_storage_paths = vec!["/data".to_string()];
 
         let suffix = app.id.simple().to_string();
         let function_name = format!("cap_test_block_unlock_audit_{suffix}");
@@ -2839,7 +3697,7 @@ mod tests {
                 deploy_id,
                 image_digest: Some(image_digest),
                 signed_workload_command: Some(new_command),
-                signed_container_port: Some(9090),
+                signed_container_port: Some(8080),
                 signed_storage_paths: Some(&new_storage_paths),
                 signing_artifacts: None,
                 signed_policy_artifact: None,
@@ -3204,6 +4062,8 @@ mod tests {
         let api_signing_pubkey = "test-api-signing-key";
         let (artifacts, signed) =
             test_signing_artifacts(&app, deploy_id, image_digest, api_signing_pubkey);
+        let stored_command = "[\"/bin/old\"]";
+        let stored_paths = vec!["/data".to_string()];
 
         let result = commit_unlock_mode_transition(
             &pool,
@@ -3220,9 +4080,9 @@ mod tests {
                 receipt_json: &receipt_json,
                 deploy_id,
                 image_digest: Some(image_digest),
-                signed_workload_command: None,
-                signed_container_port: None,
-                signed_storage_paths: None,
+                signed_workload_command: Some(stored_command),
+                signed_container_port: Some(8080),
+                signed_storage_paths: Some(&stored_paths),
                 signing_artifacts: Some(&artifacts),
                 signed_policy_artifact: Some(&signed),
                 descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
@@ -3236,13 +4096,14 @@ mod tests {
             },
         )
         .await;
-        let (status, _) = result.expect_err("invalid artifact authority rejects transition");
+        let (status, body) = result.expect_err("invalid artifact authority rejects transition");
         assert!(
             matches!(
                 status,
                 StatusCode::BAD_REQUEST | StatusCode::SERVICE_UNAVAILABLE
             ),
-            "invalid signed authority must fail before persistence, got {status}"
+            "invalid signed authority must fail before persistence, got {status} {}",
+            body.0
         );
 
         let persisted_mode: String =
@@ -3708,6 +4569,363 @@ mod tests {
         assert_eq!(tee_ownership_state_from_value(&serde_json::json!({})), None);
     }
 
+    fn generation_fixture(
+        status: &str,
+        generation_digest: &str,
+        port: Option<i32>,
+        profile: Option<&str>,
+        snapshot_profile: &str,
+    ) -> (
+        super::ApplyGenerationRow,
+        crate::models::AppContainer,
+        crate::models::AppResources,
+    ) {
+        let digest = generation_digest.to_string();
+        let generation = (
+            Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+            status.to_string(),
+            Some(digest.clone()),
+            serde_json::json!({
+                "resolved_resources": {
+                    "cpu": "1",
+                    "memory": "1Gi",
+                    "storage": "5Gi",
+                    "tls_storage": "2Gi"
+                },
+                "workload_security_profile": snapshot_profile
+            }),
+        );
+        let primary = crate::models::AppContainer {
+            id: Uuid::nil(),
+            app_id: Uuid::nil(),
+            name: "app".to_string(),
+            image_ref: format!("ghcr.io/acme/app@{digest}"),
+            image_digest: Some(digest),
+            port,
+            command: Some("[\"/bin/app\"]".to_string()),
+            storage_paths: Some(vec!["/data".to_string()]),
+            workload_security_profile: profile.map(str::to_string),
+            is_primary: true,
+        };
+        let resources = crate::models::AppResources {
+            app_id: Uuid::nil(),
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "5Gi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        };
+        (generation, primary, resources)
+    }
+
+    #[test]
+    fn omit_claim_pin_is_rejected_when_the_generation_has_a_recipient() {
+        let recipient = enclava_engine::types::LogEncryptionConfig {
+            algorithm: "x25519-hpke-v1".to_string(),
+            key_id: "log-key".to_string(),
+            public_key_base64url: "pubkey".to_string(),
+            public_key_sha256: "hash".to_string(),
+        };
+        assert!(super::reject_omitted_log_recipient(true, Some(&recipient)).is_err());
+        assert!(super::reject_omitted_log_recipient(false, Some(&recipient)).is_ok());
+        assert!(super::reject_omitted_log_recipient(true, None).is_ok());
+    }
+
+    #[test]
+    fn signed_workload_match_drops_state_and_rejects_a_rewritten_primary() {
+        let primary = crate::models::AppContainer {
+            id: Uuid::nil(),
+            app_id: Uuid::nil(),
+            name: "app".to_string(),
+            image_ref: "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            image_digest: None,
+            port: Some(8080),
+            command: Some("[\"/bin/old\"]".to_string()),
+            storage_paths: Some(vec!["/data".to_string(), "/state".to_string()]),
+            workload_security_profile: None,
+            is_primary: true,
+        };
+        let data = vec!["/data".to_string()];
+        assert!(
+            super::signed_workload_matches_locked_primary(
+                &primary,
+                Some("[\"/bin/old\"]"),
+                Some(8080),
+                Some(&data),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            super::signed_workload_matches_locked_primary(
+                &primary,
+                Some("[\"/bin/rewritten\"]"),
+                Some(8080),
+                Some(&data),
+            )
+            .unwrap_err(),
+            "signed descriptor command does not match the locked primary"
+        );
+        assert_eq!(
+            super::signed_workload_matches_locked_primary(
+                &primary,
+                Some("[\"/bin/old\"]"),
+                Some(9090),
+                Some(&data),
+            )
+            .unwrap_err(),
+            "signed descriptor port does not match the locked primary"
+        );
+        let rewritten = vec!["/other".to_string()];
+        assert_eq!(
+            super::signed_workload_matches_locked_primary(
+                &primary,
+                Some("[\"/bin/old\"]"),
+                Some(8080),
+                Some(&rewritten),
+            )
+            .unwrap_err(),
+            "signed descriptor storage paths do not match the locked primary"
+        );
+        let mut state_only = primary.clone();
+        state_only.storage_paths = Some(vec!["/state".to_string()]);
+        let empty = Vec::<String>::new();
+        assert!(
+            super::signed_workload_matches_locked_primary(
+                &state_only,
+                Some("[\"/bin/old\"]"),
+                Some(8080),
+                Some(&empty),
+            )
+            .is_ok(),
+            "a /state-only column is the honest empty user-path list"
+        );
+        assert!(super::signed_workload_matches_locked_primary(&primary, None, None, None).is_ok());
+        assert_eq!(
+            super::signed_workload_matches_locked_primary(
+                &primary,
+                Some("[\"/bin/old\"]"),
+                None,
+                Some(&data),
+            )
+            .unwrap_err(),
+            "signed descriptor omitted command, port, or storage paths"
+        );
+    }
+
+    #[test]
+    fn signed_identity_rejects_a_rewritten_name_or_limit() {
+        use enclava_common::descriptor::EnvVar;
+        let primary = crate::models::AppContainer {
+            id: Uuid::nil(),
+            app_id: Uuid::nil(),
+            name: "app".to_string(),
+            image_ref: "ghcr.io/acme/app:latest".to_string(),
+            image_digest: None,
+            port: Some(8080),
+            command: None,
+            storage_paths: None,
+            workload_security_profile: None,
+            is_primary: true,
+        };
+        let resources = crate::models::AppResources {
+            app_id: Uuid::nil(),
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "5Gi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        };
+        let env = |name: &str| {
+            vec![EnvVar {
+                name: "ENCLAVA_CONTAINER_NAME".to_string(),
+                value: name.to_string(),
+            }]
+        };
+        let limits = |cpu: &str, memory: &str| {
+            vec![
+                EnvVar {
+                    name: "cpu".to_string(),
+                    value: cpu.to_string(),
+                },
+                EnvVar {
+                    name: "memory".to_string(),
+                    value: memory.to_string(),
+                },
+            ]
+        };
+        assert!(
+            super::signed_identity_matches_locked_runtime(
+                &primary,
+                &resources,
+                &env("app"),
+                &limits("1", "1Gi"),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            super::signed_identity_matches_locked_runtime(
+                &primary,
+                &resources,
+                &env("rewritten"),
+                &limits("1", "1Gi"),
+            )
+            .unwrap_err(),
+            "signed descriptor container name does not match the locked primary"
+        );
+        assert_eq!(
+            super::signed_identity_matches_locked_runtime(
+                &primary,
+                &resources,
+                &env("app"),
+                &limits("2", "1Gi"),
+            )
+            .unwrap_err(),
+            "signed descriptor cpu limit does not match the locked resources"
+        );
+        assert_eq!(
+            super::signed_identity_matches_locked_runtime(
+                &primary,
+                &resources,
+                &env("app"),
+                &limits("1", "2Gi"),
+            )
+            .unwrap_err(),
+            "signed descriptor memory limit does not match the locked resources"
+        );
+    }
+
+    #[test]
+    fn locked_generation_is_the_apply_job_row_not_a_healthy_container() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut app = test_app();
+        app.signer_identity_subject = Some("cosign-subject".to_string());
+        app.signer_identity_issuer =
+            Some("https://token.actions.githubusercontent.com".to_string());
+        let (generation, primary, resources) = generation_fixture(
+            "healthy",
+            digest,
+            Some(9090),
+            Some("rootful-sudo"),
+            "rootful-sudo",
+        );
+        let ok =
+            locked_generation_snapshot(Some(&generation), Some(&primary), Some(&resources), &app);
+        assert!(ok.acceptable, "{ok:?}");
+        assert_eq!(ok.source, LOCKED_GENERATION_SOURCE);
+        assert_eq!(ok.port, Some(9090));
+        assert_eq!(ok.container_name.as_deref(), Some("app"));
+        assert_eq!(
+            ok.workload_security_profile.as_deref(),
+            Some("rootful-sudo")
+        );
+        assert_eq!(ok.image_ref.as_deref(), Some(primary.image_ref.as_str()));
+        assert_eq!(ok.app.as_ref().map(|identity| identity.id), Some(app.id));
+        assert!(ok.app.as_ref().unwrap().signer_identity_subject == "cosign-subject");
+        assert!(ok.log_encryption.is_none());
+        let wire = serde_json::to_value(&ok).expect("serialize locked generation");
+        assert!(
+            wire.get("log_encryption")
+                .is_some_and(|value| value.is_null()),
+            "a no-recipient generation must emit explicit null, not omit the field: {wire}"
+        );
+
+        let mut stopped = app.clone();
+        stopped.status = AppStatus::Stopped;
+        let stopped = locked_generation_snapshot(
+            Some(&generation),
+            Some(&primary),
+            Some(&resources),
+            &stopped,
+        );
+        assert_eq!(
+            stopped.refusal.as_deref(),
+            Some("start the stopped app before deploying")
+        );
+
+        let mut empty_paths = primary.clone();
+        empty_paths.storage_paths = Some(vec!["/state".to_string()]);
+        let empty = locked_generation_snapshot(
+            Some(&generation),
+            Some(&empty_paths),
+            Some(&resources),
+            &app,
+        );
+        assert!(empty.acceptable, "{empty:?}");
+        assert_eq!(empty.storage_paths.as_deref(), Some(&[][..]));
+
+        let mut deleting = app.clone();
+        deleting.status = AppStatus::Deleting;
+        let deleting = locked_generation_snapshot(
+            Some(&generation),
+            Some(&primary),
+            Some(&resources),
+            &deleting,
+        );
+        assert_eq!(
+            deleting.refusal.as_deref(),
+            Some("app deletion is in progress")
+        );
+
+        let (pending, primary, resources) = generation_fixture(
+            "pending",
+            digest,
+            Some(9090),
+            Some("restricted"),
+            "restricted",
+        );
+        let refused =
+            locked_generation_snapshot(Some(&pending), Some(&primary), Some(&resources), &app);
+        assert!(!refused.acceptable);
+        assert!(refused.image_ref.is_none());
+        assert_eq!(
+            refused.refusal.as_deref(),
+            Some("current deployment generation is still in progress")
+        );
+
+        let (watching, primary, resources) = generation_fixture(
+            "watching",
+            digest,
+            Some(9090),
+            Some("restricted"),
+            "restricted",
+        );
+        assert!(
+            !locked_generation_snapshot(Some(&watching), Some(&primary), Some(&resources), &app)
+                .acceptable
+        );
+
+        let (healthy, mut drifted, resources) = generation_fixture(
+            "healthy",
+            digest,
+            Some(9090),
+            Some("restricted"),
+            "restricted",
+        );
+        drifted.image_digest = Some(format!("sha256:{}", "b".repeat(64)));
+        let drifted =
+            locked_generation_snapshot(Some(&healthy), Some(&drifted), Some(&resources), &app);
+        assert_eq!(
+            drifted.refusal.as_deref(),
+            Some("current runtime does not match its deployment generation")
+        );
+
+        let (healthy, mut omitted_port, resources) =
+            generation_fixture("healthy", digest, None, Some("restricted"), "restricted");
+        omitted_port.port = None;
+        let omitted =
+            locked_generation_snapshot(Some(&healthy), Some(&omitted_port), Some(&resources), &app);
+        assert_eq!(
+            omitted.refusal.as_deref(),
+            Some("stored primary omitted port; refusing to assume 8080")
+        );
+        assert!(omitted.port.is_none());
+
+        let missing = locked_generation_snapshot(None, Some(&primary), Some(&resources), &app);
+        assert_eq!(
+            missing.refusal.as_deref(),
+            Some("app has no deployment generation")
+        );
+        assert_eq!(missing.source, LOCKED_GENERATION_SOURCE);
+    }
+
     /// With no admissible launch identity the attested channel fails closed:
     /// `ownership_state` must be null even though the unverified
     /// `state.tee_http_client` is wired to a live TLS endpoint that would
@@ -3812,6 +5030,157 @@ mod tests {
         assert_eq!(body.ownership_state, None);
         assert_eq!(body.unlock_mode, "auto");
         assert!(body.tee_url.ends_with("/.well-known/confidential"));
+        // The fixture has a primary and no apply-job row. A container is not
+        // the generation the handler locks, so the field must refuse rather
+        // than look acceptable.
+        assert_eq!(body.locked_generation.source, LOCKED_GENERATION_SOURCE);
+        assert!(!body.locked_generation.acceptable);
+        // The fixture has a generation and a primary, but no signer. That is
+        // not a signable identity, and the refusal must not expose a digest.
+        assert_eq!(
+            body.locked_generation.refusal.as_deref(),
+            Some("stored app has no signer subject")
+        );
+        assert!(body.locked_generation.image_digest.is_none());
+        assert!(body.locked_generation.port.is_none());
+
+        delete_unlock_test_org(&pool, fixture.app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn disable_preview_rejects_the_entitlement_gates_the_commit_enforces() {
+        let pool = database_test_pool().await;
+        let fixture = insert_unlock_test_app(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        state.db = pool.clone();
+        // The fixture has no signed blobs. Turn the signed-artifact requirement
+        // off so this test reaches the entitlement gate instead of the
+        // missing-blob refusal.
+        state.attestation = None;
+        state.signing_service = None;
+        state.require_customer_signed_policy_artifact = false;
+        let auth = crate::auth::middleware::AuthContext {
+            user_id: fixture.user_id,
+            org_id: fixture.app.org_id,
+            org_name: "unlock-preview-test".to_string(),
+            role: crate::models::Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let request = super::UpdateUnlockModeRequest {
+            mode: "password".to_string(),
+            transition_receipt: None,
+            transition_attestation: None,
+            customer_descriptor_blob: None,
+            org_keyring_blob: None,
+            signed_policy_artifact: None,
+            validate_only: true,
+        };
+
+        let Json(accepted) = super::update_unlock_mode(
+            auth.clone(),
+            State(state.clone()),
+            Path(fixture.app.name.clone()),
+            Json(request),
+        )
+        .await
+        .expect("an allowed org must pass the disable preview");
+        assert_eq!(accepted.status, "validated");
+        let mode: String = sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+            .bind(fixture.app.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "auto", "preview must not write the mode");
+
+        let paas_org_id = format!("paas-{}", fixture.app.org_id.simple());
+        sqlx::query(
+            "INSERT INTO organization_management (org_id, mode, paas_org_id, status)
+             VALUES ($1, 'paas_managed', $2, 'active')",
+        )
+        .bind(fixture.app.org_id)
+        .bind(&paas_org_id)
+        .execute(&pool)
+        .await
+        .expect("mark preview org PaaS managed");
+        sqlx::query(
+            "INSERT INTO organization_entitlements (
+                 org_id, version, deploy_allowed, block_reason, limits
+             ) VALUES ($1, 1, false, 'entitlement_blocked', $2)",
+        )
+        .bind(fixture.app.org_id)
+        .bind(serde_json::json!({
+            "name": "test",
+            "max_apps": 10,
+            "max_cpu": "4",
+            "max_memory": "8Gi",
+            "max_storage": "20Gi"
+        }))
+        .execute(&pool)
+        .await
+        .expect("block preview org deploys");
+
+        let blocked = super::update_unlock_mode(
+            auth.clone(),
+            State(state.clone()),
+            Path(fixture.app.name.clone()),
+            Json(super::UpdateUnlockModeRequest {
+                mode: "password".to_string(),
+                transition_receipt: None,
+                transition_attestation: None,
+                customer_descriptor_blob: None,
+                org_keyring_blob: None,
+                signed_policy_artifact: None,
+                validate_only: true,
+            }),
+        )
+        .await
+        .expect_err("a blocked entitlement must fail the preview");
+        assert_eq!(blocked.0, StatusCode::FORBIDDEN);
+        assert_eq!(blocked.1.0["error"], "deploy_blocked");
+        assert_eq!(blocked.1.0["reason"], "entitlement_blocked");
+        let mode: String = sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+            .bind(fixture.app.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "auto");
+
+        sqlx::query(
+            "UPDATE organization_entitlements
+                SET deploy_allowed = true, block_reason = NULL, limits = $2
+              WHERE org_id = $1",
+        )
+        .bind(fixture.app.org_id)
+        .bind(serde_json::json!({
+            "name": "test",
+            "max_apps": 10,
+            "max_cpu": "4",
+            "max_memory": "8Gi",
+            "max_storage": "1Gi"
+        }))
+        .execute(&pool)
+        .await
+        .expect("shrink preview org storage limit");
+        let over_limit = super::update_unlock_mode(
+            auth,
+            State(state),
+            Path(fixture.app.name.clone()),
+            Json(super::UpdateUnlockModeRequest {
+                mode: "password".to_string(),
+                transition_receipt: None,
+                transition_attestation: None,
+                customer_descriptor_blob: None,
+                org_keyring_blob: None,
+                signed_policy_artifact: None,
+                validate_only: true,
+            }),
+        )
+        .await
+        .expect_err("a persisted size over the live limit must fail the preview");
+        assert_eq!(over_limit.0, StatusCode::FORBIDDEN);
+        assert_eq!(over_limit.1.0["reason"], "entitlement_storage_limit");
 
         delete_unlock_test_org(&pool, fixture.app.org_id).await;
     }

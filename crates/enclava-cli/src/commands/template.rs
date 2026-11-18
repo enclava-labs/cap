@@ -486,6 +486,9 @@ async fn deploy_with_timings(
         image: &template.image,
         target_unlock_mode: Some(template.unlock_mode.as_str()),
         workload_security_profile,
+        container_name: "web",
+        log_encryption: None,
+        pin_log_encryption: false,
     })
     .await?;
     verify_signed_template_log_key(
