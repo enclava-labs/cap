@@ -577,12 +577,18 @@ async fn deploy_with_timings(
             deploy_id,
             workflow,
             log_key,
+            signed_log_key_id,
         } => {
             // The replayed request is byte-identical to the signed one, so
-            // this run's log-key flags cannot change it. Refuse a retry that
-            // names different flags instead of silently ignoring them (#402).
+            // this run's log-key flags cannot change it. Compare against the
+            // key the policy response signed, not only an explicit flag:
+            // PaaS injects an already-active key even when the original
+            // command passed none (#403).
             enclava_cli::template_deploy_retry::replay_log_key_flag_conflict(
-                log_key.as_ref().map(|key| key.key_id.as_str()),
+                enclava_cli::template_deploy_retry::signed_log_key_id_for_replay(
+                    signed_log_key_id.as_deref(),
+                    log_key.as_ref().map(|key| key.key_id.as_str()),
+                ),
                 args.log_key.as_deref(),
                 args.generate_log_key.as_deref(),
             )?;
@@ -718,6 +724,14 @@ async fn deploy_with_timings(
                             .as_ref()
                             .map(|path| path.to_string_lossy().into_owned())
                     }),
+                    // The policy response's key, including an already-active
+                    // key PaaS injected when this command passed no flag.
+                    // Retry flag checks compare against this, not only the
+                    // explicit preparation above (#403).
+                    signed_log_key_id: signed_blobs
+                        .log_encryption
+                        .as_ref()
+                        .map(|signed| signed.key_id.clone()),
                 },
             )
             .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;

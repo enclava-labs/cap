@@ -40,6 +40,29 @@ pub(crate) const MAX_RETRY_AFTER_HORIZON_SECS: i64 = 365 * 24 * 60 * 60;
 /// below this; anything longer is treated as malformed without parsing.
 const MAX_RETRY_AFTER_LEN: usize = 64;
 
+/// Stage this process has reached. The binary's `record_stage` is the only
+/// production writer; [`SafeBootstrapDiagnostic::diagnose`] is the only
+/// reader that copies it onto a diagnostic. A caller of `diagnose` cannot
+/// pass a different string.
+static LAST_STAGE: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+/// Record the fixed-vocabulary stage the current run has reached.
+///
+/// Production code writes this only from `record_stage`. Tests reset it so
+/// a previous case cannot leak a stage into the next failure report.
+pub fn set_last_stage(stage: Option<&'static str>) {
+    *LAST_STAGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = stage;
+}
+
+/// The stage [`set_last_stage`] last recorded, if any.
+pub fn last_stage() -> Option<&'static str> {
+    *LAST_STAGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Bounded, provider-text-free diagnostic code for a bootstrap failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafeDiagnosticCode {
@@ -91,17 +114,16 @@ pub struct SafeBootstrapDiagnostic {
     pub retry_after: Option<DateTime<Utc>>,
     /// The fixed-vocabulary init stage the failed run had reached (one of
     /// the `record_stage` literals), or `None` when no stage was recorded.
-    /// Safe like every other field: never free-form text. Private with the
-    /// stage set only through [`Self::diagnose`]/[`Self::with_stage`], so
-    /// "stage only from `last_stage()`" is structural, not convention
-    /// (#402).
+    /// Safe like every other field: never free-form text. Private, and set
+    /// only by [`Self::diagnose`] from the stage tracker `record_stage`
+    /// writes — a caller cannot pass a different string (#402).
     stage: Option<&'static str>,
 }
 
 impl SafeBootstrapDiagnostic {
     /// A stage-less diagnostic for a known code and validated deadline.
-    /// The stage is attached via [`Self::with_stage`] (or passed to
-    /// [`Self::diagnose`]) from `last_stage()` only.
+    /// [`Self::diagnose`] attaches the stage the run has reached; nothing
+    /// else may name one.
     pub fn new(code: SafeDiagnosticCode, retry_after: Option<DateTime<Utc>>) -> Self {
         Self {
             code,
@@ -110,11 +132,15 @@ impl SafeBootstrapDiagnostic {
         }
     }
 
-    /// Attach the fixed-vocabulary stage this run reached. The value must be
-    /// a `last_stage()` result (the `record_stage` literals) — nothing else
-    /// may name a stage (#402).
-    pub fn with_stage(mut self, stage: Option<&'static str>) -> Self {
-        self.stage = stage;
+    /// The stage [`Self::diagnose`] attached, if the run had reached one.
+    pub fn stage(&self) -> Option<&'static str> {
+        self.stage
+    }
+
+    /// Attach the stage the tracker currently holds. Not a caller-supplied
+    /// string: the only production writer is `record_stage`.
+    fn with_recorded_stage(mut self) -> Self {
+        self.stage = last_stage();
         self
     }
 
@@ -137,21 +163,23 @@ impl SafeBootstrapDiagnostic {
         }
     }
 
-    /// Derive the safe diagnostic for a failed bootstrap run, paired with
-    /// the stage the run reached (`last_stage()`) at construction time —
-    /// never by a later field write (#402).
+    /// Derive the safe diagnostic for a failed bootstrap run.
+    ///
+    /// The stage is read from the tracker `record_stage` writes, at
+    /// construction time — never from a caller-supplied string and never by
+    /// a later field write (#402).
     ///
     /// The TLS broker's typed terminal failure is recovered by typed
     /// downcast through any contextual anyhow wrappers (never string
     /// scraping); every other error — including wrapped IO, config, or
     /// validation failures — degrades to the generic safe failure, keeping
     /// its possibly path-bearing chain out of all output.
-    pub fn diagnose(error: &anyhow::Error, stage: Option<&'static str>) -> Self {
+    pub fn diagnose(error: &anyhow::Error) -> Self {
         error
             .downcast_ref::<crate::tls_certificate::TlsBrokerFailure>()
             .map(|failure| failure.diagnostic.clone())
             .unwrap_or_else(Self::generic)
-            .with_stage(stage)
+            .with_recorded_stage()
     }
 
     /// Parse and validate a broker-supplied `retry_after` value into a
@@ -206,6 +234,9 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use chrono::TimeDelta;
+
+    /// Serializes tests that read or write the process-global stage tracker.
+    static STAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn now() -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(1789000000, 0).unwrap()
@@ -281,6 +312,8 @@ mod tests {
 
     #[test]
     fn typed_broker_failure_survives_contextual_anyhow_wrappers() {
+        let _stage = STAGE_LOCK.lock().unwrap();
+        set_last_stage(Some("provisioning static tls certificate"));
         let deadline = now() + TimeDelta::minutes(30);
         let diagnostic = SafeBootstrapDiagnostic {
             code: SafeDiagnosticCode::AcmeRateLimited,
@@ -291,26 +324,32 @@ mod tests {
             .context("provisioning static TLS certificate")
             .context("outer context with SYNTHETIC-CHAIN-SENTINEL text");
 
-        let diagnosed =
-            SafeBootstrapDiagnostic::diagnose(&error, Some("provisioning static tls certificate"));
+        let diagnosed = SafeBootstrapDiagnostic::diagnose(&error);
         assert_eq!(diagnosed.code, SafeDiagnosticCode::AcmeRateLimited);
         assert_eq!(diagnosed.retry_after, Some(deadline));
-        // The stage is paired at diagnose() time, from last_stage() only.
-        assert_eq!(diagnosed.stage, Some("provisioning static tls certificate"));
+        // The stage comes from the tracker record_stage writes, not a
+        // diagnose argument. A caller cannot pass a different string.
+        assert_eq!(
+            diagnosed.stage(),
+            Some("provisioning static tls certificate")
+        );
         // The rendered output carries only the safe fields, never the chain.
         let rendered = diagnosed.render_json();
         assert!(!rendered.contains("SYNTHETIC-CHAIN-SENTINEL"));
         assert!(!rendered.contains("outer context"));
+        set_last_stage(None);
     }
 
     #[test]
     fn unknown_errors_degrade_to_generic_without_chain_text() {
+        let _stage = STAGE_LOCK.lock().unwrap();
+        set_last_stage(None);
         let error = anyhow!("reading supplied value /state/secret-path: SYNTHETIC-IO-SENTINEL")
             .context("opening luks volumes");
-        let diagnosed = SafeBootstrapDiagnostic::diagnose(&error, None);
+        let diagnosed = SafeBootstrapDiagnostic::diagnose(&error);
         assert_eq!(diagnosed.code, SafeDiagnosticCode::EnclavaInitFailed);
         assert_eq!(diagnosed.retry_after, None);
-        assert_eq!(diagnosed.stage, None);
+        assert_eq!(diagnosed.stage(), None);
         let rendered = diagnosed.render_json();
         assert!(!rendered.contains("SYNTHETIC-IO-SENTINEL"));
         assert!(!rendered.contains("/state/secret-path"));

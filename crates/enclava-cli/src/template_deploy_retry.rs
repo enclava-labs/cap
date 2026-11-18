@@ -101,8 +101,11 @@ pub struct StoredTemplateWorkflow {
     pub paas_managed_config_keys: Vec<String>,
 }
 
-/// Log-key output from the invocation that signed the request. A retry that
-/// died before printing still has to report the key the descriptor contains.
+/// Explicit `--log-key` / `--generate-log-key` output from the invocation
+/// that signed the request. A retry that died before printing still has to
+/// report a generated private-key path. This is not the key the descriptor
+/// was signed with: PaaS injects an already-active key even when no flag
+/// was passed, and that id is [`NewTemplateDeployAttempt::signed_log_key_id`].
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoredTemplateLogKey {
     pub key_id: String,
@@ -114,8 +117,15 @@ pub struct StoredTemplateLogKey {
 pub struct NewTemplateDeployAttempt {
     pub unlock_mode: String,
     pub paas_managed_config_keys: Vec<String>,
+    /// Explicit flag preparation only. Absent when the command passed no
+    /// log-key flag, even if the signed request carries an active key.
     pub log_key_id: Option<String>,
     pub log_private_key_file: Option<String>,
+    /// Key id baked into the signed deployment (`signed_blobs.log_encryption`).
+    /// Distinct from [`Self::log_key_id`]: retry flag checks compare against
+    /// this, while output keeps the explicit preparation (including a
+    /// generated private-key path).
+    pub signed_log_key_id: Option<String>,
 }
 
 /// What this run should POST.
@@ -128,7 +138,13 @@ pub enum TemplateDeployAttempt {
         request: Box<CreateTemplateInstanceRequest>,
         deploy_id: String,
         workflow: Option<StoredTemplateWorkflow>,
+        /// Explicit flag output (generated private-key path). Not the
+        /// comparison key — that is `signed_log_key_id` on this variant.
         log_key: Option<StoredTemplateLogKey>,
+        /// Key id in the signed request. `None` on files that predate the
+        /// field; callers fall back to `log_key.key_id`, which was verified
+        /// equal to the signed key when a flag was passed.
+        signed_log_key_id: Option<String>,
     },
     /// A second signed request would race an in-flight deployment. Do not POST.
     Refuse(String),
@@ -163,6 +179,12 @@ pub struct StoredTemplateDeployAttempt {
     workflow: Option<StoredTemplateWorkflow>,
     #[serde(default)]
     log_key: Option<StoredTemplateLogKey>,
+    /// Key id the policy response baked into the signed deployment. Absent
+    /// on files written before this field; those fall back to `log_key`,
+    /// which matches the signed key when a flag was passed and is absent
+    /// when it was not (the signed id is then unknown).
+    #[serde(default)]
+    signed_log_key_id: Option<String>,
     /// Set only after this command finished. A later list outage must not
     /// replay a finished request into a new server generation.
     #[serde(default)]
@@ -555,6 +577,11 @@ pub fn password_resume_key_source_seed_fallible(
 /// run's `--log-key` / `--generate-log-key` cannot change what it carries.
 /// A retry naming different flags is diverging and must refuse instead of
 /// silently ignoring them (#402).
+///
+/// `stored_key_id` is the key the request was signed with
+/// ([`signed_log_key_id_for_replay`]), not only an explicit flag. PaaS
+/// injects an already-active key into agent-policy even when the original
+/// command passed no flag, and that key enters the signed deployment.
 pub fn replay_log_key_flag_conflict(
     stored_key_id: Option<&str>,
     log_key: Option<&str>,
@@ -582,6 +609,23 @@ pub fn replay_log_key_flag_conflict(
     Err(format!(
         "the template deploy being resumed re-posts the request signed on this machine byte-identically, so {flag} `{requested}` would be silently ignored: that request was signed with {stored}. A new deployment was not started. Retry the original command to resume that deployment, or destroy the app and deploy again.",
     ))
+}
+
+/// Key id the resumed request was signed with.
+///
+/// `signed_log_key_id` is the policy response's key, persisted separately
+/// from explicit `--log-key` / `--generate-log-key` output. Files written
+/// before that field fall back to the explicit key, which was verified
+/// equal to the signed key when a flag was passed. Absent both, the
+/// signed key is unknown and a retry flag must refuse.
+pub fn signed_log_key_id_for_replay<'a>(
+    signed_log_key_id: Option<&'a str>,
+    explicit_log_key_id: Option<&'a str>,
+) -> Option<&'a str> {
+    signed_log_key_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .or(explicit_log_key_id)
 }
 
 /// Whether this attempt must satisfy password-mode gates.
@@ -898,11 +942,13 @@ fn replay(stored: Box<StoredTemplateDeployAttempt>) -> TemplateDeployAttempt {
     let deploy_id = stored.deploy_id.clone();
     let workflow = stored.workflow.clone();
     let log_key = stored.log_key.clone();
+    let signed_log_key_id = nonempty_key_id(stored.signed_log_key_id.as_deref());
     TemplateDeployAttempt::Replay {
         request: Box::new((*stored).into_request()),
         deploy_id,
         workflow,
         log_key,
+        signed_log_key_id,
     }
 }
 
@@ -1268,19 +1314,16 @@ pub fn save_template_deploy_attempt(
             paas_managed_config_keys: record.paas_managed_config_keys.clone(),
         }),
         log_key: stored_log_key(record),
+        signed_log_key_id: nonempty_key_id(record.signed_log_key_id.as_deref()),
         completed: false,
     };
     write_stored(paths, &stored)
 }
 
 fn stored_log_key(record: &NewTemplateDeployAttempt) -> Option<StoredTemplateLogKey> {
-    let key_id = record
-        .log_key_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|key_id| !key_id.is_empty())?;
+    let key_id = nonempty_key_id(record.log_key_id.as_deref())?;
     Some(StoredTemplateLogKey {
-        key_id: key_id.to_string(),
+        key_id,
         private_key_file: record
             .log_private_key_file
             .as_deref()
@@ -1288,6 +1331,13 @@ fn stored_log_key(record: &NewTemplateDeployAttempt) -> Option<StoredTemplateLog
             .filter(|path| !path.is_empty())
             .map(str::to_string),
     })
+}
+
+fn nonempty_key_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 pub fn load_template_deploy_attempt(
@@ -1529,6 +1579,7 @@ mod tests {
                 key_id: "shell-logs".to_string(),
                 private_key_file: Some("/keys/shell-logs.x25519".to_string()),
             }),
+            signed_log_key_id: Some("shell-logs".to_string()),
             completed: false,
         }
     }
@@ -1577,6 +1628,7 @@ mod tests {
             paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
             log_key_id: Some("shell-logs".to_string()),
             log_private_key_file: Some("/keys/shell-logs.x25519".to_string()),
+            signed_log_key_id: Some("shell-logs".to_string()),
         }
     }
 
@@ -1595,6 +1647,7 @@ mod tests {
             deploy_id,
             workflow,
             log_key,
+            signed_log_key_id,
         } = attempt
         else {
             panic!("in-flight retry must replay the stored request, not sign a new one");
@@ -1611,6 +1664,7 @@ mod tests {
             log_key.expect("replay must keep the signed log key").key_id,
             "shell-logs"
         );
+        assert_eq!(signed_log_key_id.as_deref(), Some("shell-logs"));
         assert_eq!(
             idempotency_key_for_request(&request),
             idempotency_key_for_request(&original),
@@ -2885,6 +2939,103 @@ mod tests {
         let error = replay_log_key_flag_conflict(Some("shell-logs"), Some("a"), Some("b"))
             .expect_err("both flags at once still refuses");
         assert!(error.contains("cannot be used together"), "{error}");
+    }
+
+    #[test]
+    fn matching_active_log_key_resumes_when_no_flag_was_prepared() {
+        // PaaS injects an already-active key into agent-policy even when the
+        // original command passed no flag, and that key enters the signed
+        // request. The resume file must remember that id, or a retry naming
+        // the same --log-key is refused as a divergence (#403). Output
+        // metadata stays absent: there is no generated private-key path.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+        let stable = stable();
+        let request = request_from(&stable, "descriptor-a");
+        save_template_deploy_attempt(
+            &paths,
+            "org:org-1",
+            "app-uuid",
+            "deploy-1",
+            &request,
+            &NewTemplateDeployAttempt {
+                unlock_mode: "password".to_string(),
+                paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
+                log_key_id: None,
+                log_private_key_file: None,
+                signed_log_key_id: Some("audit".to_string()),
+            },
+        )
+        .unwrap();
+        let LoadedTemplateDeployAttempt::Ready(stored) =
+            load_template_deploy_attempt(&paths, "org:org-1", "shell")
+        else {
+            panic!("stored request must load");
+        };
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(stored),
+            &stable,
+            &listed(vec![row("deploy-1", "applying", Some("applying"))]),
+        );
+        let TemplateDeployAttempt::Replay {
+            log_key,
+            signed_log_key_id,
+            ..
+        } = attempt
+        else {
+            panic!("in-flight retry must replay the signed request");
+        };
+        assert!(
+            log_key.is_none(),
+            "no explicit preparation must not invent output metadata"
+        );
+        let compared = signed_log_key_id_for_replay(
+            signed_log_key_id.as_deref(),
+            log_key.as_ref().map(|key| key.key_id.as_str()),
+        );
+        assert_eq!(compared, Some("audit"));
+        assert!(replay_log_key_flag_conflict(compared, Some("audit"), None).is_ok());
+        assert!(replay_log_key_flag_conflict(compared, None, None).is_ok());
+        let error = replay_log_key_flag_conflict(compared, Some("other"), None)
+            .expect_err("a different key still refuses");
+        assert!(error.contains("audit"), "{error}");
+
+        // Files written before signed_log_key_id fall back to the explicit
+        // key (verified equal to the signed key when a flag was passed).
+        assert_eq!(
+            signed_log_key_id_for_replay(None, Some("shell-logs")),
+            Some("shell-logs")
+        );
+        assert_eq!(
+            signed_log_key_id_for_replay(Some("  "), Some("shell-logs")),
+            Some("shell-logs")
+        );
+        assert_eq!(
+            signed_log_key_id_for_replay(Some("audit"), Some("shell-logs")),
+            Some("audit")
+        );
+
+        // A file written before the field still loads, and comparison falls
+        // back to the explicit key rather than refusing the resume file.
+        let path = attempt_path(&paths, "org:org-1", "shell");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("signed_log_key_id");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let LoadedTemplateDeployAttempt::Ready(legacy) =
+            load_template_deploy_attempt(&paths, "org:org-1", "shell")
+        else {
+            panic!("a pre-field resume file must still load");
+        };
+        assert!(legacy.signed_log_key_id.is_none());
+        assert_eq!(
+            signed_log_key_id_for_replay(
+                legacy.signed_log_key_id.as_deref(),
+                legacy.log_key.as_ref().map(|key| key.key_id.as_str()),
+            ),
+            None,
+            "no explicit key and no signed id stays unknown, so a new flag refuses"
+        );
     }
 
     #[test]
