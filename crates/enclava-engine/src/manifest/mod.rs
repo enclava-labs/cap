@@ -22,6 +22,12 @@ pub mod statefulset;
 pub mod verification_material;
 pub mod volumes;
 
+/// Label key carrying the deployment id on every workload pod — the single
+/// source of truth for the readers in enclava-api (`routes/status.rs`,
+/// `deploy.rs`) and the manifest itself (#402: this used to be four hardcoded
+/// copies).
+pub const DEPLOYMENT_ID_LABEL: &str = "enclava.dev/deployment-id";
+
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, ResourceQuota, Service, ServiceAccount};
 use serde_json::Value;

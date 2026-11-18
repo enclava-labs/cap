@@ -108,6 +108,12 @@ jobs:
       - name: Run fmt check
         run: cargo fmt --all -- --check
 
+      - name: Check template-deployment status vocabulary
+        # cap#402: drift-checks the owning servers' status sources against
+        # the pinned fixture (the fixture <-> classifier contract is enforced
+        # by the enclava-cli and enclava-api unit tests).
+        run: bash scripts/gen-template-deployment-status-vocabulary.sh
+
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

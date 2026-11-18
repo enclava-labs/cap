@@ -116,11 +116,10 @@ fn failure_surfaces_render_safe_json_and_stage_markers_stay_in_stage_file() {
     // adds around TLS provisioning.
     let deadline = chrono::Utc::now() + TimeDelta::hours(1);
     let error = anyhow::Error::new(TlsBrokerFailure {
-        diagnostic: SafeBootstrapDiagnostic {
-            code: SafeDiagnosticCode::AcmeRateLimited,
-            retry_after: Some(deadline),
-            stage: None,
-        },
+        diagnostic: SafeBootstrapDiagnostic::new(
+            SafeDiagnosticCode::AcmeRateLimited,
+            Some(deadline),
+        ),
     })
     .context("provisioning static TLS certificate")
     .context("chain detail SYNTHETIC-PROVIDER-SENTINEL at /supplied/raw-path");
