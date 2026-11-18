@@ -4089,7 +4089,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn signed_policy_bootstrap_generation_is_atomic_and_idempotent() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let mut tx = pool.begin().await.unwrap();
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
@@ -6350,7 +6350,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn latest_deployment_prefers_jobs_then_deterministic_legacy_identity() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         let created_at = Utc::now();
         let older_id = Uuid::parse_str("10000000-0000-0000-0000-000000000001").unwrap();
@@ -6380,7 +6380,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn receipt_authority_is_immutable_but_app_cascade_remains_available() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         let deployment_id = Uuid::new_v4();
         insert_test_deployment(&pool, org_id, app_id, deployment_id, "healthy", Utc::now()).await;
@@ -6484,7 +6484,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn legacy_authority_survives_while_the_only_durable_job_is_an_unreleased_hold() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let now = Utc::now();
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
         // The candidates query filters artifacts by current keyring
@@ -7090,7 +7090,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn replacement_handoff_keeps_running_authority_required_until_healthy() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let now = Utc::now();
 
         // A signed replacement released from its hold whose apply has not
@@ -7466,7 +7466,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn failed_replacement_keeps_running_authority_until_confirmed_takeover() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let now = Utc::now();
 
         // The released replacement of a signed workload fails mid-apply:
@@ -7807,7 +7807,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn deleting_app_keeps_authorization_only_while_teardown_pending() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let now = Utc::now();
 
         let (pending_org, pending_app) = insert_test_app(&pool, "deleting").await;
@@ -8112,7 +8112,7 @@ resource_bindings := {
     /// artifact.
     #[tokio::test]
     async fn teardown_admission_never_refuses_a_non_growing_delete() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let now = Utc::now();
 
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
@@ -8162,7 +8162,7 @@ resource_bindings := {
     /// is tight.
     #[tokio::test]
     async fn teardown_admission_bypasses_completed_teardown_retries() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let now = Utc::now();
 
         let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
@@ -8411,7 +8411,7 @@ resource_bindings := {
     /// selector admits.
     #[tokio::test]
     async fn teardown_unit_projection_matches_deleting_selector_for_job_authority() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let signer = "bb";
 
         // Missing keyring: nothing is authorized on either side.
@@ -8498,7 +8498,7 @@ resource_bindings := {
     /// selector excludes before ranking and the projection must too.
     #[tokio::test]
     async fn teardown_unit_projection_matches_deleting_selector_for_legacy_authority() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let signer = "bb";
 
         // Missing keyring.
@@ -8683,7 +8683,7 @@ resource_bindings := {
     /// demanding an impossible republication.
     #[tokio::test]
     async fn teardown_unit_already_published_checks_the_live_policy_body() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let now = Utc::now();
 
         let (org_id, app_id) = insert_test_app(&pool, "running").await;
@@ -9057,7 +9057,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn soft_delete_owner_binding_records_teardown_outcome() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
 
         // The mirrored binding-key format is load-bearing for the guard: a
         // drift in either string silently disables it. Pin it against the
@@ -9275,7 +9275,7 @@ resource_bindings := {
 
     #[tokio::test]
     async fn soft_delete_owner_binding_waives_ever_deployed_workload_without_binding() {
-        let pool = crate::test_support::database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
 
         // A signed deployment leaves no owner binding row — the deployment
         // row is the only durable signal that a TEE boot may have left the
