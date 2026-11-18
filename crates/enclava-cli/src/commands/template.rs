@@ -578,6 +578,14 @@ async fn deploy_with_timings(
             workflow,
             log_key,
         } => {
+            // The replayed request is byte-identical to the signed one, so
+            // this run's log-key flags cannot change it. Refuse a retry that
+            // names different flags instead of silently ignoring them (#402).
+            enclava_cli::template_deploy_retry::replay_log_key_flag_conflict(
+                log_key.as_ref().map(|key| key.key_id.as_str()),
+                args.log_key.as_deref(),
+                args.generate_log_key.as_deref(),
+            )?;
             let request = *request;
             pb.set_position(1);
             pb.set_message("Resuming in-flight template deployment...");
@@ -1750,15 +1758,36 @@ async fn peek_password_bootstrap_key(
 ) -> Result<Option<PeekedBootstrapKey>, Box<dyn std::error::Error>> {
     let active = resolve_current_user_org(api).await?;
     let saved = read_saved_bootstrap_peek(paths, &active.org_name, instance_name)?;
-    let derived = derive_peek_from_seed(paths, active.org_id, &active.org_name, instance_name)?;
-    let source = enclava_cli::template_deploy_retry::password_resume_key_source(
+    // The seed may be broken, removed, or replaced. That error must not
+    // pre-empt a saved key answering the signed request: the source decision
+    // below prefers the saved file in exactly that case (#402).
+    let derived = derive_peek_from_seed(paths, active.org_id, &active.org_name, instance_name);
+    let source = enclava_cli::template_deploy_retry::password_resume_key_source_seed_fallible(
         saved.as_ref().map(|key| key.hash.as_str()),
-        derived.as_ref().map(|key| key.hash.as_str()),
+        derived
+            .as_ref()
+            .ok()
+            .and_then(|key| key.as_ref())
+            .map(|key| key.hash.as_str()),
+        derived.is_err(),
         stored_hash,
     );
+    let source = match source {
+        Ok(source) => source,
+        // Neither a matching saved key nor a readable seed answers the
+        // signed request; surface the seed error.
+        Err(enclava_cli::template_deploy_retry::SeedError) => {
+            return Err(match derived {
+                Err(error) => error,
+                Ok(_) => "recovery seed derivation failed".into(),
+            });
+        }
+    };
     Ok(match source {
         Some(enclava_cli::template_deploy_retry::PasswordResumeKeySource::Saved) => saved,
-        Some(enclava_cli::template_deploy_retry::PasswordResumeKeySource::Derived) => derived,
+        Some(enclava_cli::template_deploy_retry::PasswordResumeKeySource::Derived) => {
+            derived.ok().flatten()
+        }
         None => None,
     })
 }

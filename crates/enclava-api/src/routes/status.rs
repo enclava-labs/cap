@@ -20,7 +20,7 @@ use crate::auth::{middleware::AuthContext, scopes};
 use crate::models::App;
 use crate::state::AppState;
 
-const DEPLOYMENT_ID_LABEL: &str = "enclava.dev/deployment-id";
+const DEPLOYMENT_ID_LABEL: &str = enclava_engine::manifest::DEPLOYMENT_ID_LABEL;
 const KUBERNETES_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TEE_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The per-request timeout gets the remaining probe budget minus this
@@ -1203,11 +1203,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        AppState, KubernetesEvidence, LiveObservationReason, LiveObservationState, PodEvidence,
-        RuntimeFailureEvidence, TeeEvidence, bounded_kubernetes_probe, bounded_tee_probe,
-        classify_live_observation, classify_live_observation_for_deployment,
-        clear_tee_probe_failure_state, confidential_status_url, effective_app_status, pod_is_ready,
-        probe_tee, runtime_failure_evidence, select_runtime_failure, tee_evidence_fields,
+        AppState, DEPLOYMENT_ID_LABEL, KubernetesEvidence, LiveObservationReason,
+        LiveObservationState, PodEvidence, RuntimeFailureEvidence, TeeEvidence,
+        bounded_kubernetes_probe, bounded_tee_probe, classify_live_observation,
+        classify_live_observation_for_deployment, clear_tee_probe_failure_state,
+        confidential_status_url, effective_app_status, pod_is_ready, probe_tee,
+        runtime_failure_evidence, select_runtime_failure, tee_evidence_fields,
     };
     use axum::http::StatusCode;
     use std::net::SocketAddr;
@@ -1249,7 +1250,7 @@ mod tests {
             .map(|deployment_id| deployment_id.to_string())
             .or_else(|| deployment_id_malformed.then(|| "not-a-uuid".to_string()))
             .map(|deployment_id| {
-                BTreeMap::from([("enclava.dev/deployment-id".to_string(), deployment_id)])
+                BTreeMap::from([(DEPLOYMENT_ID_LABEL.to_string(), deployment_id)])
             });
         let pod = Pod {
             metadata: ObjectMeta {

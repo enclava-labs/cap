@@ -38,6 +38,22 @@ const STORED_ATTEMPT_VERSION: u32 = 1;
 
 /// Stay an hour inside PaaS's 24h replay window so client/server clock skew
 /// cannot turn a forgotten key into a new rollout.
+///
+/// The window bounds only an absent or settled row. An in-flight row may be
+/// replayed at any age because idempotency retention extends for live rows
+/// (#402, verified against both servers): enclava-paas keeps a
+/// `hosted_operation_intents` row replayable while it is `pending`/
+/// `token_pending` (`replay_active` in `server/src/hosted_operations.rs`)
+/// and only starts its 24h `replay_expires_at` window at terminalization,
+/// while CAP's reservation for a still-retried operation is refreshed by
+/// every lease. A reservation quiet for a day is terminalized by the reaper
+/// (`IDEMPOTENCY_REAP_HORIZON_SECONDS` in
+/// `crates/enclava-api/src/routes/internal.rs`) as `abandoned`, which the
+/// route's recovery policy settles as `idempotency_recovery_required` for
+/// fail-closed mutations — already retired by
+/// [`template_instance_rejection_retires_attempt`]. An over-age replay thus
+/// re-posts the original signed bytes into the original key's fate; it never
+/// signs a second deployment.
 pub const TEMPLATE_DEPLOY_REPLAY_WINDOW_SECS: u64 = 23 * 60 * 60;
 
 /// Settings that identify "the same template deploy command". The signed blobs
@@ -502,6 +518,72 @@ pub fn password_resume_key_source(
     None
 }
 
+/// Marker for [`password_resume_key_source_seed_fallible`]'s error arm: the
+/// recovery-seed failure must surface to the caller instead of being
+/// swallowed as "no key".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeedError;
+
+/// [`password_resume_key_source`] for runs where deriving from the recovery
+/// seed failed ([`SeedError`] must surface the seed error).
+///
+/// A seed error must not pre-empt a saved per-app key that answers the signed
+/// request (#402): ownership claim reads the saved file before it derives
+/// from the seed, so a broken, removed, or replaced seed cannot hide a key
+/// that can still finish the deploy. The error surfaces only when no saved
+/// key matches — an unreadable source is not a match.
+pub fn password_resume_key_source_seed_fallible(
+    saved_hash: Option<&str>,
+    derived_hash: Option<&str>,
+    seed_error: bool,
+    stored_hash: Option<&str>,
+) -> Result<Option<PasswordResumeKeySource>, SeedError> {
+    if !seed_error {
+        return Ok(password_resume_key_source(
+            saved_hash,
+            derived_hash,
+            stored_hash,
+        ));
+    }
+    if saved_hash.is_some_and(|hash| stored_hash == Some(hash)) {
+        return Ok(Some(PasswordResumeKeySource::Saved));
+    }
+    Err(SeedError)
+}
+
+/// A resumed deploy re-posts the stored request byte-identically, so this
+/// run's `--log-key` / `--generate-log-key` cannot change what it carries.
+/// A retry naming different flags is diverging and must refuse instead of
+/// silently ignoring them (#402).
+pub fn replay_log_key_flag_conflict(
+    stored_key_id: Option<&str>,
+    log_key: Option<&str>,
+    generate_log_key: Option<&str>,
+) -> Result<(), String> {
+    if log_key.is_some() && generate_log_key.is_some() {
+        return Err("--log-key and --generate-log-key cannot be used together".to_string());
+    }
+    let Some(requested) = log_key.or(generate_log_key) else {
+        // No flags: the replay keeps the stored key, identical by design.
+        return Ok(());
+    };
+    if stored_key_id == Some(requested) {
+        return Ok(());
+    }
+    let flag = if log_key.is_some() {
+        "--log-key"
+    } else {
+        "--generate-log-key"
+    };
+    let stored = match stored_key_id {
+        Some(key_id) => format!("log key `{key_id}`"),
+        None => "no log-encryption key".to_string(),
+    };
+    Err(format!(
+        "the template deploy being resumed re-posts the request signed on this machine byte-identically, so {flag} `{requested}` would be silently ignored: that request was signed with {stored}. A new deployment was not started. Retry the original command to resume that deployment, or destroy the app and deploy again.",
+    ))
+}
+
 /// Whether this attempt must satisfy password-mode gates.
 ///
 /// A stored password workflow is not a gate by itself. Selection returns
@@ -871,11 +953,25 @@ pub fn lifecycle_status(deployment: &ObservedTemplateDeployment) -> &str {
         .unwrap_or(deployment.status.as_str())
 }
 
+/// Every row status this CLI classifies as a settled rollout, pinned against
+/// the fixture in `tests/fixtures/template_deployment_status_vocabulary.json`.
+/// A server-side status addition must update the fixture and these sets
+/// together — `deployment_status_vocabulary_stays_classified` fails otherwise.
+pub const TERMINAL_STATUSES: &[&str] = &[
+    "healthy",
+    "failed",
+    "rolled_back",
+    "superseded",
+    "cancelled",
+];
+
+/// Every row status this CLI classifies as evidence of a live rollout.
+/// Same fixture contract as [`TERMINAL_STATUSES`] (#402).
+pub const IN_FLIGHT_STATUSES: &[&str] =
+    &["pending", "applying", "watching", "creating", "deploying"];
+
 pub fn deployment_is_terminal(deployment: &ObservedTemplateDeployment) -> bool {
-    matches!(
-        lifecycle_status(deployment),
-        "healthy" | "failed" | "rolled_back" | "superseded" | "cancelled"
-    )
+    TERMINAL_STATUSES.contains(&lifecycle_status(deployment))
 }
 
 /// True only when the row is evidence of a live rollout a second POST would race.
@@ -889,17 +985,25 @@ pub fn deployment_is_in_flight(deployment: &ObservedTemplateDeployment) -> bool 
     }
     // Allowlist, not "anything that is not terminal". A future stored status
     // this CLI does not know (PaaS today only stores pending/applying/healthy/
-    // failed) must not block an intentional redeploy forever.
-    matches!(
-        lifecycle_status(deployment),
-        "pending" | "applying" | "watching" | "creating" | "deploying"
-    )
+    // failed) must not block an intentional redeploy forever. The pinned
+    // vocabulary fixture in `tests/fixtures/` is what makes such an addition
+    // visible here instead of failing open silently (#402).
+    IN_FLIGHT_STATUSES.contains(&lifecycle_status(deployment))
 }
 
 /// A consumed template-deploy key must not be replayed: PaaS stores that
 /// rejection and serves it again for the replay window. A failed placeholder
 /// row has no `cap_deployment_id`, so the next run would otherwise Replay the
 /// dead key.
+///
+/// There is no shared source of truth for these rules across the repos
+/// (#402): this allowlist mirrors enclava-paas
+/// `server/src/hosted_operations.rs::is_permanent_cap_rejection` (the
+/// status-code arm) and `record_permanent_rejection` (which stamps the
+/// `idempotency_disposition` this function trusts and replays the rejection
+/// from `hosted_operation_intents` for the 24h `replay_expires_at` window).
+/// Any edit here must land there too: drift in either direction deletes a
+/// replayable resume file or wedges the name until the replay window passes.
 ///
 /// Retire when the body says the key is consumed (`idempotency_disposition =
 /// completed`), or when the code is a terminal rejection PaaS replays even
@@ -966,8 +1070,10 @@ pub fn template_instance_rejection_retires_attempt(error: &crate::api_client::Ap
 }
 
 /// Statuses for which PaaS records an unstamped CAP rejection and replays it.
-/// Mirrors `is_permanent_cap_rejection` when the body has no disposition:
-/// 400-499, except the pre-lease and retryable statuses.
+/// Mirrors `is_permanent_cap_rejection` (enclava-paas
+/// `server/src/hosted_operations.rs`, see
+/// [`template_instance_rejection_retires_attempt`]) when the body has no
+/// disposition: 400-499, except the pre-lease and retryable statuses.
 fn unstamped_cap_rejection_is_permanent(status: u16) -> bool {
     (400..500).contains(&status) && !matches!(status, 401 | 403 | 408 | 425 | 429)
 }
@@ -2685,5 +2791,140 @@ mod tests {
             Some(PasswordResumeKeySource::Derived)
         );
         assert_eq!(password_resume_key_source(None, None, Some(&stored)), None);
+    }
+
+    #[test]
+    fn deployment_status_vocabulary_stays_classified() {
+        // The fixture in tests/fixtures/ pins the servers' status vocabulary
+        // (checked by scripts/gen-template-deployment-status-vocabulary.sh).
+        // A server-side status addition must reach this fixture AND the
+        // classifier sets together: either drifting alone fails here (#402).
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            statuses: Vec<Entry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            status: String,
+            class: String,
+        }
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/template_deployment_status_vocabulary.json"
+        ))
+        .expect("the pinned status vocabulary fixture parses");
+        let mut fixture_in_flight = std::collections::BTreeSet::new();
+        let mut fixture_terminal = std::collections::BTreeSet::new();
+        for entry in &fixture.statuses {
+            let observed = row("deploy-1", "projected", Some(entry.status.as_str()));
+            match entry.class.as_str() {
+                "in_flight" => {
+                    assert!(
+                        deployment_is_in_flight(&observed),
+                        "{} must classify as in_flight",
+                        entry.status
+                    );
+                    assert!(!deployment_is_terminal(&observed));
+                    fixture_in_flight.insert(entry.status.clone());
+                }
+                "terminal" => {
+                    assert!(
+                        deployment_is_terminal(&observed),
+                        "{} must classify as terminal",
+                        entry.status
+                    );
+                    assert!(!deployment_is_in_flight(&observed));
+                    fixture_terminal.insert(entry.status.clone());
+                }
+                "folded" => {
+                    assert!(
+                        !deployment_is_in_flight(&observed) && !deployment_is_terminal(&observed),
+                        "{} is folded before storage and must fall through to the fail-open default",
+                        entry.status
+                    );
+                }
+                other => panic!("fixture class `{other}` is not in_flight/terminal/folded"),
+            }
+        }
+        let code_in_flight: std::collections::BTreeSet<String> =
+            IN_FLIGHT_STATUSES.iter().map(|s| s.to_string()).collect();
+        let code_terminal: std::collections::BTreeSet<String> =
+            TERMINAL_STATUSES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            fixture_in_flight, code_in_flight,
+            "the fixture and IN_FLIGHT_STATUSES must pin the same vocabulary"
+        );
+        assert_eq!(
+            fixture_terminal, code_terminal,
+            "the fixture and TERMINAL_STATUSES must pin the same vocabulary"
+        );
+    }
+
+    #[test]
+    fn diverging_log_key_flags_refuse_a_replay() {
+        // A replay re-posts the stored request byte-identically: flags that
+        // match what it was signed with resume, diverging flags refuse
+        // naming the flag instead of being silently ignored (#402).
+        assert!(replay_log_key_flag_conflict(Some("shell-logs"), None, None).is_ok());
+        assert!(replay_log_key_flag_conflict(Some("shell-logs"), Some("shell-logs"), None).is_ok());
+        assert!(replay_log_key_flag_conflict(Some("shell-logs"), None, Some("shell-logs")).is_ok());
+        assert!(replay_log_key_flag_conflict(None, None, None).is_ok());
+
+        let error = replay_log_key_flag_conflict(Some("shell-logs"), Some("audit-logs"), None)
+            .expect_err("a diverging --log-key must refuse");
+        assert!(error.contains("--log-key"), "{error}");
+        assert!(error.contains("audit-logs"), "{error}");
+
+        let error = replay_log_key_flag_conflict(Some("shell-logs"), None, Some("audit-logs"))
+            .expect_err("a diverging --generate-log-key must refuse");
+        assert!(error.contains("--generate-log-key"), "{error}");
+
+        let error = replay_log_key_flag_conflict(None, Some("shell-logs"), None)
+            .expect_err("a flag naming a key the request was not signed with must refuse");
+        assert!(error.contains("--log-key"), "{error}");
+
+        let error = replay_log_key_flag_conflict(Some("shell-logs"), Some("a"), Some("b"))
+            .expect_err("both flags at once still refuses");
+        assert!(error.contains("cannot be used together"), "{error}");
+    }
+
+    #[test]
+    fn a_seed_error_does_not_pre_empt_a_matching_saved_key() {
+        let saved = Some("hash-a");
+        let stored = Some("hash-a");
+        // The regression: the recovery-seed error used to propagate before
+        // the saved per-app key was tried. A saved key matching the signed
+        // request answers it even when the seed cannot be read (#402).
+        assert_eq!(
+            password_resume_key_source_seed_fallible(saved, None, true, stored),
+            Ok(Some(PasswordResumeKeySource::Saved)),
+            "a broken seed must not hide the saved bootstrap key that matches"
+        );
+        // The seed error surfaces only when no saved key answers.
+        assert_eq!(
+            password_resume_key_source_seed_fallible(Some("hash-b"), None, true, stored),
+            Err(SeedError),
+            "a non-matching saved key cannot absorb the seed error"
+        );
+        assert_eq!(
+            password_resume_key_source_seed_fallible(None, None, true, stored),
+            Err(SeedError)
+        );
+        // Without a seed error the original selection rules apply unchanged.
+        assert_eq!(
+            password_resume_key_source_seed_fallible(saved, Some("hash-b"), false, stored),
+            Ok(Some(PasswordResumeKeySource::Saved))
+        );
+        assert_eq!(
+            password_resume_key_source_seed_fallible(None, Some("hash-a"), false, stored),
+            Ok(Some(PasswordResumeKeySource::Derived))
+        );
+        assert_eq!(
+            password_resume_key_source_seed_fallible(None, Some("hash-b"), false, stored),
+            Ok(Some(PasswordResumeKeySource::Derived))
+        );
+        assert_eq!(
+            password_resume_key_source_seed_fallible(None, None, false, stored),
+            Ok(None)
+        );
     }
 }

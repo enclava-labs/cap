@@ -91,11 +91,33 @@ pub struct SafeBootstrapDiagnostic {
     pub retry_after: Option<DateTime<Utc>>,
     /// The fixed-vocabulary init stage the failed run had reached (one of
     /// the `record_stage` literals), or `None` when no stage was recorded.
-    /// Safe like every other field: never free-form text.
-    pub stage: Option<&'static str>,
+    /// Safe like every other field: never free-form text. Private with the
+    /// stage set only through [`Self::diagnose`]/[`Self::with_stage`], so
+    /// "stage only from `last_stage()`" is structural, not convention
+    /// (#402).
+    stage: Option<&'static str>,
 }
 
 impl SafeBootstrapDiagnostic {
+    /// A stage-less diagnostic for a known code and validated deadline.
+    /// The stage is attached via [`Self::with_stage`] (or passed to
+    /// [`Self::diagnose`]) from `last_stage()` only.
+    pub fn new(code: SafeDiagnosticCode, retry_after: Option<DateTime<Utc>>) -> Self {
+        Self {
+            code,
+            retry_after,
+            stage: None,
+        }
+    }
+
+    /// Attach the fixed-vocabulary stage this run reached. The value must be
+    /// a `last_stage()` result (the `record_stage` literals) — nothing else
+    /// may name a stage (#402).
+    pub fn with_stage(mut self, stage: Option<&'static str>) -> Self {
+        self.stage = stage;
+        self
+    }
+
     /// The safe degradation for terminal ACME issuance failures without a
     /// usable deadline: unknown, malformed, or unbounded broker bodies.
     pub fn acme_failed() -> Self {
@@ -115,18 +137,21 @@ impl SafeBootstrapDiagnostic {
         }
     }
 
-    /// Derive the safe diagnostic for a failed bootstrap run.
+    /// Derive the safe diagnostic for a failed bootstrap run, paired with
+    /// the stage the run reached (`last_stage()`) at construction time —
+    /// never by a later field write (#402).
     ///
     /// The TLS broker's typed terminal failure is recovered by typed
     /// downcast through any contextual anyhow wrappers (never string
     /// scraping); every other error — including wrapped IO, config, or
     /// validation failures — degrades to the generic safe failure, keeping
     /// its possibly path-bearing chain out of all output.
-    pub fn diagnose(error: &anyhow::Error) -> Self {
+    pub fn diagnose(error: &anyhow::Error, stage: Option<&'static str>) -> Self {
         error
             .downcast_ref::<crate::tls_certificate::TlsBrokerFailure>()
             .map(|failure| failure.diagnostic.clone())
             .unwrap_or_else(Self::generic)
+            .with_stage(stage)
     }
 
     /// Parse and validate a broker-supplied `retry_after` value into a
@@ -266,9 +291,12 @@ mod tests {
             .context("provisioning static TLS certificate")
             .context("outer context with SYNTHETIC-CHAIN-SENTINEL text");
 
-        let diagnosed = SafeBootstrapDiagnostic::diagnose(&error);
+        let diagnosed =
+            SafeBootstrapDiagnostic::diagnose(&error, Some("provisioning static tls certificate"));
         assert_eq!(diagnosed.code, SafeDiagnosticCode::AcmeRateLimited);
         assert_eq!(diagnosed.retry_after, Some(deadline));
+        // The stage is paired at diagnose() time, from last_stage() only.
+        assert_eq!(diagnosed.stage, Some("provisioning static tls certificate"));
         // The rendered output carries only the safe fields, never the chain.
         let rendered = diagnosed.render_json();
         assert!(!rendered.contains("SYNTHETIC-CHAIN-SENTINEL"));
@@ -279,9 +307,10 @@ mod tests {
     fn unknown_errors_degrade_to_generic_without_chain_text() {
         let error = anyhow!("reading supplied value /state/secret-path: SYNTHETIC-IO-SENTINEL")
             .context("opening luks volumes");
-        let diagnosed = SafeBootstrapDiagnostic::diagnose(&error);
+        let diagnosed = SafeBootstrapDiagnostic::diagnose(&error, None);
         assert_eq!(diagnosed.code, SafeDiagnosticCode::EnclavaInitFailed);
         assert_eq!(diagnosed.retry_after, None);
+        assert_eq!(diagnosed.stage, None);
         let rendered = diagnosed.render_json();
         assert!(!rendered.contains("SYNTHETIC-IO-SENTINEL"));
         assert!(!rendered.contains("/state/secret-path"));

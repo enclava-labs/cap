@@ -114,8 +114,10 @@ fn main() -> ExitCode {
 /// paths, supplied values, or provider text — is never rendered here.
 fn report_failure(error: &anyhow::Error) {
     let stage = last_stage();
-    let mut diagnostic = SafeBootstrapDiagnostic::diagnose(error);
-    diagnostic.stage = stage;
+    // The stage is a `diagnose` parameter, not a post-hoc field write: the
+    // field is private, so every staged diagnostic names a `last_stage()`
+    // value by construction (#402).
+    let diagnostic = SafeBootstrapDiagnostic::diagnose(error, stage);
     let safe_json = diagnostic.render_json();
     record_failure_file(&safe_json, stage);
     tracing::error!(
@@ -481,6 +483,8 @@ fn clear_tls_unusable(path: &Path) {
 /// the stage file back to the latched error's `failed_stage`, so the
 /// last durably-latched failure is the pair that survives.
 fn record_failure_file(safe_json: &str, stage: Option<&'static str>) {
+    // Stage before error is deliberate: the inverse write order can leave a
+    // latched error whose stage file names a stage this failure never reached.
     match stage {
         Some(stage) => {
             let marker = format!("{stage}\n");
