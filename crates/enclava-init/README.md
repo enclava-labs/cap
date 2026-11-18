@@ -231,6 +231,23 @@ re-running wipe or mkfs, since a replayed marker over a populated volume
 would destroy data. Operator recovery is to delete and recreate the
 never-ready volume.
 
+## Shutdown flush
+
+Pod delete sends SIGTERM and then destroys the Kata VM. The guest page
+cache is not written back on process exit, so a file created on the
+persistent home without `fsync` can come back as a zero-length inode:
+ext4 journals the new directory entry, and the data blocks never land.
+On SIGTERM, `enclava-init` calls `sync(2)` immediately (so a later
+SIGKILL still keeps those pages), waits up to 15 seconds for workload
+processes to exit, then `syncfs`es the state and tls-state mounts and
+`sync`s again. While workload processes remain (a workload that ignores
+SIGTERM), it keeps waiting and re-flushing every 5 seconds until shortly
+before the 30s grace deadline, so writes made during the grace period
+keep landing. The flush runs on a dedicated monitor thread, so a slow
+background operation in the stay-alive loop cannot delay it. Workloads
+that keep writing after SIGTERM until the grace period expires should
+still `fsync` data they cannot afford to lose.
+
 ## Tests
 
 ```bash

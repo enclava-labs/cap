@@ -145,3 +145,72 @@ fn encrypted_log_wrapper_forwards_sigterm_to_child() {
     assert_eq!(status.signal(), None);
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// cap#193: the wrapper must flush the guest page cache after the workload
+/// exits and before the wrapper itself exits — VM teardown otherwise
+/// discards the pages and the workload's files come back zero-length.
+/// `ENCLAVA_FLUSH_PROOF_FILE` (non-prod-strict dev override) makes the
+/// production flush observable: the marker line is appended only after
+/// sync(2) returns inside `flush_guest_page_cache`, which the encrypted
+/// exit path calls after the child exits and the forwarding threads join.
+#[test]
+#[cfg(not(feature = "prod-strict"))]
+fn encrypted_log_wrapper_flushes_the_guest_cache_after_child_exit() {
+    let dir = env::temp_dir().join(format!(
+        "enclava-wait-exec-flush-proof-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("ready"), "ready\n").unwrap();
+    let flush_proof = dir.join("flush-proof");
+
+    let keypair = enclava_common::log_encryption::generate_log_keypair();
+    let mut wrapper = Command::new(env!("CARGO_BIN_EXE_enclava-wait-exec"))
+        .args(["/bin/sh", "-c", "echo hello; exit 0"])
+        .env("ENCLAVA_CONTAINER_NAME", "web")
+        .env("ENCLAVA_STARTED_DIR", dir.join("started"))
+        .env("ENCLAVA_INIT_READY_FILE", dir.join("ready"))
+        .env("ENCLAVA_LOG_ENCRYPTION_KEY_ID", "test-key")
+        .env(
+            "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL",
+            &keypair.public_key_base64url,
+        )
+        .env(
+            "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_SHA256",
+            &keypair.public_key_sha256,
+        )
+        .env("ENCLAVA_LOG_ORG_ID", "test-org")
+        .env("ENCLAVA_LOG_APP_NAME", "test-app")
+        .env("ENCLAVA_LOG_DEPLOYMENT_ID", "test-deployment")
+        .env("ENCLAVA_LOG_SPOOL_PATH", dir.join("logs.jsonl"))
+        .env("ENCLAVA_FLUSH_PROOF_FILE", &flush_proof)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = wrapper.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wrapper did not exit after the child exited"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    assert!(status.success(), "status: {status:?}");
+    let proof = fs::read_to_string(&flush_proof)
+        .expect("wrapper exited without proving the guest page cache flush");
+    assert!(
+        proof.lines().any(|line| line == "synced"),
+        "flush proof marker must record the post-child sync(2); got: {proof:?}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
