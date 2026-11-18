@@ -49,6 +49,10 @@ pub struct ConfigTokenClaims {
     pub aud: String,
     pub typ: String,
     pub jti: String,
+    /// Apply-job generation this token may write as. Omitted when absent so
+    /// pre-fence receipts still regenerate their original payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_generation: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -65,6 +69,8 @@ pub struct ConfigTokenIssuance {
     pub jti: String,
     pub resource_id: Uuid,
     pub instance_id: String,
+    /// `None` keeps the historical payload (no generation claim).
+    pub deployment_generation: Option<i64>,
 }
 
 pub const CONFIG_TOKEN_TTL_SECONDS: i64 = 5 * 60;
@@ -200,8 +206,16 @@ pub fn issue_config_token(
     instance_id: &str,
     scopes: Vec<String>,
 ) -> Result<String, JwtError> {
-    issue_config_token_with_expiry(signing_key, user_id, org_id, app_id, instance_id, scopes)
-        .map(|issued| issued.token)
+    issue_config_token_with_expiry(
+        signing_key,
+        user_id,
+        org_id,
+        app_id,
+        instance_id,
+        scopes,
+        None,
+    )
+    .map(|issued| issued.token)
 }
 
 /// Issue a config token together with the exact whole-second expiry encoded
@@ -213,6 +227,7 @@ pub fn issue_config_token_with_expiry(
     app_id: Uuid,
     instance_id: &str,
     scopes: Vec<String>,
+    deployment_generation: Option<i64>,
 ) -> Result<IssuedConfigToken, JwtError> {
     let issued_at =
         chrono::DateTime::from_timestamp(Utc::now().timestamp(), 0).ok_or(JwtError::Invalid)?;
@@ -229,6 +244,7 @@ pub fn issue_config_token_with_expiry(
             jti: new_jti(),
             resource_id: app_id,
             instance_id: instance_id.to_string(),
+            deployment_generation,
         },
     )
 }
@@ -248,6 +264,9 @@ pub fn issue_config_token_for_issuance(
     if issuance.receipt_version != CONFIG_TOKEN_RECEIPT_VERSION
         || issuance.resource_id != app_id
         || issuance.instance_id != instance_id
+        || issuance
+            .deployment_generation
+            .is_some_and(|generation| generation < 0)
     {
         return Err(JwtError::Invalid);
     }
@@ -266,6 +285,7 @@ pub fn issue_config_token_for_issuance(
         aud: CONFIG_AUDIENCE.to_string(),
         typ: CONFIG_TYP.to_string(),
         jti: issuance.jti.clone(),
+        deployment_generation: issuance.deployment_generation,
     };
 
     let secret = signing_key
@@ -437,6 +457,7 @@ mod tests {
             jti: "11111111-2222-8333-8444-555555555555".to_string(),
             resource_id: app_id,
             instance_id: "test-instance".to_string(),
+            deployment_generation: None,
         };
         let first = issue_config_token_for_issuance(
             &signing,
@@ -483,6 +504,61 @@ mod tests {
         assert_eq!(decoded.exp, first.expires_at.timestamp());
         assert_eq!(decoded.exp - decoded.iat, CONFIG_TOKEN_TTL_SECONDS);
         assert_eq!(decoded.jti, issuance.jti);
+        assert_eq!(decoded.deployment_generation, None);
+        assert!(
+            !first.token.contains("deployment_generation"),
+            "absent generation must not change the historical payload"
+        );
+    }
+
+    #[test]
+    fn config_token_receipt_binds_deployment_generation() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let issued_at = chrono::DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap();
+        let app_id = Uuid::new_v4();
+        let issuance = ConfigTokenIssuance {
+            receipt_version: CONFIG_TOKEN_RECEIPT_VERSION,
+            issued_at,
+            jti: "generation-fence-jti".to_string(),
+            resource_id: app_id,
+            instance_id: "test-instance".to_string(),
+            deployment_generation: Some(12),
+        };
+        let issued = issue_config_token_for_issuance(
+            &signing,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            app_id,
+            "test-instance",
+            vec!["config:write".to_string()],
+            &issuance,
+        )
+        .unwrap();
+        let mut validation = config_validator();
+        validation.validate_exp = false;
+        use base64::Engine;
+        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(signing.verifying_key().to_bytes());
+        let key = DecodingKey::from_ed_components(&x).unwrap();
+        let claims = decode::<ConfigTokenClaims>(&issued.token, &key, &validation)
+            .unwrap()
+            .claims;
+        assert_eq!(claims.deployment_generation, Some(12));
+        let stale = issue_config_token_for_issuance(
+            &signing,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            app_id,
+            "test-instance",
+            vec!["config:write".to_string()],
+            &ConfigTokenIssuance {
+                deployment_generation: Some(11),
+                jti: "older-generation-jti".to_string(),
+                ..issuance.clone()
+            },
+        )
+        .unwrap();
+        assert_ne!(stale.token, issued.token);
     }
 
     #[test]
@@ -507,6 +583,7 @@ mod tests {
                 jti: Uuid::new_v4().to_string(),
                 resource_id: app_id,
                 instance_id: "expired-instance".to_string(),
+                deployment_generation: None,
             },
         )
         .unwrap();

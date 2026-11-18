@@ -2242,7 +2242,7 @@ impl TemplateConfigDeliveryState<'_> {
                     let nested_deadline = self.request_deadline();
                     let refreshed = refresh_template_config_token_with_retry(
                         self.api,
-                        self.instance_name,
+                        self.deployment.deployment_id,
                         key,
                         nested_deadline,
                     )
@@ -2802,18 +2802,27 @@ async fn poll_managed_delivery_status(
     }
 }
 
+fn held_deploy_config_token_refresh_path(deployment_id: &str) -> Result<String, String> {
+    if deployment_id.is_empty() || deployment_id == "pending" {
+        return Err(
+            "held config-token refresh requires a deployment id; refusing the app-scoped route"
+                .into(),
+        );
+    }
+    Ok(format!("/deployments/{deployment_id}/config-token"))
+}
+
 async fn refresh_template_config_token_with_retry(
     api: &ApiClient,
-    instance_name: &str,
+    deployment_id: &str,
     key: &str,
     deadline: Option<Instant>,
 ) -> Result<enclava_cli::api_types::ConfigTokenResponse, Box<dyn std::error::Error>> {
     let mut attempt = 0usize;
     loop {
         attempt += 1;
-        // The deadline bounds the in-flight token request too, so a
-        // stalled response cannot run past the phase budget.
-        let token = api.get_config_token(instance_name);
+        let path = held_deploy_config_token_refresh_path(deployment_id)?;
+        let token = api.post_config_token_path(&path);
         let response = match deadline {
             Some(deadline) => {
                 match tokio::time::timeout(
@@ -4332,6 +4341,16 @@ mod tests {
     use crate::commands::app::should_retry_template_deployment_status_error;
     use std::io::{Read, Write};
     use terminal_delivery_support::deployment_entry_json;
+
+    #[test]
+    fn held_refresh_posts_the_deployment_route_and_refuses_the_app_route() {
+        let deployment_id = "11111111-1111-1111-1111-111111111111";
+        let path = held_deploy_config_token_refresh_path(deployment_id).expect("bound refresh");
+        assert_eq!(path, format!("/deployments/{deployment_id}/config-token"));
+        assert!(!path.contains("/apps/"));
+        assert!(held_deploy_config_token_refresh_path("").is_err());
+        assert!(held_deploy_config_token_refresh_path("pending").is_err());
+    }
 
     #[tokio::test]
     async fn bootstrap_subphase_timings_are_nested_fixed_and_opt_in() {

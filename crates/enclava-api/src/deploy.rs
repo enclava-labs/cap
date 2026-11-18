@@ -6360,8 +6360,9 @@ pub(crate) async fn supersede_incomplete_deployments(
     tx: &mut Transaction<'_, Postgres>,
     app_id: Uuid,
 ) -> Result<u64, SupersedeDeploymentError> {
-    // Config tokens are app-scoped, so supersession cannot cancel a CLI's
-    // writes. Keep its live hold exclusive; deletion may still stop the app.
+    // A held CLI's config token is bound to its deployment generation, so
+    // supersession does not revoke it. Keep its live hold exclusive;
+    // deletion may still stop the app.
     let active_mutation: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
