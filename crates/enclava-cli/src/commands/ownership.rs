@@ -824,6 +824,7 @@ mod tests {
             status,
             code: code.map(str::to_string),
             message: String::new(),
+            idempotency_disposition: None,
         };
         assert!(is_unimplemented_hosted(&err(
             501,

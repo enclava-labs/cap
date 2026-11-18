@@ -39,6 +39,7 @@ fn api_error_display() {
         status: 404,
         code: None,
         message: "app not found".to_string(),
+        idempotency_disposition: None,
     };
     assert!(err.to_string().contains("404"));
     assert!(err.to_string().contains("app not found"));
@@ -305,6 +306,7 @@ async fn api_errors_preserve_paas_error_code() {
             status,
             code,
             message,
+            ..
         } => {
             assert_eq!(status, 502);
             assert_eq!(code.as_deref(), Some("cap_response_invalid"));
