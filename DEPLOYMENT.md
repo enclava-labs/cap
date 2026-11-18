@@ -193,7 +193,9 @@ Production deploys need:
   `enclava-engine`.
 - Trustee KBS reachable by guest attestation and CAP callback paths.
 - Policy signing service for generated agent policy and signed policy
-  artifacts.
+  artifacts. A customer-supplied `signed_policy_artifact` is not accepted
+  while that service is absent; the fail-closed rule and the proposed
+  witness design are in `docs/canonical-policy-without-signing-service.md`.
 - Digest-pinned `attestation-proxy`, `caddy-ingress`, and `enclava-init`
   images.
 - A signed platform release, or environment values that exactly match the
