@@ -113,13 +113,16 @@ fn main() -> ExitCode {
 /// `enclava_init_failed` code. The raw anyhow chain — which may carry
 /// paths, supplied values, or provider text — is never rendered here.
 fn report_failure(error: &anyhow::Error) {
-    let diagnostic = SafeBootstrapDiagnostic::diagnose(error);
+    let stage = last_stage();
+    let mut diagnostic = SafeBootstrapDiagnostic::diagnose(error);
+    diagnostic.stage = stage;
     let safe_json = diagnostic.render_json();
-    record_failure_file(&safe_json);
+    record_failure_file(&safe_json, stage);
     tracing::error!(
         error = diagnostic.code.as_str(),
         terminal = true,
         retry_after = diagnostic.retry_after_rfc3339().as_deref(),
+        failed_stage = stage,
         "enclava-init failed"
     );
     eprintln!("enclava-init: {safe_json}");
@@ -404,6 +407,16 @@ fn clear_error_file(path: &Path) {
     }
 }
 
+/// Drop the stage marker (a stage-less failure latched, so no marker may
+/// name a stage that failure never reached). Missing is fine.
+fn clear_stage_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(path = %path.display(), error = %e, "failed to clear stage file"),
+    }
+}
+
 /// Pure readiness gate: `--probe-ready` reports ready only when the
 /// init-ready file carries `ready` and no `tls-unusable` marker exists.
 /// The TLS tick never writes init-ready itself — that file is also the
@@ -445,15 +458,38 @@ fn clear_tls_unusable(path: &Path) {
     }
 }
 
-/// Write the safe failure JSON to the init-error file and the termination
-/// log.
+/// Write the failure pair — the failing stage marker first, then the safe
+/// failure JSON to the init-error file, and the termination log.
 ///
-/// Both files carry exactly the bounded safe contract
-/// (`{"error","terminal","retry_after"}`) consumed by the attestation
-/// proxy worker and operators — never the anyhow chain, raw broker
-/// response text, or other supplied values. Stage markers stay in their
-/// own init-stage file.
-fn record_failure_file(safe_json: &str) {
+/// The init-error file and termination log carry exactly the bounded safe
+/// contract (`{"error","terminal","retry_after","failed_stage"}`) consumed
+/// by the attestation proxy worker and operators — never the anyhow chain,
+/// raw broker response text, or other supplied values.
+///
+/// The stage file is written first and paired with this failure so it
+/// names the stage THIS run failed at (#397): while the error file is
+/// latched, [`record_stage`] freezes the stage file against a restarted
+/// instance's boot markers, and every latch re-writes both surfaces
+/// together. A latch without a recorded stage drops the marker instead of
+/// leaving one naming a stage this failure never reached. Stage markers
+/// otherwise stay in their own init-stage file.
+///
+/// The two writes are separate atomics, so a container death between
+/// them can leave the stage file naming the half-latched failure while
+/// the error file still carries the previous one. That crash window is
+/// healed at the next boot: the freeze in [`record_stage`] reconciles
+/// the stage file back to the latched error's `failed_stage`, so the
+/// last durably-latched failure is the pair that survives.
+fn record_failure_file(safe_json: &str, stage: Option<&'static str>) {
+    match stage {
+        Some(stage) => {
+            let marker = format!("{stage}\n");
+            if let Err(err) = writes::atomic_write(&stage_file_path(), marker.as_bytes(), 0o644) {
+                eprintln!("enclava-init: failed to write init stage file: {err}");
+            }
+        }
+        None => clear_stage_file(&stage_file_path()),
+    }
     let body = format!("{safe_json}\n");
     let path = error_file_path();
     if let Err(err) = writes::atomic_write(&path, body.as_bytes(), 0o644) {
@@ -486,10 +522,91 @@ fn write_termination_log_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<
     file.sync_all()
 }
 
-fn record_stage(stage: &str) -> Result<()> {
+/// The fixed-vocabulary stage this run last reached ([`record_stage`]),
+/// shared with failure reporting so every latched failure can name the
+/// exact stage it occurred at (#397). Only `record_stage` literals ever
+/// land here, so the value is safe for the bounded failure payload.
+static LAST_STAGE: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+fn set_last_stage(stage: Option<&'static str>) {
+    *LAST_STAGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = stage;
+}
+
+fn last_stage() -> Option<&'static str> {
+    *LAST_STAGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Record the fixed-vocabulary bootstrap stage this run has reached.
+///
+/// The in-run stage is tracked regardless of the file write. While a
+/// terminal failure is latched (the init-error file exists), the stage
+/// file is frozen: it must keep naming the latched failure's stage, so a
+/// restarted instance's boot markers can never make the stage and error
+/// files disagree — the terminal status would name a stage the failure
+/// never reached (#397). Engaging the freeze also repairs a pair left
+/// mismatched by the crash window in [`record_failure_file`]
+/// ([`reconcile_stage_file_with_latched_error`]). The freeze lifts with
+/// [`clear_error_file`] (owner seed acquired), when live stage markers
+/// resume.
+fn record_stage(stage: &'static str) -> Result<()> {
+    set_last_stage(Some(stage));
     tracing::info!(stage, "enclava-init stage");
+    if error_file_path().exists() {
+        reconcile_stage_file_with_latched_error();
+        return Ok(());
+    }
     writes::atomic_write(&stage_file_path(), format!("{stage}\n").as_bytes(), 0o644)
         .map_err(Into::into)
+}
+
+/// Crash-window recovery for the failure pair: repair the stage file to
+/// match the latched error, whose `failed_stage` is the authority.
+///
+/// [`record_failure_file`] writes the stage file and the error file as
+/// two separate atomic writes; a container death between them leaves the
+/// stage file naming the half-latched failure while the error file still
+/// carries the previous one, and the freeze alone would preserve that
+/// mismatched pair forever. Reconciling against the latched error JSON
+/// heals every half-written combination — a marker from the new failure,
+/// a marker lost entirely, or a stale marker beside a stage-less latch —
+/// so the last durably-latched failure is the pair that survives. An
+/// unreadable or `failed_stage`-less error file (legacy payload) leaves
+/// the marker untouched: the freeze still holds, there is just nothing
+/// better to repair towards. The value is echoed into the marker file
+/// only — it is not trusted input, and consumers exact-match the fixed
+/// stage vocabulary at the TEE probe trust boundary and drop anything
+/// else.
+fn reconcile_stage_file_with_latched_error() {
+    let Ok(body) = std::fs::read_to_string(error_file_path()) else {
+        return;
+    };
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+        return;
+    };
+    match payload.get("failed_stage") {
+        Some(serde_json::Value::String(stage)) => {
+            let marker = format!("{stage}\n");
+            if std::fs::read_to_string(stage_file_path()).unwrap_or_default() != marker
+                && let Err(err) = writes::atomic_write(&stage_file_path(), marker.as_bytes(), 0o644)
+            {
+                tracing::warn!(
+                    path = %stage_file_path().display(),
+                    error = %err,
+                    "reconciling the latched stage marker failed"
+                );
+            }
+        }
+        // A stage-less latch must not keep a marker naming a stage the
+        // latched failure never reached.
+        Some(serde_json::Value::Null) => clear_stage_file(&stage_file_path()),
+        // Legacy latches without the field, or non-string garbage: keep
+        // the frozen marker as-is.
+        _ => {}
+    }
 }
 
 fn mark_ready_file(path: &Path) -> Result<()> {
