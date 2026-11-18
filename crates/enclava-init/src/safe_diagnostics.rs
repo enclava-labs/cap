@@ -16,12 +16,16 @@
 //!
 //! ```json
 //! {"error":"acme_rate_limited"|"acme_certificate_issuance_failed"|"enclava_init_failed",
-//!  "terminal":true,"retry_after":null|"2026-09-10T09:30:00Z"}
+//!  "terminal":true,"retry_after":null|"2026-09-10T09:30:00Z",
+//!  "failed_stage":null|"binding workload mount namespaces"}
 //! ```
 //!
 //! Only exact recognized codes and a validated UTC deadline are ever
 //! emitted; unknown, malformed, or out-of-bounds input degrades to the
-//! generic failure with a null deadline.
+//! generic failure with a null deadline. `failed_stage` names the fixed
+//! init-stage vocabulary phrase the failed run had reached, so the payload
+//! stays self-describing even when the stage file has moved on (a later
+//! boot attempt) — it is `null` only when no stage was recorded.
 
 use anyhow;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -85,6 +89,10 @@ pub struct SafeBootstrapDiagnostic {
     /// Validated UTC instant after which the bootstrap may be retried, or
     /// `None` when no usable deadline exists.
     pub retry_after: Option<DateTime<Utc>>,
+    /// The fixed-vocabulary init stage the failed run had reached (one of
+    /// the `record_stage` literals), or `None` when no stage was recorded.
+    /// Safe like every other field: never free-form text.
+    pub stage: Option<&'static str>,
 }
 
 impl SafeBootstrapDiagnostic {
@@ -94,6 +102,7 @@ impl SafeBootstrapDiagnostic {
         Self {
             code: SafeDiagnosticCode::AcmeCertificateIssuanceFailed,
             retry_after: None,
+            stage: None,
         }
     }
 
@@ -102,6 +111,7 @@ impl SafeBootstrapDiagnostic {
         Self {
             code: SafeDiagnosticCode::EnclavaInitFailed,
             retry_after: None,
+            stage: None,
         }
     }
 
@@ -160,6 +170,7 @@ impl SafeBootstrapDiagnostic {
             "error": self.code.as_str(),
             "terminal": true,
             "retry_after": self.retry_after_rfc3339(),
+            "failed_stage": self.stage,
         })
         .to_string()
     }
@@ -184,6 +195,7 @@ mod tests {
                 "error": "enclava_init_failed",
                 "terminal": true,
                 "retry_after": null,
+                "failed_stage": null,
             })
         );
         assert!(!rendered.contains('\n'));
@@ -199,6 +211,7 @@ mod tests {
         let diagnostic = SafeBootstrapDiagnostic {
             code: SafeDiagnosticCode::AcmeRateLimited,
             retry_after: Some(deadline),
+            stage: Some("provisioning static tls certificate"),
         };
         let rendered = diagnostic.render_json();
         assert_eq!(
@@ -207,6 +220,7 @@ mod tests {
                 "error": "acme_rate_limited",
                 "terminal": true,
                 "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "failed_stage": "provisioning static tls certificate",
             })
         );
         assert!(rendered.contains(&deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)));
@@ -246,6 +260,7 @@ mod tests {
         let diagnostic = SafeBootstrapDiagnostic {
             code: SafeDiagnosticCode::AcmeRateLimited,
             retry_after: Some(deadline),
+            stage: None,
         };
         let error = anyhow::Error::new(crate::tls_certificate::TlsBrokerFailure { diagnostic })
             .context("provisioning static TLS certificate")

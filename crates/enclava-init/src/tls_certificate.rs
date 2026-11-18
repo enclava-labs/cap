@@ -414,6 +414,7 @@ fn broker_failure_diagnostic(body: &[u8], now: DateTime<Utc>) -> SafeBootstrapDi
             .retry_after
             .as_deref()
             .and_then(|value| SafeBootstrapDiagnostic::parse_retry_after(value, now)),
+        stage: None,
     }
 }
 
@@ -703,6 +704,7 @@ fn issue_via_broker(
                 diagnostic: SafeBootstrapDiagnostic {
                     code: SafeDiagnosticCode::AcmeRateLimited,
                     retry_after: Some(deadline),
+                    stage: None,
                 },
             }));
         }
@@ -2449,6 +2451,7 @@ hkdf-info = "tls-state-luks-key"
                 "error": "acme_rate_limited",
                 "terminal": true,
                 "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "failed_stage": null,
             })
         );
     }
@@ -2477,6 +2480,7 @@ hkdf-info = "tls-state-luks-key"
                 "error": "acme_rate_limited",
                 "terminal": true,
                 "retry_after": elapsed.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "failed_stage": null,
             })
         );
     }
@@ -2683,6 +2687,7 @@ hkdf-info = "tls-state-luks-key"
                 "error": "acme_certificate_issuance_failed",
                 "terminal": true,
                 "retry_after": null,
+                "failed_stage": null,
             })
         );
     }
@@ -3109,6 +3114,7 @@ hkdf-info = "tls-state-luks-key"
         let fresh = SafeBootstrapDiagnostic {
             code: SafeDiagnosticCode::AcmeRateLimited,
             retry_after: Some(now + TimeDelta::minutes(30)),
+            stage: None,
         };
         assert_eq!(
             waitable_rate_limit(&fresh, now, ACME_RETRY_MAX_WAIT_SECS),
@@ -3119,6 +3125,7 @@ hkdf-info = "tls-state-luks-key"
         let long = SafeBootstrapDiagnostic {
             code: SafeDiagnosticCode::AcmeRateLimited,
             retry_after: Some(now + TimeDelta::seconds(ACME_RETRY_MAX_DEFER_SECS)),
+            stage: None,
         };
         assert_eq!(
             waitable_rate_limit(&long, now, ACME_RETRY_MAX_WAIT_SECS),
@@ -3137,6 +3144,7 @@ hkdf-info = "tls-state-luks-key"
             let diagnostic = SafeBootstrapDiagnostic {
                 code: SafeDiagnosticCode::AcmeRateLimited,
                 retry_after,
+                stage: None,
             };
             assert_eq!(
                 waitable_rate_limit(&diagnostic, now, ACME_RETRY_MAX_WAIT_SECS),
