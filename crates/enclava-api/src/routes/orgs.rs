@@ -182,6 +182,11 @@ pub struct OrgKeyringResponse {
     pub signature: String,
     pub signing_pubkey: String,
     pub fingerprint: String,
+    /// Creation witness of this keyring version (`org_keyrings.created_at`,
+    /// server-assigned at insertion). Owner-rotation directives bind this
+    /// value together with the version to prove post-version creation
+    /// (issue #188), so it must round-trip exactly as stored.
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +208,15 @@ pub struct RotateOrgOwnerRequest {
     pub signature: String,
     pub replacement_signing_pubkey: String,
     pub current_signing_pubkey: String,
+    /// Directive binding (issue #188): the keyring version the rotation
+    /// supersedes and its creation witness, both covered by the signed
+    /// directive bytes. Optional only so a pre-binding CLI receives an
+    /// actionable error instead of a deserialization failure; requests
+    /// without the pair are rejected before anything is persisted.
+    #[serde(default)]
+    pub base_keyring_version: Option<i64>,
+    #[serde(default)]
+    pub base_keyring_created_at: Option<DateTime<Utc>>,
     pub signed_at: DateTime<Utc>,
     pub reason: String,
     pub rotation_signature: String,
@@ -234,7 +248,7 @@ pub struct AuthorizedSignerResponse {
     pub fingerprint: String,
 }
 
-type KeyringRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
+type KeyringRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, DateTime<Utc>);
 
 #[derive(Debug, Deserialize, Serialize)]
 struct SignedOrgKeyring {
@@ -568,9 +582,9 @@ pub async fn put_keyring(
     // Re-read the latest keyring only after acquiring the shared
     // signing-authority lane. Rotation and signed acceptance therefore
     // linearize on one exact owner authority generation.
-    type LatestKeyringAuthority = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
+    type LatestKeyringAuthority = (i64, Vec<u8>, Vec<u8>, Vec<u8>, DateTime<Utc>);
     let latest: Option<LatestKeyringAuthority> = sqlx::query_as(
-        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey
+        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey, ok.created_at
          FROM org_keyrings ok
          JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
          WHERE ok.org_id = $1
@@ -583,7 +597,14 @@ pub async fn put_keyring(
     .map_err(|_| db_error())?;
 
     let mut insert_new_version = true;
-    if let Some((latest_version, latest_payload, latest_signature, latest_signing_pubkey)) = latest
+    let mut stored_created_at: Option<DateTime<Utc>> = None;
+    if let Some((
+        latest_version,
+        latest_payload,
+        latest_signature,
+        latest_signing_pubkey,
+        latest_created_at,
+    )) = latest
     {
         if body.version < latest_version {
             return Err((
@@ -610,6 +631,7 @@ pub async fn put_keyring(
         }
         if body.version == latest_version {
             insert_new_version = false;
+            stored_created_at = Some(latest_created_at);
         }
         let next_version = latest_version
             .checked_add(1)
@@ -694,19 +716,21 @@ pub async fn put_keyring(
         .map_err(|_| db_error())?
         .ok_or_else(|| bad_request("signing_pubkey is not registered for this user"))?;
 
-        sqlx::query(
+        let inserted_created_at: DateTime<Utc> = sqlx::query_scalar(
             "INSERT INTO org_keyrings
                  (org_id, version, keyring_payload, signature, signing_key_id)
-             VALUES ($1, $2, $3, $4, $5)",
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING created_at",
         )
         .bind(org_id)
         .bind(body.version)
         .bind(&keyring_payload_bytes)
         .bind(&signature)
         .bind(signing_key_id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|_| db_error())?;
+        stored_created_at = Some(inserted_created_at);
 
         sqlx::query(
             "INSERT INTO audit_log (org_id, user_id, action, detail)
@@ -744,6 +768,7 @@ pub async fn put_keyring(
             signature: hex::encode(&signature),
             signing_pubkey: hex::encode(&signing_pubkey),
             fingerprint,
+            created_at: stored_created_at.ok_or_else(db_error)?,
         }),
     ))
 }
@@ -757,7 +782,7 @@ pub async fn get_keyring(
     let (org_id, _) = active_membership(&state, &auth, &org_name).await?;
 
     let row: Option<KeyringRow> = sqlx::query_as(
-        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey
+        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey, ok.created_at
          FROM org_keyrings ok
          JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
          WHERE ok.org_id = $1
@@ -769,7 +794,7 @@ pub async fn get_keyring(
     .await
     .map_err(|_| db_error())?;
 
-    let Some((version, payload_bytes, signature, signing_pubkey)) = row else {
+    let Some((version, payload_bytes, signature, signing_pubkey, created_at)) = row else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "org keyring not found"})),
@@ -787,6 +812,7 @@ pub async fn get_keyring(
         signature: hex::encode(signature),
         signing_pubkey: hex::encode(signing_pubkey),
         fingerprint,
+        created_at,
     }))
 }
 
@@ -803,7 +829,7 @@ pub async fn get_signing_readiness(
     ))?;
 
     let row: Option<KeyringRow> = sqlx::query_as(
-        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey
+        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey, ok.created_at
          FROM org_keyrings ok
          JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
          WHERE ok.org_id = $1
@@ -845,7 +871,7 @@ pub async fn get_signing_readiness(
             )
         })?;
 
-    let Some((version, payload_bytes, _signature, signing_pubkey)) = row else {
+    let Some((version, payload_bytes, _signature, signing_pubkey, _created_at)) = row else {
         return Ok(Json(SigningReadinessResponse {
             org_id,
             state: signing_readiness_state(None, service_owner.as_deref()),
@@ -1310,11 +1336,14 @@ fn validated_rotate_owner_response(
     Ok(rotated.version as i64)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rotate_service_owner(
     signing_service: &crate::signing_service::SigningServiceClient,
     org_id: Uuid,
     current_owner: &[u8; 32],
     replacement_owner: &[u8; 32],
+    base_keyring_version: i64,
+    base_keyring_created_at: DateTime<Utc>,
     signed_at: DateTime<Utc>,
     reason: &str,
     rotation_signature: &[u8; 64],
@@ -1323,6 +1352,8 @@ async fn rotate_service_owner(
         .rotate_owner(&crate::signing_service::RotateOwnerRequest {
             org_id,
             replacement_owner_pubkey_b64: B64.encode(replacement_owner.as_slice()),
+            base_keyring_version,
+            base_keyring_created_at,
             signed_at,
             reason: reason.to_string(),
             signing_pubkey_b64: B64.encode(current_owner.as_slice()),
@@ -1495,6 +1526,18 @@ pub async fn rotate_org_owner(
     if body.version < 2 {
         return Err(bad_request("rotated keyring version must be at least two"));
     }
+    let (base_keyring_version, base_keyring_created_at) =
+        match (body.base_keyring_version, body.base_keyring_created_at) {
+            (Some(version), Some(created_at)) => (version, created_at),
+            _ => {
+                return Err(bad_request(
+                    "owner rotation directive must bind the current keyring version \
+                     (base_keyring_version and base_keyring_created_at are required); \
+                     upgrade enclava-cli, or on the hosted platform deploy the \
+                     enclava-paas proxy that forwards these fields",
+                ));
+            }
+        };
     reject_jsonb_unrepresentable_payload(&body.keyring_payload)?;
 
     let current_owner: [u8; 32] =
@@ -1565,6 +1608,8 @@ pub async fn rotate_org_owner(
         org_id,
         &current_owner,
         &replacement_owner,
+        base_keyring_version,
+        base_keyring_created_at,
         body.signed_at,
         body.reason.trim(),
     );
@@ -1779,6 +1824,7 @@ pub async fn rotate_org_owner(
         scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_owner_role(current_role)?;
     let (latest, version_created_at_floor) = read_rotation_authority(&mut tx, org_id).await?;
+    let latest_binding = (latest.0, latest.4);
     let rotation_path = derive_rotation_path(
         &mut tx,
         org_id,
@@ -1839,6 +1885,17 @@ pub async fn rotate_org_owner(
                 "owner rotation directive predates the current keyring version",
             ));
         }
+        // Issue #188: signed_at is signer-chosen and cannot prove the
+        // directive post-dates the version it supersedes. The directive
+        // bytes bind the superseded version and its creation witness
+        // (server-assigned at insertion, unknowable before the version
+        // exists), so equality with the lane-read latest is the proof;
+        // any intervening upload invalidates the directive outright.
+        if base_keyring_version != latest_binding.0 || base_keyring_created_at != latest_binding.1 {
+            return Err(bad_request(
+                "owner rotation directive is not bound to the current keyring version",
+            ));
+        }
         // Consume-once detection before any upstream side effect; the
         // final phase's unique insertion remains the authoritative guard.
         let already_consumed: Option<i32> = sqlx::query_scalar(
@@ -1897,6 +1954,8 @@ pub async fn rotate_org_owner(
                 org_id,
                 &current_owner,
                 &replacement_owner,
+                base_keyring_version,
+                base_keyring_created_at,
                 body.signed_at,
                 body.reason.trim(),
                 &rotation_signature,
@@ -1926,6 +1985,8 @@ pub async fn rotate_org_owner(
             org_id,
             &current_owner,
             &replacement_owner,
+            base_keyring_version,
+            base_keyring_created_at,
             body.signed_at,
             body.reason.trim(),
             &rotation_signature,
@@ -2012,6 +2073,7 @@ pub async fn rotate_org_owner(
         .await
         .map_err(|_| db_error())?;
     let (latest, version_created_at_floor) = read_rotation_authority(&mut tx, org_id).await?;
+    let latest_binding = (latest.0, latest.4);
     let rotation_path = derive_rotation_path(
         &mut tx,
         org_id,
@@ -2085,6 +2147,14 @@ pub async fn rotate_org_owner(
     if body.signed_at < version_created_at_floor {
         return Err(bad_request(
             "owner rotation directive predates the current keyring version",
+        ));
+    }
+    // Issue #188: same binding proof as the phase-1 lane check, re-read
+    // against the post-gap latest version before the directive is
+    // consumed and the successor keyring is committed.
+    if base_keyring_version != latest_binding.0 || base_keyring_created_at != latest_binding.1 {
+        return Err(bad_request(
+            "owner rotation directive is not bound to the current keyring version",
         ));
     }
     let consumed = sqlx::query(

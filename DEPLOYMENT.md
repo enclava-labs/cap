@@ -77,6 +77,43 @@ key still has an active registration. The removed owner remains denied;
 fresh rotations still require the caller's own active signing-key
 registration.
 
+Directive byte contract v2 (issue #188): `owner_rotation_directive_bytes`
+(purpose `enclava-recovery-v2`) now covers the superseded keyring version
+and its creation witness (`base_keyring_version`,
+`base_keyring_created_at` = the stored `org_keyrings.created_at`) alongside
+the existing fields. `signed_at` is signer-chosen and cannot prove when a
+directive was created; the creation witness is server-assigned at version
+insertion, so a directive covering it provably post-dates the version it
+supersedes, and the insert-new-version lane path rejects any directive not
+bound to the exact latest version it would supersede. The witness alone is
+a low-entropy timestamp, so the argument also rests on the per-org
+presentation rate cap (50 distinct directives per rolling hour): a
+pre-signed directive over a guessed witness can only match on an exact
+microsecond guess, and the guesser gets a handful of tries. Keep the rate
+cap in place when touching this area. CROSS-REPO CONTRACTS (deploy in
+lockstep; until all three land, owner rotations fail closed at the first
+unupdated party):
+
+1. `policy-templates/signing-service` re-derives these bytes verbatim to
+   verify `rotate-owner` `signature_b64`: update it to re-derive over the
+   new `RotateOwnerRequest` fields `base_keyring_version` /
+   `base_keyring_created_at`.
+2. `enclava-paas`'s hosted CLI proxy allowlist must forward the two fields
+   (enclava-labs/enclava-paas#366); without it the proxy silently strips
+   them and hosted owner rotations fail with a misleading "upgrade
+   enclava-cli" error.
+3. `enclava-cli` produces the bytes and sends the pair; a pre-binding CLI
+   is rejected before anything persists with an actionable
+   `base_keyring_version` / `base_keyring_created_at are required` error.
+
+Retry-path semantics after the change: the same-version idempotent replay
+path and expired exact retries remain free of freshness and binding checks
+(as before). Receipt-bound recovery on the insert path does pass the
+`signed_at` floor and the binding equality before its recovery waiver is
+recomputed; it succeeds because an honest recovery implies the latest
+version is unchanged, so the binding naturally holds — there is no blanket
+exemption for it.
+
 Successor-version keyring writes are fenced on the live owner authority:
 after an org has a configured signing service or any recorded rotation
 history, a `PUT` keyring request for a new version requires the service to

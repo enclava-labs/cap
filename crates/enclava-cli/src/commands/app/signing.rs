@@ -899,6 +899,7 @@ mod bootstrap_tests {
             "signature": envelope["signature"].clone(),
             "signing_pubkey": hex::encode(owner.public.to_bytes()),
             "fingerprint": hex::encode(owner.public.to_bytes()),
+            "created_at": Utc::now(),
         })
     }
 

@@ -432,6 +432,13 @@ pub struct OwnerStatusResponse {
 pub struct RotateOwnerRequest {
     pub org_id: Uuid,
     pub replacement_owner_pubkey_b64: String,
+    /// Directive binding: the keyring version the rotation supersedes and
+    /// its creation witness. The service re-derives
+    /// `owner_rotation_directive_bytes` verbatim over these fields when
+    /// verifying `signature_b64` (coordinated contract change per
+    /// AGENTS.md; see enclava-common::crypto).
+    pub base_keyring_version: i64,
+    pub base_keyring_created_at: DateTime<Utc>,
     pub signed_at: DateTime<Utc>,
     pub reason: String,
     pub signing_pubkey_b64: String,

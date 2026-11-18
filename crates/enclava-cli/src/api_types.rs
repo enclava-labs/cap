@@ -1146,6 +1146,10 @@ pub struct OrgKeyringResponse {
     pub signature: String,
     pub signing_pubkey: String,
     pub fingerprint: String,
+    /// Creation witness of this keyring version (server-assigned at
+    /// insertion). Owner-rotation directives bind it to prove post-version
+    /// creation; the exact stored value is what gets signed.
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1167,6 +1171,12 @@ pub struct RotateOrgOwnerRequest {
     pub signature: String,
     pub replacement_signing_pubkey: String,
     pub current_signing_pubkey: String,
+    /// Directive binding (issue #188): the keyring version the rotation
+    /// supersedes and its creation witness, exactly as bound into the
+    /// signed directive bytes. The RFC3339 rendering sent here is the
+    /// same string the signature covers.
+    pub base_keyring_version: i64,
+    pub base_keyring_created_at: String,
     pub signed_at: String,
     pub reason: String,
     pub rotation_signature: String,
