@@ -1811,21 +1811,50 @@ async fn config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authori
 
     // Initial completion is also fenced. Even if its route future
     // succeeds, CAP must not hand a bearer across the final 30 seconds.
+    // Sit at the midpoint of that window so sub-second truncation and a
+    // slow completion cannot fall out of the cutoff or cross absolute
+    // expiry. A 1-second placement races the serialized suite (#277).
     let initial_key = format!("safe-return-initial-{suffix}");
     let initial = expect_idempotency_execution(
         begin_test_config_token_receipt(&state, &initial_key, &path, &hash, &binding)
             .await
             .expect("reserve initial safe-return receipt"),
     );
-    sqlx::query(
+    let cutoff_remaining = CONFIG_TOKEN_SAFE_RETURN_SECONDS / 2;
+    let cutoff_age = crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS - cutoff_remaining;
+    let (inside_cutoff, not_expired, remaining_seconds): (bool, bool, i64) = sqlx::query_as(
         "UPDATE cap_internal_idempotency
-                SET created_at = date_trunc('second', clock_timestamp()) - interval '271 seconds'
-              WHERE idempotency_key = $1",
+                SET created_at = date_trunc('second', clock_timestamp())
+                    - ($2::bigint * interval '1 second')
+              WHERE idempotency_key = $1
+             RETURNING
+                date_trunc('second', created_at)
+                    + ($3::bigint * interval '1 second')
+                    <= clock_timestamp() + ($4::bigint * interval '1 second'),
+                date_trunc('second', created_at)
+                    + ($3::bigint * interval '1 second')
+                    > clock_timestamp(),
+                EXTRACT(EPOCH FROM (
+                    date_trunc('second', created_at)
+                        + ($3::bigint * interval '1 second')
+                        - clock_timestamp()
+                ))::bigint",
     )
     .bind(&initial_key)
-    .execute(&pool)
+    .bind(cutoff_age)
+    .bind(crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS)
+    .bind(CONFIG_TOKEN_SAFE_RETURN_SECONDS)
+    .fetch_one(&pool)
     .await
     .expect("move initial receipt inside safe-return cutoff");
+    assert!(
+        inside_cutoff && not_expired,
+        "cutoff fixture must be inside the no-return window and not expired"
+    );
+    assert!(
+        (10..=cutoff_remaining).contains(&remaining_seconds),
+        "cutoff fixture remaining={remaining_seconds}s must keep slack on both boundaries"
+    );
     let initial_error = complete_deterministic_config_token_result_with_timeout(
         initial,
         async {
@@ -1857,6 +1886,10 @@ async fn config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authori
 
     // A paused regeneration that crosses absolute expiry must observe the
     // concurrently committed terminal proof, never return its bearer.
+    // Take the lease while the receipt is still comfortably unexpired, then
+    // force expiry only after the handler is paused. Backdating to TTL-1
+    // before begin leaves a sub-second window a slow serialized run crosses,
+    // and begin returns the terminal replay instead of an execution lease (#277).
     let replay_key = format!("safe-return-replay-{suffix}");
     let first = expect_idempotency_execution(
         begin_test_config_token_receipt(&state, &replay_key, &path, &hash, &binding)
@@ -1871,21 +1904,17 @@ async fn config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authori
     )
     .await
     .expect("complete replay cutoff receipt");
-    sqlx::query(
-        "UPDATE cap_internal_idempotency
-                SET created_at = date_trunc('second', clock_timestamp()) - interval '299 seconds'
-              WHERE idempotency_key = $1",
-    )
-    .bind(&replay_key)
-    .execute(&pool)
-    .await
-    .expect("move replay receipt next to expiry");
     let replay = expect_idempotency_execution(
         begin_test_config_token_receipt(&state, &replay_key, &path, &hash, &binding)
             .await
-            .expect("begin near-expiry regeneration"),
+            .expect("begin regeneration before expiry"),
     );
     let expires_at = replay.config_token_receipt().unwrap().expires_at;
+    let margin = expires_at - database_clock(&pool).await.expect("read DB clock");
+    assert!(
+        margin >= chrono::Duration::seconds(CONFIG_TOKEN_SAFE_RETURN_SECONDS),
+        "regeneration must start with at least the safe-return margin; got {margin:?}"
+    );
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let paused = tokio::spawn(async move {
         complete_deterministic_config_token_result_with_timeout(
@@ -1897,21 +1926,24 @@ async fn config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authori
                     serde_json::json!({"token": "must-not-cross-expiry"}),
                 ))
             },
-            std::time::Duration::from_secs(5),
+            // Hang guard only. The handler is held until expiry is forced
+            // and the terminal proof is committed; this must not race the TTL.
+            std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(1),
         )
         .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            if database_clock(&pool).await.expect("read DB clock") >= expires_at {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
+    sqlx::query(
+        "UPDATE cap_internal_idempotency
+                SET created_at = date_trunc('second', clock_timestamp())
+                    - ($2::bigint * interval '1 second')
+              WHERE idempotency_key = $1",
+    )
+    .bind(&replay_key)
+    .bind(crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS + 1)
+    .execute(&pool)
     .await
-    .expect("receipt reaches DB-authored expiry");
+    .expect("force receipt past absolute expiry while regeneration is paused");
     let terminal = expect_idempotency_replay(
         begin_test_config_token_receipt(&state, &replay_key, &path, &hash, &binding)
             .await
