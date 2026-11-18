@@ -582,10 +582,19 @@ pub fn password_resume_key_source_seed_fallible(
 /// ([`signed_log_key_id_for_replay`]), not only an explicit flag. PaaS
 /// injects an already-active key into agent-policy even when the original
 /// command passed no flag, and that key enters the signed deployment.
+///
+/// `--log-key` naming that signed id resumes: it does not promise a new
+/// file. `--generate-log-key` does. A replay never calls key generation, so
+/// generation is permitted only when this attempt already recorded a
+/// private key for that id ([`recorded_generated_private_key_file`]) and the
+/// retry does not ask to write a different path. Otherwise the command
+/// would succeed without writing the file the flag promises (#403).
 pub fn replay_log_key_flag_conflict(
     stored_key_id: Option<&str>,
     log_key: Option<&str>,
     generate_log_key: Option<&str>,
+    stored_private_key_file: Option<&str>,
+    requested_private_key_file: Option<&std::path::Path>,
 ) -> Result<(), String> {
     if log_key.is_some() && generate_log_key.is_some() {
         return Err("--log-key and --generate-log-key cannot be used together".to_string());
@@ -594,21 +603,70 @@ pub fn replay_log_key_flag_conflict(
         // No flags: the replay keeps the stored key, identical by design.
         return Ok(());
     };
-    if stored_key_id == Some(requested) {
+    if stored_key_id != Some(requested) {
+        let flag = if log_key.is_some() {
+            "--log-key"
+        } else {
+            "--generate-log-key"
+        };
+        let stored = match stored_key_id {
+            Some(key_id) => format!("log key `{key_id}`"),
+            None => "no log-encryption key".to_string(),
+        };
+        return Err(format!(
+            "the template deploy being resumed re-posts the request signed on this machine byte-identically, so {flag} `{requested}` would be silently ignored: that request was signed with {stored}. A new deployment was not started. Retry the original command to resume that deployment, or destroy the app and deploy again.",
+        ));
+    }
+    // The id matches. Naming it with --log-key does not promise a file.
+    if generate_log_key.is_none() {
         return Ok(());
     }
-    let flag = if log_key.is_some() {
-        "--log-key"
-    } else {
-        "--generate-log-key"
+    // --generate-log-key promises a private key the replay will not create.
+    let Some(stored_path) = nonempty_private_key_path(stored_private_key_file) else {
+        let file = match requested_private_key_file {
+            Some(path) => format!("`{}`", path.display()),
+            None => "a private-key file".to_string(),
+        };
+        return Err(format!(
+            "the template deploy being resumed re-posts the request signed on this machine byte-identically, so --generate-log-key `{requested}` would not generate a private key or write {file}: that request was signed with log key `{requested}` and no private key was generated on this machine. A new deployment was not started. Retry the original command without --generate-log-key to resume that deployment, or destroy the app and deploy again.",
+        ));
     };
-    let stored = match stored_key_id {
-        Some(key_id) => format!("log key `{key_id}`"),
-        None => "no log-encryption key".to_string(),
-    };
-    Err(format!(
-        "the template deploy being resumed re-posts the request signed on this machine byte-identically, so {flag} `{requested}` would be silently ignored: that request was signed with {stored}. A new deployment was not started. Retry the original command to resume that deployment, or destroy the app and deploy again.",
-    ))
+    if let Some(requested_path) = requested_private_key_file
+        && !private_key_paths_consistent(stored_path, requested_path)
+    {
+        return Err(format!(
+            "the template deploy being resumed re-posts the request signed on this machine byte-identically, so --log-private-key-file `{}` would not be written: the private key was already written to `{stored_path}`. A new deployment was not started. Retry with --log-private-key-file `{stored_path}`, or omit --log-private-key-file, to resume that deployment.",
+            requested_path.display(),
+        ));
+    }
+    Ok(())
+}
+
+/// Private-key path recorded for `stored_key_id`, if this attempt generated
+/// one. A path stored under a different explicit key id is not evidence that
+/// this signed key was generated on this machine.
+pub fn recorded_generated_private_key_file<'a>(
+    stored_key_id: Option<&str>,
+    stored_log_key: Option<&'a StoredTemplateLogKey>,
+) -> Option<&'a str> {
+    let key = stored_log_key?;
+    if stored_key_id != Some(key.key_id.as_str()) {
+        return None;
+    }
+    nonempty_private_key_path(key.private_key_file.as_deref())
+}
+
+fn nonempty_private_key_path(path: Option<&str>) -> Option<&str> {
+    path.map(str::trim).filter(|path| !path.is_empty())
+}
+
+/// The retry did not ask for a different file. Omitting
+/// `--log-private-key-file` is consistent: output reports the stored path.
+/// A named path must be the path already written. Component equality only —
+/// a different spelling (`./`, relative vs absolute) refuses, and the error
+/// names the stored path.
+fn private_key_paths_consistent(stored: &str, requested: &std::path::Path) -> bool {
+    std::path::Path::new(stored) == requested
 }
 
 /// Key id the resumed request was signed with.
@@ -2918,26 +2976,80 @@ mod tests {
         // A replay re-posts the stored request byte-identically: flags that
         // match what it was signed with resume, diverging flags refuse
         // naming the flag instead of being silently ignored (#402).
-        assert!(replay_log_key_flag_conflict(Some("shell-logs"), None, None).is_ok());
-        assert!(replay_log_key_flag_conflict(Some("shell-logs"), Some("shell-logs"), None).is_ok());
-        assert!(replay_log_key_flag_conflict(Some("shell-logs"), None, Some("shell-logs")).is_ok());
-        assert!(replay_log_key_flag_conflict(None, None, None).is_ok());
+        assert!(replay_log_key_flag_conflict(Some("shell-logs"), None, None, None, None).is_ok());
+        assert!(
+            replay_log_key_flag_conflict(Some("shell-logs"), Some("shell-logs"), None, None, None)
+                .is_ok()
+        );
+        // Matching --generate-log-key is not an id match. The replay does not
+        // generate a key, so it resumes only when a private key was already
+        // recorded and the retry does not name a different path.
+        let error = replay_log_key_flag_conflict(
+            Some("shell-logs"),
+            None,
+            Some("shell-logs"),
+            None,
+            Some(std::path::Path::new("/tmp/shell.key")),
+        )
+        .expect_err("generate without a recorded private key must refuse");
+        assert!(error.contains("--generate-log-key"), "{error}");
+        assert!(error.contains("/tmp/shell.key"), "{error}");
+        assert!(
+            replay_log_key_flag_conflict(
+                Some("shell-logs"),
+                None,
+                Some("shell-logs"),
+                Some("/tmp/shell.key"),
+                Some(std::path::Path::new("/tmp/shell.key")),
+            )
+            .is_ok()
+        );
+        assert!(
+            replay_log_key_flag_conflict(
+                Some("shell-logs"),
+                None,
+                Some("shell-logs"),
+                Some("/tmp/shell.key"),
+                None,
+            )
+            .is_ok(),
+            "omitting --log-private-key-file does not ask for a different file"
+        );
+        let error = replay_log_key_flag_conflict(
+            Some("shell-logs"),
+            None,
+            Some("shell-logs"),
+            Some("/tmp/shell.key"),
+            Some(std::path::Path::new("/tmp/other.key")),
+        )
+        .expect_err("a different private-key path must refuse");
+        assert!(error.contains("/tmp/shell.key"), "{error}");
+        assert!(error.contains("/tmp/other.key"), "{error}");
+        assert!(replay_log_key_flag_conflict(None, None, None, None, None).is_ok());
 
-        let error = replay_log_key_flag_conflict(Some("shell-logs"), Some("audit-logs"), None)
-            .expect_err("a diverging --log-key must refuse");
+        let error =
+            replay_log_key_flag_conflict(Some("shell-logs"), Some("audit-logs"), None, None, None)
+                .expect_err("a diverging --log-key must refuse");
         assert!(error.contains("--log-key"), "{error}");
         assert!(error.contains("audit-logs"), "{error}");
 
-        let error = replay_log_key_flag_conflict(Some("shell-logs"), None, Some("audit-logs"))
-            .expect_err("a diverging --generate-log-key must refuse");
+        let error = replay_log_key_flag_conflict(
+            Some("shell-logs"),
+            None,
+            Some("audit-logs"),
+            Some("/tmp/shell.key"),
+            None,
+        )
+        .expect_err("a diverging --generate-log-key must refuse");
         assert!(error.contains("--generate-log-key"), "{error}");
 
-        let error = replay_log_key_flag_conflict(None, Some("shell-logs"), None)
+        let error = replay_log_key_flag_conflict(None, Some("shell-logs"), None, None, None)
             .expect_err("a flag naming a key the request was not signed with must refuse");
         assert!(error.contains("--log-key"), "{error}");
 
-        let error = replay_log_key_flag_conflict(Some("shell-logs"), Some("a"), Some("b"))
-            .expect_err("both flags at once still refuses");
+        let error =
+            replay_log_key_flag_conflict(Some("shell-logs"), Some("a"), Some("b"), None, None)
+                .expect_err("both flags at once still refuses");
         assert!(error.contains("cannot be used together"), "{error}");
     }
 
@@ -2994,11 +3106,28 @@ mod tests {
             log_key.as_ref().map(|key| key.key_id.as_str()),
         );
         assert_eq!(compared, Some("audit"));
-        assert!(replay_log_key_flag_conflict(compared, Some("audit"), None).is_ok());
-        assert!(replay_log_key_flag_conflict(compared, None, None).is_ok());
-        let error = replay_log_key_flag_conflict(compared, Some("other"), None)
+        assert!(replay_log_key_flag_conflict(compared, Some("audit"), None, None, None).is_ok());
+        assert!(replay_log_key_flag_conflict(compared, None, None, None, None).is_ok());
+        let error = replay_log_key_flag_conflict(compared, Some("other"), None, None, None)
             .expect_err("a different key still refuses");
         assert!(error.contains("audit"), "{error}");
+        // The same fixture used to let --generate-log-key audit through,
+        // because the check treated it as an id match. The replay never
+        // generates a key, and this attempt recorded no private-key path.
+        let error = replay_log_key_flag_conflict(
+            compared,
+            None,
+            Some("audit"),
+            recorded_generated_private_key_file(compared, log_key.as_ref()),
+            Some(std::path::Path::new("/tmp/audit.key")),
+        )
+        .expect_err("generate against an injected active key must refuse before posting");
+        assert!(error.contains("--generate-log-key"), "{error}");
+        assert!(error.contains("/tmp/audit.key"), "{error}");
+        assert!(
+            recorded_generated_private_key_file(compared, log_key.as_ref()).is_none(),
+            "no explicit preparation must not invent a generated private-key path"
+        );
 
         // Files written before signed_log_key_id fall back to the explicit
         // key (verified equal to the signed key when a flag was passed).
@@ -3035,6 +3164,93 @@ mod tests {
             ),
             None,
             "no explicit key and no signed id stays unknown, so a new flag refuses"
+        );
+    }
+
+    #[test]
+    fn generate_log_key_on_retry_requires_the_recorded_private_key() {
+        // A replay never generates a key. --generate-log-key resumes only
+        // when this attempt already wrote a private key for the signed id
+        // and the retry does not name a different path. The path comes from
+        // the stored explicit preparation, the same fields the command passes.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+        let stable = stable();
+        let request = request_from(&stable, "descriptor-a");
+        save_template_deploy_attempt(
+            &paths,
+            "org:org-1",
+            "app-uuid",
+            "deploy-1",
+            &request,
+            &NewTemplateDeployAttempt {
+                unlock_mode: "password".to_string(),
+                paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
+                log_key_id: Some("audit".to_string()),
+                log_private_key_file: Some(" /tmp/audit.key ".to_string()),
+                signed_log_key_id: Some("audit".to_string()),
+            },
+        )
+        .unwrap();
+        let LoadedTemplateDeployAttempt::Ready(stored) =
+            load_template_deploy_attempt(&paths, "org:org-1", "shell")
+        else {
+            panic!("stored request must load");
+        };
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(stored),
+            &stable,
+            &listed(vec![row("deploy-1", "applying", Some("applying"))]),
+        );
+        let TemplateDeployAttempt::Replay {
+            log_key,
+            signed_log_key_id,
+            ..
+        } = attempt
+        else {
+            panic!("in-flight retry must replay the signed request");
+        };
+        let compared = signed_log_key_id_for_replay(
+            signed_log_key_id.as_deref(),
+            log_key.as_ref().map(|key| key.key_id.as_str()),
+        );
+        let recorded = recorded_generated_private_key_file(compared, log_key.as_ref());
+        assert_eq!(recorded, Some("/tmp/audit.key"));
+        assert!(
+            replay_log_key_flag_conflict(
+                compared,
+                None,
+                Some("audit"),
+                recorded,
+                Some(std::path::Path::new("/tmp/audit.key")),
+            )
+            .is_ok()
+        );
+        assert!(
+            replay_log_key_flag_conflict(compared, None, Some("audit"), recorded, None).is_ok(),
+            "omitting the path still reports the stored file"
+        );
+        let error = replay_log_key_flag_conflict(
+            compared,
+            None,
+            Some("audit"),
+            recorded,
+            Some(std::path::Path::new("/tmp/other.key")),
+        )
+        .expect_err("a different path must refuse before posting");
+        assert!(error.contains("/tmp/audit.key"), "{error}");
+        assert!(error.contains("/tmp/other.key"), "{error}");
+        // A private key recorded under a different explicit id is not
+        // evidence that the signed key was generated here.
+        assert_eq!(
+            recorded_generated_private_key_file(
+                Some("audit"),
+                Some(&StoredTemplateLogKey {
+                    key_id: "other".to_string(),
+                    private_key_file: Some("/tmp/other.key".to_string()),
+                }),
+            ),
+            None
         );
     }
 

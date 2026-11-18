@@ -583,14 +583,23 @@ async fn deploy_with_timings(
             // this run's log-key flags cannot change it. Compare against the
             // key the policy response signed, not only an explicit flag:
             // PaaS injects an already-active key even when the original
-            // command passed none (#403).
+            // command passed none (#403). --generate-log-key also promises
+            // a private-key file the replay will not create, so it resumes
+            // only when that file was already recorded for this key and the
+            // retry does not name a different path.
+            let compared_log_key = enclava_cli::template_deploy_retry::signed_log_key_id_for_replay(
+                signed_log_key_id.as_deref(),
+                log_key.as_ref().map(|key| key.key_id.as_str()),
+            );
             enclava_cli::template_deploy_retry::replay_log_key_flag_conflict(
-                enclava_cli::template_deploy_retry::signed_log_key_id_for_replay(
-                    signed_log_key_id.as_deref(),
-                    log_key.as_ref().map(|key| key.key_id.as_str()),
-                ),
+                compared_log_key,
                 args.log_key.as_deref(),
                 args.generate_log_key.as_deref(),
+                enclava_cli::template_deploy_retry::recorded_generated_private_key_file(
+                    compared_log_key,
+                    log_key.as_ref(),
+                ),
+                args.log_private_key_file.as_deref(),
             )?;
             let request = *request;
             pb.set_position(1);
