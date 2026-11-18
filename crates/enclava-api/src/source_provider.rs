@@ -227,6 +227,18 @@ mod tests {
     }
 
     #[test]
+    fn gitlab_source_context_accepts_tag_and_digest_image() {
+        validate_source_context(
+            SourceProvider::GitLab,
+            "acme/platform/confidential-app",
+            "registry.gitlab.com/acme/platform/confidential-app:v1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "https://gitlab.com/acme/platform/confidential-app/-/blob/main/.gitlab-ci.yml@refs/heads/main",
+            "https://gitlab.com",
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn github_provider_rejects_gitlab_registry() {
         let err = validate_source_context(
             SourceProvider::GitHub,

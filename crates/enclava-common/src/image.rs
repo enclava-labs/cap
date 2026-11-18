@@ -19,39 +19,25 @@ pub enum ImageRefError {
 
 impl ImageRef {
     pub fn parse(raw: &str) -> Result<Self, ImageRefError> {
-        // Split on @ first (digest takes priority)
-        if let Some((name, digest)) = raw.split_once('@') {
-            crate::validate::validate_image_digest(digest)
-                .map_err(|e| ImageRefError::Invalid(e.to_string()))?;
-            let (registry, repository) = split_name(name)?;
-            return Ok(Self {
-                registry,
-                repository,
-                tag: None,
-                digest: digest.to_string(),
-            });
-        }
-
-        // Split on : for tag -- find the last : after the first /
-        let (name, tag) = if let Some(slash_pos) = raw.find('/') {
-            if let Some(colon_pos) = raw[slash_pos..].rfind(':') {
-                let abs_pos = slash_pos + colon_pos;
-                (&raw[..abs_pos], Some(raw[abs_pos + 1..].to_string()))
-            } else {
-                (raw, None)
+        let (name, digest) = match raw.split_once('@') {
+            Some((name, digest)) => {
+                crate::validate::validate_image_digest(digest)
+                    .map_err(|e| ImageRefError::Invalid(e.to_string()))?;
+                (name, digest.to_string())
             }
-        } else if let Some((name, tag)) = raw.split_once(':') {
-            (name, Some(tag.to_string()))
-        } else {
-            (raw, None)
+            None => (raw, String::new()),
         };
 
+        let (name, tag) = split_tag(name);
+        if let Some(tag) = tag {
+            validate_tag(tag)?;
+        }
         let (registry, repository) = split_name(name)?;
         Ok(Self {
             registry,
             repository,
-            tag,
-            digest: String::new(),
+            tag: tag.map(str::to_string),
+            digest,
         })
     }
 
@@ -100,6 +86,38 @@ impl ImageRef {
         } else {
             format!("{}/{}", self.registry, self.repository)
         }
+    }
+}
+
+/// Splits an optional `:tag` off a `registry/repository[:tag]` name. The first
+/// colon after the first `/` starts a tag; one before it is a registry port.
+fn split_tag(name: &str) -> (&str, Option<&str>) {
+    let tag_search_start = name.find('/').unwrap_or(0);
+    match name[tag_search_start..].find(':') {
+        Some(pos) => {
+            let colon = tag_search_start + pos;
+            (&name[..colon], Some(&name[colon + 1..]))
+        }
+        None => (name, None),
+    }
+}
+
+/// OCI distribution-spec tag grammar: `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`.
+fn validate_tag(tag: &str) -> Result<(), ImageRefError> {
+    let valid = tag.len() <= 128
+        && tag
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(ImageRefError::Invalid(format!(
+            "invalid image tag: {tag:?}"
+        )))
     }
 }
 
