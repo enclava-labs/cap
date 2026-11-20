@@ -2573,11 +2573,35 @@ pub(crate) async fn claim_initial_ownership(
         );
     }
 
-    let result = match tee
+    let mnemonic = match tee
         .bootstrap_claim(&challenge.nonce, &bootstrap_pubkey, &signature, &password)
         .await
     {
-        Ok(result) => result,
+        Ok(result) => match result.mnemonic {
+            Some(mnemonic) => mnemonic,
+            None => {
+                match crate::commands::ownership::reexport_recovery_mnemonic(
+                    &tee,
+                    &signing_key,
+                    &password,
+                )
+                .await
+                {
+                    Ok(mnemonic) => mnemonic,
+                    Err(reexport_error) => {
+                        return Err(
+                            crate::commands::ownership::ownership_committed_recovery_backup_incomplete(
+                                format!(
+                                    "the TEE's claim response contained no recovery mnemonic, \
+                                     and the immediate attested re-export did not complete \
+                                     ({reexport_error})"
+                                ),
+                            ),
+                        );
+                    }
+                }
+            }
+        },
         Err(error) => {
             // One safe status read decides the indeterminate-claim fallback:
             // an already-committed claim keeps the recovery-mnemonic halt (it
@@ -2589,13 +2613,39 @@ pub(crate) async fn claim_initial_ownership(
                 .await
             {
                 Ok(status) if status.claimed => {
-                    return Err(
-                        crate::commands::ownership::ownership_committed_recovery_backup_incomplete(
-                            "the claim response was lost after the TEE committed ownership, so the \
-                             one-time recovery mnemonic was never received"
-                                .to_string(),
-                        ),
-                    );
+                    // Ownership is committed and stays committed; re-obtain
+                    // the SAME mnemonic over the attested re-export instead
+                    // of halting without it. The re-export is not cancelled
+                    // at the hold deadline either: it is the one-time
+                    // mnemonic delivery itself.
+                    match crate::commands::ownership::reexport_recovery_mnemonic(
+                        &tee,
+                        &signing_key,
+                        &password,
+                    )
+                    .await
+                    {
+                        Ok(mnemonic) => {
+                            eprintln!(
+                                "The claim response was lost after the TEE committed ownership; \
+                                 the one-time recovery mnemonic was re-exported over the \
+                                 attested ownership channel."
+                            );
+                            mnemonic
+                        }
+                        Err(reexport_error) => {
+                            return Err(
+                                crate::commands::ownership::ownership_committed_recovery_backup_incomplete(
+                                    format!(
+                                        "the claim response was lost after the TEE committed \
+                                         ownership, so the one-time recovery mnemonic was \
+                                         never received, and the immediate attested re-export \
+                                         did not complete ({reexport_error})"
+                                    ),
+                                ),
+                            );
+                        }
+                    }
                 }
                 Ok(status) => {
                     if status.terminal_bootstrap_error.is_some()
@@ -2628,11 +2678,6 @@ pub(crate) async fn claim_initial_ownership(
     // is never written to stdout/stderr; on failure this returns the
     // ownership-committed/incomplete-backup error and the deploy/template flow
     // halts rather than proceeding past a claim whose backup is incomplete.
-    let mnemonic = result.mnemonic.ok_or_else(|| {
-        crate::commands::ownership::ownership_committed_recovery_backup_incomplete(
-            "the TEE's claim response contained no recovery mnemonic".to_string(),
-        )
-    })?;
     crate::commands::ownership::store_recovery_mnemonic_after_claim(
         paths,
         &active.org_name,
