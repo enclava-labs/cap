@@ -144,14 +144,16 @@ pub struct ChallengeResponse {
     pub ttl_seconds: u64,
 }
 
-/// Response from the claim endpoint.
+/// Response from the claim endpoint and the mnemonic re-export endpoint.
 #[derive(Debug, serde::Deserialize)]
 pub struct ClaimResponse {
     pub status: String,
-    /// BIP39 mnemonic backup (emitted exactly once; persisted to the protected
-    /// local keystore after a successful claim — never printed; deliberate
-    /// export happens via `enclava key backup`). The TEE emits this under the
-    /// `owner_seed_mnemonic` key.
+    /// BIP39 mnemonic backup (persisted to the protected local keystore after
+    /// a successful claim — never printed; deliberate export happens via
+    /// `enclava key backup`). The TEE emits this under the
+    /// `owner_seed_mnemonic` key at claim time and again — the same value,
+    /// re-derived — on an attested re-export
+    /// ([`TeeClient::bootstrap_mnemonic_export`]).
     #[serde(rename = "owner_seed_mnemonic")]
     pub mnemonic: Option<String>,
 }
@@ -623,6 +625,21 @@ impl TeeClient {
         Ok(resp.json().await?)
     }
 
+    /// Request a bootstrap challenge for the recovery-mnemonic re-export.
+    /// The purpose tag keeps this nonce single-scope: it can only be consumed
+    /// by [`TeeClient::bootstrap_mnemonic_export`], never by a claim.
+    pub async fn bootstrap_mnemonic_challenge(&self) -> Result<ChallengeResponse, TeeError> {
+        let body = serde_json::json!({ "purpose": "export-mnemonic" });
+        let resp = self
+            .http
+            .post(self.url("/bootstrap/challenge"))
+            .json(&body)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     /// Claim ownership of the app (first-time setup, password mode).
     pub async fn bootstrap_claim(
         &self,
@@ -640,6 +657,34 @@ impl TeeClient {
         let resp = self
             .http
             .post(self.url("/bootstrap/claim"))
+            .json(&body)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Re-export the one-time recovery mnemonic to a caller that repeats the
+    /// claim-time ownership proof (a fresh challenge signed by the bootstrap
+    /// key pinned in the workload identity) and presents the unlock password
+    /// (enclava-labs/cap#404). The TEE re-derives the SAME mnemonic from its
+    /// escrowed owner-seed envelope; nothing is minted or rewrapped.
+    pub async fn bootstrap_mnemonic_export(
+        &self,
+        challenge_nonce: &str,
+        bootstrap_pubkey: &str,
+        signature: &str,
+        password: &str,
+    ) -> Result<ClaimResponse, TeeError> {
+        let body = serde_json::json!({
+            "challenge": challenge_nonce,
+            "bootstrap_pubkey": bootstrap_pubkey,
+            "signature": signature,
+            "password": password,
+        });
+        let resp = self
+            .http
+            .post(self.url("/bootstrap/mnemonic"))
             .json(&body)
             .send()
             .await?;

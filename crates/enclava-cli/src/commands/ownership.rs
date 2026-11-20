@@ -66,6 +66,16 @@ pub struct ChangePasswordArgs {
     pub new_password_file: Option<PathBuf>,
 }
 
+#[derive(Args)]
+pub struct ExportMnemonicArgs {
+    /// App name (defaults to enclava.toml app.name)
+    #[arg(long)]
+    pub app: Option<String>,
+    /// Read the unlock password from a file (non-interactive; trailing newline trimmed).
+    #[arg(long)]
+    pub password_file: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 pub enum AutoUnlockCommand {
     /// Removed: auto-unlock cannot be enabled anymore (refuses immediately)
@@ -255,13 +265,26 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
         Ok(result) => result,
         Err(_) if tee.claim_state_is_successful().await.unwrap_or(false) => {
             // Ownership committed server-side but the response (which carries the
-            // one-time mnemonic) was lost. Halt with the incomplete-backup error:
-            // never retry the claim, never imply rollback, never print secrets.
-            return Err(ownership_committed_recovery_backup_incomplete(
-                "the claim response was lost after the TEE committed ownership, so the \
-                 one-time recovery mnemonic was never received"
-                    .to_string(),
-            ));
+            // one-time mnemonic) was lost. Never retry the claim, never imply
+            // rollback, never print secrets: re-obtain the SAME mnemonic over the
+            // attested re-export, and halt with the incomplete-backup error if
+            // that cannot complete either.
+            let mnemonic = match reexport_recovery_mnemonic(&tee, &signing_key, &password).await {
+                Ok(mnemonic) => mnemonic,
+                Err(reexport_error) => {
+                    return Err(ownership_committed_recovery_backup_incomplete(format!(
+                        "the claim response was lost after the TEE committed ownership, so the \
+                         one-time recovery mnemonic was never received, and the immediate \
+                         attested re-export did not complete ({reexport_error})"
+                    )));
+                }
+            };
+            eprintln!(
+                "The claim response was lost after the TEE committed ownership; the one-time \
+                 recovery mnemonic was re-exported over the attested ownership channel."
+            );
+            store_recovery_mnemonic_after_claim(&paths, &me.active_org.name, &app_name, &mnemonic)?;
+            return Ok(());
         }
         Err(err) => return Err(err.into()),
     };
@@ -271,11 +294,68 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Persist the one-time mnemonic to the prepared protected sink. The
     // mnemonic is never written to stdout/stderr; on failure this returns the
     // ownership-committed/incomplete-backup error and halts.
-    let mnemonic = result.mnemonic.ok_or_else(|| {
-        ownership_committed_recovery_backup_incomplete(
-            "the TEE's claim response contained no recovery mnemonic".to_string(),
-        )
-    })?;
+    let mnemonic = match result.mnemonic {
+        Some(mnemonic) => mnemonic,
+        None => match reexport_recovery_mnemonic(&tee, &signing_key, &password).await {
+            Ok(mnemonic) => mnemonic,
+            Err(reexport_error) => {
+                return Err(ownership_committed_recovery_backup_incomplete(format!(
+                    "the TEE's claim response contained no recovery mnemonic, and the immediate \
+                     attested re-export did not complete ({reexport_error})"
+                )));
+            }
+        },
+    };
+    store_recovery_mnemonic_after_claim(&paths, &me.active_org.name, &app_name, &mnemonic)?;
+    Ok(())
+}
+
+/// Re-export the one-time recovery mnemonic over the attested ownership
+/// channel into the protected local keystore (enclava-labs/cap#404).
+///
+/// Covers "the claim response was lost before the mnemonic was received":
+/// the owner proves claim-time authority again (a fresh challenge signed by
+/// the bootstrap key pinned in the workload identity, plus the unlock
+/// password) and the TEE re-derives the SAME mnemonic from its owner-seed
+/// envelope. The mnemonic is never printed; it is persisted exactly like a
+/// claim's, so `enclava key backup` can back it up.
+pub async fn export_mnemonic(args: ExportMnemonicArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let app_name = resolve_app_name(&args.app)?;
+    let (api, paths) = build_api_client()?;
+    let me = api.get_current_user().await?;
+
+    // Same pre-network gate as claims: nothing is re-exported unless the
+    // protected keystore can persist it.
+    prepare_recovery_mnemonic_sink(
+        &paths,
+        &me.active_org.name,
+        &app_name,
+        MnemonicCapture::Store,
+        args.password_file.is_some(),
+    )?;
+
+    let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
+    let tee =
+        TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
+    let (_attestation, tee) = tee.attest_receipt_key().await?;
+
+    let org_id = Uuid::parse_str(&me.active_org.id)?;
+    let private_key_bytes =
+        load_or_derive_bootstrap_private_key(&paths, &me.active_org.name, org_id, &app_name)?;
+    let signing_key = SigningKey::from_bytes(&private_key_bytes);
+
+    let password = secret_from_file_or_prompt(
+        args.password_file.as_deref(),
+        "password",
+        "Unlock password",
+        None,
+        "--password-file",
+    )?;
+
+    println!(
+        "Re-exporting the recovery mnemonic for {app_name} over the attested ownership channel..."
+    );
+    let mnemonic = reexport_recovery_mnemonic(&tee, &signing_key, &password).await?;
     store_recovery_mnemonic_after_claim(&paths, &me.active_org.name, &app_name, &mnemonic)?;
     Ok(())
 }
@@ -284,7 +364,9 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// `Skip` (`--no-store-mnemonic`) is rejected by
 /// [`validate_recovery_mnemonic_sink_mode`] before any claim is sent: the
 /// mnemonic is never printed to stdout/stderr, so an unpersisted mnemonic is
-/// permanently lost, and no tenant-authenticated re-export exists yet.
+/// stranded until `enclava export-mnemonic` re-obtains it from the TEE (which
+/// needs the bootstrap key and the unlock password) — claims still always
+/// persist it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MnemonicCapture {
     /// Persist to the protected local keystore so `key backup` can back it up.
@@ -315,17 +397,19 @@ const MNEMONIC_PERSIST_ATTEMPTS: u32 = 3;
 
 /// Reject unsafe sink modes before any claim is sent. `--no-store-mnemonic` used
 /// to display the mnemonic once on stdout/stderr; that display path is gone
-/// (transcripts and CI artifacts captured it, evidence E11), and until a
-/// tenant-authenticated export exists an unpersisted mnemonic is unrecoverable,
-/// so the mode is refused before the TEE mints anything.
+/// (transcripts and CI artifacts captured it, evidence E11). An unpersisted
+/// mnemonic is only recoverable through `enclava export-mnemonic` (bootstrap
+/// key and unlock password, live owner-seed envelope), so claims still refuse
+/// to skip persistence before the TEE mints anything.
 pub(crate) fn validate_recovery_mnemonic_sink_mode(
     capture: MnemonicCapture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if capture == MnemonicCapture::Skip {
         return Err(
             "--no-store-mnemonic is not allowed for ownership claims: the recovery mnemonic is \
-             never printed to stdout/stderr, so an unpersisted mnemonic would be permanently \
-             lost. Omit the flag - the mnemonic is stored in the protected local keystore, and \
+             never printed to stdout/stderr, so an unpersisted mnemonic would be stranded \
+             until `enclava export-mnemonic` re-obtains it (bootstrap key + unlock password). \
+             Omit the flag - the mnemonic is stored in the protected local keystore, and \
              `enclava key backup` performs the deliberate encrypted export."
                 .into(),
         );
@@ -435,6 +519,40 @@ pub(crate) fn store_recovery_mnemonic_after_claim(
     )))
 }
 
+/// Re-obtain the one-time recovery mnemonic over the attested ownership
+/// channel (enclava-labs/cap#404) after the claim response was lost or came
+/// back without it.
+///
+/// The proof repeats the claim's authority level exactly: a fresh single-use
+/// bootstrap challenge signed by the pinned bootstrap key, plus the unlock
+/// password that unwraps the TEE's owner-seed envelope. The TEE re-derives
+/// the SAME mnemonic (never a fresh seed) and returns it over the
+/// SPKI-pinned channel; the caller persists it with
+/// [`store_recovery_mnemonic_after_claim`]. On any failure the caller's
+/// incomplete-backup halt remains the fallback -- and `enclava export-mnemonic`
+/// can retry the same path later.
+pub(crate) async fn reexport_recovery_mnemonic(
+    tee: &TeeClient,
+    signing_key: &SigningKey,
+    password: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let challenge = tee.bootstrap_mnemonic_challenge().await?;
+    // The TEE challenge is base64url-encoded bytes. Sign the decoded challenge
+    // bytes, matching the attestation-proxy verifier.
+    let challenge_bytes = URL_SAFE_NO_PAD
+        .decode(challenge.nonce.as_bytes())
+        .map_err(|e| format!("invalid bootstrap challenge encoding: {e}"))?;
+    let signature_bytes = signing_key.sign(&challenge_bytes);
+    let bootstrap_pubkey = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(signature_bytes.to_bytes());
+    let result = tee
+        .bootstrap_mnemonic_export(&challenge.nonce, &bootstrap_pubkey, &signature, password)
+        .await?;
+    result
+        .mnemonic
+        .ok_or_else(|| "the TEE's mnemonic export response contained no recovery mnemonic".into())
+}
+
 /// Build the post-commit incomplete-backup error. `detail` must describe the
 /// failure without embedding the mnemonic or any other secret.
 pub(crate) fn ownership_committed_recovery_backup_incomplete(
@@ -442,9 +560,11 @@ pub(crate) fn ownership_committed_recovery_backup_incomplete(
 ) -> Box<dyn std::error::Error> {
     format!(
         "{OWNERSHIP_COMMITTED_RECOVERY_BACKUP_INCOMPLETE}: the TEE accepted ownership and it is \
-         NOT rolled back, but {detail}. The mnemonic is never printed and cannot be requested \
-         again; keep the unlock password safe - without the mnemonic, lost-password recovery \
-         for this app's encrypted storage is impossible. Dependent actions were halted."
+         NOT rolled back, but {detail}. The mnemonic is never printed; `enclava export-mnemonic` \
+         re-obtains it from the TEE over the attested ownership channel (proof: the bootstrap \
+         key and the unlock password). Until it is re-exported and stored, keep the unlock \
+         password safe - without the mnemonic, lost-password recovery for this app's encrypted \
+         storage is impossible. Dependent actions were halted."
     )
     .into()
 }
@@ -1117,6 +1237,10 @@ mod tests {
         assert!(response_lost.starts_with(OWNERSHIP_COMMITTED_RECOVERY_BACKUP_INCOMPLETE));
         assert!(response_lost.contains("never received"));
         assert!(response_lost.contains("NOT rolled back"));
+        assert!(
+            response_lost.contains("enclava export-mnemonic"),
+            "the halt must name the attested re-export remedy: {response_lost}"
+        );
         assert!(!response_lost.contains(SYNTHETIC_MNEMONIC));
 
         let missing = ownership_committed_recovery_backup_incomplete(

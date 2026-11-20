@@ -129,6 +129,44 @@ fn claim_response_captures_owner_seed_mnemonic_from_live_proxy_shape() {
 }
 
 #[test]
+fn mnemonic_export_response_captures_owner_seed_mnemonic_from_live_proxy_shape() {
+    // Exact shape of the attestation-proxy re-export success (HTTP 200) body
+    // (cap#404). The mnemonic only ever leaves the TEE under the
+    // `owner_seed_mnemonic` key here too; if this parse stops populating
+    // `mnemonic`, the lost-claim recovery silently delivers nothing.
+    let parsed: super::ClaimResponse = serde_json::from_value(serde_json::json!({
+        "status": "MNEMONIC_EXPORTED",
+        "owner_public_key": "x",
+        "owner_seed_mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    }))
+    .expect("parse mnemonic export success");
+    assert_eq!(parsed.status, "MNEMONIC_EXPORTED");
+    assert_eq!(
+        parsed.mnemonic.as_deref(),
+        Some(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        ),
+        "the re-exported recovery mnemonic must survive response deserialization"
+    );
+}
+
+#[test]
+fn challenge_response_accepts_purpose_tagged_live_proxy_shape() {
+    // The re-export challenge answer is the claim challenge shape plus the
+    // purpose echo (cap#404); the extra field must not break parsing.
+    let parsed: super::ChallengeResponse = serde_json::from_value(serde_json::json!({
+        "instance_id": "instance-test-01",
+        "challenge": "abc",
+        "nonce": "abc",
+        "purpose": "export-mnemonic",
+        "expires_in_seconds": 300
+    }))
+    .expect("parse purpose-tagged challenge");
+    assert_eq!(parsed.nonce, "abc");
+    assert_eq!(parsed.ttl_seconds, 300);
+}
+
+#[test]
 fn post_claim_ownership_states_mean_owner_claim_succeeded() {
     for field in ["ownership_state", "state"] {
         for state in ["locked", "unlocking", "unlocked"] {

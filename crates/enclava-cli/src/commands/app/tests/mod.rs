@@ -1489,32 +1489,54 @@ pub(crate) async fn spawn_local_tls_server(
             };
             let mut request = Vec::new();
             let mut chunk = [0_u8; 4096];
-            loop {
+            let headers_end = loop {
                 match stream.read(&mut chunk).await {
-                    Ok(0) => break,
+                    Ok(0) => break request.len(),
                     Ok(read) => {
                         request.extend_from_slice(&chunk[..read]);
-                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
+                        if let Some(at) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break at + 4;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => break request.len(),
                 }
-            }
+            };
             if request.is_empty() {
                 continue;
             }
-            let request_line = String::from_utf8_lossy(&request)
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .to_string();
+            let text = String::from_utf8_lossy(&request);
+            let mut lines = text.split("\r\n");
+            let request_line = lines.next().unwrap_or_default().to_string();
             let mut parts = request_line.split_whitespace();
             let (method, path) = (
                 parts.next().unwrap_or("?").to_string(),
                 parts.next().unwrap_or("/").to_string(),
             );
-            requests.lock().unwrap().push(format!("{method} {path}"));
+            let content_length: usize = lines
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            let mut body_bytes = request.len().saturating_sub(headers_end);
+            while body_bytes < content_length {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        request.extend_from_slice(&chunk[..read]);
+                        body_bytes += read;
+                    }
+                    Err(_) => break,
+                }
+            }
+            let body = String::from_utf8_lossy(&request[headers_end..]).to_string();
+            requests
+                .lock()
+                .unwrap()
+                .push(format!("{method} {path} {body}"));
             let (status, reason, body) = match respond(&path) {
                 (200, body) => (200, "OK", body),
                 (404, body) => (404, "Not Found", body),
@@ -3939,6 +3961,314 @@ async fn bootstrap_endpoint_wait_attests_before_probing_the_claim_endpoint() {
         attestation < challenge,
         "attestation must precede the claim-endpoint probe: {recorded:?}"
     );
+}
+
+// --- lost claim response -> attested recovery-mnemonic re-export (cap#404) ---
+//
+// The claim response is the only delivery of the one-time recovery mnemonic.
+// When it is lost after the TEE committed ownership, the CLI must re-obtain
+// the SAME mnemonic over the attested re-export (challenge signed by the
+// bootstrap key + unlock password) instead of halting without it. Synthetic,
+// publicly-documented BIP39 test vector; never a real secret.
+const REEXPORT_TEST_MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+/// Stub TEE for the claim/re-export flows. `claim_status` simulates the lost
+/// claim response (any non-2xx makes the CLI treat it as lost after checking
+/// `/status`); `export_status` selects the re-export surface (200 serves the
+/// mnemonic, 404 stands in for a proxy build without the route).
+fn reexport_tee_stub(
+    claim_status: u16,
+    export_status: u16,
+) -> impl Fn(&str) -> (u16, String) + Send + Sync + 'static {
+    move |path| {
+        if path.starts_with("/.well-known/confidential/attestation") {
+            (200, dev_json_attestation_body(path))
+        } else if path.ends_with("/bootstrap/challenge") {
+            (
+                200,
+                serde_json::json!({
+                    "challenge": "cmVwb3J0LW5vbmNl",
+                    "nonce": "cmVwb3J0LW5vbmNl",
+                    "expires_in_seconds": 300
+                })
+                .to_string(),
+            )
+        } else if path.ends_with("/bootstrap/claim") {
+            (claim_status, "{\"error\":\"claim_failed\"}".to_string())
+        } else if path.ends_with("/bootstrap/mnemonic") {
+            if export_status == 200 {
+                (
+                    200,
+                    serde_json::json!({
+                        "status": "MNEMONIC_EXPORTED",
+                        "owner_public_key": "test-owner-pubkey",
+                        "owner_seed_mnemonic": REEXPORT_TEST_MNEMONIC,
+                    })
+                    .to_string(),
+                )
+            } else {
+                (export_status, "{\"error\":\"not_found\"}".to_string())
+            }
+        } else if path.ends_with("/status") {
+            (
+                200,
+                serde_json::json!({
+                    "ownership_state": "unlocked",
+                    "unlock_state": "unlocked",
+                    "auto_unlock_enabled": false,
+                })
+                .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    }
+}
+
+/// Stub CAP API for the claim/re-export flows: user/org lookup and the
+/// ownership endpoint resolution, pointing at `tee_base`.
+fn reexport_api_stub(
+    tee_base: String,
+) -> impl Fn(&str) -> (u16, serde_json::Value) + Send + Sync + 'static {
+    move |path| {
+        if path == "/users/me" {
+            (
+                200,
+                serde_json::json!({
+                    "user_id": "user-1",
+                    "display_name": "Test User",
+                    "active_org": {
+                        "id": "22222222-2222-2222-2222-222222222222",
+                        "name": "test-org",
+                        "display_name": null,
+                        "role": "owner",
+                        "is_personal": false
+                    },
+                    "orgs": []
+                }),
+            )
+        } else if path.ends_with("/unlock/endpoint") {
+            (
+                200,
+                serde_json::json!({
+                    "tee_url": tee_base,
+                    "tee_resolve_ip": "127.0.0.1",
+                    "unlock_endpoint": format!("{tee_base}/unlock"),
+                    "claim_endpoint": format!("{tee_base}/bootstrap/claim"),
+                }),
+            )
+        } else {
+            (404, serde_json::json!({}))
+        }
+    }
+}
+
+/// Parse the recorded request body of the one re-export POST and prove the
+/// ownership proof is real: a signature over the challenge bytes that verifies
+/// against the bootstrap key, and the unlock password that unwraps the TEE's
+/// owner-seed envelope.
+fn assert_valid_reexport_proof(recorded: &[String]) {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let export_request = recorded
+        .iter()
+        .find(|request| request.starts_with("POST /.well-known/confidential/bootstrap/mnemonic "))
+        .expect("the re-export must reach the TEE");
+    let body: serde_json::Value =
+        serde_json::from_str(export_request.splitn(3, ' ').nth(2).unwrap_or("{}"))
+            .expect("re-export request body");
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let challenge_bytes = engine
+        .decode(body["challenge"].as_str().expect("challenge"))
+        .expect("challenge bytes");
+    let signature = Signature::from_slice(
+        &engine
+            .decode(body["signature"].as_str().expect("signature"))
+            .expect("signature bytes"),
+    )
+    .expect("signature shape");
+    let pubkey_bytes = engine
+        .decode(body["bootstrap_pubkey"].as_str().expect("pubkey"))
+        .expect("pubkey bytes");
+    let verifying_key =
+        VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().expect("pubkey length"))
+            .expect("pubkey shape");
+    verifying_key
+        .verify(&challenge_bytes, &signature)
+        .expect("the re-export signature must verify against the bootstrap key");
+    assert_eq!(
+        body["password"], "storage-password",
+        "the re-export must carry the unlock password factor"
+    );
+}
+
+#[tokio::test]
+async fn claim_recovers_a_lost_response_via_the_attested_mnemonic_reexport() {
+    // A claim response lost after the TEE committed ownership (transport cut)
+    // must recover the one-time mnemonic through the attested re-export and
+    // persist it -- not halt without it.
+    let tee_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tee_address =
+        spawn_local_tls_server(tee_requests.clone(), reexport_tee_stub(500, 200)).await;
+    let api_address = spawn_json_api_stub(
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        reexport_api_stub(format!("https://localhost:{}", tee_address.port())),
+    )
+    .await;
+
+    let env = pinned_tee_env(&format!("http://{api_address}"));
+    let paths = env.paths();
+    enclava_cli::config::save_bootstrap_key(&paths, "test-org", "shell", &hex::encode([7u8; 32]))
+        .expect("bootstrap key fixture");
+    let password_file = paths.keys_dir.join("claim-password.txt");
+    std::fs::write(&password_file, "storage-password\n").unwrap();
+
+    crate::commands::ownership::claim(crate::commands::ownership::ClaimArgs {
+        app: Some("shell".to_string()),
+        password_file: Some(password_file),
+        store_mnemonic: false,
+        no_store_mnemonic: false,
+    })
+    .await
+    .expect("a lost claim response must be recovered through the attested re-export");
+
+    assert_eq!(
+        enclava_cli::keys::load_app_mnemonic(&paths, "test-org", "shell").unwrap(),
+        Some(REEXPORT_TEST_MNEMONIC.to_string()),
+        "the re-exported mnemonic must be persisted to the protected keystore"
+    );
+
+    let recorded = tee_requests.lock().unwrap().clone();
+    event_position(&recorded, "POST /.well-known/confidential/bootstrap/claim ");
+    event_position(
+        &recorded,
+        "POST /.well-known/confidential/bootstrap/challenge {\"purpose\":\"export-mnemonic\"}",
+    );
+    let claim = event_position(&recorded, "POST /.well-known/confidential/bootstrap/claim ");
+    let reexport_challenge = event_position(
+        &recorded,
+        "POST /.well-known/confidential/bootstrap/challenge {\"purpose\":\"export-mnemonic\"}",
+    );
+    let reexport = event_position(
+        &recorded,
+        "POST /.well-known/confidential/bootstrap/mnemonic ",
+    );
+    assert!(
+        claim < reexport_challenge && reexport_challenge < reexport,
+        "the re-export must mint its own purpose-tagged challenge after the lost claim: {recorded:?}"
+    );
+    assert_valid_reexport_proof(&recorded);
+}
+
+#[tokio::test]
+async fn claim_loss_without_a_reexport_surface_halts_with_the_incomplete_backup_error() {
+    // Old proxy builds (no /bootstrap/mnemonic route): the halt remains, but
+    // it must name the manual remedy and must never embed the mnemonic.
+    let tee_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tee_address =
+        spawn_local_tls_server(tee_requests.clone(), reexport_tee_stub(500, 404)).await;
+    let api_address = spawn_json_api_stub(
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        reexport_api_stub(format!("https://localhost:{}", tee_address.port())),
+    )
+    .await;
+
+    let env = pinned_tee_env(&format!("http://{api_address}"));
+    let paths = env.paths();
+    enclava_cli::config::save_bootstrap_key(&paths, "test-org", "shell", &hex::encode([7u8; 32]))
+        .expect("bootstrap key fixture");
+    let password_file = paths.keys_dir.join("claim-password.txt");
+    std::fs::write(&password_file, "storage-password\n").unwrap();
+
+    let error = crate::commands::ownership::claim(crate::commands::ownership::ClaimArgs {
+        app: Some("shell".to_string()),
+        password_file: Some(password_file),
+        store_mnemonic: false,
+        no_store_mnemonic: false,
+    })
+    .await
+    .expect_err("without a re-export surface the incomplete-backup halt must remain")
+    .to_string();
+
+    assert!(
+        error.starts_with("ownership_committed_recovery_backup_incomplete"),
+        "the halt must keep its stable code: {error}"
+    );
+    assert!(
+        error.contains("never received"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("enclava export-mnemonic"),
+        "the halt must name the manual remedy: {error}"
+    );
+    assert!(
+        !error.contains(REEXPORT_TEST_MNEMONIC),
+        "halt leaked mnemonic"
+    );
+    assert!(
+        enclava_cli::keys::load_app_mnemonic(&paths, "test-org", "shell")
+            .unwrap()
+            .is_none(),
+        "nothing may be persisted under the halt"
+    );
+
+    // The re-export was genuinely attempted before halting.
+    let recorded = tee_requests.lock().unwrap().clone();
+    event_position(
+        &recorded,
+        "POST /.well-known/confidential/bootstrap/mnemonic ",
+    );
+}
+
+#[tokio::test]
+async fn export_mnemonic_command_reexports_over_the_attested_channel_and_persists() {
+    // The standalone remedy named by the halt: `enclava export-mnemonic`
+    // re-obtains the one-time mnemonic later (e.g. the operator walked away
+    // from the halt) and persists it exactly like a claim.
+    let tee_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tee_address =
+        spawn_local_tls_server(tee_requests.clone(), reexport_tee_stub(500, 200)).await;
+    let api_address = spawn_json_api_stub(
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        reexport_api_stub(format!("https://localhost:{}", tee_address.port())),
+    )
+    .await;
+
+    let env = pinned_tee_env(&format!("http://{api_address}"));
+    let paths = env.paths();
+    enclava_cli::config::save_bootstrap_key(&paths, "test-org", "shell", &hex::encode([7u8; 32]))
+        .expect("bootstrap key fixture");
+    let password_file = paths.keys_dir.join("claim-password.txt");
+    std::fs::write(&password_file, "storage-password\n").unwrap();
+
+    crate::commands::ownership::export_mnemonic(crate::commands::ownership::ExportMnemonicArgs {
+        app: Some("shell".to_string()),
+        password_file: Some(password_file),
+    })
+    .await
+    .expect("the standalone re-export must complete");
+
+    assert_eq!(
+        enclava_cli::keys::load_app_mnemonic(&paths, "test-org", "shell").unwrap(),
+        Some(REEXPORT_TEST_MNEMONIC.to_string()),
+        "the re-exported mnemonic must be persisted to the protected keystore"
+    );
+
+    let recorded = tee_requests.lock().unwrap().clone();
+    assert!(
+        !recorded
+            .iter()
+            .any(|request| request.starts_with("POST /.well-known/confidential/bootstrap/claim ")),
+        "export-mnemonic must never send a claim: {recorded:?}"
+    );
+    event_position(
+        &recorded,
+        "POST /.well-known/confidential/bootstrap/challenge {\"purpose\":\"export-mnemonic\"}",
+    );
+    assert_valid_reexport_proof(&recorded);
 }
 
 #[test]
