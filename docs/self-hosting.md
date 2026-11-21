@@ -144,9 +144,10 @@ Enclava's.
    `DATABASE_URL` set. Removing that variable makes the API apply migrations at
    startup instead.
 4. Start with `CAP_DEPLOYMENT_DISPATCH_ENABLED=false`, confirm `/readyz`, then
-   enable dispatch. While it is `false`, the API rejects app creation and
-   deployment changes with HTTP 503 `deploy_blocked`; nothing is queued.
-   Sign-up, login, organization management, and app deletion still work.
+   enable dispatch. While it is `false`, the API rejects most writes,
+   including app creation, deployment changes, and public-key registration,
+   with HTTP 503 `deploy_blocked`; nothing is queued. Run the acceptance flow
+   below only after enabling it.
 
 ## Accept the Installation
 

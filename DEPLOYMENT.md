@@ -213,7 +213,7 @@ exhaustive reference: the source of truth is the startup code in
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CAP_DEPLOYMENT_DISPATCH_ENABLED` | `false` | Enables the deployment dispatcher. Must be exactly `true` or `false`. While `false`, tenant workload mutations are rejected with HTTP 503 `deploy_blocked` (reason `deployment_dispatch_disabled`); they are not queued. Account, API-key, and organization writes and app deletion are not gated. |
+| `CAP_DEPLOYMENT_DISPATCH_ENABLED` | `false` | Enables the deployment dispatcher. Must be exactly `true` or `false`. While `false`, every write is rejected with HTTP 503 `deploy_blocked` (reason `deployment_dispatch_disabled`) and is not queued, except sign-up, login, API-key creation and deletion, organization creation, invitations, member removal, and app deletion. Public-key registration and organization keyring changes are among the rejected writes. |
 | `ENCLAVA_INIT_IMAGE` | none | Digest-pinned `enclava-init` image rendered into every workload. Required in release builds, which panic at render time if it is unset or lacks `@sha256:`. The signed platform release does not supply it. |
 | `ATTESTATION_PROXY_SIGNER_SUBJECT` and `ATTESTATION_PROXY_SIGNER_ISSUER`, or `ATTESTATION_PROXY_SIGNER_PUBLIC_KEY_PEM` | none | Keyless identity, or a pinned public key, that the API verifies the `attestation-proxy` image signature against. Required whenever that image is configured. |
 | `CADDY_INGRESS_SIGNER_SUBJECT` and `CADDY_INGRESS_SIGNER_ISSUER`, or `CADDY_INGRESS_SIGNER_PUBLIC_KEY_PEM` | none | The same for the `caddy-ingress` image. |

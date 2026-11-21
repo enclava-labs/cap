@@ -48,9 +48,10 @@ as the template for your own overlay, together with
   ConfigMap and Deployment. Grant those permissions for your cluster, scoped as
   tightly as it allows.
 - **Deployment dispatch.** `CAP_DEPLOYMENT_DISPATCH_ENABLED` is `false`: the
-  API rejects app creation and deployment changes with HTTP 503
-  `deploy_blocked` until a later rollout sets it to `true`. Sign-up, login,
-  organization management, and app deletion are not gated.
+  API rejects most writes, including app creation and deployment changes,
+  with HTTP 503 `deploy_blocked` until a later rollout sets it to `true`. The
+  `CAP_DEPLOYMENT_DISPATCH_ENABLED` row in
+  [DEPLOYMENT.md](../../DEPLOYMENT.md) lists the writes that stay open.
 
 ## Other files
 
