@@ -4,9 +4,7 @@
 
 Please do not open a public issue for a security problem.
 
-Report it privately through GitHub: open the repository's **Security** tab and
-choose **Report a vulnerability**. This creates a private advisory visible only
-to the maintainers and to you.
+Report it privately by email to <security@enclava-labs.com>.
 
 Include what you can of the following:
 
