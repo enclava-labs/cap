@@ -41,7 +41,7 @@ deploy a workload. Names in code font are what CAP renders or looks up today.
 | API ingress | The reference overlay assumes ingress-nginx and cert-manager for the API's own hostname. Any ingress works if you adapt `deploy/api/ingress.yaml` and the trusted-proxy settings. |
 | PostgreSQL | One database for API state. |
 | DNS | Cloudflare is the only DNS provider CAP manages. Without it, tenant hostnames must be provisioned by other means and `DNS_MANAGEMENT_REQUIRED` left unset. |
-| Workload images | Tenant images must be cosign-signed by the identity given at `enclava create --signer-subject`. They need no CAP-specific contents: `enclava-wait-exec` is copied into each pod from the `enclava-init` image. |
+| Workload images | Tenant images must be cosign-signed by the identity given at `enclava create --signer-subject`. The API checks the issuer too: `--signer-issuer` defaults to the GitHub Actions OIDC issuer, so pass it for any other keyless signer. They need no CAP-specific contents: `enclava-wait-exec` is copied into each pod from the `enclava-init` image. |
 
 Installing and operating these components is outside the scope of this
 repository.
@@ -144,8 +144,9 @@ Enclava's.
    `DATABASE_URL` set. Removing that variable makes the API apply migrations at
    startup instead.
 4. Start with `CAP_DEPLOYMENT_DISPATCH_ENABLED=false`, confirm `/readyz`, then
-   enable dispatch. While it is `false`, the API rejects app and deployment
-   changes with HTTP 503 `deploy_blocked`; nothing is queued.
+   enable dispatch. While it is `false`, the API rejects app creation and
+   deployment changes with HTTP 503 `deploy_blocked`; nothing is queued.
+   Sign-up, login, organization management, and app deletion still work.
 
 ## Accept the Installation
 
@@ -156,7 +157,7 @@ end to end with a CLI built from your fork:
 enclava signup --email
 enclava login --email
 enclava init
-enclava create --signer-subject <cosign-subject>
+enclava create --signer-subject <cosign-subject> --signer-issuer <oidc-issuer>
 enclava deploy --image <registry>/<image>@sha256:<digest>
 enclava status
 ```
