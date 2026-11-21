@@ -13,7 +13,6 @@ on:
       - "scripts/verify-api-image-ref.bash"
       - "scripts/verify-api-image-ref.sh"
       - "deploy/api/**"
-      - "!deploy/api/**/*.md"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/*/Cargo.toml"
@@ -27,6 +26,8 @@ on:
       - "crates/enclava-engine/**"
       - "crates/enclava-snp/**"
       - "crates/enclava-verifier/**"
+      # Keep last: a later positive pattern would re-include Markdown.
+      - "!**/*.md"
   pull_request:
     paths:
       - ".github/workflows/api-image.yml"
@@ -37,7 +38,6 @@ on:
       - "scripts/verify-api-image-ref.bash"
       - "scripts/verify-api-image-ref.sh"
       - "deploy/api/**"
-      - "!deploy/api/**/*.md"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/*/Cargo.toml"
@@ -51,6 +51,8 @@ on:
       - "crates/enclava-engine/**"
       - "crates/enclava-snp/**"
       - "crates/enclava-verifier/**"
+      # Keep last: a later positive pattern would re-include Markdown.
+      - "!**/*.md"
   workflow_dispatch:
     inputs:
       version_tag:
