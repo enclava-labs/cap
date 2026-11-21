@@ -2,12 +2,8 @@
 /target
 /web/verifier/pkg
 /web/verifier/release
-/docs
 /tools
 /runbooks/audits
-/runbooks/*
-!/runbooks/paas-config-token-idempotency.md
-!/runbooks/cap-api-network-policy-rollout.md
 /design-proposals/*
 # Agent scratch (never commit)
 .claude/
