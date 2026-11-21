@@ -2,14 +2,18 @@
 
 ## Toolchain
 
-CAP is a Rust 2024 workspace with MSRV 1.85. Use the workspace root for normal
+CAP is a Rust 2024 workspace with MSRV 1.88. Use the workspace root for normal
 commands:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-features
+cargo test --workspace -- --test-threads=1
 ```
+
+Do not use `--all-features` for the workspace: some feature combinations
+intentionally fail, such as `prod-strict` with debug-only features. The suite
+runs serialized because fixtures share global state.
 
 Workspace tests include the API integration suite, so set `DATABASE_URL` to a
 disposable PostgreSQL database or use the targeted commands below. The role in
