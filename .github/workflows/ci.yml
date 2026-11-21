@@ -1,10 +1,17 @@
 name: CI
 
 on:
+  # Changes that touch only Markdown skip this workflow. No job reads a
+  # Markdown file. Path filters are not evaluated for tag pushes, so release
+  # tags always run. If a job here becomes a required status check, replace
+  # these filters with a job-level skip, or Markdown-only PRs will wait on it
+  # forever.
   push:
     branches: ["main", "develop"]
     tags: ["v*"]
+    paths-ignore: ["**/*.md"]
   pull_request:
+    paths-ignore: ["**/*.md"]
   workflow_dispatch:
 
 permissions:
