@@ -213,7 +213,10 @@ exhaustive reference: the source of truth is the startup code in
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CAP_DEPLOYMENT_DISPATCH_ENABLED` | `false` | Enables the deployment dispatcher. Must be exactly `true` or `false`. While `false`, the API accepts requests but applies no workloads. |
+| `CAP_DEPLOYMENT_DISPATCH_ENABLED` | `false` | Enables the deployment dispatcher. Must be exactly `true` or `false`. While `false`, tenant workload mutations are rejected with HTTP 503 `deploy_blocked` (reason `deployment_dispatch_disabled`); they are not queued. |
+| `ENCLAVA_INIT_IMAGE` | none | Digest-pinned `enclava-init` image rendered into every workload. Required in release builds, which panic at render time if it is unset or lacks `@sha256:`. The signed platform release does not supply it. |
+| `ATTESTATION_PROXY_SIGNER_SUBJECT` and `ATTESTATION_PROXY_SIGNER_ISSUER`, or `ATTESTATION_PROXY_SIGNER_PUBLIC_KEY_PEM` | none | Keyless identity, or a pinned public key, that the API verifies the `attestation-proxy` image signature against. Required whenever that image is configured. |
+| `CADDY_INGRESS_SIGNER_SUBJECT` and `CADDY_INGRESS_SIGNER_ISSUER`, or `CADDY_INGRESS_SIGNER_PUBLIC_KEY_PEM` | none | The same for the `caddy-ingress` image. |
 | `DATABASE_MIGRATION_MODE` | `apply` | `apply` runs pending migrations at API startup. `verify` only checks that the schema is current, so migrations must be applied first with the `cap-migrate` binary shipped in the API image (it needs only `DATABASE_URL`). |
 | `ENCLAVA_USE_PLATFORM_RELEASE` | unset | Loads the signed platform release even when `TRUSTEE_POLICY_READ_AVAILABLE` is not set. |
 | `ENCLAVA_LUKS2_HEADER_SEAL` | unset | Optional restatement of the signed release's `luks2_header_seal` value. Startup is refused if it disagrees with the release. |

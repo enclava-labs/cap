@@ -221,7 +221,7 @@ Security-relevant behavior is built into both the API and runtime path:
 - `enclava-init` verifies the in-TEE trust chain before releasing app secrets or
   mounted state.
 
-To report a vulnerability, see [SECURITY.md](SECURITY.md).
+To report a vulnerability, see [SECURITY.md](.github/SECURITY.md).
 
 ## More Documentation
 
@@ -231,7 +231,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
   plus upgrade, recovery, and CLI behavior notes.
 - [deploy/api/README.md](deploy/api/README.md) - what the reference overlay
   contains and omits.
-- [CONTRIBUTING.md](CONTRIBUTING.md) - how to propose changes.
+- [CONTRIBUTING.md](.github/CONTRIBUTING.md) - how to propose changes.
 - [docs/verification/contracts-v1.md](docs/verification/contracts-v1.md) -
   proof-bundle and trust-policy contracts for independent verification.
 - [DEV.md](DEV.md) - local development commands and workflow notes.

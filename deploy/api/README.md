@@ -17,7 +17,7 @@ as the template for your own overlay, together with
 | `deployment.yaml` | `API_URL=https://cap.enclava.dev` | Your public API URL. It must be an origin listed in the selected release profile. |
 | `deployment.yaml` | `ENCLAVA_PLATFORM_RELEASE_PROFILE=production` | The profile in your trust bundle that matches `API_URL`. |
 | `deployment.yaml` | `PLATFORM_DOMAIN`, `CLOUDFLARE_ZONE_NAME` = `enclava.dev` | Your tenant hostname suffix and managed DNS zone. |
-| `deployment.yaml` | `DNS_MANAGEMENT_REQUIRED=true` | Leave unset if CAP does not manage DNS in your installation. |
+| `deployment.yaml` | `DNS_MANAGEMENT_REQUIRED=true`, `CLOUDFLARE_API_TOKEN`, `TENANT_DNS_TARGET` | If CAP does not manage DNS in your installation, remove all three. The last two are required Secret references, so the pod cannot start while they point at missing keys. |
 | `deployment.yaml` | `AMD_KDS_BASE_URL` pointing at an in-cluster `amd-kds-relay` | Your own AMD KDS relay, or remove it to use `https://kdsintf.amd.com/vcek/v1`. |
 | `deployment.yaml` | `TRUSTED_PROXY_CIDRS=10.0.0.0/8` | The address range of your ingress controllers. |
 | `deployment.yaml` | `imagePullSecrets: ghcr-login` | A pull secret for your registry, or remove it for a public image. |
@@ -48,8 +48,8 @@ as the template for your own overlay, together with
   ConfigMap and Deployment. Grant those permissions for your cluster, scoped as
   tightly as it allows.
 - **Deployment dispatch.** `CAP_DEPLOYMENT_DISPATCH_ENABLED` is `false`: the
-  API serves requests but applies no workloads until a later rollout sets it to
-  `true`.
+  API rejects app and deployment changes with HTTP 503 `deploy_blocked` until a
+  later rollout sets it to `true`.
 
 ## Other files
 
@@ -57,5 +57,6 @@ as the template for your own overlay, together with
 part of the Kustomization. It is the contract for the internal log route,
 checked by `crates/enclava-api/tests/contract_files.rs`.
 
-`runbooks/cap-api-network-policy-rollout.md` lists the checks to run on a
+[runbooks/cap-api-network-policy-rollout.md](../../runbooks/cap-api-network-policy-rollout.md)
+lists the checks to run on a
 cluster before enabling the NetworkPolicy and the trusted-proxy settings.

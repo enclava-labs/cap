@@ -41,7 +41,7 @@ deploy a workload. Names in code font are what CAP renders or looks up today.
 | API ingress | The reference overlay assumes ingress-nginx and cert-manager for the API's own hostname. Any ingress works if you adapt `deploy/api/ingress.yaml` and the trusted-proxy settings. |
 | PostgreSQL | One database for API state. |
 | DNS | Cloudflare is the only DNS provider CAP manages. Without it, tenant hostnames must be provisioned by other means and `DNS_MANAGEMENT_REQUIRED` left unset. |
-| Workload images | Tenant images must be cosign-signed and must contain `/usr/local/bin/enclava-wait-exec` (see Runtime Contract Notes in [DEV.md](../DEV.md)). |
+| Workload images | Tenant images must be cosign-signed by the identity given at `enclava create --signer-subject`. They need no CAP-specific contents: `enclava-wait-exec` is copied into each pod from the `enclava-init` image. |
 
 Installing and operating these components is outside the scope of this
 repository.
@@ -55,7 +55,7 @@ fork changes each of them.
 | --- | --- |
 | `crates/enclava-common/platform-release-profiles.json` | The trust bundle: root public keys, API origins, and signed baselines for your installations. See [Build Your Trust Bundle](#build-your-trust-bundle). |
 | Repository secret `ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON` | The release workflows overwrite the committed bundle with this secret before building. Set it to your bundle, or the tag and manual builds fail. |
-| `.github/workflows/*.yml`, `scripts/render-api-release-manifest.sh` | Image names under `ghcr.io/enclava-labs/`. The render script rejects any other API image name. |
+| `.github/workflows/*.yml`, `scripts/render-api-release-manifest.sh`, `scripts/verify-api-image-ref.bash` | Image names under `ghcr.io/enclava-labs/`, and the signer identity `https://github.com/enclava-labs/cap/.github/workflows/api-image.yml@...`. The render script rejects any other API image name, and the publish workflow runs the verifier script, which accepts only Enclava's image and workflow identity. |
 | `deploy/api/` | Hostname, platform domain, DNS zone, release profile, image, and secrets. See [deploy/api/README.md](../deploy/api/README.md). |
 | `crates/enclava-cli/src/config.rs` | The CLI's default API URL (`https://api.enclava.dev`). Users can override it in `~/.enclava/config.toml`, but a fork should default to its own API. |
 | `crates/enclava-engine/src/manifest/ingress.rs` | The ACME account contact email rendered into every tenant's Caddy configuration. |
@@ -81,7 +81,8 @@ For each profile:
 2. Write the release payload: sidecar image digests, Trustee KBS URL and CA,
    signing-service URL and key, trustee policy key, runtime class, genpolicy
    version, and policy template.
-3. Sign it with the helper in this repository.
+3. Sign it with the `platform-release` example in `crates/enclava-cli`
+   (`cargo run --locked -p enclava-cli --example platform-release -- sign`).
 
 The exact commands, including how to keep the seed out of shell history, are
 in the "Rotating the production root" section of
@@ -126,14 +127,25 @@ Enclava's.
 1. Read [deploy/api/README.md](../deploy/api/README.md) and adapt the overlay.
 2. Provide the environment described in [DEPLOYMENT.md](../DEPLOYMENT.md):
    Required Environment, the policy-read variables, and whichever optional
-   integrations you use.
+   integrations you use. Two settings are easy to miss because the signed
+   release does not carry them:
+   - `ENCLAVA_INIT_IMAGE`, the digest-pinned `enclava-init` image you built.
+     Release builds panic while rendering a workload if it is unset or not
+     pinned with `@sha256:`.
+   - The signer of each sidecar image. For `attestation-proxy` set
+     `ATTESTATION_PROXY_SIGNER_SUBJECT` and `ATTESTATION_PROXY_SIGNER_ISSUER`
+     (keyless), or `ATTESTATION_PROXY_SIGNER_PUBLIC_KEY_PEM`; for
+     `caddy-ingress` set the matching `CADDY_INGRESS_SIGNER_*` variables.
+     Signing the images is not enough: the API refuses to start without the
+     identity to verify them against.
 3. Apply database migrations. The reference overlay sets
    `DATABASE_MIGRATION_MODE=verify`, which expects migrations to have been
    applied already by running `cap-migrate` from the API image with
    `DATABASE_URL` set. Removing that variable makes the API apply migrations at
    startup instead.
 4. Start with `CAP_DEPLOYMENT_DISPATCH_ENABLED=false`, confirm `/readyz`, then
-   enable dispatch.
+   enable dispatch. While it is `false`, the API rejects app and deployment
+   changes with HTTP 503 `deploy_blocked`; nothing is queued.
 
 ## Accept the Installation
 
@@ -141,12 +153,19 @@ Health endpoints do not show that confidential deploys work. Run the user flow
 end to end with a CLI built from your fork:
 
 ```bash
-enclava login
+enclava signup --email
+enclava login --email
 enclava init
 enclava create --signer-subject <cosign-subject>
 enclava deploy --image <registry>/<image>@sha256:<digest>
 enclava status
 ```
+
+`enclava signup` uses the CLI's configured API URL, which is why the fork
+changes the default. Use email (or `--nostr`) authentication. A plain `enclava login` starts the
+device flow, which sends the browser to a `/cli/login` approval page. This API
+does not serve that page; it belongs to a separate console, located by
+`ENCLAVA_DASHBOARD_URL`.
 
 Then confirm the ownership claim, the public HTTPS endpoint, and that data
 survives a redeploy.

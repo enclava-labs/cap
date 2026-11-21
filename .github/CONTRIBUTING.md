@@ -13,7 +13,7 @@ Thanks for looking at CAP. This file covers how to get a change reviewed.
 
 ## Setup
 
-[DEV.md](DEV.md) lists the toolchain, native dependencies, and the local
+[DEV.md](../DEV.md) lists the toolchain, native dependencies, and the local
 Compose stack. The workspace needs Rust 1.88 or newer.
 
 ## Checks
@@ -42,7 +42,7 @@ on purpose. The test suite must stay serialized. If you cannot install
   move forward.
 - **Rollout order.** If a change requires the sidecar, the API, and the CLI to
   be deployed in a particular order, document that order in
-  [DEPLOYMENT.md](DEPLOYMENT.md).
+  [DEPLOYMENT.md](../DEPLOYMENT.md).
 - **Migrations are append-only.** Never edit an applied migration file; sqlx
   checksums its bytes.
 - **No installation-specific values.** Hostnames, domains, keys, and image
@@ -54,4 +54,4 @@ Keep one logical change per pull request, and describe what you tested and how.
 
 ## License
 
-Contributions are accepted under the repository's [MIT license](LICENSE).
+Contributions are accepted under the repository's [MIT license](../LICENSE).
