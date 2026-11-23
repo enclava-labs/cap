@@ -296,6 +296,11 @@ const DELEGATION_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// and the in-zone target it must point at:
 /// `_acme-challenge.<hostname>` -> `<hostname>.acme.<zone>`.
 pub(crate) fn expected_acme_cname_pair(hostname: &str, zone: &str) -> (String, String) {
+    // A configured zone name may carry leading (or trailing) dots that
+    // zone-membership checks tolerate; the derived target must be a
+    // publishable DNS name, so the dots are stripped here just as
+    // `manages_hostname` strips them.
+    let zone = zone.trim_matches('.');
     (
         format!("_acme-challenge.{hostname}"),
         format!("{hostname}.acme.{zone}"),
@@ -351,10 +356,17 @@ pub(crate) type CnameLookupFn = std::sync::Arc<
         + Sync,
 >;
 
-pub(crate) fn live_cname_lookup() -> CnameLookupFn {
-    std::sync::Arc::new(|name: &str| {
+/// Build the live CNAME lookup honouring the ACME resolver policy when
+/// one is configured (preferred resolver order and per-lookup timeout,
+/// the same knobs `lookup_txt` honours). Without a config (the domains
+/// verify route on a deployment without the broker) external-first with
+/// the resolver family's own default timeouts applies.
+pub(crate) fn live_cname_lookup(config: Option<&AcmeConfig>) -> CnameLookupFn {
+    let config = config.cloned();
+    std::sync::Arc::new(move |name: &str| {
         let name = name.to_string();
-        Box::pin(async move { lookup_cname(&name).await })
+        let config = config.clone();
+        Box::pin(async move { lookup_cname(&name, config.as_ref()).await })
     })
 }
 
@@ -387,14 +399,46 @@ fn first_cname(lookup: hickory_resolver::lookup::Lookup) -> Option<String> {
         })
 }
 
-/// Query the CNAME (if any) at `name` from the external resolver family,
-/// falling back to the system resolver on error. A successful
-/// no-such-record answer is `Ok(None)`, not an error.
-async fn lookup_cname(name: &str) -> Result<Option<String>, DnsLookupError> {
-    match lookup_cname_external(name).await {
-        Ok(value) => Ok(value),
-        Err(_) => lookup_cname_system(name).await,
+/// Query the CNAME (if any) at `name`, external-first with a system
+/// fallback (or the configured order), each attempt bounded by the
+/// configured lookup timeout when one is set. A successful
+/// no-such-record answer is `Ok(None)`, not an error: the refusal total
+/// does not depend on which resolver answered.
+async fn lookup_cname(
+    name: &str,
+    config: Option<&AcmeConfig>,
+) -> Result<Option<String>, DnsLookupError> {
+    let prefer_system = config.map(|c| c.dns_lookup_prefer_system).unwrap_or(false);
+    let order: Vec<bool> = vec![prefer_system, !prefer_system];
+    let mut last = None;
+    for system in order {
+        let attempt = async {
+            if system {
+                lookup_cname_system(name).await
+            } else {
+                lookup_cname_external(name).await
+            }
+        };
+        let result = match config.and_then(|c| c.dns_lookup_timeout) {
+            Some(timeout) => {
+                tokio::time::timeout(timeout, attempt)
+                    .await
+                    .map_err(|_| DnsLookupError {
+                        message: "DNS CNAME lookup timed out".to_string(),
+                        category: DnsErrorCategory::Timeout,
+                    })?
+            }
+            None => attempt.await,
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) => last = Some(error),
+        }
     }
+    Err(last.unwrap_or_else(|| DnsLookupError {
+        message: "no DNS resolver available".to_string(),
+        category: DnsErrorCategory::Other,
+    }))
 }
 
 async fn lookup_cname_external(name: &str) -> Result<Option<String>, DnsLookupError> {
@@ -467,7 +511,7 @@ pub(crate) async fn issue_dns01_certificate_timed(
         hostnames,
         csr_der,
         timing,
-        live_cname_lookup(),
+        live_cname_lookup(Some(acme_config)),
     )
     .await
     .map_err(|error| IssuanceFailure::diagnose(&error, &failures))
@@ -2696,24 +2740,14 @@ mod tests {
         assert_eq!(tally!(calls, cf_zone_lookups), 0, "not even a zone lookup");
         assert_eq!(tally!(calls, cf_deletes), 0);
 
-        // The surfaced diagnostic is the bounded code.
-        let surfaced = issue_dns01_certificate_timed(
-            &client,
-            &dns_config,
-            &config,
-            &issuance_hostnames(),
-            &[0u8; 16],
-            RequestTiming::new(),
-        )
-        .await
-        .expect_err("must refuse");
-        assert_eq!(
-            surfaced.code,
-            IssuanceFailureCode::DelegationMissing,
-            "code {}",
-            surfaced.code.as_str()
-        );
+        // The surfaced diagnostic for the refusal is the bounded code: no
+        // provider text, no retry deadline. (Asserted on diagnose() so this
+        // test never contacts a real resolver through the live lookup.)
+        let surfaced =
+            IssuanceFailure::diagnose(&AcmeError::DelegationMissing, &FailureHeaders::default());
+        assert_eq!(surfaced.code, IssuanceFailureCode::DelegationMissing);
         assert_eq!(surfaced.code.as_str(), "acme_delegation_missing");
+        assert_eq!(surfaced.retry_after, None);
     }
 
     #[tokio::test]

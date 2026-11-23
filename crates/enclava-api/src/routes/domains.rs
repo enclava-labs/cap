@@ -194,14 +194,19 @@ pub struct ChallengeResponse {
 }
 
 /// The ACME delegation record pair for a custom domain, or `(None, None)`
-/// when the domain is inside the managed zone (or no DNS provider is
-/// configured, where no certificate can be issued either).
+/// when no pair applies: in-zone domains (answered directly), and
+/// deployments where the DNS-01 certificate broker is not the issuer (no
+/// broker configured -- e.g. Caddy TLS-ALPN mode -- or no managed DNS
+/// provider, where no DNS-01 certificate can be issued either). Demanding
+/// the CNAME there would block domains a TLS-ALPN deployment serves
+/// without it.
 fn acme_cname_fields(
     dns: Option<&crate::dns::DnsConfig>,
+    broker: Option<&crate::acme::AcmeConfig>,
     domain: &str,
 ) -> (Option<String>, Option<String>) {
-    match dns {
-        Some(dns) if !dns.manages_hostname(domain) => {
+    match (dns, broker) {
+        (Some(dns), Some(_)) if !dns.manages_hostname(domain) => {
             let (name, target) =
                 crate::acme::expected_acme_cname_pair(domain, &dns.cloudflare_zone_name);
             (Some(name), Some(target))
@@ -277,7 +282,8 @@ pub async fn create_challenge(
     .await
     .map_err(|_| internal_error())?;
 
-    let (acme_cname_name, acme_cname_target) = acme_cname_fields(state.dns.as_ref(), &domain);
+    let (acme_cname_name, acme_cname_target) =
+        acme_cname_fields(state.dns.as_ref(), state.acme.as_ref(), &domain);
     let instructions = match (&acme_cname_name, &acme_cname_target) {
         (Some(cname_name), Some(cname_target)) => format!(
             "Publish BOTH records at your DNS provider: the ownership TXT record at the listed name with the listed value, and a CNAME record named {cname_name} pointing at {cname_target}, then call POST /apps/{app_name}/domains/<domain>/verify",
@@ -435,25 +441,33 @@ pub async fn verify_challenge(
 
     // Every verify also re-proves the ACME CNAME delegation for out-of-zone
     // domains with a live lookup (the same shared predicate the certificate
-    // pre-flight uses, so the proof and issuance cannot drift). The
-    // actionable expected pair rides the refusal. In-zone domains -- and
-    // deployments with no DNS provider configured -- are unaffected.
-    if let Some(dns) = state.dns.as_ref()
+    // pre-flight uses, so the proof and issuance cannot drift). The check
+    // applies only where the DNS-01 broker is the certificate issuer:
+    // in-zone domains (answered directly), broker-less deployments (e.g.
+    // Caddy TLS-ALPN, which never queries _acme-challenge), and
+    // deployments with no managed DNS provider are unaffected.
+    if let (Some(dns), Some(acme_config)) = (state.dns.as_ref(), state.acme.as_ref())
         && !dns.manages_hostname(&domain)
         && crate::acme::verify_acme_delegation(
             &domain,
             &dns.cloudflare_zone_name,
-            &crate::acme::live_cname_lookup(),
+            &crate::acme::live_cname_lookup(Some(acme_config)),
         )
         .await
         .is_err()
     {
-        let (acme_cname_name, acme_cname_target) = acme_cname_fields(Some(dns), &domain);
-        let (name, target) = (
-            acme_cname_name.unwrap_or_default(),
-            acme_cname_target.unwrap_or_default(),
+        // Mirror the issuance path's bounded warn so an operator can see
+        // refused verifies in diagnostics; no hostname or provider text.
+        tracing::warn!(
+            code = "acme_delegation_missing",
+            "custom domain verify refused: ACME CNAME delegation missing"
         );
-        return Err(delegation_missing_response(&name, &target));
+        // Out-of-zone with the broker configured always derives a pair;
+        // the match keeps the invariant explicit instead of defaulting.
+        match acme_cname_fields(Some(dns), Some(acme_config), &domain) {
+            (Some(name), Some(target)) => return Err(delegation_missing_response(&name, &target)),
+            _ => return Err(internal_error()),
+        }
     }
     // Reuse the captured timestamp or stage a new one; it is persisted inside
     // the apply transaction below.
@@ -1141,36 +1155,68 @@ mod tests {
         }
     }
 
+    fn test_acme_config() -> crate::acme::AcmeConfig {
+        crate::acme::AcmeConfig {
+            directory_url: "https://synthetic.invalid/dir".to_string(),
+            account_credentials_path: None,
+            dns_propagation_wait: std::time::Duration::from_secs(30),
+            dns_lookup_prefer_system: false,
+            dns_lookup_timeout: None,
+        }
+    }
+
     #[test]
     fn acme_cname_fields_pair_by_zone_membership() {
         let dns = test_dns_config("managed.test");
-        let (name, target) = acme_cname_fields(Some(&dns), "app.example.com");
+        let acme = test_acme_config();
+        let (name, target) = acme_cname_fields(Some(&dns), Some(&acme), "app.example.com");
         assert_eq!(name.as_deref(), Some("_acme-challenge.app.example.com"));
         assert_eq!(target.as_deref(), Some("app.example.com.acme.managed.test"));
 
         // In-zone domains (exact or suffix) need no delegation: null pair.
         for in_zone in ["managed.test", "app.managed.test"] {
-            let (name, target) = acme_cname_fields(Some(&dns), in_zone);
+            let (name, target) = acme_cname_fields(Some(&dns), Some(&acme), in_zone);
             assert!(name.is_none(), "{in_zone}");
             assert!(target.is_none(), "{in_zone}");
         }
 
         // No DNS provider configured: pair stays null (no certificate can
         // be issued there either).
-        let (name, target) = acme_cname_fields(None, "app.example.com");
+        let (name, target) = acme_cname_fields(None, Some(&acme), "app.example.com");
         assert!(name.is_none());
         assert!(target.is_none());
+
+        // Broker not configured (e.g. Caddy TLS-ALPN deployments): no
+        // CNAME is demanded of the tenant even with managed DNS -- the
+        // ownership TXT alone remains the proof, matching that mode's
+        // certificate path, which never queries _acme-challenge.
+        let (name, target) = acme_cname_fields(Some(&dns), None, "app.example.com");
+        assert!(name.is_none(), "TLS-ALPN mode must not demand a CNAME");
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn delegation_targets_strip_dotted_zone_names() {
+        // A zone configured with leading/trailing dots (tolerated by
+        // manages_hostname) must still derive a publishable target.
+        for zone in [".managed.test", "managed.test.", ".managed.test."] {
+            let (name, target) = crate::acme::expected_acme_cname_pair("app.example.com", zone);
+            assert_eq!(name, "_acme-challenge.app.example.com", "{zone}");
+            assert_eq!(target, "app.example.com.acme.managed.test", "{zone}");
+            assert!(!target.contains(".."), "{zone}");
+        }
     }
 
     #[test]
     fn challenge_response_serializes_the_delegation_pair_as_null_in_zone() {
         let dns = test_dns_config("managed.test");
+        let acme = test_acme_config();
         let in_zone = ChallengeResponse {
             domain: "app.managed.test".to_string(),
             txt_record_name: "_enclava-challenge.app.managed.test".to_string(),
             txt_record_value: "enclava-domain-verification=tok".to_string(),
-            acme_cname_name: acme_cname_fields(Some(&dns), "app.managed.test").0,
-            acme_cname_target: acme_cname_fields(Some(&dns), "app.managed.test").1,
+            acme_cname_name: acme_cname_fields(Some(&dns), Some(&acme), "app.managed.test").0,
+            acme_cname_target: acme_cname_fields(Some(&dns), Some(&acme), "app.managed.test").1,
             expires_at: Utc::now(),
             instructions: "publish".to_string(),
         };
@@ -1179,7 +1225,7 @@ mod tests {
         assert_eq!(value["acme_cname_name"], serde_json::json!(null));
         assert_eq!(value["acme_cname_target"], serde_json::json!(null));
 
-        let (name, target) = acme_cname_fields(Some(&dns), "app.example.com");
+        let (name, target) = acme_cname_fields(Some(&dns), Some(&acme), "app.example.com");
         let out_zone = ChallengeResponse {
             domain: "app.example.com".to_string(),
             txt_record_name: "_enclava-challenge.app.example.com".to_string(),
