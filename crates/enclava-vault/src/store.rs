@@ -66,11 +66,7 @@ impl Store {
     /// Opens the store, creating its directories owner-only if missing.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir.join(CONNECTIONS_DIR))?;
-        sync_dir(&dir)?;
+        create_dir_durable(&dir.join(CONNECTIONS_DIR))?;
         Ok(Self { dir })
     }
 
@@ -242,12 +238,42 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
+/// The directory holding `path`; `.` for a bare file name.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// Creates `dir` and any missing ancestors owner-only. Each directory it
+/// creates is synced into its parent, so a store that was just created
+/// survives a crash together with what was written into it.
+fn create_dir_durable(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let parent = parent_dir(dir);
+    create_dir_durable(parent)?;
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => sync_dir(parent),
+        // Another process got there first and does the sync itself.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Writes `bytes` to a `0600` temp file next to `path`, syncs it, renames it
 /// into place and syncs the directory.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    write_atomic_mode(path, bytes, 0o600)
+}
+
+/// [`write_atomic`] with a chosen file mode. Because the file is renamed
+/// into place, a symlink or hard link at `path` is replaced, never written
+/// through.
+pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let dir = parent_dir(path);
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -260,7 +286,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode)
             .open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -345,6 +371,28 @@ mod tests {
         assert_eq!(mode(store.dir().join(CONNECTIONS_DIR)), 0o700);
         assert_eq!(mode(store.connection_path("github")), 0o600);
         assert_eq!(mode(store.dir().join(GENERATION_FILE)), 0o600);
+    }
+
+    #[test]
+    fn nested_store_path_is_created_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("a/b/vault");
+        let store = Store::open(&root).unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        for created in [dir.path().join("a"), dir.path().join("a/b"), root.clone()] {
+            assert_eq!(mode(&created), 0o700, "{}", created.display());
+        }
+        // Opening an existing store is a no-op.
+        store.put(spec("github", None), "a").unwrap();
+        assert_eq!(
+            Store::open(&root)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .connections()
+                .len(),
+            1
+        );
     }
 
     #[test]

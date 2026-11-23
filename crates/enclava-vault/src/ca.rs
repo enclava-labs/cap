@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
-use crate::store::{lock_dir, write_atomic};
+use crate::store::{lock_dir, write_atomic, write_atomic_mode};
 
 const CA_COMMON_NAME: &str = "Enclava Vault CA";
 /// Private key followed by the certificate, both PEM. One file, so the pair
@@ -48,6 +48,8 @@ pub enum CaError {
     Tls(#[from] rustls::Error),
     #[error("stored CA is unusable: {0}")]
     Corrupt(&'static str),
+    #[error("refusing to export the CA certificate into the store directory")]
+    ExportIntoStore,
 }
 
 pub struct VaultCa {
@@ -142,6 +144,26 @@ impl VaultCa {
         &self.cert_pem
     }
 
+    /// Writes the CA certificate to `path`, world-readable, for the
+    /// workload to trust.
+    ///
+    /// The store directory holds the CA key, so nothing is exported into
+    /// it, however the path is spelled. The file is renamed into place: if
+    /// `path` is a link to the key file, the link is replaced and the key
+    /// file is left alone.
+    pub fn export_cert(&self, store_dir: &Path, path: &Path) -> Result<(), CaError> {
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        if resolve(parent)?.starts_with(resolve(store_dir)?) {
+            return Err(CaError::ExportIntoStore);
+        }
+        fs::create_dir_all(parent)?;
+        write_atomic_mode(path, self.cert_pem.as_bytes(), 0o644)?;
+        Ok(())
+    }
+
     /// TLS server configuration presenting a leaf for `host`.
     pub fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>, CaError> {
         let mut leaves = self.leaves.lock().unwrap_or_else(|e| e.into_inner());
@@ -178,6 +200,32 @@ impl VaultCa {
             .with_single_cert(vec![cert.der().clone()], pkcs8(&key))?;
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(config)
+    }
+}
+
+/// Canonical form of `path`, following symlinks in the part that exists and
+/// keeping the part that does not.
+fn resolve(path: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match existing.canonicalize() {
+            Ok(canonical) => {
+                return Ok(missing
+                    .iter()
+                    .rev()
+                    .fold(canonical, |path, part| path.join(part)));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return Err(e);
+                };
+                missing.push(name);
+                existing = parent;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -269,6 +317,61 @@ mod tests {
             fs::read_to_string(dir.path().join(CA_FILE)).unwrap(),
             "not a pem bundle"
         );
+    }
+
+    #[test]
+    fn certificate_is_exported_world_readable_outside_the_store() {
+        let store = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let ca = VaultCa::load_or_generate(store.path()).unwrap();
+        let path = out.path().join("new/dir/ca.crt");
+        ca.export_cert(store.path(), &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), ca.cert_pem());
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+    }
+
+    #[test]
+    fn export_never_touches_the_stored_key() {
+        let store = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let ca = VaultCa::load_or_generate(store.path()).unwrap();
+        let bundle_path = store.path().join(CA_FILE);
+        let bundle = fs::read_to_string(&bundle_path).unwrap();
+
+        // Straight at the bundle, into a new directory under the store, and
+        // through a symlink to the store directory.
+        let alias = out.path().join("alias");
+        std::os::unix::fs::symlink(store.path(), &alias).unwrap();
+        for inside in [
+            bundle_path.clone(),
+            store.path().join("sub/ca.crt"),
+            alias.join(CA_FILE),
+        ] {
+            let error = ca.export_cert(store.path(), &inside).err().unwrap();
+            assert!(
+                matches!(error, CaError::ExportIntoStore),
+                "{}",
+                inside.display()
+            );
+        }
+        assert!(!store.path().join("sub").exists());
+
+        // A link outside the store that points at the bundle is replaced,
+        // not written through.
+        let link = out.path().join("ca.crt");
+        std::os::unix::fs::symlink(&bundle_path, &link).unwrap();
+        ca.export_cert(store.path(), &link).unwrap();
+        assert_eq!(fs::read_to_string(&link).unwrap(), ca.cert_pem());
+        assert!(
+            !fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        assert_eq!(fs::read_to_string(&bundle_path).unwrap(), bundle);
+        VaultCa::load_or_generate(store.path()).unwrap();
     }
 
     #[test]

@@ -168,10 +168,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let store = Store::open(&args.store_dir).context("opening the store")?;
     let ca = VaultCa::load_or_generate(store.dir()).context("loading the vault CA")?;
     if let Some(path) = &args.ca_cert_out {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(path, ca.cert_pem())
+        ca.export_cert(store.dir(), path)
             .with_context(|| format!("writing the CA certificate to {}", path.display()))?;
     }
     let proxy = Proxy::new(

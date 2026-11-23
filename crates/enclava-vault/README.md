@@ -79,6 +79,9 @@ and certificate. Changes take an exclusive lock on the directory and are
 synced to it before a command reports success, so concurrent commands and a
 first start racing another agree on one placeholder and one CA.
 
+`--ca-cert-out` must point outside the store directory; `serve` refuses a
+path inside it, because that is where the CA key lives.
+
 The directory must live somewhere the workload cannot read; the crate sets
 owner-only modes and marks the process non-dumpable, and relies on the
 deployment for the rest.

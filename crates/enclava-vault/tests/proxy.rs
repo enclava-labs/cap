@@ -108,7 +108,7 @@ struct Vault {
     proxy_url: String,
     ca_pem: String,
     store: Store,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 struct VaultOptions {
@@ -130,7 +130,15 @@ impl Default for VaultOptions {
 impl Vault {
     /// Starts a vault that trusts `upstreams` and holds no connections yet.
     async fn spawn(upstreams: &[&Upstream], options: VaultOptions) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::spawn_in(tempfile::tempdir().unwrap(), upstreams, options).await
+    }
+
+    /// Starts a vault on the store in `dir`, as a restart would.
+    async fn spawn_in(
+        dir: tempfile::TempDir,
+        upstreams: &[&Upstream],
+        options: VaultOptions,
+    ) -> Self {
         let store = Store::open(dir.path()).unwrap();
         let ca = VaultCa::load_or_generate(store.dir()).unwrap();
         let ca_pem = ca.cert_pem().to_owned();
@@ -156,7 +164,7 @@ impl Vault {
             proxy_url,
             ca_pem,
             store,
-            _dir: dir,
+            dir,
         }
     }
 
@@ -521,6 +529,32 @@ async fn rotation_and_removal_take_effect_without_a_restart() {
         .await;
     assert!(after_removal.is_err(), "CONNECT should have been refused");
     assert_eq!(upstream.seen().len(), 2);
+}
+
+#[tokio::test]
+async fn restarted_vault_serves_tls_the_workload_already_trusts() {
+    let upstream = Upstream::spawn().await;
+    let first = Vault::spawn(&[&upstream], VaultOptions::default()).await;
+    let placeholder = first.connect("api", &upstream, "/");
+    let trusted_before_restart = first.ca_pem.clone();
+
+    // A second vault on the same store: the CA is loaded from disk, not
+    // generated, and leaves are signed with the loaded key.
+    let restarted = Vault::spawn_in(first.dir, &[&upstream], VaultOptions::default()).await;
+    assert_eq!(restarted.ca_pem, trusted_before_restart);
+
+    let response = restarted
+        .client(&trusted_before_restart, true)
+        .get(upstream.url("/v1/me"))
+        .bearer_auth(&placeholder)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        upstream.seen()[0].headers["authorization"],
+        format!("Bearer {SECRET}")
+    );
 }
 
 #[tokio::test]
