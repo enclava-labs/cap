@@ -37,10 +37,11 @@ use crate::commands::app::{
     deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
     fail_if_template_deployment_failed, fetch_verified_platform_release, generate_log_key_for_app,
-    reconcile_rollout_with_deployment_history, reconcile_success_with_deployment_history,
-    resolve_current_user_org, tee_supplemental_fields_are_consistent,
-    tee_terminal_diagnostic_probe_due, tee_unlock_state, terminal_bootstrap_failure_message,
-    terminal_diagnostic_budget, terminal_diagnostic_probe_with_budget,
+    parse_config_inputs, reconcile_rollout_with_deployment_history,
+    reconcile_success_with_deployment_history, resolve_current_user_org,
+    tee_supplemental_fields_are_consistent, tee_terminal_diagnostic_probe_due, tee_unlock_state,
+    terminal_bootstrap_failure_message, terminal_diagnostic_budget,
+    terminal_diagnostic_probe_with_budget,
 };
 use crate::commands::config::CONFIG_APPLICATION_NOTE;
 use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
@@ -83,7 +84,7 @@ pub enum TemplateCommand {
     /// List hosted templates available to the active organization
     List(TemplateListArgs),
     /// Deploy a hosted template instance
-    Deploy(TemplateDeployArgs),
+    Deploy(Box<TemplateDeployArgs>),
     /// Fetch and validate the PaaS-rendered stable SSH endpoint command for a hosted Debian SSH app
     SshCommand(TemplateSshCommandArgs),
 }
@@ -102,6 +103,14 @@ pub struct TemplateDeployArgs {
     /// File containing one or more SSH public keys.
     #[arg(long = "ssh-public-key-file", value_name = "PATH")]
     pub ssh_public_key_files: Vec<PathBuf>,
+    /// Customer config entry to deliver to the TEE config channel (KEY=VALUE),
+    /// same as `deploy --set`.
+    #[arg(long = "set", value_name = "KEY=VALUE")]
+    pub set: Vec<String>,
+    /// Customer config entry whose value is read from a file (KEY=PATH), same
+    /// as `deploy --set-file`. Use for secrets; values never belong on argv.
+    #[arg(long = "set-file", value_name = "KEY=PATH")]
+    pub set_file: Vec<String>,
     /// Existing reserved stable SSH endpoint to import instead of letting PaaS reserve one.
     #[arg(
         long = "stable-ssh-endpoint",
@@ -201,7 +210,7 @@ fn build_api_client() -> Result<ApiClient, Box<dyn std::error::Error>> {
 pub async fn run(cmd: TemplateCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         TemplateCommand::List(args) => list(args).await,
-        TemplateCommand::Deploy(args) => deploy(args).await,
+        TemplateCommand::Deploy(args) => deploy(*args).await,
         TemplateCommand::SshCommand(args) => ssh_command(args).await,
     }
 }
@@ -403,12 +412,17 @@ async fn deploy_with_timings(
         .cloned();
 
     let public_keys = read_ssh_public_keys(&args.ssh_public_keys, &args.ssh_public_key_files)?;
-    validate_ssh_public_keys(
-        &public_keys,
-        catalog
-            .as_ref()
-            .and_then(|template| template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS")),
-    )?;
+    let ssh_key_metadata = catalog
+        .as_ref()
+        .and_then(|template| template_key(template, DEBIAN_SSH_CONFIG_KEY));
+    validate_ssh_public_keys(&public_keys, ssh_key_metadata)?;
+    let set_pairs = parse_config_inputs(&args.set, &args.set_file)?;
+    let customer_config_pairs =
+        template_customer_config_pairs(catalog.as_ref(), &public_keys, &set_pairs)?;
+    let takes_ssh_keys = ssh_key_metadata.is_some();
+    if explicit_stable_endpoint.is_some() && !takes_ssh_keys {
+        return Err("--stable-ssh-endpoint is only supported for SSH endpoint templates".into());
+    }
     let storage_password =
         StoragePasswordInput::from_file_option(args.storage_password_file.as_ref())?;
     let capture = mnemonic_capture_from_flags(args.no_store_mnemonic);
@@ -544,17 +558,9 @@ async fn deploy_with_timings(
     if matches!(
         attempt,
         enclava_cli::template_deploy_retry::TemplateDeployAttempt::Fresh
-    ) {
-        let Some(template) = catalog.as_ref() else {
-            return Err(format!("template '{}' is not available", args.template).into());
-        };
-        if template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS").is_none() {
-            return Err(format!(
-                "template '{}' is not a Debian SSH template supported by this CLI",
-                args.template
-            )
-            .into());
-        }
+    ) && catalog.is_none()
+    {
+        return Err(format!("template '{}' is not available", args.template).into());
     }
     // Replay overwrites unlock mode and managed keys from the signed request.
     // A stub is only reached when the catalog entry is gone and selection
@@ -688,7 +694,10 @@ async fn deploy_with_timings(
                 customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
                 org_keyring_blob: Some(signed_blobs.org_keyring_blob),
                 signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
-                customer_config_roll_hold_seconds: Some(roll_hold_seconds),
+                // Hold the roll only when customer config must land before the
+                // workload replaces: a no-config deploy has nothing to sequence.
+                customer_config_roll_hold_seconds: (!customer_config_pairs.is_empty())
+                    .then_some(roll_hold_seconds),
             };
             // Persist before the POST so a client death during the request
             // retries the same bytes instead of signing a second deployment.
@@ -774,10 +783,14 @@ async fn deploy_with_timings(
             return Err(template_instance_create_api_error(error));
         }
     };
-    let stable_endpoint = stored_stable_endpoint_from_template_instance_response(
-        &response,
-        explicit_stable_endpoint.as_deref(),
-    )?;
+    let stable_endpoint = if takes_ssh_keys {
+        stored_stable_endpoint_from_template_instance_response(
+            &response,
+            explicit_stable_endpoint.as_deref(),
+        )?
+    } else {
+        String::new()
+    };
     if let Some(mode) = resume_unlock_mode {
         template.unlock_mode = mode;
     }
@@ -932,79 +945,84 @@ async fn deploy_with_timings(
             )
             .await?;
     }
-    pb.set_message("Delivering config to TEE...");
+    if !customer_config_pairs.is_empty() {
+        pb.set_message("Delivering config to TEE...");
 
-    let token = response
-        .config_token
-        .as_ref()
-        .ok_or("PaaS did not return a TEE config token")?;
-    let tee_url = token
-        .tee_url
-        .as_deref()
-        .ok_or("PaaS did not return a TEE config URL")?;
-    let tee_url = template_config_endpoint_url(tee_url)?;
-    let mut tee_resolve_ip = token.tee_resolve_ip;
-    let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
-    // A held redeploy must stop attestation before CAP expires the hold.
-    // Unheld deploys keep the unbounded retry loop.
-    let mut tee = timings
-        .run(
-            DeployPhase::CustomerConfigAttestation,
-            attest_template_config_tee_with_retry(tee, pre_release_deadline),
-        )
-        .await?;
-    let mut tee_url = tee_url;
-
-    let mut config_token = token.token.clone();
-    let config_pairs = debian_ssh_config_pairs(public_keys);
-    pb.set_message(counted_progress("Customer config", 0, config_pairs.len()));
-    let delivered = timings
-        .run(
-            DeployPhase::CustomerConfigWrite,
-            deliver_template_config_with_retry(
-                api,
-                DeliverTemplateConfigTarget {
-                    instance_name: &instance_name,
-                    deployment,
-                    password_mode: template.unlock_mode == "password",
-                    owner_wait_budget: bounded_phase(
-                        pre_release_deadline,
-                        Duration::from_secs(args.ssh_timeout_seconds),
-                    ),
-                    hold_deadline: pre_release_deadline,
-                    progress: &pb,
-                    timings_mode: args.timings,
-                },
-                &mut tee,
-                &mut config_token,
-                &mut tee_url,
-                &mut tee_resolve_ip,
-                &config_pairs,
-            ),
-        )
-        .await;
-    if let Err(error) = delivered {
-        let values_stored = error
-            .downcast_ref::<TemplateConfigStoredSyncFailed>()
-            .is_some();
-        if customer_config_hold && values_stored {
-            pb.set_message("Customer config stored; releasing workload roll...");
-            release_customer_config_roll_with_retry(
-                api,
-                &instance_name,
-                &deployment_id,
-                hold_expires_at.expect("a held roll always resolves an expiry"),
+        let token = response
+            .config_token
+            .as_ref()
+            .ok_or("PaaS did not return a TEE config token")?;
+        let tee_url = token
+            .tee_url
+            .as_deref()
+            .ok_or("PaaS did not return a TEE config URL")?;
+        let tee_url = template_config_endpoint_url(tee_url)?;
+        let mut tee_resolve_ip = token.tee_resolve_ip;
+        let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
+        // A held redeploy must stop attestation before CAP expires the hold.
+        // Unheld deploys keep the unbounded retry loop.
+        let mut tee = timings
+            .run(
+                DeployPhase::CustomerConfigAttestation,
+                attest_template_config_tee_with_retry(tee, pre_release_deadline),
             )
             .await?;
-            return Err(error);
-        }
-        if customer_config_hold {
-            return Err(format!(
+        let mut tee_url = tee_url;
+
+        let mut config_token = token.token.clone();
+        pb.set_message(counted_progress(
+            "Customer config",
+            0,
+            customer_config_pairs.len(),
+        ));
+        let delivered = timings
+            .run(
+                DeployPhase::CustomerConfigWrite,
+                deliver_template_config_with_retry(
+                    api,
+                    DeliverTemplateConfigTarget {
+                        instance_name: &instance_name,
+                        deployment,
+                        password_mode: template.unlock_mode == "password",
+                        owner_wait_budget: bounded_phase(
+                            pre_release_deadline,
+                            Duration::from_secs(args.ssh_timeout_seconds),
+                        ),
+                        hold_deadline: pre_release_deadline,
+                        progress: &pb,
+                        timings_mode: args.timings,
+                    },
+                    &mut tee,
+                    &mut config_token,
+                    &mut tee_url,
+                    &mut tee_resolve_ip,
+                    &customer_config_pairs,
+                ),
+            )
+            .await;
+        if let Err(error) = delivered {
+            let values_stored = error
+                .downcast_ref::<TemplateConfigStoredSyncFailed>()
+                .is_some();
+            if customer_config_hold && values_stored {
+                pb.set_message("Customer config stored; releasing workload roll...");
+                release_customer_config_roll_with_retry(
+                    api,
+                    &instance_name,
+                    &deployment_id,
+                    hold_expires_at.expect("a held roll always resolves an expiry"),
+                )
+                .await?;
+                return Err(error);
+            }
+            if customer_config_hold {
+                return Err(format!(
                 "{error}\nThe workload roll was not released, so this deployment will not replace the running workload."
             )
             .into());
+            }
+            return Err(error);
         }
-        return Err(error);
     }
     if customer_config_hold {
         pb.set_message("Customer config stored; releasing workload roll...");
@@ -1018,30 +1036,34 @@ async fn deploy_with_timings(
     }
     pb.set_message(counted_progress(
         "Customer config",
-        config_pairs.len(),
-        config_pairs.len(),
+        customer_config_pairs.len(),
+        customer_config_pairs.len(),
     ));
     pb.set_position(4);
 
     let mut app_url = app_url_from_template_response_cap(&response.cap)?;
 
-    let ssh_response = timings
-        .ssh_command(args.no_wait, async {
-            pb.set_position(4);
-            pb.set_message("Waiting for stable SSH endpoint command...");
-            wait_for_paas_ssh_command(
-                api,
-                &instance_name,
-                deployment,
-                template.unlock_mode == "password",
-                stable_endpoint.as_str(),
-                app_url.as_str(),
-                Duration::from_secs(args.ssh_timeout_seconds),
-                &pb,
-            )
-            .await
-        })
-        .await?;
+    let ssh_response = if takes_ssh_keys {
+        timings
+            .ssh_command(args.no_wait, async {
+                pb.set_position(4);
+                pb.set_message("Waiting for stable SSH endpoint command...");
+                wait_for_paas_ssh_command(
+                    api,
+                    &instance_name,
+                    deployment,
+                    template.unlock_mode == "password",
+                    stable_endpoint.as_str(),
+                    app_url.as_str(),
+                    Duration::from_secs(args.ssh_timeout_seconds),
+                    &pb,
+                )
+                .await
+            })
+            .await?
+    } else {
+        None
+    };
     let (ssh_command, ssh_endpoint) = if let Some(response) = ssh_response {
         if let Some(url) = response.app_url {
             app_url = normalize_paas_ssh_command_app_url(&url)?;
@@ -1063,7 +1085,7 @@ async fn deploy_with_timings(
             instance_name: &instance_name,
             app_url: &app_url,
             deployment_id: &deployment_id,
-            stable_endpoint: Some(stable_endpoint.as_str()),
+            stable_endpoint: (!stable_endpoint.is_empty()).then_some(stable_endpoint.as_str()),
             ssh_command: ssh_command.as_deref(),
             ssh_endpoint: ssh_endpoint.as_deref(),
             log_key_id: output_log_key.as_ref().map(|key| key.key_id.as_str()),
@@ -2115,8 +2137,58 @@ fn template_create_config(explicit_stable_endpoint: Option<&str>) -> serde_json:
     }
 }
 
-fn debian_ssh_config_pairs(public_keys: String) -> Vec<(&'static str, String)> {
-    vec![("DEBIAN_SSH_AUTHORIZED_KEYS", public_keys)]
+const DEBIAN_SSH_CONFIG_KEY: &str = "DEBIAN_SSH_AUTHORIZED_KEYS";
+
+/// Build the customer config pairs a template deploy delivers to the TEE
+/// config channel: the SSH key (dedicated flags, kept first) plus every
+/// `--set`/`--set-file` entry, validated against the template's declared
+/// customer config keys. With no catalog entry (a removed template replayed
+/// from its stored request) entries pass through unvalidated.
+fn template_customer_config_pairs<'a>(
+    template: Option<&HostedTemplate>,
+    public_keys: &'a str,
+    set_pairs: &'a [(String, String)],
+) -> Result<Vec<(&'a str, String)>, Box<dyn std::error::Error>> {
+    let declared_ssh = template.is_none_or(|t| template_key(t, DEBIAN_SSH_CONFIG_KEY).is_some());
+    if !declared_ssh && !public_keys.trim().is_empty() {
+        return Err(
+            "this template does not take SSH public keys; pass its config keys with --set/--set-file"
+                .into(),
+        );
+    }
+    let mut pairs: Vec<(&str, String)> = Vec::new();
+    if declared_ssh && (template.is_some() || !public_keys.is_empty()) {
+        pairs.push((DEBIAN_SSH_CONFIG_KEY, public_keys.to_string()));
+    }
+    for (key, value) in set_pairs {
+        if key.trim().is_empty() {
+            return Err("config key must not be empty".into());
+        }
+        if pairs.iter().any(|(existing, _)| existing == key) {
+            return Err(format!("config key {key} passed more than once").into());
+        }
+        if let Some(entry) = template.and_then(|t| template_key(t, key)) {
+            if entry.input_type == "ssh_public_keys" {
+                validate_ssh_public_keys(value, Some(entry))?;
+            } else {
+                if let Some(max_bytes) = entry.validation.as_ref().and_then(|v| v.max_bytes)
+                    && value.len() > max_bytes as usize
+                {
+                    return Err(format!("{key} must be {max_bytes} bytes or smaller").into());
+                }
+                if let Some(max_items) = entry.validation.as_ref().and_then(|v| v.max_items) {
+                    let lines = value.lines().filter(|line| !line.trim().is_empty()).count();
+                    if lines > max_items as usize {
+                        return Err(format!("{key} must have at most {max_items} entries").into());
+                    }
+                }
+            }
+        } else if template.is_some() {
+            return Err(format!("template does not declare config key {key}").into());
+        }
+        pairs.push((key.as_str(), value.clone()));
+    }
+    Ok(pairs)
 }
 
 /// Wait for the password-mode TEE bootstrap endpoint to accept a claim.
@@ -2433,7 +2505,7 @@ async fn deliver_template_config_with_retry(
     config_token: &mut String,
     tee_url: &mut String,
     tee_resolve_ip: &mut Option<std::net::IpAddr>,
-    pairs: &[(&'static str, String)],
+    pairs: &[(&str, String)],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut delivery = TemplateConfigDeliveryState {
         api,
@@ -2516,7 +2588,7 @@ impl std::error::Error for TemplateConfigStoredSyncFailed {}
 
 fn undelivered_template_config_error(
     instance_name: &str,
-    undelivered: &[(&'static str, String)],
+    undelivered: &[(&str, String)],
     source: &(dyn std::error::Error + '_),
     owner_blocked: bool,
 ) -> String {
@@ -5146,7 +5218,7 @@ mod tests {
             };
             let output = std::cell::RefCell::new(Vec::new());
             assert!(
-                deploy_to_timing_sink(args, |line| {
+                deploy_to_timing_sink(*args, |line| {
                     output.borrow_mut().extend_from_slice(line);
                     Ok(())
                 })
@@ -5748,6 +5820,8 @@ mod tests {
             name: "shell".to_string(),
             ssh_public_keys: vec![],
             ssh_public_key_files: vec![],
+            set: vec![],
+            set_file: vec![],
             ngrok_tcp_url: None,
             no_wait: false,
             timings: false,
@@ -8309,11 +8383,97 @@ mod tests {
     }
 
     #[test]
-    fn debian_ssh_config_pairs_only_write_customer_owned_keys() {
-        let pairs = debian_ssh_config_pairs("ssh-ed25519 AAAA".to_string());
+    fn template_customer_config_pairs_only_write_customer_owned_keys() {
+        let template = hosted_template_with_stable_ssh();
+        let pairs =
+            template_customer_config_pairs(Some(&template), "ssh-ed25519 AAAA", &[]).unwrap();
 
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "DEBIAN_SSH_AUTHORIZED_KEYS");
+    }
+
+    #[test]
+    fn template_customer_config_pairs_merge_set_entries_after_ssh_keys() {
+        let template = hosted_template_with_stable_ssh();
+        let sets = vec![(
+            "NGROK_TCP_URL".to_string(),
+            "6.tcp.eu.ngrok.io:17958".to_string(),
+        )];
+        let pairs =
+            template_customer_config_pairs(Some(&template), "ssh-ed25519 AAAA", &sets).unwrap();
+
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "DEBIAN_SSH_AUTHORIZED_KEYS");
+        assert_eq!(pairs[1].0, "NGROK_TCP_URL");
+    }
+
+    #[test]
+    fn template_customer_config_pairs_reject_undeclared_duplicate_and_empty_keys() {
+        let template = hosted_template_with_stable_ssh();
+        let undeclared = vec![("TYPO".to_string(), "x".to_string())];
+        assert!(
+            template_customer_config_pairs(Some(&template), "", &undeclared).is_err(),
+            "undeclared keys must fail closed"
+        );
+        let duplicate = vec![
+            ("NGROK_TCP_URL".to_string(), "a".to_string()),
+            ("NGROK_TCP_URL".to_string(), "b".to_string()),
+        ];
+        assert!(template_customer_config_pairs(Some(&template), "", &duplicate).is_err());
+        let empty_key = vec![(String::new(), "x".to_string())];
+        assert!(template_customer_config_pairs(Some(&template), "", &empty_key).is_err());
+    }
+
+    #[test]
+    fn template_customer_config_pairs_reject_ssh_keys_for_configless_templates() {
+        let mut template = hosted_template_with_stable_ssh();
+        template.config_keys.clear();
+        assert!(
+            template_customer_config_pairs(Some(&template), "ssh-ed25519 AAAA", &[]).is_err(),
+            "a template without the SSH key must reject --ssh-public-key input"
+        );
+        assert!(
+            template_customer_config_pairs(Some(&template), "", &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn template_customer_config_pairs_pass_through_without_catalog() {
+        let sets = vec![("ANY_KEY".to_string(), "v".to_string())];
+        let pairs = template_customer_config_pairs(None, "ssh-ed25519 AAAA", &sets).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert!(
+            template_customer_config_pairs(None, "", &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn template_customer_config_pairs_enforce_value_limits() {
+        let mut template = hosted_template_with_stable_ssh();
+        template.config_keys.push(HostedTemplateConfigKey {
+            key: "NOTE".to_string(),
+            label: "Note".to_string(),
+            description: "note".to_string(),
+            input_type: "text".to_string(),
+            required: false,
+            secret: false,
+            default_value: None,
+            validation: Some(HostedTemplateConfigValidation {
+                format: None,
+                example: None,
+                max_bytes: Some(4),
+                max_items: None,
+                allowed_algorithms: vec![],
+            }),
+        });
+        let ok = vec![("NOTE".to_string(), "1234".to_string())];
+        assert!(template_customer_config_pairs(Some(&template), "", &ok).is_ok());
+        let oversized = vec![("NOTE".to_string(), "12345".to_string())];
+        assert!(template_customer_config_pairs(Some(&template), "", &oversized).is_err());
     }
 
     #[test]
