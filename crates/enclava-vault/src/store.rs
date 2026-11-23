@@ -11,7 +11,7 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use rand::RngCore;
@@ -67,6 +67,10 @@ impl Store {
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
         create_dir_durable(&dir.join(CONNECTIONS_DIR))?;
+        // The store may have been created by a process that stopped before
+        // syncing it. Syncing again is cheap and makes this one durable.
+        sync_dir(parent_dir(&dir))?;
+        sync_dir(&dir)?;
         Ok(Self { dir })
     }
 
@@ -256,11 +260,19 @@ fn create_dir_durable(dir: &Path) -> io::Result<()> {
     let parent = parent_dir(dir);
     create_dir_durable(parent)?;
     match fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => sync_dir(parent),
-        // Another process got there first and does the sync itself.
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e),
+        Ok(()) => {}
+        // Another process created it first. It may not have synced yet,
+        // so the sync below is done here as well.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a directory", dir.display()),
+            ));
+        }
+        Err(e) => return Err(e),
     }
+    sync_dir(parent)
 }
 
 /// Writes `bytes` to a `0600` temp file next to `path`, syncs it, renames it
@@ -288,6 +300,8 @@ pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Res
             .create_new(true)
             .mode(mode)
             .open(&tmp)?;
+        // The mode passed to open is reduced by the umask; set it exactly.
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&tmp, path)?;
@@ -393,6 +407,14 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn a_file_where_a_store_directory_belongs_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(CONNECTIONS_DIR), "").unwrap();
+        let error = Store::open(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[test]

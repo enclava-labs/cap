@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,8 @@ pub enum CaError {
     Corrupt(&'static str),
     #[error("refusing to export the CA certificate into the store directory")]
     ExportIntoStore,
+    #[error("refusing to replace {0}: not a regular file or symlink")]
+    ExportTarget(PathBuf),
 }
 
 pub struct VaultCa {
@@ -159,6 +161,14 @@ impl VaultCa {
         if resolve(parent)?.starts_with(resolve(store_dir)?) {
             return Err(CaError::ExportIntoStore);
         }
+        // The export is a rename, which would replace a device node, FIFO
+        // or socket as readily as a file.
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {}
+            Ok(_) => return Err(CaError::ExportTarget(path.to_owned())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         fs::create_dir_all(parent)?;
         write_atomic_mode(path, self.cert_pem.as_bytes(), 0o644)?;
         Ok(())
@@ -203,30 +213,39 @@ impl VaultCa {
     }
 }
 
-/// Canonical form of `path`, following symlinks in the part that exists and
-/// keeping the part that does not.
+/// Where `path` will point once its missing directories are created.
+///
+/// Components are resolved one at a time: each one that exists is
+/// canonicalized, so symlinks are followed, and each one that does not is
+/// kept as written. A `..` after a missing directory therefore climbs back
+/// into real directories, as it will once the directory exists. A dangling
+/// symlink is an error, because its target is not known.
 fn resolve(path: &Path) -> io::Result<PathBuf> {
-    let absolute = std::path::absolute(path)?;
-    let mut existing = absolute.as_path();
-    let mut missing = Vec::new();
-    loop {
-        match existing.canonicalize() {
-            Ok(canonical) => {
-                return Ok(missing
-                    .iter()
-                    .rev()
-                    .fold(canonical, |path, part| path.join(part)));
+    let mut resolved = PathBuf::new();
+    for part in std::path::absolute(path)?.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-                    return Err(e);
-                };
-                missing.push(name);
-                existing = parent;
+            other => {
+                resolved.push(other);
+                match resolved.canonicalize() {
+                    Ok(canonical) => resolved = canonical,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        if fs::symlink_metadata(&resolved).is_ok() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("{} is a dangling symlink", resolved.display()),
+                            ));
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            Err(e) => return Err(e),
         }
     }
+    Ok(resolved)
 }
 
 fn pkcs8(key: &KeyPair) -> PrivateKeyDer<'static> {
@@ -246,7 +265,7 @@ fn ca_params() -> Result<CertificateParams, rcgen::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     use super::*;
 
@@ -347,6 +366,8 @@ mod tests {
             bundle_path.clone(),
             store.path().join("sub/ca.crt"),
             alias.join(CA_FILE),
+            store.path().join("missing/../ca.pem"),
+            out.path().join("missing/../alias").join(CA_FILE),
         ] {
             let error = ca.export_cert(store.path(), &inside).err().unwrap();
             assert!(
@@ -372,6 +393,83 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&bundle_path).unwrap(), bundle);
         VaultCa::load_or_generate(store.path()).unwrap();
+    }
+
+    #[test]
+    fn export_through_a_missing_directory_and_back_out_works() {
+        let store = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let ca = VaultCa::load_or_generate(store.path()).unwrap();
+        ca.export_cert(store.path(), &out.path().join("new/../ca.crt"))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(out.path().join("ca.crt")).unwrap(),
+            ca.cert_pem()
+        );
+    }
+
+    #[test]
+    fn export_through_a_dangling_symlink_is_refused() {
+        let store = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let ca = VaultCa::load_or_generate(store.path()).unwrap();
+        let dangling = out.path().join("dangling");
+        std::os::unix::fs::symlink(store.path().join("not-yet"), &dangling).unwrap();
+        let error = ca
+            .export_cert(store.path(), &dangling.join("ca.crt"))
+            .err()
+            .unwrap();
+        assert!(matches!(error, CaError::Io(_)), "{error}");
+        assert!(!store.path().join("not-yet").exists());
+    }
+
+    #[test]
+    fn export_refuses_to_replace_special_files() {
+        let store = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let ca = VaultCa::load_or_generate(store.path()).unwrap();
+        let fifo = out.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let directory = out.path().join("dir");
+        fs::create_dir(&directory).unwrap();
+        for special in [&fifo, &directory] {
+            let error = ca.export_cert(store.path(), special).err().unwrap();
+            assert!(
+                matches!(error, CaError::ExportTarget(_)),
+                "{}",
+                special.display()
+            );
+        }
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+    }
+
+    /// The export runs in a child process so the umask change does not leak
+    /// into tests running in parallel.
+    #[test]
+    fn export_is_world_readable_under_a_restrictive_umask() {
+        const CHILD: &str = "ENCLAVA_VAULT_TEST_UMASK_EXPORT";
+        const NAME: &str = "ca::tests::export_is_world_readable_under_a_restrictive_umask";
+        if let Some(out) = std::env::var_os(CHILD) {
+            nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+            let store = tempfile::tempdir().unwrap();
+            let ca = VaultCa::load_or_generate(store.path()).unwrap();
+            ca.export_cert(store.path(), Path::new(&out)).unwrap();
+            return;
+        }
+        let out = tempfile::tempdir().unwrap();
+        let path = out.path().join("ca.crt");
+        // An existing, readable certificate must stay readable.
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--test-threads=1"])
+            .env(CHILD, &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_ne!(fs::read_to_string(&path).unwrap(), "old");
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
     }
 
     #[test]
