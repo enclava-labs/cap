@@ -126,7 +126,7 @@ fn parse_config_vars(vars: &[String]) -> Result<Vec<(String, String)>, Box<dyn s
         .collect()
 }
 
-fn parse_config_inputs(
+pub(crate) fn parse_config_inputs(
     vars: &[String],
     file_vars: &[String],
 ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {

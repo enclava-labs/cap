@@ -117,6 +117,8 @@ pub struct StoredTemplateLogKey {
 pub struct NewTemplateDeployAttempt {
     pub unlock_mode: String,
     pub paas_managed_config_keys: Vec<String>,
+    /// Key names of the customer config batch being delivered (names only).
+    pub customer_config_keys: Vec<String>,
     /// Explicit flag preparation only. Absent when the command passed no
     /// log-key flag, even if the signed request carries an active key.
     pub log_key_id: Option<String>,
@@ -141,6 +143,7 @@ pub enum TemplateDeployAttempt {
         /// Explicit flag output (generated private-key path). Not the
         /// comparison key — that is `signed_log_key_id` on this variant.
         log_key: Option<StoredTemplateLogKey>,
+        customer_config_keys: Vec<String>,
         /// Key id in the signed request. `None` on files that predate the
         /// field; callers fall back to `log_key.key_id`, which was verified
         /// equal to the signed key when a flag was passed.
@@ -164,6 +167,10 @@ pub struct StoredTemplateDeployAttempt {
     org_keyring_blob: String,
     signed_policy_artifact: String,
     customer_config_roll_hold_seconds: Option<u32>,
+    /// Key names of the customer config batch this request was signed with
+    /// (names only — values are never stored). A retry must re-supply them.
+    #[serde(default)]
+    customer_config_keys: Vec<String>,
     /// Unix seconds when the request was signed, before the POST. `0` means
     /// the file predates this field and must not be replayed without a live row.
     #[serde(default)]
@@ -1000,12 +1007,14 @@ fn replay(stored: Box<StoredTemplateDeployAttempt>) -> TemplateDeployAttempt {
     let deploy_id = stored.deploy_id.clone();
     let workflow = stored.workflow.clone();
     let log_key = stored.log_key.clone();
+    let customer_config_keys = stored.customer_config_keys.clone();
     let signed_log_key_id = nonempty_key_id(stored.signed_log_key_id.as_deref());
     TemplateDeployAttempt::Replay {
         request: Box::new((*stored).into_request()),
         deploy_id,
         workflow,
         log_key,
+        customer_config_keys,
         signed_log_key_id,
     }
 }
@@ -1364,6 +1373,7 @@ pub fn save_template_deploy_attempt(
         org_keyring_blob: org_keyring_blob.to_string(),
         signed_policy_artifact: signed_policy_artifact.to_string(),
         customer_config_roll_hold_seconds: request.customer_config_roll_hold_seconds,
+        customer_config_keys: record.customer_config_keys.clone(),
         created_at_unix: unix_now(),
         post_accepted: false,
         post_accepted_at_unix: None,
@@ -1626,6 +1636,7 @@ mod tests {
             org_keyring_blob: request.org_keyring_blob.unwrap(),
             signed_policy_artifact: request.signed_policy_artifact.unwrap(),
             customer_config_roll_hold_seconds: request.customer_config_roll_hold_seconds,
+            customer_config_keys: vec![],
             created_at_unix: NOW,
             post_accepted: false,
             post_accepted_at_unix: None,
@@ -1684,6 +1695,7 @@ mod tests {
         NewTemplateDeployAttempt {
             unlock_mode: "password".to_string(),
             paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
+            customer_config_keys: Vec::new(),
             log_key_id: Some("shell-logs".to_string()),
             log_private_key_file: Some("/keys/shell-logs.x25519".to_string()),
             signed_log_key_id: Some("shell-logs".to_string()),
@@ -1705,6 +1717,7 @@ mod tests {
             deploy_id,
             workflow,
             log_key,
+            customer_config_keys: _,
             signed_log_key_id,
         } = attempt
         else {
@@ -3073,6 +3086,7 @@ mod tests {
             &NewTemplateDeployAttempt {
                 unlock_mode: "password".to_string(),
                 paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
+                customer_config_keys: Vec::new(),
                 log_key_id: None,
                 log_private_key_file: None,
                 signed_log_key_id: Some("audit".to_string()),
@@ -3186,6 +3200,7 @@ mod tests {
             &NewTemplateDeployAttempt {
                 unlock_mode: "password".to_string(),
                 paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
+                customer_config_keys: Vec::new(),
                 log_key_id: Some("audit".to_string()),
                 log_private_key_file: Some(" /tmp/audit.key ".to_string()),
                 signed_log_key_id: Some("audit".to_string()),
