@@ -268,3 +268,19 @@ mode = "public_internet"
     .unwrap_err();
     assert!(err.to_string().contains("'egres'"), "{err}");
 }
+
+#[test]
+fn egress_accepts_allow_alias_used_by_existing_files() {
+    let config = enclava_cli::app_config::AppConfig::parse(
+        r#"
+[app]
+name = "my-api"
+port = 8080
+
+[egress]
+allow = [{ host = "ghcr.io", ports = [443] }]
+"#,
+    )
+    .unwrap();
+    assert_eq!(config.egress.allowlist_for_request()[0].host, "ghcr.io");
+}

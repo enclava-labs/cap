@@ -34,7 +34,8 @@ pub struct EgressSection {
     /// `None` takes the server default (restricted).
     #[serde(default, deserialize_with = "deserialize_egress_mode")]
     pub mode: Option<enclava_engine::types::EgressMode>,
-    #[serde(default)]
+    /// `allow` is accepted as an alias: existing canary files already use it.
+    #[serde(default, alias = "allow")]
     pub allowlist: Vec<EgressAllowSection>,
 }
 
