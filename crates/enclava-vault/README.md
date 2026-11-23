@@ -83,7 +83,9 @@ first start racing another agree on one placeholder and one CA.
 `--ca-cert-out` must be a plain path (no `.` or `..` segments, no trailing
 `/`) into a directory that already exists and is outside the store
 directory, where the CA key lives. The vault creates nothing outside its
-store.
+store. The certificate is written `0644`; the workload must also be able to
+traverse every directory on the path to it, which is why the example
+creates `/run/vault` as `0755`.
 
 The directory must live somewhere the workload cannot read; the crate sets
 owner-only modes and marks the process non-dumpable, and relies on the
