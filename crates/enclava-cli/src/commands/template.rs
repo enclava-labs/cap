@@ -566,12 +566,26 @@ async fn deploy_with_timings(
         &deployments,
         now_unix,
     );
-    if matches!(
+    let is_fresh = matches!(
         attempt,
         enclava_cli::template_deploy_retry::TemplateDeployAttempt::Fresh
-    ) && catalog.is_none()
-    {
+    );
+    if is_fresh && catalog.is_none() {
         return Err(format!("template '{}' is not available", args.template).into());
+    }
+    if is_fresh {
+        // Fresh deploys must satisfy the live catalog's required keys; a
+        // resume/replay replays the accepted request and must not be
+        // blocked by requirements the catalog gained after it was accepted.
+        let missing = missing_required_config_keys(catalog.as_ref(), &set_pairs);
+        if !missing.is_empty() {
+            return Err(format!(
+                "missing required config keys: {}. Pass each with --set KEY=VALUE or \
+                 --set-file KEY=PATH",
+                missing.join(", ")
+            )
+            .into());
+        }
     }
     // Replay overwrites unlock mode and managed keys from the signed request.
     // A stub is only reached when the catalog entry is gone and selection
@@ -2215,33 +2229,31 @@ fn template_customer_config_pairs<'a>(
         }
         pairs.push((key.as_str(), value.clone()));
     }
-    if let Some(template) = template {
-        // Fail closed on omitted required inputs: a configless-looking
-        // deploy must not roll out an unconfigured workload. The SSH key is
-        // satisfied by the --ssh-public-key flags; a declared default
-        // satisfies the rest.
-        let missing = template
-            .config_keys
-            .iter()
-            .filter(|entry| {
-                entry.required
-                    && !entry.generated
-                    && entry.default_value.is_none()
-                    && entry.key != DEBIAN_SSH_CONFIG_KEY
-                    && !set_pairs.iter().any(|(key, _)| key == &entry.key)
-            })
-            .map(|entry| entry.key.as_str())
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(format!(
-                "missing required config keys: {}. Pass each with --set KEY=VALUE or \
-                 --set-file KEY=PATH",
-                missing.join(", ")
-            )
-            .into());
-        }
-    }
     Ok(pairs)
+}
+
+/// Declared customer keys a fresh deploy must supply: required, not
+/// generated, no declared default. PaaS-managed keys are excluded (the
+/// platform delivers those) and the SSH key is excluded (its own flags
+/// enforce it). A resume/replay is checked against the accepted request
+/// instead — the live catalog may have grown requirements since.
+fn missing_required_config_keys<'a>(
+    template: Option<&'a HostedTemplate>,
+    set_pairs: &[(String, String)],
+) -> Vec<&'a str> {
+    let Some(template) = template else {
+        return Vec::new();
+    };
+    template_customer_config_keys(template)
+        .filter(|entry| {
+            entry.required
+                && !entry.generated
+                && entry.default_value.is_none()
+                && entry.key != DEBIAN_SSH_CONFIG_KEY
+                && !set_pairs.iter().any(|(key, _)| key == &entry.key)
+        })
+        .map(|entry| entry.key.as_str())
+        .collect()
 }
 
 /// Fail closed when a `secret: true` config key is passed inline: `--set`
@@ -2620,6 +2632,18 @@ async fn deliver_template_config_with_retry(
                     .is_some_and(is_locked_template_config_error)
                     || (error.downcast_ref::<OwnerWaitDeadlineExceeded>().is_some()
                         && delivery.owner_wait_ever_engaged()));
+            // Values already stored still get their metadata sync so
+            // `config get` reflects them; the write error stays primary and
+            // an incomplete batch still must not release the roll.
+            for (stored_key, _) in &pairs[..index] {
+                let _ = sync_template_config_key_with_retry(
+                    api,
+                    target.instance_name,
+                    stored_key,
+                    delivery.request_deadline(),
+                )
+                .await;
+            }
             return Err(undelivered_template_config_error(
                 target.instance_name,
                 &pairs[index..],
@@ -5963,7 +5987,7 @@ mod tests {
     }
 
     #[test]
-    fn template_customer_config_pairs_require_declared_required_keys() {
+    fn missing_required_config_keys_gates_fresh_deploys_only() {
         let mut template = hosted_template_with_stable_ssh();
         template.config_keys.push(HostedTemplateConfigKey {
             key: "API_TOKEN".to_string(),
@@ -5976,16 +6000,24 @@ mod tests {
             default_value: None,
             validation: None,
         });
-        let err = template_customer_config_pairs(Some(&template), "ssh-ed25519 AAAA", &[])
-            .expect_err("a missing required key must fail closed");
-        assert!(err.to_string().contains("API_TOKEN"), "{err}");
-        let provided = vec![("API_TOKEN".to_string(), "t".to_string())];
-        assert!(
-            template_customer_config_pairs(Some(&template), "ssh-ed25519 AAAA", &provided).is_ok()
+        assert_eq!(
+            missing_required_config_keys(Some(&template), &[]),
+            vec!["API_TOKEN"],
+            "the SSH key is satisfied by its flags; API_TOKEN is not"
         );
-        // A declared default satisfies the requirement.
+        let provided = vec![("API_TOKEN".to_string(), "t".to_string())];
+        assert!(missing_required_config_keys(Some(&template), &provided).is_empty());
         template.config_keys.last_mut().unwrap().default_value = Some("x".to_string());
-        assert!(template_customer_config_pairs(Some(&template), "ssh-ed25519 AAAA", &[]).is_ok());
+        assert!(
+            missing_required_config_keys(Some(&template), &[]).is_empty(),
+            "a declared default satisfies the requirement"
+        );
+        // PaaS-managed keys are the platform's job even when required.
+        template.config_keys.last_mut().unwrap().default_value = None;
+        template
+            .paas_managed_config_keys
+            .push("API_TOKEN".to_string());
+        assert!(missing_required_config_keys(Some(&template), &[]).is_empty());
     }
 
     #[test]
@@ -9318,6 +9350,104 @@ mod tests {
             "every value must reach the TEE store: {tee_requests:?}"
         );
         drop(tee_requests);
+        let _guard = tls_env_lock();
+        unsafe {
+            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
+        }
+    }
+
+    #[tokio::test]
+    async fn template_config_delivery_syncs_stored_values_after_a_write_failure() {
+        use terminal_delivery_support::*;
+
+        // A write failure must still sync the metadata of the values that
+        // landed, or `config get` hides them. The write error stays primary
+        // and the incomplete batch must not be release-eligible.
+        let tee_requests = std::sync::Arc::new(TestMutex::new(Vec::new()));
+        let writes = std::sync::Arc::new(TestMutex::new(0usize));
+        let writes_seen = writes.clone();
+        let tee_address = spawn_local_tls_server(tee_requests.clone(), move |path| {
+            if path.ends_with("/status") {
+                return (200, "{}".to_string());
+            }
+            let mut count = writes_seen.lock().unwrap();
+            *count += 1;
+            if *count == 1 {
+                (200, "{}".to_string())
+            } else {
+                (400, "{}".to_string())
+            }
+        })
+        .await;
+        let sync_calls = std::sync::Arc::new(TestMutex::new(0usize));
+        let sync_seen = sync_calls.clone();
+        let api_address = spawn_json_api_stub(move |path| {
+            if path.ends_with("/deployments") {
+                Some(deployment_entry_json("expected-1", "watching"))
+                    .map(|entry| serde_json::json!([entry]))
+            } else if path.ends_with("/config/sync") {
+                *sync_seen.lock().unwrap() += 1;
+                Some(serde_json::json!({}))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+
+        let tee_url = format!(
+            "https://localhost:{}/.well-known/confidential/config",
+            tee_address.port()
+        );
+        let mut tee = {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
+            }
+            TeeClient::from_config_url_with_resolve_ip(&tee_url, Some(tee_address.ip()))
+        };
+        let expectation = template_test_expectation("expected-1", [0x09; 32]);
+        let mut config_token = "token".to_string();
+        let mut tee_url = tee_url;
+        let mut tee_resolve_ip: Option<std::net::IpAddr> = Some(tee_address.ip());
+        let progress = ProgressBar::hidden();
+        let target = DeliverTemplateConfigTarget {
+            instance_name: "shell",
+            deployment: DeploymentWait::trusted("expected-1", Some(&expectation)),
+            password_mode: false,
+            owner_wait_budget: Duration::from_secs(1800),
+            hold_deadline: None,
+            progress: &progress,
+            timings_mode: false,
+        };
+        let pairs = [
+            ("SKEY-1", "1".to_string()),
+            ("SKEY-2", "2".to_string()),
+            ("SKEY-3", "3".to_string()),
+        ];
+        let error = deliver_template_config_with_retry(
+            &api,
+            target,
+            &mut tee,
+            &mut config_token,
+            &mut tee_url,
+            &mut tee_resolve_ip,
+            &pairs,
+        )
+        .await
+        .expect_err("a terminal write failure must surface");
+        assert!(
+            error
+                .downcast_ref::<TemplateConfigStoredSyncFailed>()
+                .is_none(),
+            "an incomplete batch must not be release-eligible: {error}"
+        );
+        assert!(error.to_string().contains("SKEY-2"), "{error}");
+        assert_eq!(
+            *sync_calls.lock().unwrap(),
+            1,
+            "the one stored value's metadata must still sync"
+        );
         let _guard = tls_env_lock();
         unsafe {
             std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
