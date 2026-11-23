@@ -9672,7 +9672,7 @@ fn live_workload_publication_reads_the_applied_spec_identity() {
         "spec": {
             "template": {
                 "metadata": {
-                    "labels": { "enclava.dev/deployment-id": deployment_id.to_string() }
+                    "labels": { (enclava_engine::manifest::DEPLOYMENT_ID_LABEL): deployment_id.to_string() }
                 }
             }
         }
@@ -9728,7 +9728,7 @@ pub(crate) fn publication_statefulset_client(deployment_id: Uuid, fail: bool) ->
                     "replicas": 1,
                     "template": {
                         "metadata": {
-                            "labels": { "enclava.dev/deployment-id": deployment_id.to_string() }
+                            "labels": { (enclava_engine::manifest::DEPLOYMENT_ID_LABEL): deployment_id.to_string() }
                         }
                     }
                 }

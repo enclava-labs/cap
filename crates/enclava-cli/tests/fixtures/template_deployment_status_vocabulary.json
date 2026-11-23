@@ -1,0 +1,30 @@
+{
+  "_comment": "Pinned template-deployment status vocabulary shared by the servers and this CLI (cap#402). Checked by scripts/gen-template-deployment-status-vocabulary.sh — run that script against ../enclava-paas and crates/enclava-api whenever either side's status vocabulary changes; the contract test deployment_status_vocabulary_stays_classified fails until both this fixture and the CLI sets (template_deploy_retry.rs::IN_FLIGHT_STATUSES / TERMINAL_STATUSES) agree.",
+  "_owners": {
+    "cap_deploy_status": "enclava-labs/cap crates/enclava-api/src/models.rs::DeployStatus — the CAP deployment row vocabulary, relayed to the CLI as reconciled_status through enclava-paas hosted_deployments",
+    "paas_stored_status": "enclava-labs/enclava-paas server/src/hosted_operations.rs::deployment_db_status and the operator whitelist in server/src/http.rs — every stored template-deployment status PaaS serves as `status` (all unknown observations fold to pending)",
+    "paas_projection": "enclava-labs/enclava-paas server/src/http.rs deployment/app projections and server/src/worker/mod.rs outcome maps",
+    "paas_observation_folded": "enclava-labs/enclava-paas server/src/hosted_status.rs::normalize_observed_status and server/src/hosted_operations.rs::deployment_db_status inputs — normalized into the stored vocabulary before the CLI can observe them",
+    "cli_classifier": "enclava-labs/cap crates/enclava-cli/src/template_deploy_retry.rs::deployment_is_in_flight / deployment_is_terminal"
+  },
+  "statuses": [
+    { "status": "pending",    "class": "in_flight", "origin": "cap_deploy_status; paas_stored_status" },
+    { "status": "applying",   "class": "in_flight", "origin": "cap_deploy_status; paas_stored_status" },
+    { "status": "watching",   "class": "in_flight", "origin": "cap_deploy_status" },
+    { "status": "creating",   "class": "in_flight", "origin": "paas_projection" },
+    { "status": "deploying",  "class": "in_flight", "origin": "paas_projection" },
+    { "status": "healthy",    "class": "terminal",  "origin": "cap_deploy_status; paas_stored_status" },
+    { "status": "failed",     "class": "terminal",  "origin": "cap_deploy_status; paas_stored_status" },
+    { "status": "rolled_back","class": "terminal",  "origin": "cap_deploy_status" },
+    { "status": "superseded", "class": "terminal",  "origin": "paas_projection" },
+    { "status": "cancelled",  "class": "terminal",  "origin": "paas_projection" },
+    { "status": "queued",     "class": "folded",    "origin": "paas_observation_folded" },
+    { "status": "starting",   "class": "folded",    "origin": "paas_observation_folded" },
+    { "status": "succeeded",  "class": "folded",    "origin": "paas_observation_folded" },
+    { "status": "running",    "class": "folded",    "origin": "paas_observation_folded" },
+    { "status": "active",     "class": "folded",    "origin": "paas_observation_folded" },
+    { "status": "ready",      "class": "folded",    "origin": "paas_observation_folded" },
+    { "status": "blocked",    "class": "folded",    "origin": "paas_observation_folded" },
+    { "status": "error",      "class": "folded",    "origin": "paas_observation_folded" }
+  ]
+}
