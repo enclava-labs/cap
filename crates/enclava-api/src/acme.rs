@@ -431,25 +431,48 @@ async fn lookup_cname(
     name: &str,
     config: Option<&AcmeConfig>,
 ) -> Result<Option<String>, DnsLookupError> {
+    lookup_cname_with_resolvers(config, |system| async move {
+        if system {
+            lookup_cname_system(name).await
+        } else {
+            lookup_cname_external(name).await
+        }
+    })
+    .await
+}
+
+/// The CNAME order loop, mirroring `lookup_txt_with_resolvers`' injection
+/// seam so the fallback behaviour is testable without live DNS: the
+/// preferred resolver runs first, its failure (including a configured
+/// timeout, which is that resolver's answer -- never the lookup's end)
+/// falls through to the other resolver with its own full budget, and a
+/// code-only warn marks the fallback so a stalled preferred resolver is
+/// visible in logs (diagnostics policy: no hostname, no provider text).
+async fn lookup_cname_with_resolvers<F>(
+    config: Option<&AcmeConfig>,
+    mut lookup: impl FnMut(bool) -> F,
+) -> Result<Option<String>, DnsLookupError>
+where
+    F: Future<Output = Result<Option<String>, DnsLookupError>>,
+{
     let prefer_system = config.map(|c| c.dns_lookup_prefer_system).unwrap_or(false);
-    let order: Vec<bool> = vec![prefer_system, !prefer_system];
     let mut last = None;
-    for system in order {
-        let attempt = async {
-            if system {
-                lookup_cname_system(name).await
-            } else {
-                lookup_cname_external(name).await
-            }
-        };
-        // A timed-out preferred resolver must NOT end the lookup: the
-        // timeout becomes that resolver's error answer so the fallback
-        // gets its own full budget (same shape as the TXT path).
+    for system in [prefer_system, !prefer_system] {
         let result =
-            bounded_cname_attempt(attempt, config.and_then(|c| c.dns_lookup_timeout)).await;
+            bounded_cname_attempt(lookup(system), config.and_then(|c| c.dns_lookup_timeout)).await;
         match result {
             Ok(value) => return Ok(value),
             Err(error) => last = Some(error),
+        }
+        if system == prefer_system {
+            tracing::warn!(
+                "{}; falling back to the other DNS resolver for the ACME CNAME check",
+                if system {
+                    "system DNS CNAME lookup failed"
+                } else {
+                    "external DNS CNAME lookup failed"
+                }
+            );
         }
     }
     Err(last.unwrap_or_else(|| DnsLookupError {
@@ -2894,5 +2917,79 @@ mod tests {
             Ok(None)
         };
         assert_eq!(bounded_cname_attempt(native, None).await.unwrap(), None);
+    }
+
+    fn cname_test_config(prefer_system: bool) -> Option<AcmeConfig> {
+        Some(AcmeConfig {
+            directory_url: "https://synthetic.invalid/dir".to_string(),
+            account_credentials_path: None,
+            dns_propagation_wait: Duration::from_secs(30),
+            dns_lookup_prefer_system: prefer_system,
+            dns_lookup_timeout: Some(Duration::from_millis(20)),
+        })
+    }
+
+    #[tokio::test]
+    async fn cname_timeout_on_preferred_falls_back_and_answers() {
+        // The regression b98ddf8d introduced and round 4 closes at the
+        // loop level: a timed-out preferred resolver must NOT end the
+        // lookup; the fallback answers within its own budget.
+        let config = cname_test_config(false);
+        let result = lookup_cname_with_resolvers(config.as_ref(), |system| async move {
+            if system {
+                std::future::pending().await
+            } else {
+                Ok(Some("app.example.com.acme.managed.test".to_string()))
+            }
+        })
+        .await
+        .expect("fallback must answer");
+        assert_eq!(result.as_deref(), Some("app.example.com.acme.managed.test"));
+
+        // Preferred resolver swapped: same property with the other order.
+        let config = cname_test_config(true);
+        let result = lookup_cname_with_resolvers(config.as_ref(), |system| async move {
+            if !system {
+                std::future::pending().await
+            } else {
+                Ok(Some("app.example.com.acme.managed.test".to_string()))
+            }
+        })
+        .await
+        .expect("system fallback must answer");
+        assert_eq!(result.as_deref(), Some("app.example.com.acme.managed.test"));
+    }
+
+    #[tokio::test]
+    async fn cname_timeout_on_both_resolvers_is_a_classified_timeout() {
+        let config = cname_test_config(false);
+        let error = lookup_cname_with_resolvers(config.as_ref(), |_| {
+            std::future::pending::<Result<Option<String>, DnsLookupError>>()
+        })
+        .await
+        .expect_err("both resolvers stalled must fail");
+        assert!(matches!(error.category, DnsErrorCategory::Timeout));
+        assert_eq!(error.message, "DNS CNAME lookup timed out");
+    }
+
+    #[tokio::test]
+    async fn cname_resolver_order_honors_prefer_system() {
+        for prefer_system in [false, true] {
+            let config = cname_test_config(prefer_system);
+            let visits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let record = visits.clone();
+            lookup_cname_with_resolvers(config.as_ref(), move |system| {
+                let record = record.clone();
+                async move {
+                    record.lock().unwrap().push(system);
+                    // Answer on the preferred resolver so the fallback is
+                    // never tried: the visit order is the assertion.
+                    Ok(Some("app.example.com.acme.managed.test".to_string()))
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(*visits.lock().unwrap(), vec![prefer_system]);
+        }
     }
 }
