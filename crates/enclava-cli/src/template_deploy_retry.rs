@@ -98,6 +98,8 @@ pub struct StoredTemplateLogKey {
 pub struct NewTemplateDeployAttempt {
     pub unlock_mode: String,
     pub paas_managed_config_keys: Vec<String>,
+    /// Key names of the customer config batch being delivered (names only).
+    pub customer_config_keys: Vec<String>,
     pub log_key_id: Option<String>,
     pub log_private_key_file: Option<String>,
 }
@@ -113,6 +115,7 @@ pub enum TemplateDeployAttempt {
         deploy_id: String,
         workflow: Option<StoredTemplateWorkflow>,
         log_key: Option<StoredTemplateLogKey>,
+        customer_config_keys: Vec<String>,
     },
     /// A second signed request would race an in-flight deployment. Do not POST.
     Refuse(String),
@@ -132,6 +135,10 @@ pub struct StoredTemplateDeployAttempt {
     org_keyring_blob: String,
     signed_policy_artifact: String,
     customer_config_roll_hold_seconds: Option<u32>,
+    /// Key names of the customer config batch this request was signed with
+    /// (names only — values are never stored). A retry must re-supply them.
+    #[serde(default)]
+    customer_config_keys: Vec<String>,
     /// Unix seconds when the request was signed, before the POST. `0` means
     /// the file predates this field and must not be replayed without a live row.
     #[serde(default)]
@@ -816,11 +823,13 @@ fn replay(stored: Box<StoredTemplateDeployAttempt>) -> TemplateDeployAttempt {
     let deploy_id = stored.deploy_id.clone();
     let workflow = stored.workflow.clone();
     let log_key = stored.log_key.clone();
+    let customer_config_keys = stored.customer_config_keys.clone();
     TemplateDeployAttempt::Replay {
         request: Box::new((*stored).into_request()),
         deploy_id,
         workflow,
         log_key,
+        customer_config_keys,
     }
 }
 
@@ -1154,6 +1163,7 @@ pub fn save_template_deploy_attempt(
         org_keyring_blob: org_keyring_blob.to_string(),
         signed_policy_artifact: signed_policy_artifact.to_string(),
         customer_config_roll_hold_seconds: request.customer_config_roll_hold_seconds,
+        customer_config_keys: record.customer_config_keys.clone(),
         created_at_unix: unix_now(),
         post_accepted: false,
         post_accepted_at_unix: None,
@@ -1412,6 +1422,7 @@ mod tests {
             org_keyring_blob: request.org_keyring_blob.unwrap(),
             signed_policy_artifact: request.signed_policy_artifact.unwrap(),
             customer_config_roll_hold_seconds: request.customer_config_roll_hold_seconds,
+            customer_config_keys: vec![],
             created_at_unix: NOW,
             post_accepted: false,
             post_accepted_at_unix: None,
@@ -1469,6 +1480,7 @@ mod tests {
         NewTemplateDeployAttempt {
             unlock_mode: "password".to_string(),
             paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
+            customer_config_keys: Vec::new(),
             log_key_id: Some("shell-logs".to_string()),
             log_private_key_file: Some("/keys/shell-logs.x25519".to_string()),
         }
@@ -1489,6 +1501,7 @@ mod tests {
             deploy_id,
             workflow,
             log_key,
+            customer_config_keys: _,
         } = attempt
         else {
             panic!("in-flight retry must replay the stored request, not sign a new one");

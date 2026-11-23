@@ -608,7 +608,21 @@ async fn deploy_with_timings(
             deploy_id,
             workflow,
             log_key,
+            customer_config_keys,
         } => {
+            // The accepted request kept only key names; the values live in
+            // this invocation. A retry that drops an original key would
+            // release the roll with the workload unconfigured.
+            let missing =
+                missing_replayed_config_keys(&customer_config_keys, &customer_config_pairs);
+            if !missing.is_empty() {
+                return Err(format!(
+                    "retry is missing config keys the original deploy delivered: {}. Re-supply \
+                     the same --set/--set-file entries (values are never stored).",
+                    missing.join(", ")
+                )
+                .into());
+            }
             let request = *request;
             pb.set_position(1);
             pb.set_message("Resuming in-flight template deployment...");
@@ -735,6 +749,10 @@ async fn deploy_with_timings(
                 &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
                     unlock_mode: template.unlock_mode.clone(),
                     paas_managed_config_keys: template.paas_managed_config_keys.clone(),
+                    customer_config_keys: customer_config_pairs
+                        .iter()
+                        .map(|(key, _)| (*key).to_string())
+                        .collect(),
                     log_key_id: prepared_log_key
                         .as_ref()
                         .map(|prepared| prepared.config.key_id.clone()),
@@ -2253,6 +2271,19 @@ fn missing_required_config_keys<'a>(
                 && !set_pairs.iter().any(|(key, _)| key == &entry.key)
         })
         .map(|entry| entry.key.as_str())
+        .collect()
+}
+
+/// Config keys the accepted deploy delivered but this retry omits. The
+/// stored request keeps key names, never values, so a resumed redeploy must
+/// re-supply the same keys or the replacement workload comes up without
+/// them. Keys the catalog gained after acceptance are Fresh-only and are
+/// not demanded here.
+fn missing_replayed_config_keys(stored_keys: &[String], pairs: &[(&str, String)]) -> Vec<String> {
+    stored_keys
+        .iter()
+        .filter(|key| !pairs.iter().any(|(pair_key, _)| pair_key == key))
+        .cloned()
         .collect()
 }
 
@@ -6061,6 +6092,21 @@ mod tests {
             reject_inline_secret_config_keys(Some(&template), &["NOTE=hi".into()]).is_ok(),
             "non-secret keys stay inline-friendly"
         );
+    }
+
+    #[test]
+    fn missing_replayed_config_keys_demands_the_original_batch() {
+        let stored = vec!["REGION".to_string(), "API_TOKEN".to_string()];
+        let supplied = vec![("REGION", "eu".to_string())];
+        assert_eq!(
+            missing_replayed_config_keys(&stored, &supplied),
+            vec!["API_TOKEN".to_string()]
+        );
+        let complete = vec![("REGION", "eu".to_string()), ("API_TOKEN", "t".to_string())];
+        assert!(missing_replayed_config_keys(&stored, &complete).is_empty());
+        // Keys the catalog gained after acceptance are Fresh-only: the
+        // replayed batch is checked against the stored names only.
+        assert!(missing_replayed_config_keys(&["REGION".to_string()], &supplied).is_empty());
     }
 
     #[test]

@@ -660,6 +660,7 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
         &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
             unlock_mode: "password".to_string(),
             paas_managed_config_keys: Vec::new(),
+            customer_config_keys: Vec::new(),
             log_key_id: None,
             log_private_key_file: None,
         },
@@ -674,6 +675,7 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
         &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
             unlock_mode: "password".to_string(),
             paas_managed_config_keys: Vec::new(),
+            customer_config_keys: Vec::new(),
             log_key_id: None,
             log_private_key_file: None,
         },
@@ -706,6 +708,7 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
         &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
             unlock_mode: "password".to_string(),
             paas_managed_config_keys: Vec::new(),
+            customer_config_keys: Vec::new(),
             log_key_id: None,
             log_private_key_file: None,
         },
