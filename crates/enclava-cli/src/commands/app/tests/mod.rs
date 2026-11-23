@@ -146,6 +146,7 @@ fn test_app_config() -> AppConfig {
             memory: "1Gi".to_string(),
         },
         health: None,
+        egress: Default::default(),
     }
 }
 

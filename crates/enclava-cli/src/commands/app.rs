@@ -374,8 +374,8 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
         health_timeout: app_config.health.as_ref().map(|h| h.timeout),
         signer_identity_subject,
         signer_identity_issuer,
-        egress_allowlist: vec![],
-        egress_mode: None,
+        egress_allowlist: app_config.egress.allowlist_for_request(),
+        egress_mode: app_config.egress.mode_for_request(),
     };
 
     let spinner = ProgressBar::new_spinner();

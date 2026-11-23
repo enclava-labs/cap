@@ -15,6 +15,53 @@ pub struct AppConfig {
     #[serde(default)]
     pub resources: ResourcesSection,
     pub health: Option<HealthSection>,
+    #[serde(default)]
+    pub egress: EgressSection,
+}
+
+/// Outbound network posture for the workload, fixed at `enclava create`.
+///
+/// `mode = "restricted"` (default) allows only platform endpoints plus the
+/// `allowlist` hostnames. `mode = "public_internet"` allows any public
+/// address; private, link-local and metadata ranges stay blocked.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressSection {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub allowlist: Vec<EgressAllowSection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressAllowSection {
+    pub host: String,
+    /// TCP ports; defaults to `[443]` when omitted.
+    pub ports: Option<Vec<u16>>,
+}
+
+impl EgressSection {
+    /// Canonical mode string for the create request, or `None` to take the
+    /// server default (restricted).
+    pub fn mode_for_request(&self) -> Option<String> {
+        self.mode
+            .as_deref()
+            .and_then(|mode| mode.parse::<enclava_engine::types::EgressMode>().ok())
+            .map(|mode| mode.as_str().to_string())
+    }
+
+    /// Allowlist rules for the create request, with omitted ports set to 443
+    /// (the server default, made explicit so the request is self-describing).
+    pub fn allowlist_for_request(&self) -> Vec<crate::api_types::HostedTemplateEgressRule> {
+        self.allowlist
+            .iter()
+            .map(|rule| crate::api_types::HostedTemplateEgressRule {
+                host: rule.host.clone(),
+                ports: rule.ports.clone().unwrap_or_else(|| vec![443]),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +247,27 @@ impl AppConfig {
             return Err(AppConfigError::Validation(
                 "app command entries cannot be empty".to_string(),
             ));
+        }
+
+        if let Some(mode) = self.egress.mode.as_deref() {
+            mode.parse::<enclava_engine::types::EgressMode>()
+                .map_err(|e| AppConfigError::Validation(format!("[egress] {e}")))?;
+        }
+        for rule in &self.egress.allowlist {
+            if rule.host.trim().is_empty() || rule.host.trim() != rule.host {
+                return Err(AppConfigError::Validation(format!(
+                    "[egress] allowlist host {:?} must be a non-empty hostname without surrounding whitespace",
+                    rule.host
+                )));
+            }
+            if let Some(ports) = &rule.ports
+                && (ports.is_empty() || ports.contains(&0))
+            {
+                return Err(AppConfigError::Validation(format!(
+                    "[egress] allowlist ports for {} must be between 1 and 65535",
+                    rule.host
+                )));
+            }
         }
 
         Ok(())

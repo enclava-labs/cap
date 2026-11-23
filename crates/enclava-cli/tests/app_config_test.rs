@@ -141,3 +141,97 @@ fn load_missing_file_returns_error() {
     let err = enclava_cli::app_config::AppConfig::load(&path).unwrap_err();
     assert!(err.to_string().contains("enclava.toml"));
 }
+
+#[test]
+fn egress_defaults_to_server_default() {
+    let config = enclava_cli::app_config::AppConfig::parse(
+        r#"
+[app]
+name = "my-api"
+port = 8080
+"#,
+    )
+    .unwrap();
+    assert_eq!(config.egress.mode_for_request(), None);
+    assert!(config.egress.allowlist_for_request().is_empty());
+}
+
+#[test]
+fn egress_public_internet_and_allowlist_map_to_request() {
+    let config = enclava_cli::app_config::AppConfig::parse(
+        r#"
+[app]
+name = "my-api"
+port = 8080
+
+[egress]
+mode = "public-internet"
+allowlist = [
+  { host = "api.openai.com" },
+  { host = "relay.example.com", ports = [443, 8443] },
+]
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.egress.mode_for_request().as_deref(),
+        Some("public_internet")
+    );
+    let rules = config.egress.allowlist_for_request();
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].host, "api.openai.com");
+    assert_eq!(rules[0].ports, vec![443]);
+    assert_eq!(rules[1].ports, vec![443, 8443]);
+}
+
+#[test]
+fn egress_rejects_unknown_mode() {
+    let err = enclava_cli::app_config::AppConfig::parse(
+        r#"
+[app]
+name = "my-api"
+port = 8080
+
+[egress]
+mode = "open"
+"#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("egress_mode"), "{err}");
+}
+
+#[test]
+fn egress_rejects_empty_or_zero_ports() {
+    for ports in ["[]", "[0]"] {
+        let toml_str = format!(
+            r#"
+[app]
+name = "my-api"
+port = 8080
+
+[egress]
+allowlist = [{{ host = "api.example.com", ports = {ports} }}]
+"#
+        );
+        let err = enclava_cli::app_config::AppConfig::parse(&toml_str).unwrap_err();
+        assert!(err.to_string().contains("ports"), "{ports}: {err}");
+    }
+}
+
+#[test]
+fn egress_rejects_misspelled_keys() {
+    // A typo must not silently fall back to restricted egress.
+    assert!(
+        enclava_cli::app_config::AppConfig::parse(
+            r#"
+[app]
+name = "my-api"
+port = 8080
+
+[egress]
+mdoe = "public_internet"
+"#,
+        )
+        .is_err()
+    );
+}
