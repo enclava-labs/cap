@@ -201,6 +201,22 @@ mode = "open"
 }
 
 #[test]
+fn egress_rejects_empty_mode() {
+    let err = enclava_cli::app_config::AppConfig::parse(
+        r#"
+[app]
+name = "my-api"
+port = 8080
+
+[egress]
+mode = ""
+"#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("egress_mode"), "{err}");
+}
+
+#[test]
 fn egress_rejects_empty_or_zero_ports() {
     for ports in ["[]", "[0]"] {
         let toml_str = format!(

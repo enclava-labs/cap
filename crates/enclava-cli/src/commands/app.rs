@@ -87,6 +87,23 @@ fn optional_app_name_from_config_result(
     }
 }
 
+/// Only a missing `enclava.toml` gets the "run `enclava init`" hint; a file
+/// that exists but fails to parse or validate reports its own error, so the
+/// user learns which key to fix.
+fn load_deploy_app_config(
+    result: Result<AppConfig, AppConfigError>,
+) -> Result<AppConfig, Box<dyn std::error::Error>> {
+    match result {
+        Ok(config) => Ok(config),
+        Err(AppConfigError::ReadFile { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Err("no enclava.toml found -- run `enclava init` or specify --app".into())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Build an authenticated API client from stored config/credentials.
 fn build_api_client() -> Result<(ApiClient, CliPaths, config::CliConfig), Box<dyn std::error::Error>>
 {
@@ -433,12 +450,7 @@ pub struct DeployArgs {
 
 pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> {
     let deploy_started = Instant::now();
-    let app_config = match AppConfig::find_and_load() {
-        Ok(config) => config,
-        Err(_) => {
-            return Err("no enclava.toml found -- run `enclava init` or specify --app".into());
-        }
-    };
+    let app_config = load_deploy_app_config(AppConfig::find_and_load())?;
     let app_name = app_config.app.name.clone();
 
     let config_pairs = parse_config_inputs(&args.config_vars, &args.config_file_vars)?;

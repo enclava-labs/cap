@@ -4435,3 +4435,15 @@ fn log_key_json_entries_share_one_stable_shape_across_scopes() {
     assert_eq!(org_entry["selected_at"], serde_json::Value::Null);
     assert_eq!(org_entry["selected_by_count"], serde_json::json!(2));
 }
+
+#[test]
+fn deploy_config_load_reports_invalid_file_instead_of_missing() {
+    let invalid = AppConfig::parse("[app]\nname = \"demo\"\nport = 1\n\n[extra]\nkey = 1\n");
+    let err = load_deploy_app_config(invalid).unwrap_err().to_string();
+    assert!(err.contains("'extra'"), "{err}");
+    assert!(!err.contains("no enclava.toml found"), "{err}");
+
+    let missing = AppConfig::load(std::path::Path::new("/nonexistent-dir/enclava.toml"));
+    let err = load_deploy_app_config(missing).unwrap_err().to_string();
+    assert!(err.contains("no enclava.toml found"), "{err}");
+}

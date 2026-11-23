@@ -31,10 +31,31 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressSection {
-    #[serde(default)]
-    pub mode: Option<String>,
+    /// `None` takes the server default (restricted).
+    #[serde(default, deserialize_with = "deserialize_egress_mode")]
+    pub mode: Option<enclava_engine::types::EgressMode>,
     #[serde(default)]
     pub allowlist: Vec<EgressAllowSection>,
+}
+
+/// Parses `mode` at load time so an unusable value can never reach the create
+/// request as "unset". An empty string is rejected rather than read as
+/// restricted: egress is fixed at create time, so a blank is likely a mistake.
+fn deserialize_egress_mode<'de, D>(
+    deserializer: D,
+) -> Result<Option<enclava_engine::types::EgressMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(raw) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Err(serde::de::Error::custom(
+            "invalid egress_mode \"\"; expected restricted or public_internet",
+        ));
+    }
+    raw.parse().map(Some).map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,10 +70,7 @@ impl EgressSection {
     /// Canonical mode string for the create request, or `None` to take the
     /// server default (restricted).
     pub fn mode_for_request(&self) -> Option<String> {
-        self.mode
-            .as_deref()
-            .and_then(|mode| mode.parse::<enclava_engine::types::EgressMode>().ok())
-            .map(|mode| mode.as_str().to_string())
+        self.mode.map(|mode| mode.as_str().to_string())
     }
 
     /// Allowlist rules for the create request, with omitted ports set to 443
@@ -263,10 +281,6 @@ impl AppConfig {
             )));
         }
 
-        if let Some(mode) = self.egress.mode.as_deref() {
-            mode.parse::<enclava_engine::types::EgressMode>()
-                .map_err(|e| AppConfigError::Validation(format!("[egress] {e}")))?;
-        }
         for rule in &self.egress.allowlist {
             if rule.host.trim().is_empty() || rule.host.trim() != rule.host {
                 return Err(AppConfigError::Validation(format!(
