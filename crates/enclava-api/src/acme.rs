@@ -2932,32 +2932,28 @@ mod tests {
     #[tokio::test]
     async fn cname_timeout_on_preferred_falls_back_and_answers() {
         // The regression b98ddf8d introduced and round 4 closes at the
-        // loop level: a timed-out preferred resolver must NOT end the
-        // lookup; the fallback answers within its own budget.
-        let config = cname_test_config(false);
-        let result = lookup_cname_with_resolvers(config.as_ref(), |system| async move {
-            if system {
-                std::future::pending().await
-            } else {
-                Ok(Some("app.example.com.acme.managed.test".to_string()))
-            }
-        })
-        .await
-        .expect("fallback must answer");
-        assert_eq!(result.as_deref(), Some("app.example.com.acme.managed.test"));
-
-        // Preferred resolver swapped: same property with the other order.
-        let config = cname_test_config(true);
-        let result = lookup_cname_with_resolvers(config.as_ref(), |system| async move {
-            if !system {
-                std::future::pending().await
-            } else {
-                Ok(Some("app.example.com.acme.managed.test".to_string()))
-            }
-        })
-        .await
-        .expect("system fallback must answer");
-        assert_eq!(result.as_deref(), Some("app.example.com.acme.managed.test"));
+        // loop level: a timed-out PREFERRED resolver must not end the
+        // lookup; the other resolver answers within its own budget. The
+        // preferred slot is `system == prefer_system`, so the stall
+        // targets whichever resolver runs first for that configuration —
+        // answering on the preferred slot would pass trivially.
+        for prefer_system in [false, true] {
+            let config = cname_test_config(prefer_system);
+            let result = lookup_cname_with_resolvers(config.as_ref(), move |system| async move {
+                if system == prefer_system {
+                    std::future::pending().await
+                } else {
+                    Ok(Some("app.example.com.acme.managed.test".to_string()))
+                }
+            })
+            .await
+            .unwrap_or_else(|error| panic!("fallback must answer: {error:?}"));
+            assert_eq!(
+                result.as_deref(),
+                Some("app.example.com.acme.managed.test"),
+                "prefer_system={prefer_system}"
+            );
+        }
     }
 
     #[tokio::test]
