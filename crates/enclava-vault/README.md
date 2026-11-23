@@ -65,6 +65,7 @@ enclava-vault connection list --store-dir /var/lib/vault
 enclava-vault connection rm   --store-dir /var/lib/vault --name github
 
 # Run the proxy and write the CA certificate the workload must trust.
+install -d -m 0755 /run/vault
 enclava-vault serve --store-dir /var/lib/vault \
   --ca-cert-out /run/vault/ca.crt --passthrough https://example.com
 ```
@@ -79,8 +80,10 @@ and certificate. Changes take an exclusive lock on the directory and are
 synced to it before a command reports success, so concurrent commands and a
 first start racing another agree on one placeholder and one CA.
 
-`--ca-cert-out` must point outside the store directory; `serve` refuses a
-path inside it, because that is where the CA key lives.
+`--ca-cert-out` must be a plain path (no `.` or `..` segments, no trailing
+`/`) into a directory that already exists and is outside the store
+directory, where the CA key lives. The vault creates nothing outside its
+store.
 
 The directory must live somewhere the workload cannot read; the crate sets
 owner-only modes and marks the process non-dumpable, and relies on the

@@ -9,11 +9,10 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt as _};
 
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -54,6 +53,8 @@ pub enum CaError {
     ExportIntoStore,
     #[error("refusing to replace {0}: not a regular file or symlink")]
     ExportTarget(PathBuf),
+    #[error("{0} must be a plain path: no . or .. segments and no trailing /")]
+    ExportPath(PathBuf),
 }
 
 pub struct VaultCa {
@@ -151,23 +152,30 @@ impl VaultCa {
     /// Writes the CA certificate to `path`, world-readable, for the
     /// workload to trust.
     ///
-    /// The store directory holds the CA key, so nothing is exported into
-    /// it, however the path is spelled. The file is renamed into place: if
-    /// `path` is a link to the key file, the link is replaced and the key
-    /// file is left alone.
+    /// `path` must be a plain path into a directory that already exists:
+    /// no `.` or `..` segment after the start and no trailing `/`. The
+    /// vault creates nothing outside its store. The store directory holds
+    /// the CA key, so nothing is exported into it, however the directory is
+    /// reached. The file is renamed into place: if `path` is a link, the
+    /// link is replaced and its target is left alone.
     pub fn export_cert(&self, store_dir: &Path, path: &Path) -> Result<(), CaError> {
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| CaError::ExportTarget(path.to_owned()))?;
+        let bytes = path.as_os_str().as_bytes();
+        let plain = !bytes.is_empty()
+            && !bytes.ends_with(b"/")
+            && bytes
+                .split(|b| *b == b'/')
+                .enumerate()
+                .all(|(i, segment)| segment != b".." && (segment != b"." || i == 0));
+        let file_name = path.file_name().filter(|_| plain);
+        let Some(file_name) = file_name else {
+            return Err(CaError::ExportPath(path.to_owned()));
+        };
         let parent = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
             _ => Path::new("."),
         };
-        // Everything below uses the resolved directory, so a `..` in the
-        // path never reaches the filesystem and cannot create directories
-        // on the way, including inside the store.
-        let parent = resolve(parent)?;
-        if parent.starts_with(resolve(store_dir)?) {
+        let parent = parent.canonicalize()?;
+        if parent.starts_with(store_dir.canonicalize()?) {
             return Err(CaError::ExportIntoStore);
         }
         let target = parent.join(file_name);
@@ -179,7 +187,6 @@ impl VaultCa {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        create_public_dirs(&parent)?;
         write_atomic_mode(&target, self.cert_pem.as_bytes(), 0o644)?;
         Ok(())
     }
@@ -221,57 +228,6 @@ impl VaultCa {
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(config)
     }
-}
-
-/// Creates `dir` and any missing ancestors `0755`, whatever the umask, so
-/// another user can reach the exported certificate.
-fn create_public_dirs(dir: &Path) -> io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
-    if let Some(parent) = dir.parent() {
-        create_public_dirs(parent)?;
-    }
-    match fs::DirBuilder::new().mode(0o755).create(dir) {
-        Ok(()) => fs::set_permissions(dir, fs::Permissions::from_mode(0o755)),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
-/// Where `path` will point once its missing directories are created.
-///
-/// Components are resolved one at a time: each one that exists is
-/// canonicalized, so symlinks are followed, and each one that does not is
-/// kept as written. A `..` after a missing directory therefore climbs back
-/// into real directories, as it will once the directory exists. A dangling
-/// symlink is an error, because its target is not known.
-fn resolve(path: &Path) -> io::Result<PathBuf> {
-    let mut resolved = PathBuf::new();
-    for part in std::path::absolute(path)?.components() {
-        match part {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            other => {
-                resolved.push(other);
-                match resolved.canonicalize() {
-                    Ok(canonical) => resolved = canonical,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        if fs::symlink_metadata(&resolved).is_ok() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                format!("{} is a dangling symlink", resolved.display()),
-                            ));
-                        }
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-    }
-    Ok(resolved)
 }
 
 fn pkcs8(key: &KeyPair) -> PrivateKeyDer<'static> {
@@ -369,7 +325,7 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         let ca = VaultCa::load_or_generate(store.path()).unwrap();
-        let path = out.path().join("new/dir/ca.crt");
+        let path = out.path().join("ca.crt");
         ca.export_cert(store.path(), &path).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), ca.cert_pem());
         let mode = fs::metadata(&path).unwrap().permissions().mode();
@@ -381,19 +337,18 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         let ca = VaultCa::load_or_generate(store.path()).unwrap();
+        crate::Store::open(store.path()).unwrap();
         let bundle_path = store.path().join(CA_FILE);
         let bundle = fs::read_to_string(&bundle_path).unwrap();
 
-        // Straight at the bundle, into a new directory under the store, and
+        // Straight at the bundle, into a directory under the store, and
         // through a symlink to the store directory.
         let alias = out.path().join("alias");
         std::os::unix::fs::symlink(store.path(), &alias).unwrap();
         for inside in [
             bundle_path.clone(),
-            store.path().join("sub/ca.crt"),
+            store.path().join("connections/ca.crt"),
             alias.join(CA_FILE),
-            store.path().join("missing/../ca.pem"),
-            out.path().join("missing/../alias").join(CA_FILE),
         ] {
             let error = ca.export_cert(store.path(), &inside).err().unwrap();
             assert!(
@@ -402,7 +357,6 @@ mod tests {
                 inside.display()
             );
         }
-        assert!(!store.path().join("sub").exists());
 
         // A link outside the store that points at the bundle is replaced,
         // not written through.
@@ -422,40 +376,41 @@ mod tests {
     }
 
     #[test]
-    fn export_that_passes_through_the_store_creates_nothing_there() {
+    fn export_path_must_be_plain_and_its_directory_must_exist() {
         let store = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         let ca = VaultCa::load_or_generate(store.path()).unwrap();
         crate::Store::open(store.path()).unwrap();
-        // Into connections/, out again, and over to the export directory.
-        let path = store
-            .path()
-            .join("connections/new/../../..")
-            .join(out.path().file_name().unwrap())
-            .join("ca.crt");
-        ca.export_cert(store.path(), &path).unwrap();
-        assert_eq!(
-            fs::read_to_string(out.path().join("ca.crt")).unwrap(),
-            ca.cert_pem()
-        );
+        let file = out.path().join("ca.crt");
+        fs::write(&file, "keep").unwrap();
+        let dir = out.path().display();
+        for malformed in [
+            format!("{dir}/ca.crt/"),
+            format!("{dir}/ca.crt/."),
+            format!("{dir}/./ca.crt"),
+            format!("{dir}/new/../ca.crt"),
+            format!("{dir}/ca.crt/../ca.crt"),
+            format!("{}/connections/new/../../ca.pem", store.path().display()),
+            String::new(),
+        ] {
+            let error = ca
+                .export_cert(store.path(), Path::new(&malformed))
+                .err()
+                .unwrap();
+            assert!(
+                matches!(error, CaError::ExportPath(_)),
+                "{malformed}: {error}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&file).unwrap(), "keep");
         assert!(!store.path().join("connections/new").exists());
-        crate::Store::open(store.path())
-            .unwrap()
-            .snapshot()
-            .unwrap();
-    }
 
-    #[test]
-    fn export_through_a_missing_directory_and_back_out_works() {
-        let store = tempfile::tempdir().unwrap();
-        let out = tempfile::tempdir().unwrap();
-        let ca = VaultCa::load_or_generate(store.path()).unwrap();
-        ca.export_cert(store.path(), &out.path().join("new/../ca.crt"))
-            .unwrap();
-        assert_eq!(
-            fs::read_to_string(out.path().join("ca.crt")).unwrap(),
-            ca.cert_pem()
-        );
+        let missing = out.path().join("missing/ca.crt");
+        assert!(matches!(
+            ca.export_cert(store.path(), &missing).err().unwrap(),
+            CaError::Io(_)
+        ));
+        assert!(!out.path().join("missing").exists());
     }
 
     #[test]
@@ -503,9 +458,7 @@ mod tests {
             nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
             let store = tempfile::tempdir().unwrap();
             let ca = VaultCa::load_or_generate(store.path()).unwrap();
-            let out = Path::new(&out);
-            ca.export_cert(store.path(), &out.join("ca.crt")).unwrap();
-            ca.export_cert(store.path(), &out.join("new/dir/ca.crt"))
+            ca.export_cert(store.path(), &Path::new(&out).join("ca.crt"))
                 .unwrap();
             return;
         }
@@ -521,12 +474,8 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert_ne!(fs::read_to_string(&path).unwrap(), "old");
-        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o644);
-        // Directories the export created must be traversable by others.
-        assert_eq!(mode(&out.path().join("new")), 0o755);
-        assert_eq!(mode(&out.path().join("new/dir")), 0o755);
-        assert_eq!(mode(&out.path().join("new/dir/ca.crt")), 0o644);
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
     }
 
     #[test]
