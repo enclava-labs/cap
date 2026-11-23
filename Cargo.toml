@@ -8,6 +8,7 @@ members = [
     "crates/enclava-cli",
     "crates/enclava-init",
     "crates/enclava-snp",
+    "crates/enclava-vault",
     "crates/enclava-verifier",
     "crates/enclava-verifier-wasm",
     "crates/enclava-wait-exec",

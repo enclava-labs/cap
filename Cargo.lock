@@ -1666,6 +1666,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "enclava-vault"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "enclava-common",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "nix",
+ "percent-encoding",
+ "rand 0.8.6",
+ "rcgen",
+ "reqwest 0.13.2",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots 1.0.10",
+ "zeroize",
+]
+
+[[package]]
 name = "enclava-verifier"
 version = "0.1.0"
 dependencies = [
@@ -4372,6 +4407,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
