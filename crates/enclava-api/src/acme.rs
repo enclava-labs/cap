@@ -404,6 +404,29 @@ fn first_cname(lookup: hickory_resolver::lookup::Lookup) -> Option<String> {
 /// configured lookup timeout when one is set. A successful
 /// no-such-record answer is `Ok(None)`, not an error: the refusal total
 /// does not depend on which resolver answered.
+/// One bounded resolver attempt: a timeout becomes this resolver's error
+/// answer (so the caller's fallback loop still runs) rather than ending
+/// the whole lookup.
+async fn bounded_cname_attempt<F>(
+    attempt: F,
+    timeout: Option<Duration>,
+) -> Result<Option<String>, DnsLookupError>
+where
+    F: Future<Output = Result<Option<String>, DnsLookupError>>,
+{
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, attempt)
+            .await
+            .unwrap_or_else(|_| {
+                Err(DnsLookupError {
+                    message: "DNS CNAME lookup timed out".to_string(),
+                    category: DnsErrorCategory::Timeout,
+                })
+            }),
+        None => attempt.await,
+    }
+}
+
 async fn lookup_cname(
     name: &str,
     config: Option<&AcmeConfig>,
@@ -419,17 +442,11 @@ async fn lookup_cname(
                 lookup_cname_external(name).await
             }
         };
-        let result = match config.and_then(|c| c.dns_lookup_timeout) {
-            Some(timeout) => {
-                tokio::time::timeout(timeout, attempt)
-                    .await
-                    .map_err(|_| DnsLookupError {
-                        message: "DNS CNAME lookup timed out".to_string(),
-                        category: DnsErrorCategory::Timeout,
-                    })?
-            }
-            None => attempt.await,
-        };
+        // A timed-out preferred resolver must NOT end the lookup: the
+        // timeout becomes that resolver's error answer so the fallback
+        // gets its own full budget (same shape as the TXT path).
+        let result =
+            bounded_cname_attempt(attempt, config.and_then(|c| c.dns_lookup_timeout)).await;
         match result {
             Ok(value) => return Ok(value),
             Err(error) => last = Some(error),
@@ -2845,5 +2862,37 @@ mod tests {
         assert!(matches!(error, AcmeError::Acme(_)));
         assert_eq!(calls.cf_creates.lock().unwrap().len(), 2);
         assert_cleanup(&calls);
+    }
+
+    #[tokio::test]
+    async fn cname_timeout_is_one_resolvers_answer_not_the_lookup_end() {
+        // A stalled preferred resolver yields a classified Timeout error
+        // from ONE attempt -- the value the fallback loop consumes --
+        // rather than ending the whole lookup.
+        let stalled = std::future::pending::<Result<Option<String>, DnsLookupError>>();
+        let timed_out = bounded_cname_attempt(stalled, Some(Duration::from_millis(10)))
+            .await
+            .unwrap_err();
+        assert!(matches!(timed_out.category, DnsErrorCategory::Timeout));
+        assert_eq!(timed_out.message, "DNS CNAME lookup timed out");
+
+        // The fallback's own budget is independent: a slow-but-successful
+        // answer within its window is returned, not punished for the
+        // preferred resolver's earlier stall.
+        let slow_ok = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok(Some("app.example.com.acme.managed.test".to_string()))
+        };
+        let answer = bounded_cname_attempt(slow_ok, Some(Duration::from_millis(200)))
+            .await
+            .unwrap();
+        assert_eq!(answer.as_deref(), Some("app.example.com.acme.managed.test"));
+
+        // No configured timeout preserves the native wait.
+        let native = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(None)
+        };
+        assert_eq!(bounded_cname_attempt(native, None).await.unwrap(), None);
     }
 }
