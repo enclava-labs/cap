@@ -663,6 +663,7 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
             customer_config_keys: Vec::new(),
             log_key_id: None,
             log_private_key_file: None,
+            signed_log_key_id: None,
         },
     )
     .unwrap();
@@ -678,6 +679,7 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
             customer_config_keys: Vec::new(),
             log_key_id: None,
             log_private_key_file: None,
+            signed_log_key_id: None,
         },
     )
     .unwrap();
@@ -711,6 +713,7 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
             customer_config_keys: Vec::new(),
             log_key_id: None,
             log_private_key_file: None,
+            signed_log_key_id: None,
         },
     )
     .unwrap();
