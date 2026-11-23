@@ -408,14 +408,13 @@ fn broker_failure_diagnostic(body: &[u8], now: DateTime<Utc>) -> SafeBootstrapDi
     let Some(code) = SafeDiagnosticCode::from_broker_code(&parsed.error) else {
         return SafeBootstrapDiagnostic::acme_failed();
     };
-    SafeBootstrapDiagnostic {
+    SafeBootstrapDiagnostic::new(
         code,
-        retry_after: parsed
+        parsed
             .retry_after
             .as_deref()
             .and_then(|value| SafeBootstrapDiagnostic::parse_retry_after(value, now)),
-        stage: None,
-    }
+    )
 }
 
 /// Read at most `limit` bytes of a blocking response body. Returns `None`
@@ -701,11 +700,10 @@ fn issue_via_broker(
             // Defer to a later check instead of sleeping or ordering; the
             // persisted deadline stays in force.
             return Err(anyhow::Error::new(TlsBrokerFailure {
-                diagnostic: SafeBootstrapDiagnostic {
-                    code: SafeDiagnosticCode::AcmeRateLimited,
-                    retry_after: Some(deadline),
-                    stage: None,
-                },
+                diagnostic: SafeBootstrapDiagnostic::new(
+                    SafeDiagnosticCode::AcmeRateLimited,
+                    Some(deadline),
+                ),
             }));
         }
         (wait.sleep_until)(deadline);
@@ -3111,22 +3109,20 @@ hkdf-info = "tls-state-luks-key"
     #[test]
     fn waitable_rate_limit_predicate_is_exact() {
         let now = DateTime::from_timestamp(1789000000, 0).unwrap();
-        let fresh = SafeBootstrapDiagnostic {
-            code: SafeDiagnosticCode::AcmeRateLimited,
-            retry_after: Some(now + TimeDelta::minutes(30)),
-            stage: None,
-        };
+        let fresh = SafeBootstrapDiagnostic::new(
+            SafeDiagnosticCode::AcmeRateLimited,
+            Some(now + TimeDelta::minutes(30)),
+        );
         assert_eq!(
             waitable_rate_limit(&fresh, now, ACME_RETRY_MAX_WAIT_SECS),
             Some(now + TimeDelta::minutes(30))
         );
         // A deadline beyond the given bound is not actionable under it:
         // out of the boot wait bound, inside the no-wait defer bound.
-        let long = SafeBootstrapDiagnostic {
-            code: SafeDiagnosticCode::AcmeRateLimited,
-            retry_after: Some(now + TimeDelta::seconds(ACME_RETRY_MAX_DEFER_SECS)),
-            stage: None,
-        };
+        let long = SafeBootstrapDiagnostic::new(
+            SafeDiagnosticCode::AcmeRateLimited,
+            Some(now + TimeDelta::seconds(ACME_RETRY_MAX_DEFER_SECS)),
+        );
         assert_eq!(
             waitable_rate_limit(&long, now, ACME_RETRY_MAX_WAIT_SECS),
             None
@@ -3141,11 +3137,8 @@ hkdf-info = "tls-state-luks-key"
             None,
             Some(now + TimeDelta::seconds(ACME_RETRY_MAX_WAIT_SECS + 1)),
         ] {
-            let diagnostic = SafeBootstrapDiagnostic {
-                code: SafeDiagnosticCode::AcmeRateLimited,
-                retry_after,
-                stage: None,
-            };
+            let diagnostic =
+                SafeBootstrapDiagnostic::new(SafeDiagnosticCode::AcmeRateLimited, retry_after);
             assert_eq!(
                 waitable_rate_limit(&diagnostic, now, ACME_RETRY_MAX_WAIT_SECS),
                 None

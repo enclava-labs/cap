@@ -38,6 +38,22 @@ const STORED_ATTEMPT_VERSION: u32 = 1;
 
 /// Stay an hour inside PaaS's 24h replay window so client/server clock skew
 /// cannot turn a forgotten key into a new rollout.
+///
+/// The window bounds only an absent or settled row. An in-flight row may be
+/// replayed at any age because idempotency retention extends for live rows
+/// (#402, verified against both servers): enclava-paas keeps a
+/// `hosted_operation_intents` row replayable while it is `pending`/
+/// `token_pending` (`replay_active` in `server/src/hosted_operations.rs`)
+/// and only starts its 24h `replay_expires_at` window at terminalization,
+/// while CAP's reservation for a still-retried operation is refreshed by
+/// every lease. A reservation quiet for a day is terminalized by the reaper
+/// (`IDEMPOTENCY_REAP_HORIZON_SECONDS` in
+/// `crates/enclava-api/src/routes/internal.rs`) as `abandoned`, which the
+/// route's recovery policy settles as `idempotency_recovery_required` for
+/// fail-closed mutations — already retired by
+/// [`template_instance_rejection_retires_attempt`]. An over-age replay thus
+/// re-posts the original signed bytes into the original key's fate; it never
+/// signs a second deployment.
 pub const TEMPLATE_DEPLOY_REPLAY_WINDOW_SECS: u64 = 23 * 60 * 60;
 
 /// Settings that identify "the same template deploy command". The signed blobs
@@ -85,8 +101,11 @@ pub struct StoredTemplateWorkflow {
     pub paas_managed_config_keys: Vec<String>,
 }
 
-/// Log-key output from the invocation that signed the request. A retry that
-/// died before printing still has to report the key the descriptor contains.
+/// Explicit `--log-key` / `--generate-log-key` output from the invocation
+/// that signed the request. A retry that died before printing still has to
+/// report a generated private-key path. This is not the key the descriptor
+/// was signed with: PaaS injects an already-active key even when no flag
+/// was passed, and that id is [`NewTemplateDeployAttempt::signed_log_key_id`].
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoredTemplateLogKey {
     pub key_id: String,
@@ -98,8 +117,15 @@ pub struct StoredTemplateLogKey {
 pub struct NewTemplateDeployAttempt {
     pub unlock_mode: String,
     pub paas_managed_config_keys: Vec<String>,
+    /// Explicit flag preparation only. Absent when the command passed no
+    /// log-key flag, even if the signed request carries an active key.
     pub log_key_id: Option<String>,
     pub log_private_key_file: Option<String>,
+    /// Key id baked into the signed deployment (`signed_blobs.log_encryption`).
+    /// Distinct from [`Self::log_key_id`]: retry flag checks compare against
+    /// this, while output keeps the explicit preparation (including a
+    /// generated private-key path).
+    pub signed_log_key_id: Option<String>,
 }
 
 /// What this run should POST.
@@ -112,7 +138,13 @@ pub enum TemplateDeployAttempt {
         request: Box<CreateTemplateInstanceRequest>,
         deploy_id: String,
         workflow: Option<StoredTemplateWorkflow>,
+        /// Explicit flag output (generated private-key path). Not the
+        /// comparison key — that is `signed_log_key_id` on this variant.
         log_key: Option<StoredTemplateLogKey>,
+        /// Key id in the signed request. `None` on files that predate the
+        /// field; callers fall back to `log_key.key_id`, which was verified
+        /// equal to the signed key when a flag was passed.
+        signed_log_key_id: Option<String>,
     },
     /// A second signed request would race an in-flight deployment. Do not POST.
     Refuse(String),
@@ -147,6 +179,12 @@ pub struct StoredTemplateDeployAttempt {
     workflow: Option<StoredTemplateWorkflow>,
     #[serde(default)]
     log_key: Option<StoredTemplateLogKey>,
+    /// Key id the policy response baked into the signed deployment. Absent
+    /// on files written before this field; those fall back to `log_key`,
+    /// which matches the signed key when a flag was passed and is absent
+    /// when it was not (the signed id is then unknown).
+    #[serde(default)]
+    signed_log_key_id: Option<String>,
     /// Set only after this command finished. A later list outage must not
     /// replay a finished request into a new server generation.
     #[serde(default)]
@@ -502,6 +540,152 @@ pub fn password_resume_key_source(
     None
 }
 
+/// Marker for [`password_resume_key_source_seed_fallible`]'s error arm: the
+/// recovery-seed failure must surface to the caller instead of being
+/// swallowed as "no key".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeedError;
+
+/// [`password_resume_key_source`] for runs where deriving from the recovery
+/// seed failed ([`SeedError`] must surface the seed error).
+///
+/// A seed error must not pre-empt a saved per-app key that answers the signed
+/// request (#402): ownership claim reads the saved file before it derives
+/// from the seed, so a broken, removed, or replaced seed cannot hide a key
+/// that can still finish the deploy. The error surfaces only when no saved
+/// key matches — an unreadable source is not a match.
+pub fn password_resume_key_source_seed_fallible(
+    saved_hash: Option<&str>,
+    derived_hash: Option<&str>,
+    seed_error: bool,
+    stored_hash: Option<&str>,
+) -> Result<Option<PasswordResumeKeySource>, SeedError> {
+    if !seed_error {
+        return Ok(password_resume_key_source(
+            saved_hash,
+            derived_hash,
+            stored_hash,
+        ));
+    }
+    if saved_hash.is_some_and(|hash| stored_hash == Some(hash)) {
+        return Ok(Some(PasswordResumeKeySource::Saved));
+    }
+    Err(SeedError)
+}
+
+/// A resumed deploy re-posts the stored request byte-identically, so this
+/// run's `--log-key` / `--generate-log-key` cannot change what it carries.
+/// A retry naming different flags is diverging and must refuse instead of
+/// silently ignoring them (#402).
+///
+/// `stored_key_id` is the key the request was signed with
+/// ([`signed_log_key_id_for_replay`]), not only an explicit flag. PaaS
+/// injects an already-active key into agent-policy even when the original
+/// command passed no flag, and that key enters the signed deployment.
+///
+/// `--log-key` naming that signed id resumes: it does not promise a new
+/// file. `--generate-log-key` does. A replay never calls key generation, so
+/// generation is permitted only when this attempt already recorded a
+/// private key for that id ([`recorded_generated_private_key_file`]) and the
+/// retry does not ask to write a different path. Otherwise the command
+/// would succeed without writing the file the flag promises (#403).
+pub fn replay_log_key_flag_conflict(
+    stored_key_id: Option<&str>,
+    log_key: Option<&str>,
+    generate_log_key: Option<&str>,
+    stored_private_key_file: Option<&str>,
+    requested_private_key_file: Option<&std::path::Path>,
+) -> Result<(), String> {
+    if log_key.is_some() && generate_log_key.is_some() {
+        return Err("--log-key and --generate-log-key cannot be used together".to_string());
+    }
+    let Some(requested) = log_key.or(generate_log_key) else {
+        // No flags: the replay keeps the stored key, identical by design.
+        return Ok(());
+    };
+    if stored_key_id != Some(requested) {
+        let flag = if log_key.is_some() {
+            "--log-key"
+        } else {
+            "--generate-log-key"
+        };
+        let stored = match stored_key_id {
+            Some(key_id) => format!("log key `{key_id}`"),
+            None => "no log-encryption key".to_string(),
+        };
+        return Err(format!(
+            "the template deploy being resumed re-posts the request signed on this machine byte-identically, so {flag} `{requested}` would be silently ignored: that request was signed with {stored}. A new deployment was not started. Retry the original command to resume that deployment, or destroy the app and deploy again.",
+        ));
+    }
+    // The id matches. Naming it with --log-key does not promise a file.
+    if generate_log_key.is_none() {
+        return Ok(());
+    }
+    // --generate-log-key promises a private key the replay will not create.
+    let Some(stored_path) = nonempty_private_key_path(stored_private_key_file) else {
+        let file = match requested_private_key_file {
+            Some(path) => format!("`{}`", path.display()),
+            None => "a private-key file".to_string(),
+        };
+        return Err(format!(
+            "the template deploy being resumed re-posts the request signed on this machine byte-identically, so --generate-log-key `{requested}` would not generate a private key or write {file}: that request was signed with log key `{requested}` and no private key was generated on this machine. A new deployment was not started. Retry the original command without --generate-log-key to resume that deployment, or destroy the app and deploy again.",
+        ));
+    };
+    if let Some(requested_path) = requested_private_key_file
+        && !private_key_paths_consistent(stored_path, requested_path)
+    {
+        return Err(format!(
+            "the template deploy being resumed re-posts the request signed on this machine byte-identically, so --log-private-key-file `{}` would not be written: the private key was already written to `{stored_path}`. A new deployment was not started. Retry with --log-private-key-file `{stored_path}`, or omit --log-private-key-file, to resume that deployment.",
+            requested_path.display(),
+        ));
+    }
+    Ok(())
+}
+
+/// Private-key path recorded for `stored_key_id`, if this attempt generated
+/// one. A path stored under a different explicit key id is not evidence that
+/// this signed key was generated on this machine.
+pub fn recorded_generated_private_key_file<'a>(
+    stored_key_id: Option<&str>,
+    stored_log_key: Option<&'a StoredTemplateLogKey>,
+) -> Option<&'a str> {
+    let key = stored_log_key?;
+    if stored_key_id != Some(key.key_id.as_str()) {
+        return None;
+    }
+    nonempty_private_key_path(key.private_key_file.as_deref())
+}
+
+fn nonempty_private_key_path(path: Option<&str>) -> Option<&str> {
+    path.map(str::trim).filter(|path| !path.is_empty())
+}
+
+/// The retry did not ask for a different file. Omitting
+/// `--log-private-key-file` is consistent: output reports the stored path.
+/// A named path must be the path already written. Component equality only —
+/// a different spelling (`./`, relative vs absolute) refuses, and the error
+/// names the stored path.
+fn private_key_paths_consistent(stored: &str, requested: &std::path::Path) -> bool {
+    std::path::Path::new(stored) == requested
+}
+
+/// Key id the resumed request was signed with.
+///
+/// `signed_log_key_id` is the policy response's key, persisted separately
+/// from explicit `--log-key` / `--generate-log-key` output. Files written
+/// before that field fall back to the explicit key, which was verified
+/// equal to the signed key when a flag was passed. Absent both, the
+/// signed key is unknown and a retry flag must refuse.
+pub fn signed_log_key_id_for_replay<'a>(
+    signed_log_key_id: Option<&'a str>,
+    explicit_log_key_id: Option<&'a str>,
+) -> Option<&'a str> {
+    signed_log_key_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .or(explicit_log_key_id)
+}
+
 /// Whether this attempt must satisfy password-mode gates.
 ///
 /// A stored password workflow is not a gate by itself. Selection returns
@@ -816,11 +1000,13 @@ fn replay(stored: Box<StoredTemplateDeployAttempt>) -> TemplateDeployAttempt {
     let deploy_id = stored.deploy_id.clone();
     let workflow = stored.workflow.clone();
     let log_key = stored.log_key.clone();
+    let signed_log_key_id = nonempty_key_id(stored.signed_log_key_id.as_deref());
     TemplateDeployAttempt::Replay {
         request: Box::new((*stored).into_request()),
         deploy_id,
         workflow,
         log_key,
+        signed_log_key_id,
     }
 }
 
@@ -871,11 +1057,25 @@ pub fn lifecycle_status(deployment: &ObservedTemplateDeployment) -> &str {
         .unwrap_or(deployment.status.as_str())
 }
 
+/// Every row status this CLI classifies as a settled rollout, pinned against
+/// the fixture in `tests/fixtures/template_deployment_status_vocabulary.json`.
+/// A server-side status addition must update the fixture and these sets
+/// together — `deployment_status_vocabulary_stays_classified` fails otherwise.
+pub const TERMINAL_STATUSES: &[&str] = &[
+    "healthy",
+    "failed",
+    "rolled_back",
+    "superseded",
+    "cancelled",
+];
+
+/// Every row status this CLI classifies as evidence of a live rollout.
+/// Same fixture contract as [`TERMINAL_STATUSES`] (#402).
+pub const IN_FLIGHT_STATUSES: &[&str] =
+    &["pending", "applying", "watching", "creating", "deploying"];
+
 pub fn deployment_is_terminal(deployment: &ObservedTemplateDeployment) -> bool {
-    matches!(
-        lifecycle_status(deployment),
-        "healthy" | "failed" | "rolled_back" | "superseded" | "cancelled"
-    )
+    TERMINAL_STATUSES.contains(&lifecycle_status(deployment))
 }
 
 /// True only when the row is evidence of a live rollout a second POST would race.
@@ -889,17 +1089,25 @@ pub fn deployment_is_in_flight(deployment: &ObservedTemplateDeployment) -> bool 
     }
     // Allowlist, not "anything that is not terminal". A future stored status
     // this CLI does not know (PaaS today only stores pending/applying/healthy/
-    // failed) must not block an intentional redeploy forever.
-    matches!(
-        lifecycle_status(deployment),
-        "pending" | "applying" | "watching" | "creating" | "deploying"
-    )
+    // failed) must not block an intentional redeploy forever. The pinned
+    // vocabulary fixture in `tests/fixtures/` is what makes such an addition
+    // visible here instead of failing open silently (#402).
+    IN_FLIGHT_STATUSES.contains(&lifecycle_status(deployment))
 }
 
 /// A consumed template-deploy key must not be replayed: PaaS stores that
 /// rejection and serves it again for the replay window. A failed placeholder
 /// row has no `cap_deployment_id`, so the next run would otherwise Replay the
 /// dead key.
+///
+/// There is no shared source of truth for these rules across the repos
+/// (#402): this allowlist mirrors enclava-paas
+/// `server/src/hosted_operations.rs::is_permanent_cap_rejection` (the
+/// status-code arm) and `record_permanent_rejection` (which stamps the
+/// `idempotency_disposition` this function trusts and replays the rejection
+/// from `hosted_operation_intents` for the 24h `replay_expires_at` window).
+/// Any edit here must land there too: drift in either direction deletes a
+/// replayable resume file or wedges the name until the replay window passes.
 ///
 /// Retire when the body says the key is consumed (`idempotency_disposition =
 /// completed`), or when the code is a terminal rejection PaaS replays even
@@ -966,8 +1174,10 @@ pub fn template_instance_rejection_retires_attempt(error: &crate::api_client::Ap
 }
 
 /// Statuses for which PaaS records an unstamped CAP rejection and replays it.
-/// Mirrors `is_permanent_cap_rejection` when the body has no disposition:
-/// 400-499, except the pre-lease and retryable statuses.
+/// Mirrors `is_permanent_cap_rejection` (enclava-paas
+/// `server/src/hosted_operations.rs`, see
+/// [`template_instance_rejection_retires_attempt`]) when the body has no
+/// disposition: 400-499, except the pre-lease and retryable statuses.
 fn unstamped_cap_rejection_is_permanent(status: u16) -> bool {
     (400..500).contains(&status) && !matches!(status, 401 | 403 | 408 | 425 | 429)
 }
@@ -1162,19 +1372,16 @@ pub fn save_template_deploy_attempt(
             paas_managed_config_keys: record.paas_managed_config_keys.clone(),
         }),
         log_key: stored_log_key(record),
+        signed_log_key_id: nonempty_key_id(record.signed_log_key_id.as_deref()),
         completed: false,
     };
     write_stored(paths, &stored)
 }
 
 fn stored_log_key(record: &NewTemplateDeployAttempt) -> Option<StoredTemplateLogKey> {
-    let key_id = record
-        .log_key_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|key_id| !key_id.is_empty())?;
+    let key_id = nonempty_key_id(record.log_key_id.as_deref())?;
     Some(StoredTemplateLogKey {
-        key_id: key_id.to_string(),
+        key_id,
         private_key_file: record
             .log_private_key_file
             .as_deref()
@@ -1182,6 +1389,13 @@ fn stored_log_key(record: &NewTemplateDeployAttempt) -> Option<StoredTemplateLog
             .filter(|path| !path.is_empty())
             .map(str::to_string),
     })
+}
+
+fn nonempty_key_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 pub fn load_template_deploy_attempt(
@@ -1423,6 +1637,7 @@ mod tests {
                 key_id: "shell-logs".to_string(),
                 private_key_file: Some("/keys/shell-logs.x25519".to_string()),
             }),
+            signed_log_key_id: Some("shell-logs".to_string()),
             completed: false,
         }
     }
@@ -1471,6 +1686,7 @@ mod tests {
             paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
             log_key_id: Some("shell-logs".to_string()),
             log_private_key_file: Some("/keys/shell-logs.x25519".to_string()),
+            signed_log_key_id: Some("shell-logs".to_string()),
         }
     }
 
@@ -1489,6 +1705,7 @@ mod tests {
             deploy_id,
             workflow,
             log_key,
+            signed_log_key_id,
         } = attempt
         else {
             panic!("in-flight retry must replay the stored request, not sign a new one");
@@ -1505,6 +1722,7 @@ mod tests {
             log_key.expect("replay must keep the signed log key").key_id,
             "shell-logs"
         );
+        assert_eq!(signed_log_key_id.as_deref(), Some("shell-logs"));
         assert_eq!(
             idempotency_key_for_request(&request),
             idempotency_key_for_request(&original),
@@ -2685,5 +2903,395 @@ mod tests {
             Some(PasswordResumeKeySource::Derived)
         );
         assert_eq!(password_resume_key_source(None, None, Some(&stored)), None);
+    }
+
+    #[test]
+    fn deployment_status_vocabulary_stays_classified() {
+        // The fixture in tests/fixtures/ pins the servers' status vocabulary
+        // (checked by scripts/gen-template-deployment-status-vocabulary.sh).
+        // A server-side status addition must reach this fixture AND the
+        // classifier sets together: either drifting alone fails here (#402).
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            statuses: Vec<Entry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            status: String,
+            class: String,
+        }
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/template_deployment_status_vocabulary.json"
+        ))
+        .expect("the pinned status vocabulary fixture parses");
+        let mut fixture_in_flight = std::collections::BTreeSet::new();
+        let mut fixture_terminal = std::collections::BTreeSet::new();
+        for entry in &fixture.statuses {
+            let observed = row("deploy-1", "projected", Some(entry.status.as_str()));
+            match entry.class.as_str() {
+                "in_flight" => {
+                    assert!(
+                        deployment_is_in_flight(&observed),
+                        "{} must classify as in_flight",
+                        entry.status
+                    );
+                    assert!(!deployment_is_terminal(&observed));
+                    fixture_in_flight.insert(entry.status.clone());
+                }
+                "terminal" => {
+                    assert!(
+                        deployment_is_terminal(&observed),
+                        "{} must classify as terminal",
+                        entry.status
+                    );
+                    assert!(!deployment_is_in_flight(&observed));
+                    fixture_terminal.insert(entry.status.clone());
+                }
+                "folded" => {
+                    assert!(
+                        !deployment_is_in_flight(&observed) && !deployment_is_terminal(&observed),
+                        "{} is folded before storage and must fall through to the fail-open default",
+                        entry.status
+                    );
+                }
+                other => panic!("fixture class `{other}` is not in_flight/terminal/folded"),
+            }
+        }
+        let code_in_flight: std::collections::BTreeSet<String> =
+            IN_FLIGHT_STATUSES.iter().map(|s| s.to_string()).collect();
+        let code_terminal: std::collections::BTreeSet<String> =
+            TERMINAL_STATUSES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            fixture_in_flight, code_in_flight,
+            "the fixture and IN_FLIGHT_STATUSES must pin the same vocabulary"
+        );
+        assert_eq!(
+            fixture_terminal, code_terminal,
+            "the fixture and TERMINAL_STATUSES must pin the same vocabulary"
+        );
+    }
+
+    #[test]
+    fn diverging_log_key_flags_refuse_a_replay() {
+        // A replay re-posts the stored request byte-identically: flags that
+        // match what it was signed with resume, diverging flags refuse
+        // naming the flag instead of being silently ignored (#402).
+        assert!(replay_log_key_flag_conflict(Some("shell-logs"), None, None, None, None).is_ok());
+        assert!(
+            replay_log_key_flag_conflict(Some("shell-logs"), Some("shell-logs"), None, None, None)
+                .is_ok()
+        );
+        // Matching --generate-log-key is not an id match. The replay does not
+        // generate a key, so it resumes only when a private key was already
+        // recorded and the retry does not name a different path.
+        let error = replay_log_key_flag_conflict(
+            Some("shell-logs"),
+            None,
+            Some("shell-logs"),
+            None,
+            Some(std::path::Path::new("/tmp/shell.key")),
+        )
+        .expect_err("generate without a recorded private key must refuse");
+        assert!(error.contains("--generate-log-key"), "{error}");
+        assert!(error.contains("/tmp/shell.key"), "{error}");
+        assert!(
+            replay_log_key_flag_conflict(
+                Some("shell-logs"),
+                None,
+                Some("shell-logs"),
+                Some("/tmp/shell.key"),
+                Some(std::path::Path::new("/tmp/shell.key")),
+            )
+            .is_ok()
+        );
+        assert!(
+            replay_log_key_flag_conflict(
+                Some("shell-logs"),
+                None,
+                Some("shell-logs"),
+                Some("/tmp/shell.key"),
+                None,
+            )
+            .is_ok(),
+            "omitting --log-private-key-file does not ask for a different file"
+        );
+        let error = replay_log_key_flag_conflict(
+            Some("shell-logs"),
+            None,
+            Some("shell-logs"),
+            Some("/tmp/shell.key"),
+            Some(std::path::Path::new("/tmp/other.key")),
+        )
+        .expect_err("a different private-key path must refuse");
+        assert!(error.contains("/tmp/shell.key"), "{error}");
+        assert!(error.contains("/tmp/other.key"), "{error}");
+        assert!(replay_log_key_flag_conflict(None, None, None, None, None).is_ok());
+
+        let error =
+            replay_log_key_flag_conflict(Some("shell-logs"), Some("audit-logs"), None, None, None)
+                .expect_err("a diverging --log-key must refuse");
+        assert!(error.contains("--log-key"), "{error}");
+        assert!(error.contains("audit-logs"), "{error}");
+
+        let error = replay_log_key_flag_conflict(
+            Some("shell-logs"),
+            None,
+            Some("audit-logs"),
+            Some("/tmp/shell.key"),
+            None,
+        )
+        .expect_err("a diverging --generate-log-key must refuse");
+        assert!(error.contains("--generate-log-key"), "{error}");
+
+        let error = replay_log_key_flag_conflict(None, Some("shell-logs"), None, None, None)
+            .expect_err("a flag naming a key the request was not signed with must refuse");
+        assert!(error.contains("--log-key"), "{error}");
+
+        let error =
+            replay_log_key_flag_conflict(Some("shell-logs"), Some("a"), Some("b"), None, None)
+                .expect_err("both flags at once still refuses");
+        assert!(error.contains("cannot be used together"), "{error}");
+    }
+
+    #[test]
+    fn matching_active_log_key_resumes_when_no_flag_was_prepared() {
+        // PaaS injects an already-active key into agent-policy even when the
+        // original command passed no flag, and that key enters the signed
+        // request. The resume file must remember that id, or a retry naming
+        // the same --log-key is refused as a divergence (#403). Output
+        // metadata stays absent: there is no generated private-key path.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+        let stable = stable();
+        let request = request_from(&stable, "descriptor-a");
+        save_template_deploy_attempt(
+            &paths,
+            "org:org-1",
+            "app-uuid",
+            "deploy-1",
+            &request,
+            &NewTemplateDeployAttempt {
+                unlock_mode: "password".to_string(),
+                paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
+                log_key_id: None,
+                log_private_key_file: None,
+                signed_log_key_id: Some("audit".to_string()),
+            },
+        )
+        .unwrap();
+        let LoadedTemplateDeployAttempt::Ready(stored) =
+            load_template_deploy_attempt(&paths, "org:org-1", "shell")
+        else {
+            panic!("stored request must load");
+        };
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(stored),
+            &stable,
+            &listed(vec![row("deploy-1", "applying", Some("applying"))]),
+        );
+        let TemplateDeployAttempt::Replay {
+            log_key,
+            signed_log_key_id,
+            ..
+        } = attempt
+        else {
+            panic!("in-flight retry must replay the signed request");
+        };
+        assert!(
+            log_key.is_none(),
+            "no explicit preparation must not invent output metadata"
+        );
+        let compared = signed_log_key_id_for_replay(
+            signed_log_key_id.as_deref(),
+            log_key.as_ref().map(|key| key.key_id.as_str()),
+        );
+        assert_eq!(compared, Some("audit"));
+        assert!(replay_log_key_flag_conflict(compared, Some("audit"), None, None, None).is_ok());
+        assert!(replay_log_key_flag_conflict(compared, None, None, None, None).is_ok());
+        let error = replay_log_key_flag_conflict(compared, Some("other"), None, None, None)
+            .expect_err("a different key still refuses");
+        assert!(error.contains("audit"), "{error}");
+        // The same fixture used to let --generate-log-key audit through,
+        // because the check treated it as an id match. The replay never
+        // generates a key, and this attempt recorded no private-key path.
+        let error = replay_log_key_flag_conflict(
+            compared,
+            None,
+            Some("audit"),
+            recorded_generated_private_key_file(compared, log_key.as_ref()),
+            Some(std::path::Path::new("/tmp/audit.key")),
+        )
+        .expect_err("generate against an injected active key must refuse before posting");
+        assert!(error.contains("--generate-log-key"), "{error}");
+        assert!(error.contains("/tmp/audit.key"), "{error}");
+        assert!(
+            recorded_generated_private_key_file(compared, log_key.as_ref()).is_none(),
+            "no explicit preparation must not invent a generated private-key path"
+        );
+
+        // Files written before signed_log_key_id fall back to the explicit
+        // key (verified equal to the signed key when a flag was passed).
+        assert_eq!(
+            signed_log_key_id_for_replay(None, Some("shell-logs")),
+            Some("shell-logs")
+        );
+        assert_eq!(
+            signed_log_key_id_for_replay(Some("  "), Some("shell-logs")),
+            Some("shell-logs")
+        );
+        assert_eq!(
+            signed_log_key_id_for_replay(Some("audit"), Some("shell-logs")),
+            Some("audit")
+        );
+
+        // A file written before the field still loads, and comparison falls
+        // back to the explicit key rather than refusing the resume file.
+        let path = attempt_path(&paths, "org:org-1", "shell");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("signed_log_key_id");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let LoadedTemplateDeployAttempt::Ready(legacy) =
+            load_template_deploy_attempt(&paths, "org:org-1", "shell")
+        else {
+            panic!("a pre-field resume file must still load");
+        };
+        assert!(legacy.signed_log_key_id.is_none());
+        assert_eq!(
+            signed_log_key_id_for_replay(
+                legacy.signed_log_key_id.as_deref(),
+                legacy.log_key.as_ref().map(|key| key.key_id.as_str()),
+            ),
+            None,
+            "no explicit key and no signed id stays unknown, so a new flag refuses"
+        );
+    }
+
+    #[test]
+    fn generate_log_key_on_retry_requires_the_recorded_private_key() {
+        // A replay never generates a key. --generate-log-key resumes only
+        // when this attempt already wrote a private key for the signed id
+        // and the retry does not name a different path. The path comes from
+        // the stored explicit preparation, the same fields the command passes.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+        let stable = stable();
+        let request = request_from(&stable, "descriptor-a");
+        save_template_deploy_attempt(
+            &paths,
+            "org:org-1",
+            "app-uuid",
+            "deploy-1",
+            &request,
+            &NewTemplateDeployAttempt {
+                unlock_mode: "password".to_string(),
+                paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
+                log_key_id: Some("audit".to_string()),
+                log_private_key_file: Some(" /tmp/audit.key ".to_string()),
+                signed_log_key_id: Some("audit".to_string()),
+            },
+        )
+        .unwrap();
+        let LoadedTemplateDeployAttempt::Ready(stored) =
+            load_template_deploy_attempt(&paths, "org:org-1", "shell")
+        else {
+            panic!("stored request must load");
+        };
+        let attempt = select(
+            LoadedTemplateDeployAttempt::Ready(stored),
+            &stable,
+            &listed(vec![row("deploy-1", "applying", Some("applying"))]),
+        );
+        let TemplateDeployAttempt::Replay {
+            log_key,
+            signed_log_key_id,
+            ..
+        } = attempt
+        else {
+            panic!("in-flight retry must replay the signed request");
+        };
+        let compared = signed_log_key_id_for_replay(
+            signed_log_key_id.as_deref(),
+            log_key.as_ref().map(|key| key.key_id.as_str()),
+        );
+        let recorded = recorded_generated_private_key_file(compared, log_key.as_ref());
+        assert_eq!(recorded, Some("/tmp/audit.key"));
+        assert!(
+            replay_log_key_flag_conflict(
+                compared,
+                None,
+                Some("audit"),
+                recorded,
+                Some(std::path::Path::new("/tmp/audit.key")),
+            )
+            .is_ok()
+        );
+        assert!(
+            replay_log_key_flag_conflict(compared, None, Some("audit"), recorded, None).is_ok(),
+            "omitting the path still reports the stored file"
+        );
+        let error = replay_log_key_flag_conflict(
+            compared,
+            None,
+            Some("audit"),
+            recorded,
+            Some(std::path::Path::new("/tmp/other.key")),
+        )
+        .expect_err("a different path must refuse before posting");
+        assert!(error.contains("/tmp/audit.key"), "{error}");
+        assert!(error.contains("/tmp/other.key"), "{error}");
+        // A private key recorded under a different explicit id is not
+        // evidence that the signed key was generated here.
+        assert_eq!(
+            recorded_generated_private_key_file(
+                Some("audit"),
+                Some(&StoredTemplateLogKey {
+                    key_id: "other".to_string(),
+                    private_key_file: Some("/tmp/other.key".to_string()),
+                }),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_seed_error_does_not_pre_empt_a_matching_saved_key() {
+        let saved = Some("hash-a");
+        let stored = Some("hash-a");
+        // The regression: the recovery-seed error used to propagate before
+        // the saved per-app key was tried. A saved key matching the signed
+        // request answers it even when the seed cannot be read (#402).
+        assert_eq!(
+            password_resume_key_source_seed_fallible(saved, None, true, stored),
+            Ok(Some(PasswordResumeKeySource::Saved)),
+            "a broken seed must not hide the saved bootstrap key that matches"
+        );
+        // The seed error surfaces only when no saved key answers.
+        assert_eq!(
+            password_resume_key_source_seed_fallible(Some("hash-b"), None, true, stored),
+            Err(SeedError),
+            "a non-matching saved key cannot absorb the seed error"
+        );
+        assert_eq!(
+            password_resume_key_source_seed_fallible(None, None, true, stored),
+            Err(SeedError)
+        );
+        // Without a seed error the original selection rules apply unchanged.
+        assert_eq!(
+            password_resume_key_source_seed_fallible(saved, Some("hash-b"), false, stored),
+            Ok(Some(PasswordResumeKeySource::Saved))
+        );
+        assert_eq!(
+            password_resume_key_source_seed_fallible(None, Some("hash-a"), false, stored),
+            Ok(Some(PasswordResumeKeySource::Derived))
+        );
+        assert_eq!(
+            password_resume_key_source_seed_fallible(None, Some("hash-b"), false, stored),
+            Ok(Some(PasswordResumeKeySource::Derived))
+        );
+        assert_eq!(
+            password_resume_key_source_seed_fallible(None, None, false, stored),
+            Ok(None)
+        );
     }
 }

@@ -113,9 +113,10 @@ fn main() -> ExitCode {
 /// `enclava_init_failed` code. The raw anyhow chain — which may carry
 /// paths, supplied values, or provider text — is never rendered here.
 fn report_failure(error: &anyhow::Error) {
-    let stage = last_stage();
-    let mut diagnostic = SafeBootstrapDiagnostic::diagnose(error);
-    diagnostic.stage = stage;
+    // diagnose reads the stage tracker record_stage writes. There is no
+    // stage parameter, so a caller cannot name a stage the run never reached.
+    let diagnostic = SafeBootstrapDiagnostic::diagnose(error);
+    let stage = diagnostic.stage();
     let safe_json = diagnostic.render_json();
     record_failure_file(&safe_json, stage);
     tracing::error!(
@@ -481,6 +482,8 @@ fn clear_tls_unusable(path: &Path) {
 /// the stage file back to the latched error's `failed_stage`, so the
 /// last durably-latched failure is the pair that survives.
 fn record_failure_file(safe_json: &str, stage: Option<&'static str>) {
+    // Stage before error is deliberate: the inverse write order can leave a
+    // latched error whose stage file names a stage this failure never reached.
     match stage {
         Some(stage) => {
             let marker = format!("{stage}\n");
@@ -526,18 +529,10 @@ fn write_termination_log_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<
 /// shared with failure reporting so every latched failure can name the
 /// exact stage it occurred at (#397). Only `record_stage` literals ever
 /// land here, so the value is safe for the bounded failure payload.
-static LAST_STAGE: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
-
+/// The tracker lives in `safe_diagnostics` so `diagnose` reads it itself
+/// and cannot be handed a different string (#402).
 fn set_last_stage(stage: Option<&'static str>) {
-    *LAST_STAGE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = stage;
-}
-
-fn last_stage() -> Option<&'static str> {
-    *LAST_STAGE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    enclava_init::safe_diagnostics::set_last_stage(stage);
 }
 
 /// Record the fixed-vocabulary bootstrap stage this run has reached.

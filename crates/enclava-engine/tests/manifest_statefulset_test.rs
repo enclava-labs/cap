@@ -222,7 +222,7 @@ fn statefulset_phase5_uses_only_steady_state_containers() {
             .as_ref()
             .and_then(|spec| spec.template.metadata.as_ref())
             .and_then(|metadata| metadata.labels.as_ref())
-            .and_then(|labels| labels.get("enclava.dev/deployment-id"))
+            .and_then(|labels| labels.get(enclava_engine::manifest::DEPLOYMENT_ID_LABEL))
             .map(String::as_str),
         Some("11111111-2222-3333-4444-555555555555"),
         "pods must carry the exact deployment identity used by live status observations"
