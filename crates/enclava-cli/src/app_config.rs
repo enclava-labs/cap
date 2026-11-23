@@ -15,6 +15,76 @@ pub struct AppConfig {
     #[serde(default)]
     pub resources: ResourcesSection,
     pub health: Option<HealthSection>,
+    #[serde(default)]
+    pub egress: EgressSection,
+    /// Unrecognised top-level keys, kept only so `validate` can name them.
+    #[serde(flatten, skip_serializing)]
+    pub unknown: HashMap<String, toml::Value>,
+}
+
+/// Outbound network posture for the workload, fixed at `enclava create`.
+///
+/// `mode = "restricted"` (default) allows only platform endpoints plus the
+/// `allowlist` hostnames. `mode = "public_internet"` allows any public IPv4
+/// address; private, link-local and metadata ranges stay blocked, and the
+/// policy grants no general IPv6 egress.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressSection {
+    /// `None` takes the server default (restricted).
+    #[serde(default, deserialize_with = "deserialize_egress_mode")]
+    pub mode: Option<enclava_engine::types::EgressMode>,
+    /// `allow` is accepted as an alias: existing canary files already use it.
+    #[serde(default, alias = "allow")]
+    pub allowlist: Vec<EgressAllowSection>,
+}
+
+/// Parses `mode` at load time so an unusable value can never reach the create
+/// request as "unset". An empty string is rejected rather than read as
+/// restricted: egress is fixed at create time, so a blank is likely a mistake.
+fn deserialize_egress_mode<'de, D>(
+    deserializer: D,
+) -> Result<Option<enclava_engine::types::EgressMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(raw) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Err(serde::de::Error::custom(
+            "invalid egress_mode \"\"; expected restricted or public_internet",
+        ));
+    }
+    raw.parse().map(Some).map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressAllowSection {
+    pub host: String,
+    /// TCP ports; defaults to `[443]` when omitted.
+    pub ports: Option<Vec<u16>>,
+}
+
+impl EgressSection {
+    /// Canonical mode string for the create request, or `None` to take the
+    /// server default (restricted).
+    pub fn mode_for_request(&self) -> Option<String> {
+        self.mode.map(|mode| mode.as_str().to_string())
+    }
+
+    /// Allowlist rules for the create request, with omitted ports set to 443
+    /// (the server default, made explicit so the request is self-describing).
+    pub fn allowlist_for_request(&self) -> Vec<crate::api_types::HostedTemplateEgressRule> {
+        self.allowlist
+            .iter()
+            .map(|rule| crate::api_types::HostedTemplateEgressRule {
+                host: rule.host.clone(),
+                ports: rule.ports.clone().unwrap_or_else(|| vec![443]),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +270,33 @@ impl AppConfig {
             return Err(AppConfigError::Validation(
                 "app command entries cannot be empty".to_string(),
             ));
+        }
+
+        // Unknown top-level tables are rejected: egress is fixed at create
+        // time, so a misspelled `[egres]` must not silently create a
+        // restricted app.
+        if let Some(unknown) = self.unknown.keys().min() {
+            return Err(AppConfigError::Validation(format!(
+                "unknown enclava.toml section or key '{unknown}'; expected one of: \
+                 app, storage, unlock, services, resources, health, egress"
+            )));
+        }
+
+        for rule in &self.egress.allowlist {
+            if rule.host.trim().is_empty() || rule.host.trim() != rule.host {
+                return Err(AppConfigError::Validation(format!(
+                    "[egress] allowlist host {:?} must be a non-empty hostname without surrounding whitespace",
+                    rule.host
+                )));
+            }
+            if let Some(ports) = &rule.ports
+                && (ports.is_empty() || ports.contains(&0))
+            {
+                return Err(AppConfigError::Validation(format!(
+                    "[egress] allowlist ports for {} must be between 1 and 65535",
+                    rule.host
+                )));
+            }
         }
 
         Ok(())

@@ -1873,6 +1873,9 @@ fn template_app_config(template: &HostedTemplate, instance_name: &str) -> AppCon
             interval: template.health_interval.unwrap_or(30),
             timeout: template.health_timeout.unwrap_or(5),
         }),
+        // Template egress travels on the template deploy request, not here.
+        egress: Default::default(),
+        unknown: HashMap::new(),
     }
 }
 
