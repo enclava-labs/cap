@@ -77,6 +77,14 @@ memory = "1Gi"
 path = "/health"
 interval = 30
 timeout = 5
+
+# Outbound network, fixed when the app is created. The default "restricted"
+# mode reaches only platform endpoints plus the allowlist below.
+# "public_internet" reaches any public IPv4 address (private ranges stay
+# blocked; there is no general IPv6 egress).
+# [egress]
+# mode = "public_internet"
+# allowlist = [{{ host = "api.example.com", ports = [443] }}]
 "#
     )
 }

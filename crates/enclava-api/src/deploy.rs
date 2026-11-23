@@ -7121,6 +7121,13 @@ const ROLLOUT_OBSERVATION_SLICE: std::time::Duration = std::time::Duration::from
 /// trip, and probes run on their own bounded dispatch lane
 /// (`MAX_OWNER_WAIT_PROBE_WORKERS` in deployment_jobs.rs), never on a shared
 /// apply-worker slot (#231, #387).
+///
+/// The one-poll property is pinned against `ApplyConfig::default().poll_interval`
+/// only (`extended_owner_wait_probe_slice_covers_a_single_poll`): a runtime
+/// `poll_interval` configured at or below this slice silently degrades a probe
+/// to repeated polls. That shape is deliberately tolerated (the rollout tests
+/// run a 5 ms poll interval under the full slice), so this stays a documented
+/// coupling instead of a debug assertion (#402).
 const EXTENDED_OWNER_WAIT_PROBE_SLICE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// A rollout handle returned after Kubernetes accepted the rendered manifests.
@@ -7271,7 +7278,7 @@ fn app_status_label(status: AppStatus) -> &'static str {
 /// carrying this label has had that operation's spec accepted by the API
 /// server — the fact `workload_spec_published_at` records, and the fact a
 /// crash between `apply_statefulset` and the stamp can lose.
-const WORKLOAD_DEPLOYMENT_ID_LABEL: &str = "enclava.dev/deployment-id";
+const WORKLOAD_DEPLOYMENT_ID_LABEL: &str = enclava_engine::manifest::DEPLOYMENT_ID_LABEL;
 
 /// Bound for the publication-recovery GET. Matches the rollout-settling
 /// probe: a hung API server must not hold the deployment lane forever.

@@ -17,6 +17,8 @@ on:
       - 'crates/enclava-common/**'
       - 'crates/enclava-init/**'
       - 'crates/enclava-wait-exec/**'
+      # Keep last: a later positive pattern would re-include Markdown.
+      - '!**/*.md'
   pull_request:
     paths:
       - '.github/workflows/enclava-init-image.yml'
@@ -25,6 +27,8 @@ on:
       - 'crates/enclava-common/**'
       - 'crates/enclava-init/**'
       - 'crates/enclava-wait-exec/**'
+      # Keep last: a later positive pattern would re-include Markdown.
+      - '!**/*.md'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
