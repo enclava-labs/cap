@@ -428,6 +428,7 @@ async fn deploy_with_timings(
         validate_ssh_public_keys(&public_keys, ssh_key_metadata)?;
     }
     let set_pairs = parse_config_inputs(&args.set, &args.set_file)?;
+    reject_inline_secret_config_keys(catalog.as_ref(), &args.set)?;
     let customer_config_pairs =
         template_customer_config_pairs(catalog.as_ref(), &public_keys, &set_pairs)?;
     if explicit_stable_endpoint.is_some() && !takes_ssh_keys {
@@ -1035,7 +1036,11 @@ async fn deploy_with_timings(
         }
     }
     if customer_config_hold {
-        pb.set_message("Customer config stored; releasing workload roll...");
+        if customer_config_pairs.is_empty() {
+            pb.set_message("No customer config to store; releasing workload roll...");
+        } else {
+            pb.set_message("Customer config stored; releasing workload roll...");
+        }
         release_customer_config_roll_with_retry(
             api,
             &instance_name,
@@ -2188,9 +2193,14 @@ fn template_customer_config_pairs<'a>(
             if entry.input_type == "ssh_public_keys" {
                 validate_ssh_public_keys(value, Some(entry))?;
             } else {
-                if let Some(max_bytes) = entry.validation.as_ref().and_then(|v| v.max_bytes)
-                    && value.len() > max_bytes as usize
-                {
+                // A bare key with no metadata still gets a sane ceiling so a
+                // malformed --set cannot flood the TEE config channel.
+                let max_bytes = entry
+                    .validation
+                    .as_ref()
+                    .and_then(|v| v.max_bytes)
+                    .unwrap_or(32 * 1024);
+                if value.len() > max_bytes as usize {
                     return Err(format!("{key} must be {max_bytes} bytes or smaller").into());
                 }
                 if let Some(max_items) = entry.validation.as_ref().and_then(|v| v.max_items) {
@@ -2205,7 +2215,57 @@ fn template_customer_config_pairs<'a>(
         }
         pairs.push((key.as_str(), value.clone()));
     }
+    if let Some(template) = template {
+        // Fail closed on omitted required inputs: a configless-looking
+        // deploy must not roll out an unconfigured workload. The SSH key is
+        // satisfied by the --ssh-public-key flags; a declared default
+        // satisfies the rest.
+        let missing = template
+            .config_keys
+            .iter()
+            .filter(|entry| {
+                entry.required
+                    && !entry.generated
+                    && entry.default_value.is_none()
+                    && entry.key != DEBIAN_SSH_CONFIG_KEY
+                    && !set_pairs.iter().any(|(key, _)| key == &entry.key)
+            })
+            .map(|entry| entry.key.as_str())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "missing required config keys: {}. Pass each with --set KEY=VALUE or \
+                 --set-file KEY=PATH",
+                missing.join(", ")
+            )
+            .into());
+        }
+    }
     Ok(pairs)
+}
+
+/// Fail closed when a `secret: true` config key is passed inline: `--set`
+/// values land in shell history and process listings. Secrets are
+/// file-sourced (`--set-file KEY=PATH`), matching the secrets protocol.
+fn reject_inline_secret_config_keys(
+    template: Option<&HostedTemplate>,
+    inline_set_entries: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in inline_set_entries {
+        let (key, _) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("invalid config format '{entry}': expected KEY=VALUE"))?;
+        if let Some(config_key) = template.and_then(|t| template_key(t, key))
+            && config_key.secret
+        {
+            return Err(format!(
+                "config key {key} is marked secret; pass it with --set-file {key}=<PATH> so the \
+                 value never touches the command line"
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Wait for the password-mode TEE bootstrap endpoint to accept a claim.
@@ -2545,7 +2605,9 @@ async fn deliver_template_config_with_retry(
         observed_lock: false,
         engaged_deadline: None,
     };
-    let mut sync_failures: Vec<String> = Vec::new();
+    // Phase 1: every value reaches the TEE store before any metadata sync,
+    // so a slow or failing sync cannot consume the write budget of the keys
+    // behind it.
     for (index, (key, value)) in pairs.iter().enumerate() {
         if let Err(error) = delivery.set_key(key, value).await {
             // The unlock prescription follows the error that terminated the
@@ -2566,6 +2628,12 @@ async fn deliver_template_config_with_retry(
             )
             .into());
         }
+    }
+    // Phase 2: platform metadata for the stored values. Failures are
+    // collected: every value is already in the TEE store, so the caller's
+    // release decision is safe with the whole batch done.
+    let mut sync_failures: Vec<String> = Vec::new();
+    for (key, _) in pairs.iter() {
         if let Err(error) = sync_template_config_key_with_retry(
             api,
             target.instance_name,
@@ -2575,9 +2643,7 @@ async fn deliver_template_config_with_retry(
         .await
         {
             // Distinct failure class from an undelivered value: the value is
-            // in the TEE store; only the platform's key metadata lags. Keep
-            // delivering the remaining values so a held roll only releases
-            // after every value landed.
+            // in the TEE store; only the platform's key metadata lags.
             sync_failures.push(format!("{key}: {error}"));
         }
     }
@@ -5897,6 +5963,75 @@ mod tests {
     }
 
     #[test]
+    fn template_customer_config_pairs_require_declared_required_keys() {
+        let mut template = hosted_template_with_stable_ssh();
+        template.config_keys.push(HostedTemplateConfigKey {
+            key: "API_TOKEN".to_string(),
+            label: "API token".to_string(),
+            description: "token".to_string(),
+            input_type: "password".to_string(),
+            required: true,
+            secret: true,
+            generated: false,
+            default_value: None,
+            validation: None,
+        });
+        let err = template_customer_config_pairs(Some(&template), "ssh-ed25519 AAAA", &[])
+            .expect_err("a missing required key must fail closed");
+        assert!(err.to_string().contains("API_TOKEN"), "{err}");
+        let provided = vec![("API_TOKEN".to_string(), "t".to_string())];
+        assert!(
+            template_customer_config_pairs(Some(&template), "ssh-ed25519 AAAA", &provided).is_ok()
+        );
+        // A declared default satisfies the requirement.
+        template.config_keys.last_mut().unwrap().default_value = Some("x".to_string());
+        assert!(template_customer_config_pairs(Some(&template), "ssh-ed25519 AAAA", &[]).is_ok());
+    }
+
+    #[test]
+    fn template_customer_config_pairs_default_size_cap() {
+        let mut template = hosted_template_with_stable_ssh();
+        template.config_keys.push(HostedTemplateConfigKey {
+            key: "NOTE".to_string(),
+            label: "Note".to_string(),
+            description: "note".to_string(),
+            input_type: "text".to_string(),
+            required: false,
+            secret: false,
+            generated: false,
+            default_value: None,
+            validation: None,
+        });
+        let big = vec![("NOTE".to_string(), "x".repeat(32 * 1024 + 1))];
+        assert!(template_customer_config_pairs(Some(&template), "", &big).is_err());
+        let ok = vec![("NOTE".to_string(), "x".repeat(32 * 1024))];
+        assert!(template_customer_config_pairs(Some(&template), "", &ok).is_ok());
+    }
+
+    #[test]
+    fn reject_inline_secret_config_keys_requires_file_sourcing() {
+        let mut template = hosted_template_with_stable_ssh();
+        template.config_keys.push(HostedTemplateConfigKey {
+            key: "API_TOKEN".to_string(),
+            label: "API token".to_string(),
+            description: "token".to_string(),
+            input_type: "password".to_string(),
+            required: true,
+            secret: true,
+            generated: false,
+            default_value: None,
+            validation: None,
+        });
+        let inline = vec!["API_TOKEN=abc".to_string()];
+        let err = reject_inline_secret_config_keys(Some(&template), &inline).unwrap_err();
+        assert!(err.to_string().contains("--set-file"), "{err}");
+        assert!(
+            reject_inline_secret_config_keys(Some(&template), &["NOTE=hi".into()]).is_ok(),
+            "non-secret keys stay inline-friendly"
+        );
+    }
+
+    #[test]
     fn template_instance_name_uses_server_slug_rules() {
         assert_eq!(normalize_slug(" Shell-01 ").unwrap(), "shell-01");
         assert!(normalize_slug("1234").is_err());
@@ -9080,17 +9215,25 @@ mod tests {
         // Every value must reach the TEE store even when one key's platform
         // metadata sync terminally fails: a held roll only releases on the
         // stored-sync error, so a mid-batch stop would release the workload
-        // with the remaining values missing.
+        // with the remaining values missing. Writes must also all precede
+        // the syncs so a slow sync cannot eat the write budget.
+        let order = std::sync::Arc::new(TestMutex::new(Vec::new()));
         let tee_requests = std::sync::Arc::new(TestMutex::new(Vec::new()));
-        let tee_address =
-            spawn_local_tls_server(tee_requests.clone(), |_| (200, "{}".to_string())).await;
+        let tee_order = order.clone();
+        let tee_address = spawn_local_tls_server(tee_requests.clone(), move |_| {
+            tee_order.lock().unwrap().push("write");
+            (200, "{}".to_string())
+        })
+        .await;
         let sync_calls = std::sync::Arc::new(TestMutex::new(0usize));
         let sync_seen = sync_calls.clone();
+        let sync_order = order.clone();
         let api_address = spawn_json_api_stub(move |path| {
             if path.ends_with("/deployments") {
                 Some(deployment_entry_json("expected-1", "watching"))
                     .map(|entry| serde_json::json!([entry]))
             } else if path.ends_with("/config/sync") {
+                sync_order.lock().unwrap().push("sync");
                 let mut calls = sync_seen.lock().unwrap();
                 *calls += 1;
                 // First sync fails terminally (404 is not retried); the rest
@@ -9159,6 +9302,11 @@ mod tests {
             *sync_calls.lock().unwrap(),
             3,
             "every key's metadata must be attempted"
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["write", "write", "write", "sync", "sync", "sync"],
+            "every value must be written before any metadata sync"
         );
         let tee_requests = tee_requests.lock().unwrap();
         let writes = tee_requests
