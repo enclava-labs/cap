@@ -69,7 +69,7 @@ impl Store {
         create_dir_durable(&dir.join(CONNECTIONS_DIR))?;
         // The store may have been created by a process that stopped before
         // syncing it. Syncing again is cheap and makes this one durable.
-        sync_dir(parent_dir(&dir))?;
+        sync_parent(parent_dir(&dir))?;
         sync_dir(&dir)?;
         Ok(Self { dir })
     }
@@ -242,6 +242,16 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
+/// [`sync_dir`] for a directory above the store. Syncing needs read access,
+/// which an operator who may only search a parent directory does not have;
+/// that parent is skipped rather than failing the command.
+fn sync_parent(dir: &Path) -> io::Result<()> {
+    match sync_dir(dir) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+        other => other,
+    }
+}
+
 /// The directory holding `path`; `.` for a bare file name.
 fn parent_dir(path: &Path) -> &Path {
     match path.parent() {
@@ -272,7 +282,7 @@ fn create_dir_durable(dir: &Path) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     }
-    sync_dir(parent)
+    sync_parent(parent)
 }
 
 /// Writes `bytes` to a `0600` temp file next to `path`, syncs it, renames it
@@ -415,6 +425,16 @@ mod tests {
         fs::write(dir.path().join(CONNECTIONS_DIR), "").unwrap();
         let error = Store::open(dir.path()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_search_only_parent_does_not_block_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write and search, but no read: the parent cannot be opened.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300)).unwrap();
+        let opened = Store::open(dir.path().join("vault"));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        opened.unwrap().put(spec("github", None), "a").unwrap();
     }
 
     #[test]
