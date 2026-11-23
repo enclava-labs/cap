@@ -1875,6 +1875,7 @@ fn template_app_config(template: &HostedTemplate, instance_name: &str) -> AppCon
         }),
         // Template egress travels on the template deploy request, not here.
         egress: Default::default(),
+        unknown: HashMap::new(),
     }
 }
 

@@ -17,13 +17,17 @@ pub struct AppConfig {
     pub health: Option<HealthSection>,
     #[serde(default)]
     pub egress: EgressSection,
+    /// Unrecognised top-level keys, kept only so `validate` can name them.
+    #[serde(flatten, skip_serializing)]
+    pub unknown: HashMap<String, toml::Value>,
 }
 
 /// Outbound network posture for the workload, fixed at `enclava create`.
 ///
 /// `mode = "restricted"` (default) allows only platform endpoints plus the
-/// `allowlist` hostnames. `mode = "public_internet"` allows any public
-/// address; private, link-local and metadata ranges stay blocked.
+/// `allowlist` hostnames. `mode = "public_internet"` allows any public IPv4
+/// address; private, link-local and metadata ranges stay blocked, and the
+/// policy grants no general IPv6 egress.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressSection {
@@ -247,6 +251,16 @@ impl AppConfig {
             return Err(AppConfigError::Validation(
                 "app command entries cannot be empty".to_string(),
             ));
+        }
+
+        // Unknown top-level tables are rejected: egress is fixed at create
+        // time, so a misspelled `[egres]` must not silently create a
+        // restricted app.
+        if let Some(unknown) = self.unknown.keys().min() {
+            return Err(AppConfigError::Validation(format!(
+                "unknown enclava.toml section or key '{unknown}'; expected one of: \
+                 app, storage, unlock, services, resources, health, egress"
+            )));
         }
 
         if let Some(mode) = self.egress.mode.as_deref() {

@@ -147,6 +147,7 @@ fn test_app_config() -> AppConfig {
         },
         health: None,
         egress: Default::default(),
+        unknown: HashMap::new(),
     }
 }
 

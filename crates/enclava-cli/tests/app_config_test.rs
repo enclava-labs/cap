@@ -235,3 +235,20 @@ mdoe = "public_internet"
         .is_err()
     );
 }
+
+#[test]
+fn rejects_misspelled_top_level_table() {
+    // `[egres]` must fail before create instead of yielding a restricted app.
+    let err = enclava_cli::app_config::AppConfig::parse(
+        r#"
+[app]
+name = "my-api"
+port = 8080
+
+[egres]
+mode = "public_internet"
+"#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("'egres'"), "{err}");
+}
