@@ -346,6 +346,10 @@ pub struct HostedTemplateConfigKey {
     pub input_type: String,
     pub required: bool,
     pub secret: bool,
+    /// Platform-generated value (e.g. the reserved stable SSH endpoint):
+    /// delivered through its dedicated flag, never customer config.
+    #[serde(default)]
+    pub generated: bool,
     #[serde(default)]
     pub default_value: Option<String>,
     #[serde(default)]

@@ -411,15 +411,25 @@ async fn deploy_with_timings(
         .find(|template| template.slug == args.template)
         .cloned();
 
-    let public_keys = read_ssh_public_keys(&args.ssh_public_keys, &args.ssh_public_key_files)?;
     let ssh_key_metadata = catalog
         .as_ref()
         .and_then(|template| template_key(template, DEBIAN_SSH_CONFIG_KEY));
-    validate_ssh_public_keys(&public_keys, ssh_key_metadata)?;
+    // A catalog entry that declares no SSH key deploys without keys; a
+    // missing entry (removed template, replay) keeps the historical
+    // SSH-centric behavior so removed SSH templates still deploy and replay.
+    let takes_ssh_keys = ssh_key_metadata.is_some() || catalog.is_none();
+    let has_ssh_input = !args.ssh_public_keys.is_empty() || !args.ssh_public_key_files.is_empty();
+    let public_keys = if takes_ssh_keys || has_ssh_input {
+        read_ssh_public_keys(&args.ssh_public_keys, &args.ssh_public_key_files)?
+    } else {
+        String::new()
+    };
+    if takes_ssh_keys || has_ssh_input {
+        validate_ssh_public_keys(&public_keys, ssh_key_metadata)?;
+    }
     let set_pairs = parse_config_inputs(&args.set, &args.set_file)?;
     let customer_config_pairs =
         template_customer_config_pairs(catalog.as_ref(), &public_keys, &set_pairs)?;
-    let takes_ssh_keys = ssh_key_metadata.is_some();
     if explicit_stable_endpoint.is_some() && !takes_ssh_keys {
         return Err("--stable-ssh-endpoint is only supported for SSH endpoint templates".into());
     }
@@ -2168,6 +2178,13 @@ fn template_customer_config_pairs<'a>(
             return Err(format!("config key {key} passed more than once").into());
         }
         if let Some(entry) = template.and_then(|t| template_key(t, key)) {
+            if entry.generated {
+                return Err(format!(
+                    "config key {key} is platform-generated and delivered by the platform; use \
+                     its dedicated flag instead (stable SSH endpoints: --stable-ssh-endpoint)"
+                )
+                .into());
+            }
             if entry.input_type == "ssh_public_keys" {
                 validate_ssh_public_keys(value, Some(entry))?;
             } else {
@@ -2528,6 +2545,7 @@ async fn deliver_template_config_with_retry(
         observed_lock: false,
         engaged_deadline: None,
     };
+    let mut sync_failures: Vec<String> = Vec::new();
     for (index, (key, value)) in pairs.iter().enumerate() {
         if let Err(error) = delivery.set_key(key, value).await {
             // The unlock prescription follows the error that terminated the
@@ -2557,14 +2575,19 @@ async fn deliver_template_config_with_retry(
         .await
         {
             // Distinct failure class from an undelivered value: the value is
-            // in the TEE store; only the platform's key metadata lags.
-            return Err(TemplateConfigStoredSyncFailed(format!(
-                "config value delivered to the TEE store, but the platform key sync failed \
-                 for {key}: {error}. The platform may not report this key as managed until a \
-                 later sync succeeds."
-            ))
-            .into());
+            // in the TEE store; only the platform's key metadata lags. Keep
+            // delivering the remaining values so a held roll only releases
+            // after every value landed.
+            sync_failures.push(format!("{key}: {error}"));
         }
+    }
+    if !sync_failures.is_empty() {
+        return Err(TemplateConfigStoredSyncFailed(format!(
+            "config values delivered to the TEE store, but the platform key sync failed for {}. \
+             The platform may not report these keys as managed until a later sync succeeds.",
+            sync_failures.join("; ")
+        ))
+        .into());
     }
     Ok(())
 }
@@ -5366,6 +5389,7 @@ mod tests {
                     input_type: "text".to_string(),
                     required: false,
                     secret: false,
+                    generated: true,
                     default_value: None,
                     validation: Some(HostedTemplateConfigValidation {
                         format: Some("ngrok_tcp_url".to_string()),
@@ -5382,6 +5406,7 @@ mod tests {
                     input_type: "ssh_public_keys".to_string(),
                     required: true,
                     secret: false,
+                    generated: false,
                     default_value: None,
                     validation: None,
                 },
@@ -5844,6 +5869,31 @@ mod tests {
                 && !message.contains("submitted stable SSH endpoint"),
             "unknown template errors must not come from stable SSH endpoint validation: {message}"
         );
+    }
+
+    #[test]
+    fn template_customer_config_pairs_reject_generated_keys() {
+        let mut template = hosted_template_with_stable_ssh();
+        template.config_keys[0] = HostedTemplateConfigKey {
+            key: "NGROK_TCP_URL".to_string(),
+            label: "Stable SSH endpoint".to_string(),
+            description: "Optional existing reserved stable SSH endpoint.".to_string(),
+            input_type: "text".to_string(),
+            required: false,
+            secret: false,
+            generated: true,
+            default_value: None,
+            validation: None,
+        };
+        let set_pairs = vec![(
+            "NGROK_TCP_URL".to_string(),
+            "6.tcp.eu.ngrok.io:17958".to_string(),
+        )];
+        let err = template_customer_config_pairs(Some(&template), "", &set_pairs)
+            .expect_err("platform-generated keys must not ride --set");
+        let message = err.to_string();
+        assert!(message.contains("NGROK_TCP_URL"), "{message}");
+        assert!(message.contains("--stable-ssh-endpoint"), "{message}");
     }
 
     #[test]
@@ -8350,6 +8400,7 @@ mod tests {
             input_type: "password".to_string(),
             required: true,
             secret: true,
+            generated: false,
             default_value: None,
             validation: Some(HostedTemplateConfigValidation {
                 format: Some("single_token".to_string()),
@@ -8394,17 +8445,25 @@ mod tests {
 
     #[test]
     fn template_customer_config_pairs_merge_set_entries_after_ssh_keys() {
-        let template = hosted_template_with_stable_ssh();
-        let sets = vec![(
-            "NGROK_TCP_URL".to_string(),
-            "6.tcp.eu.ngrok.io:17958".to_string(),
-        )];
+        let mut template = hosted_template_with_stable_ssh();
+        template.config_keys.push(HostedTemplateConfigKey {
+            key: "NOTE".to_string(),
+            label: "Note".to_string(),
+            description: "note".to_string(),
+            input_type: "text".to_string(),
+            required: false,
+            secret: false,
+            generated: false,
+            default_value: None,
+            validation: None,
+        });
+        let sets = vec![("NOTE".to_string(), "hi".to_string())];
         let pairs =
             template_customer_config_pairs(Some(&template), "ssh-ed25519 AAAA", &sets).unwrap();
 
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, "DEBIAN_SSH_AUTHORIZED_KEYS");
-        assert_eq!(pairs[1].0, "NGROK_TCP_URL");
+        assert_eq!(pairs[1].0, "NOTE");
     }
 
     #[test]
@@ -8461,6 +8520,7 @@ mod tests {
             input_type: "text".to_string(),
             required: false,
             secret: false,
+            generated: false,
             default_value: None,
             validation: Some(HostedTemplateConfigValidation {
                 format: None,
@@ -9010,6 +9070,109 @@ mod tests {
                 "created_at": "2026-09-09T00:00:00Z",
                 "completed_at": null,
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn template_config_delivery_continues_after_a_metadata_sync_failure() {
+        use terminal_delivery_support::*;
+
+        // Every value must reach the TEE store even when one key's platform
+        // metadata sync terminally fails: a held roll only releases on the
+        // stored-sync error, so a mid-batch stop would release the workload
+        // with the remaining values missing.
+        let tee_requests = std::sync::Arc::new(TestMutex::new(Vec::new()));
+        let tee_address =
+            spawn_local_tls_server(tee_requests.clone(), |_| (200, "{}".to_string())).await;
+        let sync_calls = std::sync::Arc::new(TestMutex::new(0usize));
+        let sync_seen = sync_calls.clone();
+        let api_address = spawn_json_api_stub(move |path| {
+            if path.ends_with("/deployments") {
+                Some(deployment_entry_json("expected-1", "watching"))
+                    .map(|entry| serde_json::json!([entry]))
+            } else if path.ends_with("/config/sync") {
+                let mut calls = sync_seen.lock().unwrap();
+                *calls += 1;
+                // First sync fails terminally (404 is not retried); the rest
+                // succeed.
+                if *calls == 1 {
+                    None
+                } else {
+                    Some(serde_json::json!({}))
+                }
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{api_address}"), Some("test".to_string()));
+
+        let tee_url = format!(
+            "https://localhost:{}/.well-known/confidential/config",
+            tee_address.port()
+        );
+        let mut tee = {
+            let _guard = tls_env_lock();
+            unsafe {
+                std::env::set_var("ENCLAVA_TEE_TLS_MODE", "staging");
+            }
+            TeeClient::from_config_url_with_resolve_ip(&tee_url, Some(tee_address.ip()))
+        };
+        let expectation = template_test_expectation("expected-1", [0x09; 32]);
+        let mut config_token = "token".to_string();
+        let mut tee_url = tee_url;
+        let mut tee_resolve_ip: Option<std::net::IpAddr> = Some(tee_address.ip());
+        let progress = ProgressBar::hidden();
+        let target = DeliverTemplateConfigTarget {
+            instance_name: "shell",
+            deployment: DeploymentWait::trusted("expected-1", Some(&expectation)),
+            password_mode: false,
+            owner_wait_budget: Duration::from_secs(1800),
+            hold_deadline: None,
+            progress: &progress,
+            timings_mode: false,
+        };
+        let pairs = [
+            ("SKEY-1", "1".to_string()),
+            ("SKEY-2", "2".to_string()),
+            ("SKEY-3", "3".to_string()),
+        ];
+        let error = deliver_template_config_with_retry(
+            &api,
+            target,
+            &mut tee,
+            &mut config_token,
+            &mut tee_url,
+            &mut tee_resolve_ip,
+            &pairs,
+        )
+        .await
+        .expect_err("a terminal sync failure must surface");
+        assert!(
+            error
+                .downcast_ref::<TemplateConfigStoredSyncFailed>()
+                .is_some(),
+            "a sync-only failure must stay release-eligible, got: {error}"
+        );
+        assert!(error.to_string().contains("SKEY-1"), "{error}");
+        assert_eq!(
+            *sync_calls.lock().unwrap(),
+            3,
+            "every key's metadata must be attempted"
+        );
+        let tee_requests = tee_requests.lock().unwrap();
+        let writes = tee_requests
+            .iter()
+            .filter(|path| !path.ends_with("/status"))
+            .count();
+        assert_eq!(
+            writes, 3,
+            "every value must reach the TEE store: {tee_requests:?}"
+        );
+        drop(tee_requests);
+        let _guard = tls_env_lock();
+        unsafe {
+            std::env::remove_var("ENCLAVA_TEE_TLS_MODE");
         }
     }
 
