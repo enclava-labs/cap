@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
+use enclava_common::outbound_http::BlockedNetworks;
 use enclava_vault::connection::{ConnectionSpec, Origin, Position};
 use enclava_vault::{Proxy, ProxyConfig, Store, VaultCa};
 use zeroize::Zeroizing;
@@ -167,6 +168,9 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let store = Store::open(&args.store_dir).context("opening the store")?;
     let ca = VaultCa::load_or_generate(store.dir()).context("loading the vault CA")?;
     if let Some(path) = &args.ca_cert_out {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
         fs::write(path, ca.cert_pem())
             .with_context(|| format!("writing the CA certificate to {}", path.display()))?;
     }
@@ -175,6 +179,9 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         ca,
         ProxyConfig {
             passthrough,
+            // Adds CLUSTER_POD_CIDR and CLUSTER_SERVICE_CIDR to the default
+            // blocked networks, for clusters outside the private ranges.
+            blocked: BlockedNetworks::from_env(),
             ..ProxyConfig::default()
         },
     )?;

@@ -94,7 +94,9 @@ pub fn rewrite(
         .filter(|c| {
             head_contains(parts, &c.placeholder)
                 || (c.spec.position == Position::BasicAuth
-                    && basic.as_deref().is_some_and(|b| b.contains(&c.placeholder)))
+                    && basic
+                        .as_deref()
+                        .is_some_and(|b| contains_bytes(b, c.placeholder.as_bytes())))
         })
         .collect();
     if present.is_empty() {
@@ -119,6 +121,21 @@ pub fn rewrite(
     for connection in &present {
         apply(parts, connection)?;
         outcome.substituted.push(connection.spec.name.clone());
+    }
+    // Writing a credential into the path must not move the request: the
+    // rewritten path is held to the same rules as the one that was sent.
+    let rewritten = parts.uri.path();
+    if rewritten != path {
+        if !path_is_safe(rewritten) {
+            return Err(Refusal::UnsafePath);
+        }
+        for connection in &present {
+            if !path_within_prefix(rewritten, &connection.spec.path_prefix) {
+                return Err(Refusal::PathNotAllowed {
+                    connection: connection.spec.name.clone(),
+                });
+            }
+        }
     }
     // Whatever is left was outside the declared position.
     for connection in &present {
@@ -198,15 +215,14 @@ fn basic_payload(value: &HeaderValue) -> Option<&[u8]> {
         .then(|| bytes[6..].trim_ascii())
 }
 
-fn decoded_basic_credentials(parts: &Parts) -> Option<String> {
+/// The raw credential bytes. Basic credentials are not required to be
+/// UTF-8, so nothing here assumes they are.
+fn decoded_basic_credentials(parts: &Parts) -> Option<Vec<u8>> {
     parts
         .headers
         .get_all(AUTHORIZATION)
         .iter()
-        .find_map(|value| {
-            let decoded = BASE64.decode(basic_payload(value)?).ok()?;
-            String::from_utf8(decoded).ok()
-        })
+        .find_map(|value| BASE64.decode(basic_payload(value)?).ok())
 }
 
 fn sensitive(bytes: &[u8]) -> Result<HeaderValue, Refusal> {
@@ -229,10 +245,13 @@ fn apply(parts: &mut Parts, connection: &Connection) -> Result<(), Refusal> {
         }
         Position::BasicAuth => rewrite_header(parts, &AUTHORIZATION, |value| {
             let decoded = BASE64.decode(basic_payload(value)?).ok()?;
-            let decoded = String::from_utf8(decoded).ok()?;
-            decoded.contains(placeholder).then(|| {
-                let credentials = decoded.replace(placeholder, secret);
-                format!("Basic {}", BASE64.encode(credentials)).into_bytes()
+            contains_bytes(&decoded, placeholder.as_bytes()).then(|| {
+                let credentials = zeroize::Zeroizing::new(replace_bytes(
+                    &decoded,
+                    placeholder.as_bytes(),
+                    secret.as_bytes(),
+                ));
+                format!("Basic {}", BASE64.encode(&*credentials)).into_bytes()
             })
         }),
         Position::Query { name } => {
@@ -365,7 +384,7 @@ mod tests {
                 REGISTRY,
                 "p@ss:word",
             ),
-            connection("bot", api, "/", Position::PathSegment, BOT, "123:AB/c"),
+            connection("bot", api, "/", Position::PathSegment, BOT, "123:AB c"),
             connection(
                 "other",
                 "https://other.example.com",
@@ -584,7 +603,45 @@ mod tests {
         let uri = format!("/bot{BOT}/sendMessage?chat=1");
         let (parts, result) = run(&uri, &[]);
         assert_eq!(result.unwrap().substituted, ["bot"]);
-        assert_eq!(parts.uri, "/bot123%3AAB%2Fc/sendMessage?chat=1");
+        assert_eq!(parts.uri, "/bot123%3AAB%20c/sendMessage?chat=1");
+    }
+
+    #[test]
+    fn path_credential_that_would_move_the_request_is_refused() {
+        // The store rejects such credentials; this is the second line.
+        let api = "https://api.example.com";
+        for (secret, uri, refusal) in [
+            ("..", format!("/v1/files/{BOT}/admin"), Refusal::UnsafePath),
+            ("a/../b", format!("/v1/files/{BOT}"), Refusal::UnsafePath),
+        ] {
+            let snapshot = Snapshot::new(vec![connection(
+                "bot",
+                api,
+                "/v1/files",
+                Position::PathSegment,
+                BOT,
+                secret,
+            )]);
+            let mut parts = parts(&uri, &[]);
+            assert_eq!(
+                rewrite(&mut parts, &origin(), &snapshot).unwrap_err(),
+                refusal,
+                "{secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_auth_placeholder_is_swapped_next_to_non_utf8_bytes() {
+        // ISO-8859-1 "café" as the user name: 0xE9 is not valid UTF-8.
+        let mut credentials = b"caf\xe9:".to_vec();
+        credentials.extend_from_slice(REGISTRY.as_bytes());
+        let value = format!("Basic {}", BASE64.encode(&credentials));
+        let (parts, result) = run("/v2/", &[("authorization", &value)]);
+        assert_eq!(result.unwrap().substituted, ["registry"]);
+        let sent = parts.headers["authorization"].to_str().unwrap();
+        let decoded = BASE64.decode(sent.strip_prefix("Basic ").unwrap()).unwrap();
+        assert_eq!(decoded, b"caf\xe9:p@ss:word");
     }
 
     #[test]

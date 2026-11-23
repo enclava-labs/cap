@@ -43,7 +43,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::ca::VaultCa;
-use crate::connection::{Origin, Snapshot};
+use crate::connection::{HOP_BY_HOP, Origin, Snapshot};
 use crate::store::{Store, StoreError};
 use crate::substitute;
 
@@ -53,18 +53,6 @@ type Body = BoxBody<Bytes, BoxError>;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Headers that describe one hop and must not be forwarded.
-const HOP_BY_HOP: [&str; 8] = [
-    "connection",
-    "proxy-connection",
-    "keep-alive",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "proxy-authorization",
-    "proxy-authenticate",
-];
 
 pub struct ProxyConfig {
     /// Origins relayed without interception.
@@ -262,10 +250,17 @@ impl Inner {
         origin: Origin,
         config: Arc<rustls::ServerConfig>,
     ) -> Result<(), BoxError> {
-        let upgraded = hyper::upgrade::on(request).await?;
-        let tls = TlsAcceptor::from(config)
-            .accept(TokioIo::new(upgraded))
-            .await?;
+        // A client that opens a tunnel and then stalls must not keep a
+        // connection slot forever.
+        let tls = tokio::time::timeout(HEAD_TIMEOUT, async {
+            let upgraded = hyper::upgrade::on(request).await?;
+            let tls = TlsAcceptor::from(config)
+                .accept(TokioIo::new(upgraded))
+                .await?;
+            Ok::<_, BoxError>(tls)
+        })
+        .await
+        .map_err(|_| "TLS handshake timed out")??;
         let service = service_fn(move |request| {
             let inner = self.clone();
             let origin = origin.clone();
@@ -292,6 +287,13 @@ impl Inner {
                 return refusal(StatusCode::SERVICE_UNAVAILABLE, "store_unavailable");
             }
         };
+
+        // The tunnel was opened while the origin had a connection. If the
+        // last one has been removed since, the tunnel stops being a way out.
+        if !snapshot.has_origin(origin) {
+            tracing::warn!(origin = %origin, "refused request on a tunnel whose origin was removed");
+            return refusal(StatusCode::FORBIDDEN, "origin_not_connected");
+        }
 
         let (mut parts, body) = request.into_parts();
         let outcome = match substitute::rewrite(&mut parts, origin, &snapshot) {

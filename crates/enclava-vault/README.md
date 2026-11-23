@@ -27,6 +27,12 @@ A placeholder is swapped only when all of these hold:
   named header, as the value of a named query parameter, inside
   `Authorization: Basic` credentials, or inside the path.
 
+Two limits on what can be declared: a hop-by-hop header such as
+`Proxy-Authorization` cannot be a position, because the proxy never forwards
+those, and a path credential cannot contain `/` or `\`. After a credential is
+written into the path, the result is checked against the same path rules
+again.
+
 A known placeholder anywhere else in the request head fails the request with
 `403` and an `x-enclava-vault: <reason>` header; nothing is forwarded.
 
@@ -34,9 +40,13 @@ Other behaviour worth knowing:
 
 - Only `CONNECT` is served. An origin with no connection is refused unless it
   is on the pass-through list, in which case bytes are relayed untouched.
+- When the last connection for an origin is removed, tunnels already open to
+  it stop forwarding.
 - The upstream is always the tunnel's origin; the request cannot redirect it.
 - Every outbound dial resolves the name in the proxy and is refused if any
   answer is in a blocked network (loopback, RFC 1918, link-local, CGNAT, ULA).
+  `serve` also blocks the comma-separated CIDRs in `CLUSTER_POD_CIDR` and
+  `CLUSTER_SERVICE_CIDR`; set them when the cluster uses other ranges.
 - Request bodies are not inspected. A placeholder in a body is never swapped.
 - Requests that ask for a protocol upgrade (WebSocket) are refused with `501`.
 - Responses are passed through unmodified. An upstream endpoint that echoes
@@ -64,7 +74,11 @@ its placeholder. A running proxy picks up changes without a restart.
 
 ## Storage
 
-`--store-dir` holds one `0600` file per connection and the CA key. The
-directory must live somewhere the workload cannot read; the crate sets
+`--store-dir` holds one `0600` file per connection and `ca.pem`, the CA key
+and certificate. Changes take an exclusive lock on the directory and are
+synced to it before a command reports success, so concurrent commands and a
+first start racing another agree on one placeholder and one CA.
+
+The directory must live somewhere the workload cannot read; the crate sets
 owner-only modes and marks the process non-dumpable, and relies on the
 deployment for the rest.

@@ -11,6 +11,19 @@ use zeroize::Zeroizing;
 /// Every placeholder starts with this, followed by `<connection>_<random>`.
 pub const PLACEHOLDER_PREFIX: &str = "encv_";
 
+/// Headers that describe one hop. The proxy never forwards them, so they
+/// cannot carry a credential either.
+pub const HOP_BY_HOP: [&str; 8] = [
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-authenticate",
+];
+
 const MAX_NAME_LEN: usize = 32;
 const MAX_EXPOSE_AS_LEN: usize = 128;
 
@@ -183,6 +196,11 @@ impl Position {
                 if parsed == http::header::HOST {
                     return Err(ConnectionError::Position("Host cannot carry a credential"));
                 }
+                if parsed == http::header::TE || HOP_BY_HOP.contains(&parsed.as_str()) {
+                    return Err(ConnectionError::Position(
+                        "hop-by-hop headers are not forwarded",
+                    ));
+                }
                 Ok(())
             }
             Position::Query { name } => {
@@ -303,6 +321,15 @@ pub fn validate_secret(position: &Position, secret: &str) -> Result<(), Connecti
                 ));
             }
         }
+    }
+    // A path credential must stay inside one segment, or writing it into
+    // the path could point the request at a different resource.
+    if *position == Position::PathSegment
+        && (secret.contains(['/', '\\']) || secret == "." || secret == "..")
+    {
+        return Err(ConnectionError::Secret(
+            "a path credential must not contain / or \\, or be a dot segment",
+        ));
     }
     Ok(())
 }
@@ -480,6 +507,12 @@ mod tests {
             name: "Host".into(),
         };
         assert!(spec("github", "/", host, None).is_err());
+        for stripped in ["Proxy-Authorization", "connection", "TE", "Upgrade"] {
+            let position = Position::Header {
+                name: stripped.into(),
+            };
+            assert!(spec("github", "/", position, None).is_err(), "{stripped}");
+        }
         let query = Position::Query { name: "a&b".into() };
         assert!(spec("github", "/", query, None).is_err());
     }
@@ -495,6 +528,17 @@ mod tests {
         assert!(validate_secret(&header, "snowman-☃").is_err());
         assert!(validate_secret(&Position::BasicAuth, "pässword").is_ok());
         assert!(validate_secret(&Position::PathSegment, "a\nb").is_err());
+        assert!(validate_secret(&Position::PathSegment, "123:AB c").is_ok());
+        for moving in ["a/b", "a\\b", ".", ".."] {
+            assert!(
+                validate_secret(&Position::PathSegment, moving).is_err(),
+                "{moving}"
+            );
+            assert!(
+                validate_secret(&Position::BasicAuth, moving).is_ok(),
+                "{moving}"
+            );
+        }
         assert!(validate_secret(&Position::BasicAuth, "encv_other_00").is_err());
     }
 

@@ -162,16 +162,28 @@ impl Vault {
 
     /// Adds a header connection for `upstream` and returns its placeholder.
     fn connect(&self, name: &str, upstream: &Upstream, prefix: &str) -> String {
+        let position = Position::Header {
+            name: "authorization".into(),
+        };
+        self.connect_at(name, upstream, prefix, position, SECRET)
+    }
+
+    fn connect_at(
+        &self,
+        name: &str,
+        upstream: &Upstream,
+        prefix: &str,
+        position: Position,
+        secret: &str,
+    ) -> String {
         let spec = ConnectionSpec {
             name: name.into(),
             origin: upstream.origin(),
             path_prefix: prefix.into(),
-            position: Position::Header {
-                name: "authorization".into(),
-            },
+            position,
             expose_as: None,
         };
-        self.store.put(spec, SECRET).unwrap().placeholder
+        self.store.put(spec, secret).unwrap().placeholder
     }
 
     /// A client that reaches the world only through the vault and trusts
@@ -244,6 +256,74 @@ async fn placeholder_is_swapped_over_http2_on_both_legs() {
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].version, Version::HTTP_2);
     assert_eq!(seen[0].headers["authorization"], format!("Bearer {SECRET}"));
+}
+
+#[tokio::test]
+async fn query_basic_auth_and_path_positions_reach_the_upstream() {
+    let upstream = Upstream::spawn().await;
+    let vault = Vault::spawn(&[&upstream], VaultOptions::default()).await;
+    let query = Position::Query { name: "key".into() };
+    let in_query = vault.connect_at("maps", &upstream, "/maps", query, "k/e y&1");
+    let in_basic = vault.connect_at(
+        "registry",
+        &upstream,
+        "/v2",
+        Position::BasicAuth,
+        "p@ss:word",
+    );
+    let in_path = vault.connect_at("bot", &upstream, "/bot", Position::PathSegment, "123:AB c");
+    let client = vault.client(&vault.ca_pem, true);
+
+    let ok = |response: reqwest::Response| assert_eq!(response.status(), StatusCode::OK);
+    ok(client
+        .get(upstream.url(&format!("/maps/geocode?q=x&key={in_query}")))
+        .send()
+        .await
+        .unwrap());
+    ok(client
+        .get(upstream.url("/v2/"))
+        .basic_auth("ci-user", Some(&in_basic))
+        .send()
+        .await
+        .unwrap());
+    ok(client
+        .get(upstream.url(&format!("/bot/{in_path}/sendMessage?chat=1")))
+        .send()
+        .await
+        .unwrap());
+
+    let seen = upstream.seen();
+    assert_eq!(seen[0].target, "/maps/geocode?q=x&key=k%2Fe%20y%261");
+    // base64("ci-user:p@ss:word")
+    assert_eq!(
+        seen[1].headers["authorization"],
+        "Basic Y2ktdXNlcjpwQHNzOndvcmQ="
+    );
+    assert_eq!(seen[2].target, "/bot/123%3AAB%20c/sendMessage?chat=1");
+}
+
+#[tokio::test]
+async fn open_tunnel_stops_forwarding_once_its_origin_is_removed() {
+    let upstream = Upstream::spawn().await;
+    let vault = Vault::spawn(&[&upstream], VaultOptions::default()).await;
+    let placeholder = vault.connect("api", &upstream, "/");
+    // HTTP/2 keeps one connection for every request, so the second call is
+    // certain to arrive on the tunnel the first one opened.
+    let client = vault.client(&vault.ca_pem, false);
+
+    let first = client
+        .get(upstream.url("/v1/me"))
+        .bearer_auth(&placeholder)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.version(), Version::HTTP_2);
+    assert_eq!(first.text().await.unwrap(), "upstream saw 0 bytes");
+
+    assert!(vault.store.remove("api").unwrap());
+    let second = client.get(upstream.url("/v1/me")).send().await.unwrap();
+    assert_eq!(refusal_reason(second).await, "origin_not_connected");
+    assert_eq!(upstream.seen().len(), 1);
 }
 
 #[tokio::test]

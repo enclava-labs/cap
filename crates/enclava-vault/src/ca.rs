@@ -2,9 +2,9 @@
 //!
 //! The CA key is generated where the vault runs and never leaves it. The
 //! workload trusts the CA certificate; the vault mints a short-lived leaf
-//! for each origin it intercepts. The key is persisted next to the store so
-//! a vault restart does not invalidate the certificate the workload already
-//! loaded.
+//! for each origin it intercepts. Key and certificate are persisted together
+//! in one file next to the store, so a vault restart does not invalidate the
+//! certificate the workload already loaded.
 
 use std::collections::HashMap;
 use std::fs;
@@ -19,14 +19,19 @@ use rcgen::{
 };
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
-use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::sign::CertifiedKey;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use time::OffsetDateTime;
+use zeroize::Zeroizing;
 
-use crate::store::write_atomic;
+use crate::store::{lock_dir, write_atomic};
 
 const CA_COMMON_NAME: &str = "Enclava Vault CA";
-const CA_KEY_FILE: &str = "ca.key.pem";
-const CA_CERT_FILE: &str = "ca.crt.pem";
+/// Private key followed by the certificate, both PEM. One file, so the pair
+/// is always published together.
+const CA_FILE: &str = "ca.pem";
+const CERT_MARKER: &str = "-----BEGIN CERTIFICATE-----";
 const CA_LIFETIME: time::Duration = time::Duration::days(3650);
 const LEAF_LIFETIME: time::Duration = time::Duration::hours(24);
 /// A cached leaf is replaced well before it expires.
@@ -41,6 +46,8 @@ pub enum CaError {
     Rcgen(#[from] rcgen::Error),
     #[error("TLS configuration failed: {0}")]
     Tls(#[from] rustls::Error),
+    #[error("stored CA is unusable: {0}")]
+    Corrupt(&'static str),
 }
 
 pub struct VaultCa {
@@ -58,38 +65,61 @@ impl VaultCa {
     }
 
     /// Loads the CA from `dir`, creating and persisting one on first use.
+    ///
+    /// The store lock is held throughout, so processes that start together
+    /// against an empty store all end up with the same CA.
     pub fn load_or_generate(dir: &Path) -> Result<Self, CaError> {
-        let key_path = dir.join(CA_KEY_FILE);
-        let cert_path = dir.join(CA_CERT_FILE);
-        match (
-            fs::read_to_string(&key_path),
-            fs::read_to_string(&cert_path),
-        ) {
-            (Ok(key_pem), Ok(cert_pem)) => {
-                let key = KeyPair::from_pem(&key_pem)?;
-                // The issuer only needs the subject name and the key; both
-                // are fixed, so the stored certificate does not have to be
-                // parsed back.
-                Ok(Self::assemble(Issuer::new(ca_params()?, key), cert_pem))
-            }
-            (Err(key_err), Err(cert_err))
-                if key_err.kind() == io::ErrorKind::NotFound
-                    && cert_err.kind() == io::ErrorKind::NotFound =>
-            {
+        let _lock = lock_dir(dir)?;
+        let path = dir.join(CA_FILE);
+        match fs::read_to_string(&path) {
+            Ok(bundle) => Self::from_bundle(&Zeroizing::new(bundle)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let (ca, key_pem) = Self::generate_with_key()?;
-                write_atomic(&key_path, key_pem.as_bytes())?;
-                write_atomic(&cert_path, ca.cert_pem.as_bytes())?;
+                let mut bundle = Zeroizing::new(String::new());
+                bundle.push_str(&key_pem);
+                if !bundle.ends_with('\n') {
+                    bundle.push('\n');
+                }
+                bundle.push_str(&ca.cert_pem);
+                write_atomic(&path, bundle.as_bytes())?;
                 Ok(ca)
             }
-            // One file without the other, or an unreadable file: refuse to
-            // guess rather than silently replace the CA the workload trusts.
-            (Err(e), _) | (_, Err(e)) => Err(e.into()),
+            Err(e) => Err(e.into()),
         }
     }
 
-    fn generate_with_key() -> Result<(Self, zeroize::Zeroizing<String>), CaError> {
+    fn from_bundle(bundle: &str) -> Result<Self, CaError> {
+        let at = bundle
+            .find(CERT_MARKER)
+            .ok_or(CaError::Corrupt("no certificate"))?;
+        let (key_pem, cert_pem) = bundle.split_at(at);
+        // rcgen's error is dropped on purpose: it must not quote key text.
+        let key = KeyPair::from_pem(key_pem).map_err(|_| CaError::Corrupt("unreadable key"))?;
+        let cert = CertificateDer::from_pem_slice(cert_pem.as_bytes())
+            .map_err(|_| CaError::Corrupt("unreadable certificate"))?;
+
+        // Leaves are signed with `key` and checked against `cert`. If the
+        // two do not belong together, every client would reject them.
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let signing_key = provider
+            .key_provider
+            .load_private_key(pkcs8(&key))
+            .map_err(|_| CaError::Corrupt("unusable key"))?;
+        CertifiedKey::new(vec![cert], signing_key)
+            .keys_match()
+            .map_err(|_| CaError::Corrupt("key does not match certificate"))?;
+
+        // The issuer only needs the subject name and the key. Both are
+        // fixed, so the stored certificate does not have to be parsed back.
+        Ok(Self::assemble(
+            Issuer::new(ca_params()?, key),
+            cert_pem.to_owned(),
+        ))
+    }
+
+    fn generate_with_key() -> Result<(Self, Zeroizing<String>), CaError> {
         let key = KeyPair::generate()?;
-        let key_pem = zeroize::Zeroizing::new(key.serialize_pem());
+        let key_pem = Zeroizing::new(key.serialize_pem());
         let mut params = ca_params()?;
         let now = OffsetDateTime::now_utc();
         params.not_before = now - CLOCK_SKEW;
@@ -121,6 +151,9 @@ impl VaultCa {
             return Ok(config.clone());
         }
         let config = Arc::new(self.mint(host)?);
+        // Drop every stale leaf while here, so hosts that are no longer
+        // used do not stay cached for the life of the process.
+        leaves.retain(|_, (minted, _)| minted.elapsed() < LEAF_REFRESH);
         leaves.insert(host.to_owned(), (Instant::now(), config.clone()));
         Ok(config)
     }
@@ -139,14 +172,17 @@ impl VaultCa {
         params.use_authority_key_identifier_extension = true;
         let cert = params.signed_by(&key, &self.issuer)?;
 
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
         let mut config = ServerConfig::builder_with_provider(self.provider.clone())
             .with_safe_default_protocol_versions()?
             .with_no_client_auth()
-            .with_single_cert(vec![cert.der().clone()], key)?;
+            .with_single_cert(vec![cert.der().clone()], pkcs8(&key))?;
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(config)
     }
+}
+
+fn pkcs8(key: &KeyPair) -> PrivateKeyDer<'static> {
+    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()))
 }
 
 fn ca_params() -> Result<CertificateParams, rcgen::Error> {
@@ -167,13 +203,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persisted_ca_is_reused_and_key_is_owner_only() {
+    fn persisted_ca_is_reused_and_owner_only() {
         let dir = tempfile::tempdir().unwrap();
         let first = VaultCa::load_or_generate(dir.path()).unwrap();
         let second = VaultCa::load_or_generate(dir.path()).unwrap();
         assert_eq!(first.cert_pem(), second.cert_pem());
-        assert!(first.cert_pem().starts_with("-----BEGIN CERTIFICATE-----"));
-        let mode = fs::metadata(dir.path().join(CA_KEY_FILE))
+        assert!(first.cert_pem().starts_with(CERT_MARKER));
+        let mode = fs::metadata(dir.path().join(CA_FILE))
             .unwrap()
             .permissions()
             .mode();
@@ -181,11 +217,58 @@ mod tests {
     }
 
     #[test]
-    fn half_a_ca_is_an_error_not_a_silent_regeneration() {
+    fn concurrent_first_start_agrees_on_one_ca() {
         let dir = tempfile::tempdir().unwrap();
-        VaultCa::load_or_generate(dir.path()).unwrap();
-        fs::remove_file(dir.path().join(CA_KEY_FILE)).unwrap();
-        assert!(VaultCa::load_or_generate(dir.path()).is_err());
+        let starts: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.path().to_owned();
+                std::thread::spawn(move || {
+                    VaultCa::load_or_generate(&dir)
+                        .unwrap()
+                        .cert_pem()
+                        .to_owned()
+                })
+            })
+            .collect();
+        let certs: Vec<String> = starts.into_iter().map(|s| s.join().unwrap()).collect();
+        let stored = VaultCa::load_or_generate(dir.path()).unwrap();
+        assert!(certs.iter().all(|cert| cert == stored.cert_pem()));
+    }
+
+    #[test]
+    fn key_that_does_not_match_the_certificate_is_refused() {
+        let ours = tempfile::tempdir().unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        VaultCa::load_or_generate(ours.path()).unwrap();
+        VaultCa::load_or_generate(theirs.path()).unwrap();
+        let read = |dir: &Path| fs::read_to_string(dir.join(CA_FILE)).unwrap();
+        let (our_key, _) = read(ours.path())
+            .split_once(CERT_MARKER)
+            .map(|(k, c)| (k.to_owned(), c.to_owned()))
+            .unwrap();
+        let their_bundle = read(theirs.path());
+        let their_cert = &their_bundle[their_bundle.find(CERT_MARKER).unwrap()..];
+        fs::write(ours.path().join(CA_FILE), format!("{our_key}{their_cert}")).unwrap();
+
+        let error = VaultCa::load_or_generate(ours.path()).err().unwrap();
+        assert!(matches!(
+            error,
+            CaError::Corrupt("key does not match certificate")
+        ));
+    }
+
+    #[test]
+    fn unreadable_ca_file_is_an_error_not_a_silent_regeneration() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(CA_FILE), "not a pem bundle").unwrap();
+        assert!(matches!(
+            VaultCa::load_or_generate(dir.path()).err().unwrap(),
+            CaError::Corrupt(_)
+        ));
+        assert_eq!(
+            fs::read_to_string(dir.path().join(CA_FILE)).unwrap(),
+            "not a pem bundle"
+        );
     }
 
     #[test]

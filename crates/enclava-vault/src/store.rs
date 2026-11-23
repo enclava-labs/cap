@@ -2,9 +2,12 @@
 //!
 //! One `0600` TOML file per connection under `<dir>/connections`, written
 //! atomically, plus a `generation` marker that changes on every mutation so
-//! a running proxy can tell when to reload. The directory is meant to live
-//! on storage the workload cannot read; this module only sets owner-only
-//! modes and does not try to defend against a reader with the same UID.
+//! a running proxy can tell when to reload. Mutations hold an exclusive
+//! lock on `<dir>/lock`, so two processes cannot interleave a read and a
+//! write, and each one is synced to the directory before it is reported
+//! done. The directory is meant to live on storage the workload cannot
+//! read; this module only sets owner-only modes and does not try to defend
+//! against a reader with the same UID.
 
 use std::fs;
 use std::io::{self, Write};
@@ -22,6 +25,7 @@ use crate::connection::{
 
 const CONNECTIONS_DIR: &str = "connections";
 const GENERATION_FILE: &str = "generation";
+const LOCK_FILE: &str = "lock";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -66,6 +70,7 @@ impl Store {
             .recursive(true)
             .mode(0o700)
             .create(dir.join(CONNECTIONS_DIR))?;
+        sync_dir(&dir)?;
         Ok(Self { dir })
     }
 
@@ -80,6 +85,9 @@ impl Store {
         spec.validate()?;
         validate_secret(&spec.position, secret)?;
 
+        // Held across the read below and the write, so two writers cannot
+        // both decide the connection is new and mint different placeholders.
+        let _lock = lock_dir(&self.dir)?;
         let existing = self.snapshot()?;
         if let Some(key) = &spec.expose_as {
             let taken = existing
@@ -124,16 +132,21 @@ impl Store {
     }
 
     /// Removes a connection. Returns whether it existed.
+    ///
+    /// The generation changes even when the file was already gone. If an
+    /// earlier call deleted the file and then failed, a running proxy may
+    /// still hold the credential; the retry has to make it reload.
     pub fn remove(&self, name: &str) -> Result<bool, StoreError> {
         validate_name(name)?;
-        match fs::remove_file(self.connection_path(name)) {
-            Ok(()) => {
-                self.bump_generation()?;
-                Ok(true)
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+        let _lock = lock_dir(&self.dir)?;
+        let existed = match fs::remove_file(self.connection_path(name)) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        sync_dir(&self.dir.join(CONNECTIONS_DIR))?;
+        self.bump_generation()?;
+        Ok(existed)
     }
 
     /// Loads every connection. Any unreadable or inconsistent file is an
@@ -208,8 +221,29 @@ fn load(path: &Path, file: &str) -> Result<Connection, StoreError> {
     })
 }
 
-/// Writes `bytes` to a `0600` temp file next to `path`, syncs it and renames
-/// it into place.
+/// Exclusive advisory lock on a store directory, released on drop.
+pub(crate) struct DirLock(#[allow(dead_code)] nix::fcntl::Flock<fs::File>);
+
+/// Blocks until this process holds the lock on `dir`.
+pub(crate) fn lock_dir(dir: &Path) -> io::Result<DirLock> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(dir.join(LOCK_FILE))?;
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+        .map(DirLock)
+        .map_err(|(_, errno)| io::Error::from(errno))
+}
+
+/// Makes renames, creations and removals inside `dir` durable.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Writes `bytes` to a `0600` temp file next to `path`, syncs it, renames it
+/// into place and syncs the directory.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path
         .parent()
@@ -230,7 +264,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)
+        fs::rename(&tmp, path)?;
+        sync_dir(dir)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -342,6 +377,44 @@ mod tests {
         assert!(!store.remove("github").unwrap());
         assert!(store.remove("../escape").is_err());
         assert!(store.snapshot().unwrap().connections().is_empty());
+    }
+
+    #[test]
+    fn concurrent_creation_agrees_on_one_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let secret = format!("secret-{i}");
+                    store
+                        .put(spec("github", None), &secret)
+                        .unwrap()
+                        .placeholder
+                })
+            })
+            .collect();
+        let placeholders: Vec<String> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+        let stored = store.snapshot().unwrap().connections()[0]
+            .placeholder
+            .clone();
+        assert!(
+            placeholders.iter().all(|p| *p == stored),
+            "{placeholders:?}"
+        );
+    }
+
+    #[test]
+    fn removing_an_absent_connection_still_changes_the_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.put(spec("github", None), "a").unwrap();
+        // What a remove that failed after deleting the file leaves behind.
+        fs::remove_file(store.connection_path("github")).unwrap();
+        let stale = store.generation().unwrap();
+        assert!(!store.remove("github").unwrap());
+        assert_ne!(stale, store.generation().unwrap());
     }
 
     #[test]
