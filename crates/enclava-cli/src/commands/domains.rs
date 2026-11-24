@@ -73,10 +73,18 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             println!("Publish this TXT record at your DNS provider:");
             println!("  Name:  {}", resp.txt_record_name);
             println!("  Value: {}", resp.txt_record_value);
+            if let (Some(cname_name), Some(cname_target)) =
+                (&resp.acme_cname_name, &resp.acme_cname_target)
+            {
+                println!();
+                println!("Also publish this CNAME record (required for the TLS certificate):");
+                println!("  Name:      {cname_name}");
+                println!("  Points at: {cname_target}");
+            }
             println!();
             println!("Expires at: {}", resp.expires_at);
             println!();
-            println!("Once published, run:");
+            println!("Once BOTH records are published, run:");
             println!("  enclava domains verify {domain} --app {app_name}");
         }
 

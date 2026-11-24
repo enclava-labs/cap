@@ -1115,6 +1115,14 @@ fn compose_api_error(status_code: u16, body: ApiErrorBody) -> ComposedApiError {
     if let Some(retry_after) = body.retry_after {
         message = format!("{message} (retry after ~{retry_after}s)");
     }
+    // Same client-side remediation pattern: the expected ACME delegation
+    // pair travels only with this code and is actionable, not hostile,
+    // text.
+    if code.as_deref() == Some("acme_delegation_missing")
+        && let (Some(name), Some(target)) = (&body.acme_cname_name, &body.acme_cname_target)
+    {
+        message = format!("{message} (publish CNAME {name} -> {target})");
+    }
     // The hosted sanitizer drops provider message text by design, so this one
     // known code carries its remediation client-side.
     if code.as_deref() == Some("stale_owner_seed") {
@@ -1251,6 +1259,40 @@ mod tests {
         let ComposedApiError { code, message, .. } = compose_api_error(409, body);
         assert_eq!(code.as_deref(), Some("idempotency_request_in_progress"));
         assert_eq!(message, "idempotency_request_in_progress");
+    }
+
+    #[test]
+    fn delegation_missing_error_carries_the_cname_pair() {
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "acme_delegation_missing",
+            "acme_cname_name": "_acme-challenge.app.example.com",
+            "acme_cname_target": "app.example.com.acme.managed.test"
+        }))
+        .unwrap();
+        let composed = compose_api_error(422, body);
+        assert_eq!(composed.code.as_deref(), Some("acme_delegation_missing"));
+        assert_eq!(
+            composed.message,
+            "acme_delegation_missing (publish CNAME _acme-challenge.app.example.com -> app.example.com.acme.managed.test)"
+        );
+
+        // Without the pair (older server): the bare code still composes.
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "acme_delegation_missing"
+        }))
+        .unwrap();
+        let composed = compose_api_error(422, body);
+        assert_eq!(composed.message, "acme_delegation_missing");
+
+        // Other codes never print a CNAME remediation.
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "app_not_found",
+            "acme_cname_name": "_acme-challenge.app.example.com",
+            "acme_cname_target": "app.example.com.acme.managed.test"
+        }))
+        .unwrap();
+        let composed = compose_api_error(404, body);
+        assert_eq!(composed.message, "app_not_found");
     }
 
     #[test]
