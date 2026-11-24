@@ -73,6 +73,7 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             println!("Publish this TXT record at your DNS provider:");
             println!("  Name:  {}", resp.txt_record_name);
             println!("  Value: {}", resp.txt_record_value);
+            let needs_cname = resp.acme_cname_name.is_some() && resp.acme_cname_target.is_some();
             if let (Some(cname_name), Some(cname_target)) =
                 (&resp.acme_cname_name, &resp.acme_cname_target)
             {
@@ -84,7 +85,11 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             println!();
             println!("Expires at: {}", resp.expires_at);
             println!();
-            println!("Once BOTH records are published, run:");
+            if needs_cname {
+                println!("Once BOTH records are published, run:");
+            } else {
+                println!("Once the record is published, run:");
+            }
             println!("  enclava domains verify {domain} --app {app_name}");
         }
 
@@ -96,6 +101,18 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             println!(
                 "Domain '{}' verified for {app_name} at {}.",
                 resp.domain, resp.verified_at,
+            );
+            // Verify routes the hostname; the certificate's hostname list is
+            // part of the signed deployment, so it only reaches the workload
+            // with the next deploy.
+            println!();
+            println!("To serve HTTPS on {}:", resp.domain);
+            println!("  - Not deployed yet: run `enclava deploy`.");
+            println!(
+                "  - Already deployed: the app restarts to pick up the route (unlock it again if it"
+            );
+            println!(
+                "    uses password unlock), then run `enclava deploy` to issue the certificate."
             );
         }
 
