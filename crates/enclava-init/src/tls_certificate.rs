@@ -24,8 +24,12 @@
 //! certificate and key are regular files and the full anchored validation
 //! passes. Anything else — non-regular files, symlinks (including dangling
 //! ones), unreadable state, malformed/expired-otherwise-invalid/untrusted
-//! chains, key mismatches — aborts provisioning without ordering a
-//! replacement certificate and without replacing the retained private key.
+//! chains, key mismatches, and un-parseable configured hostnames — aborts
+//! provisioning without ordering a replacement certificate and without
+//! replacing the retained private key. A pure hostname-coverage miss on an
+//! otherwise-trustworthy chain re-orders with the retained key (the
+//! configured set can grow after the first deploy; see
+//! `TLS_CERTIFICATE_VALIDATION.md`).
 //! Only an actually absent certificate (ENOENT) starts issuance; a
 //! certificate-less retained key is reused for the new CSR so an
 //! interrupted first issuance retries with the same key.
@@ -598,6 +602,7 @@ fn provision_with_policy(
             trust_anchors,
             at,
         );
+        let mut coverage_reissue = false;
         let due = match (validated, validity) {
             (Ok(()), Ok((not_before, not_after))) => {
                 let now_secs = (wait.now)().timestamp();
@@ -619,8 +624,12 @@ fn provision_with_policy(
                 // hostname check removed: only a pure coverage miss
                 // re-orders; any other defect keeps the original error
                 // and fails closed.
-                let coverage_only_miss =
-                    validate_certificate_chain(&chain_pem, &key_pair, &[], trust_anchors, at)
+                let hostnames_parse = cfg
+                    .tls_certificate_hostnames
+                    .iter()
+                    .all(|hostname| ServerName::try_from(hostname.as_str()).is_ok());
+                let coverage_only_miss = hostnames_parse
+                    && validate_certificate_chain(&chain_pem, &key_pair, &[], trust_anchors, at)
                         .is_ok();
                 if !coverage_only_miss {
                     return Err(err.context("validating retained static TLS certificate"));
@@ -629,6 +638,7 @@ fn provision_with_policy(
                     cert = %cert_path.display(),
                     "retained static TLS certificate does not cover the configured hostname set; re-ordering with the retained key"
                 );
+                coverage_reissue = true;
                 true
             }
             (Err(err), Err(_)) => {
@@ -673,7 +683,11 @@ fn provision_with_policy(
                 return Ok(());
             }
             Err(err) => {
-                return Err(err.context("renewing expired retained static TLS certificate"));
+                return Err(err.context(if coverage_reissue {
+                    "re-ordering retained static TLS certificate for the grown hostname set"
+                } else {
+                    "renewing expired retained static TLS certificate"
+                }));
             }
         }
     }
@@ -1881,7 +1895,6 @@ hkdf-info = "tls-state-luks-key"
         // the retained certificate (renewal-failure semantics: it still
         // serves the hostnames it covers; the next boot retries).
         let dir = tempdir().unwrap();
-        let cfg = broker_config(dir.path(), &["app.example.test"]);
         let (root, chain) = mint_test_chain(&["other.example.test"], |_| {});
         let anchors = [root.anchor()];
         let persistent = write_retained_state(
@@ -1892,7 +1905,26 @@ hkdf-info = "tls-state-luks-key"
         let cert_before = std::fs::read(cert_path(&persistent)).unwrap();
         let key_before = std::fs::read(key_path(&persistent)).unwrap();
 
+        // The re-order must reach the BROKER (not die at token resolution):
+        // a scripted broker that answers 500 proves the POST happened and
+        // the failure keeps the retained certificate.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (base, _server) = spawn_scripted_broker(
+            vec![("500 Internal Server Error".to_string(), String::new())],
+            events.clone(),
+        );
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            &["app.example.test"],
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
         provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["post"],
+            "the re-order must reach the broker POST"
+        );
         assert_eq!(std::fs::read(cert_path(&persistent)).unwrap(), cert_before);
         assert_eq!(std::fs::read(key_path(&persistent)).unwrap(), key_before);
     }
