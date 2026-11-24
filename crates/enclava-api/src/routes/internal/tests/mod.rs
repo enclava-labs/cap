@@ -3412,7 +3412,7 @@ async fn whitelisted_known_not_applied_outcomes_preserve_binding_and_re_execute(
     let messages: Vec<&str> = TRANSIENT_RETRY_CONFLICT_MESSAGES.to_vec();
     assert_eq!(
         messages.len(),
-        7,
+        9,
         "whitelist drift: update this count when editing the constant"
     );
     for (i, message) in messages.iter().enumerate() {

@@ -1866,6 +1866,13 @@ async fn finish_idempotent_request(
 /// never grants re-execution authority.
 const TRANSIENT_RETRY_CONFLICT_MESSAGES: &[&str] = &[
     "app mutation already in progress",
+    // Code-shaped verify refusals (custom-domain paths): both fire BEFORE
+    // any mutation is applied — the lane guard and the restart-admission
+    // probe — so a retry after the blocking deployment settles must
+    // RE-EXECUTE instead of replaying the stored refusal (Devin review on
+    // #415).
+    "deployment_in_progress",
+    "volume_init_unproven",
     "deployment mutation is still in progress",
     "deployment mutation is still in progress; retry after its lease completes",
     "deployment mutation is still in progress; retry rollback",
