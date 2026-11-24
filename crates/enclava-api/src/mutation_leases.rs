@@ -4740,8 +4740,13 @@ pub(crate) mod tests {
             .await
             .expect("arm the infinite fence (the pre-F-C behavior)");
         let (owner_token, _generation) = (lease.token, 0i64);
-        // Simulate the lost holder: the stopped heartbeat lapses BOTH the
-        // app lease's and the fence row's renewal clocks.
+        // Simulate the lost holder: `renew` keeps the app lease and every
+        // fence in ONE transaction, so heartbeat death (process loss,
+        // request cancellation) lapses BOTH clocks together — that is the
+        // real orphan shape this reconciler repairs. Nothing ever bounds
+        // an armed fence on its own: `renew`'s CASE preserves
+        // reclaim_after = 'infinity', so once the holder is gone the
+        // fence-row clock is the only selector that can pick it up.
         for table in ["app_mutation_leases", "external_resource_mutation_leases"] {
             sqlx::query(&format!(
                 "UPDATE {table} SET locked_until = clock_timestamp() - interval '1 second' WHERE owner_token = $1"
