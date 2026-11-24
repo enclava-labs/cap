@@ -335,7 +335,10 @@ async fn ensure_no_apply_in_progress(
     if apply_in_progress {
         Err((
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "app deployment in progress"})),
+            Json(serde_json::json!({
+                "error": "deployment_in_progress",
+                "message": "app deployment in progress"
+            })),
         ))
     } else {
         Ok(())
@@ -591,12 +594,38 @@ pub async fn verify_challenge(
         {
             Ok(crate::deploy::IngressRestartVerdict::NotDeployed)
             | Ok(crate::deploy::IngressRestartVerdict::Ready) => None,
-            Ok(crate::deploy::IngressRestartVerdict::Unproven) => Some((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "volume initialization has not proven complete; recover the deployment before changing domains"
-                })),
-            )),
+            Ok(crate::deploy::IngressRestartVerdict::Unproven) => {
+                // The strict whole-second rule exists to defend the
+                // size-floor waiver against a pod predating a REPLACED
+                // claim; as restart admission it refuses the FIRST domain
+                // verify of every fresh app, because a StatefulSet's
+                // ordinal-0 pod is normally created in the same whole
+                // second as its claims (observed on dev). Adding the first
+                // domain admits on the timestamp-agnostic proof instead: a
+                // Ready pod that mounts both claims completed first-boot on
+                // these volumes, and the residual same-second replacement
+                // ambiguity is healed by the very rollout restart this
+                // admits. Domain CHANGES keep the strict rule.
+                if previous_custom.is_none()
+                    && enclava_engine::apply::orchestrator::inspect_ready_pod_mounts_all_claims(
+                        engine,
+                        &app.namespace,
+                        &app.name,
+                    )
+                    .await
+                    .unwrap_or(false)
+                {
+                    None
+                } else {
+                    Some((
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "volume_init_unproven",
+                            "message": "volume initialization has not proven complete; recover the deployment before changing domains"
+                        })),
+                    ))
+                }
+            }
             Err(error) => {
                 tracing::error!(
                     app_id = %app.id,
