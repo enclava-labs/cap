@@ -307,11 +307,14 @@ pub async fn create_challenge(
 pub struct VerifyResponse {
     pub domain: String,
     pub verified_at: chrono::DateTime<Utc>,
-    /// Whether the tenant-ingress restart that publishes this domain's
-    /// serving config is complete. `false` after a verify that SCHEDULED the
-    /// restart (the pod converges on its own clock — in password mode after
-    /// the owner's unlock) or for an app not yet deployed: the domain is
-    /// verified and routed; serving converges with the rollout.
+    /// Whether the tenant ingress is provably serving this domain. `false`
+    /// after a verify that SCHEDULED the restart (the pod converges on its
+    /// own clock — in password mode only after the owner's unlock), for an
+    /// app not yet deployed, and on same-domain re-verification while the
+    /// live StatefulSet rollout has not settled. Clients learn convergence
+    /// from the app's readiness surfaces (a re-verify consults the live
+    /// rollout; a deploy re-renders the signed descriptor); this field is
+    /// the verify-time snapshot, not a subscription.
     pub ingress_ready: bool,
 }
 
@@ -516,7 +519,7 @@ pub async fn verify_challenge(
     let mutation = crate::mutation_leases::claim(
         &state,
         app.id,
-        "custom_domain_set",
+        crate::mutation_leases::CUSTOM_DOMAIN_SET_OPERATION,
         challenge_id,
         false,
         resources.clone(),
@@ -684,12 +687,26 @@ pub async fn verify_challenge(
             .map_err(|_| internal_error())?;
         app_lane.commit().await.map_err(|_| internal_error())?;
         drop(apply_permit);
+        // Same-domain re-verification repairs DNS/edge only — but the
+        // ingress is only provably serving when the live StatefulSet has
+        // converged (a restart scheduled by an earlier verify may still be
+        // replacing a locked password-mode pod). Fail closed on probe
+        // errors, a missing workload, or an in-flight rollout.
+        let rollout_settled = crate::deploy::workload_rollout_settled(
+            &enclava_engine::apply::engine::ApplyEngine::new(
+                state.kube_client.clone(),
+                enclava_engine::apply::types::ApplyConfig::default(),
+            ),
+            &app.namespace,
+            &app.name,
+        )
+        .await
+        .unwrap_or(None)
+        .unwrap_or(false);
         return Ok(Json(VerifyResponse {
             domain,
             verified_at,
-            // Same-domain re-verification repairs DNS/edge only; the ingress
-            // was already published by the verifying deploy or verify.
-            ingress_ready: true,
+            ingress_ready: rollout_settled,
         }));
     }
 
