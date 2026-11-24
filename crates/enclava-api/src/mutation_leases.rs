@@ -4945,4 +4945,58 @@ pub(crate) mod tests {
         assert!(bounded > chrono::Utc::now());
         drop(replacement);
     }
+
+    #[tokio::test]
+    async fn custom_domain_fence_reconciler_never_bounds_a_fence_with_live_owner() {
+        // The crash-between-renews shape: `renew` (app lease) and
+        // `renew_resources` (fence rows) are SEPARATE transactions, so a
+        // holder can crash between them leaving fence-EXPIRED +
+        // owner-LIVE. The NOT-EXISTS live-owner exclusion is what keeps
+        // the reconciler from bounding a live operation's fence (which
+        // would admit a concurrent same-scope mutation mid-operation).
+        // Mixed clocks — ONLY the fence row's clock is expired.
+        let pool = database_test_pool(2).await;
+        let (_org_id, app_id) = insert_app(&pool, "fence-mixed-clock.example.test").await;
+        let state = std::sync::Arc::new(state_with_pool(pool.clone()));
+        let fence_key = format!("cap-testing-fence-{}", uuid::Uuid::new_v4().simple());
+        let lease = claim(
+            &state,
+            app_id,
+            "custom_domain_set",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::new("kubernetes_namespace", &fence_key)],
+        )
+        .await
+        .expect("claim");
+        lease
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("arm");
+        // ONLY the fence row's clock lapses; the app lease stays live
+        // (heartbeat still running).
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases SET locked_until = clock_timestamp() - interval '1 second' WHERE owner_token = $1 AND resource_scope = 'kubernetes_namespace'",
+        )
+        .bind(lease.token)
+        .execute(&pool)
+        .await
+        .expect("lapse only the fence clock");
+
+        let repaired = reconcile_orphaned_custom_domain_fences(&pool)
+            .await
+            .expect("reconciler run");
+        assert_eq!(
+            repaired, 0,
+            "a fence whose owner lease is still live is never bounded"
+        );
+        let still_infinite: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM external_resource_mutation_leases WHERE reclaim_after = 'infinity'::timestamptz AND owner_token = $1 AND resource_scope = 'kubernetes_namespace'",
+        )
+        .bind(lease.token)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(still_infinite, 1, "the live owner's fence stays armed");
+    }
 }

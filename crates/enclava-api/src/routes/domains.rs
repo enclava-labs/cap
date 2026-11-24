@@ -303,6 +303,28 @@ pub async fn create_challenge(
     }))
 }
 
+/// Total-time bound for the same-domain re-verify readiness probe. The
+/// kube client carries no default total timeout, and the receipt must not
+/// be delayed behind one hung StatefulSet GET (the residual the finite
+/// lease + reconciler already bound; this keeps the request path fast
+/// too).
+const VERIFY_ROLLOUT_PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Map a rollout-settled probe outcome to the verify receipt's
+/// `ingress_ready`, failing closed on every shape but a positively
+/// settled rollout: probe error, missing workload (None), an in-flight
+/// rollout (Some(false)), and a probe that exceeds `bound` all read as
+/// not-ready.
+async fn ingress_ready_from_probe<F>(probe: F, bound: std::time::Duration) -> bool
+where
+    F: std::future::Future<Output = Result<Option<bool>, crate::deploy::DeployError>>,
+{
+    match tokio::time::timeout(bound, probe).await {
+        Ok(Ok(Some(true))) => true,
+        Ok(Ok(Some(false))) | Ok(Ok(None)) | Ok(Err(_)) | Err(_) => false,
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct VerifyResponse {
     pub domain: String,
@@ -692,21 +714,16 @@ pub async fn verify_challenge(
         // converged (a restart scheduled by an earlier verify may still be
         // replacing a locked password-mode pod). Fail closed on probe
         // errors, a missing workload, or an in-flight rollout.
-        let rollout_settled = crate::deploy::workload_rollout_settled(
-            &enclava_engine::apply::engine::ApplyEngine::new(
-                state.kube_client.clone(),
-                enclava_engine::apply::types::ApplyConfig::default(),
-            ),
-            &app.namespace,
-            &app.name,
-        )
-        .await
-        .unwrap_or(None)
-        .unwrap_or(false);
+        let engine = enclava_engine::apply::engine::ApplyEngine::new(
+            state.kube_client.clone(),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        );
+        let probe = crate::deploy::workload_rollout_settled(&engine, &app.namespace, &app.name);
+        let ingress_ready = ingress_ready_from_probe(probe, VERIFY_ROLLOUT_PROBE_BOUND).await;
         return Ok(Json(VerifyResponse {
             domain,
             verified_at,
-            ingress_ready: rollout_settled,
+            ingress_ready,
         }));
     }
 
@@ -1338,5 +1355,39 @@ mod tests {
         let serialized = body.to_string();
         assert!(!serialized.contains("detail"));
         assert!(!serialized.contains("reason"));
+    }
+
+    // The verify receipt's ingress_ready contract (review MUST-FIX 2):
+    // fail closed on every probe shape but a positively settled rollout,
+    // including a probe that exceeds its bound. Run with
+    // --test-threads=1 (the repo's ci.yml convention for DB-backed
+    // suites; these are pure but keep the convention).
+    #[tokio::test]
+    async fn ingress_ready_is_true_only_for_a_settled_rollout() {
+        use crate::deploy::DeployError;
+
+        let settled = std::future::ready(Ok(Some(true)));
+        assert!(ingress_ready_from_probe(settled, VERIFY_ROLLOUT_PROBE_BOUND).await);
+
+        for not_ready in [
+            std::future::ready(Ok(Some(false))),
+            std::future::ready(Ok(None)),
+            std::future::ready(Err(DeployError::MissingAttestationConfig)),
+        ] {
+            assert!(
+                !ingress_ready_from_probe(not_ready, VERIFY_ROLLOUT_PROBE_BOUND).await,
+                "unsettled / missing / errored probes must read not-ready"
+            );
+        }
+
+        // A probe that never resolves is cut off by the bound: not-ready,
+        // and the helper returns within it.
+        let hung = tokio::time::timeout(
+            VERIFY_ROLLOUT_PROBE_BOUND + std::time::Duration::from_secs(5),
+            ingress_ready_from_probe(std::future::pending(), std::time::Duration::from_millis(20)),
+        )
+        .await
+        .expect("the bound cuts the hung probe off");
+        assert!(!hung);
     }
 }
