@@ -6939,15 +6939,18 @@ pub async fn reapply_tenant_ingress(
     let ledger = crate::deployment_failure_cleanup::load_creation_ledger(pool, app.id).await?;
     let engine =
         ApplyEngine::new(client.clone(), ApplyConfig::default()).with_creation_ledger(ledger);
-    // Domain-only reapply: the pod restart re-opens existing volumes, so the
-    // base rollout budget applies — the fresh-initialization allowance is
-    // reserved for renders that provision a new claim.
-    let rollout_timeout = engine.config().rollout_timeout;
     ensure_statefulset_exists(&engine, &app_spec.namespace, &app_spec.name).await?;
     let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
-    mutation
-        .arm_resource_scope_until_reconciled("kubernetes_namespace")
-        .await?;
+    // No infinite namespace fence here, unlike a real deployment apply.
+    // This domain-only reapply never deletes the namespace and its only
+    // Kubernetes writes are generation-CAS'd and idempotent (the ConfigMap
+    // SSA apply and the rollout-restart annotation patch below), so a
+    // cancelled request leaves desired state applied and the ordinary
+    // finite fence from the lease claim self-heals on the normal
+    // expiry/quarantine clock. Arming `until_reconciled` here — the tool
+    // for precondition-less provider writes and namespace-delete races —
+    // wedged apps forever when the request was cancelled mid-rollout (the
+    // retained-fence reconciler did not cover custom_domain_set).
     let step = apply_namespaced_resource(&engine, &app_spec.namespace, &cm, generation).await;
     complete_creation_step(
         step,
@@ -6964,22 +6967,13 @@ pub async fn reapply_tenant_ingress(
     restart_statefulset_for_ingress(&engine, &app_spec.namespace, &app_spec.name, generation)
         .await?;
 
-    let status = watch_rollout(
-        &engine,
-        &app_spec.namespace,
-        &app_spec.name,
-        rollout_timeout,
-    )
-    .await?;
-    if status.phase != DeployPhase::Running {
-        return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
-            status
-                .message
-                .unwrap_or_else(|| format!("tenant ingress rollout ended in {:?}", status.phase)),
-        )
-        .into());
-    }
-
+    // The restart is SCHEDULED, not waited on: the replacement pod becomes
+    // Ready on its own clock — in password mode only after the owner's
+    // unlock — and the verify request must return well inside the hosted
+    // proxy timeout instead of holding the app lease through a rollout
+    // that cannot converge (F-C). The annotation patch above is
+    // generation-pinned, so the restart happens exactly once; convergence
+    // is observed by the app's normal readiness path.
     Ok(())
 }
 

@@ -307,6 +307,12 @@ pub async fn create_challenge(
 pub struct VerifyResponse {
     pub domain: String,
     pub verified_at: chrono::DateTime<Utc>,
+    /// Whether the tenant-ingress restart that publishes this domain's
+    /// serving config is complete. `false` after a verify that SCHEDULED the
+    /// restart (the pod converges on its own clock — in password mode after
+    /// the owner's unlock) or for an app not yet deployed: the domain is
+    /// verified and routed; serving converges with the rollout.
+    pub ingress_ready: bool,
 }
 
 /// Refuse the verify when this app's apply is still in progress: restarting
@@ -681,6 +687,9 @@ pub async fn verify_challenge(
         return Ok(Json(VerifyResponse {
             domain,
             verified_at,
+            // Same-domain re-verification repairs DNS/edge only; the ingress
+            // was already published by the verifying deploy or verify.
+            ingress_ready: true,
         }));
     }
 
@@ -688,15 +697,22 @@ pub async fn verify_challenge(
 
     // Re-render the tenant-ingress ConfigMap before publishing the HAProxy
     // route. Caddy does not watch its ConfigMap, so reapply_tenant_ingress
-    // also restarts the StatefulSet and waits for the new pod to become ready.
-    // If the app has not been deployed yet, persist the verified custom domain
-    // and let the first deploy publish the route.
+    // also restarts the StatefulSet; the restart is scheduled, not waited
+    // on — the pod becomes Ready on its own clock (in password mode only
+    // after the owner's unlock), and the request returns well inside the
+    // hosted proxy timeout. If the app has not been deployed yet, persist
+    // the verified custom domain and let the first deploy publish the route.
     let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
     let next_app = App {
         custom_domain: Some(domain.clone()),
         ..app.clone()
     };
-    let ingress_ready = match mutation
+    // `false` for the scheduled-restart and not-deployed paths: the custom
+    // domain is verified and routed, but the serving ingress converges on
+    // the pod's own readiness clock (the route below still publishes — the
+    // backend exists in both cases; only the not-deployed path defers it).
+    let mut ingress_scheduled = false;
+    match mutation
         .guard_provider(crate::deploy::reapply_tenant_ingress(
             &state.kube_client,
             &state.db,
@@ -710,7 +726,9 @@ pub async fn verify_challenge(
         .await
         .map_err(|_| internal_error())?
     {
-        Ok(()) => true,
+        Ok(()) => {
+            ingress_scheduled = true;
+        }
         Err(crate::deploy::DeployError::NoContainers)
         | Err(crate::deploy::DeployError::NotDeployed(_)) => {
             tracing::info!(
@@ -718,7 +736,6 @@ pub async fn verify_challenge(
                 %domain,
                 "tenant ingress regeneration skipped: app not yet deployed"
             );
-            false
         }
         Err(e) => {
             // Codex P2: an ingress reapply whose accepted write lost CAP
@@ -752,11 +769,17 @@ pub async fn verify_challenge(
             );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("tenant ingress update failed: {e}")})),
+                // Code-shaped, provider-text-free (the DeployError display
+                // carries internals); the full cause is in the log line above.
+                Json(serde_json::json!({"error": "tenant_ingress_update_failed"})),
             ));
         }
     };
-    let app_backend = if ingress_ready {
+    let app_backend = if ingress_scheduled {
+        // The restart is scheduled: the edge route publishes now (the
+        // backend exists and serves once the rollout converges), while the
+        // response's ingress_ready stays false so the client knows serving
+        // is converging rather than established.
         mutation
             .guard_provider(ensure_custom_domain_haproxy_route(
                 &state,
@@ -834,6 +857,9 @@ pub async fn verify_challenge(
     Ok(Json(VerifyResponse {
         domain,
         verified_at,
+        // Scheduled restart (or not-yet-deployed): verified and routed, but
+        // serving converges with the rollout.
+        ingress_ready: false,
     }))
 }
 
