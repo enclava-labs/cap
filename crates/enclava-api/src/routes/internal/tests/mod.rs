@@ -3412,9 +3412,39 @@ async fn whitelisted_known_not_applied_outcomes_preserve_binding_and_re_execute(
     let messages: Vec<&str> = TRANSIENT_RETRY_CONFLICT_MESSAGES.to_vec();
     assert_eq!(
         messages.len(),
-        9,
+        8,
         "whitelist drift: update this count when editing the constant"
     );
+    // Hand-written literals pinning BOTH directions against the hosted
+    // verification guards (Devin T2): every refusal code the verify path
+    // can return is either transient-whitelisted (re-execute on retry) or
+    // deliberately surfaced as-is (cached and replayed).
+    // - deployment_in_progress (the apply-lane guard, domains.rs
+    //   ensure_no_apply_in_progress): transient — whitelisted above.
+    // - volume_init_unproven (the restart-admission refusal, domains.rs
+    //   verify_challenge): recovery-needed, NOT whitelisted — a same-key
+    //   retry replays the refusal with its code + message instead of
+    //   hiding behind idempotency_request_in_progress.
+    // - acme_delegation_missing (the CNAME gate): a 422, not a conflict —
+    //   cached as the completed refusal and surfaced the same way.
+    assert_eq!(
+        idempotency_error_disposition(
+            StatusCode::CONFLICT,
+            &serde_json::json!({"error": "deployment_in_progress"}),
+        ),
+        IdempotencyErrorDisposition::KnownNotApplied,
+        "the transient apply-lane guard code re-executes on same-key retry"
+    );
+    for surfaced in ["volume_init_unproven", "custom_domain_limit_exceeded"] {
+        assert_eq!(
+            idempotency_error_disposition(
+                StatusCode::CONFLICT,
+                &serde_json::json!({"error": surfaced}),
+            ),
+            IdempotencyErrorDisposition::Completed,
+            "{surfaced} stays cached and surfaced: recovery guidance must reach the caller"
+        );
+    }
     for (i, message) in messages.iter().enumerate() {
         let key = format!("transient-retry-cancel-{suffix}-{i}");
         let path = format!("/internal/test/transient-retry-cancel-{suffix}/{i}");
