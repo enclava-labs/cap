@@ -1,6 +1,7 @@
 pub mod acme;
 pub mod auth;
 pub mod clients;
+pub mod compensation_reconcile;
 pub mod cosign;
 pub mod db;
 pub mod deploy;
@@ -1834,9 +1835,14 @@ pub(crate) mod test_support {
     use std::sync::Arc;
     use uuid::Uuid;
 
+    pub(crate) fn database_test_url() -> String {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string())
+    }
+
     pub(crate) async fn database_test_pool() -> sqlx::PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let database_url = database_test_url();
+
         let pool = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect test database");
