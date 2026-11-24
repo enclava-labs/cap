@@ -4704,14 +4704,14 @@ pub(crate) mod tests {
         // next mutation can proceed — this is also the repair for apps
         // wedged by the pre-fix behavior.
         let pool = database_test_pool(2).await;
-        let (org_id, app_id) = insert_app(&pool, "fence-reconcile.example.test").await;
+        let (_org_id, app_id) = insert_app(&pool, "fence-reconcile.example.test").await;
         let state = std::sync::Arc::new(state_with_pool(pool.clone()));
         let operation_id = Uuid::new_v4();
         let resources = vec![ResourceFence::new(
             "kubernetes_namespace",
             "cap-testing-fence-reconcile",
         )];
-        let mut lease = claim(
+        let lease = claim(
             &state,
             app_id,
             "custom_domain_set",
@@ -4769,7 +4769,7 @@ pub(crate) mod tests {
         let (_org_id, app_id) = insert_app(&pool, "fence-live.example.test").await;
         let state = std::sync::Arc::new(state_with_pool(pool.clone()));
         let operation_id = Uuid::new_v4();
-        let mut lease = claim(
+        let lease = claim(
             &state,
             app_id,
             "custom_domain_set",
@@ -4807,7 +4807,7 @@ pub(crate) mod tests {
         let (_org_two, app_two) = insert_app(&pool, "fence-other.example.test").await;
         let state_two = std::sync::Arc::new(state_with_pool(pool.clone()));
         let op_two = Uuid::new_v4();
-        let mut other = claim(
+        let other = claim(
             &state_two,
             app_two,
             RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
