@@ -53,9 +53,11 @@ the workload-attested broker and validates retained state on the encrypted
   can legitimately grow after the first deploy (a custom domain verified
   on an already-deployed app). An un-parseable *configured* hostname is
   NOT a coverage miss and still aborts.
-- Only an actually missing certificate (`ENOENT`) starts issuance. A
-  certificate-less retained key is kept and reused for the new CSR, so an
-  interrupted first issuance retries with the same key.
+- Only an actually missing certificate (`ENOENT`) starts FIRST issuance
+  — distinct from the re-ordering paths above (coverage miss, renewal),
+  which run with `tls.crt` present. A certificate-less retained key is
+  kept and reused for the new CSR, so an interrupted first issuance
+  retries with the same key.
 - Fresh broker responses are validated with the same anchored checks before
   `tls.crt` is written.
 

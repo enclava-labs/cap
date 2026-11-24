@@ -3690,4 +3690,51 @@ hkdf-info = "tls-state-luks-key"
             "no broker call may happen"
         );
     }
+
+    #[test]
+    fn uncovered_then_malformed_hostname_stays_fail_closed() {
+        // Devin 4686759885: validate_certificate_chain stops at the first
+        // uncovered hostname, so [uncovered, un-parseable] must still abort
+        // — the hostnames_parse gate runs BEFORE the coverage-only
+        // re-check, and a malformed configured hostname can never ride the
+        // coverage path. No broker POST; retained state byte-identical.
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (root, chain) = mint_test_chain(&["app.example.test"], |_| {});
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let cert_before = std::fs::read(cert_path(&persistent)).unwrap();
+        let key_before = std::fs::read(key_path(&persistent)).unwrap();
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), String::new())], events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            &["www.example.test", "not a server name"],
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (wait, _clock) = fake_wait(
+            dir.path().join("init-acme-cooldown"),
+            Utc::now(),
+            events.clone(),
+        );
+
+        let error = provision_with_policy(&cfg, &persistent, &anchors, &wait)
+            .expect_err("a malformed configured hostname must abort provisioning");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("validating retained static TLS certificate"),
+            "error context: {rendered}"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no broker POST may happen"
+        );
+        assert_eq!(std::fs::read(cert_path(&persistent)).unwrap(), cert_before);
+        assert_eq!(std::fs::read(key_path(&persistent)).unwrap(), key_before);
+    }
 }
