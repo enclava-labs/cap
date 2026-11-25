@@ -5214,16 +5214,6 @@ async fn hosted_plain_deploy_with_declared_pod_groups_reproduces_the_masked_409(
         .expect("app status");
     assert_eq!(status, "creating");
 
-    // The refusal was reached and counted exactly once: the /sign fallback
-    // ran and the deployed-behavior fake refused it (a transport error on
-    // /agent-policy would produce the same receipt without any /sign call —
-    // the counter is the discriminator).
-    assert_eq!(
-        sign_refusals.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "the /sign fallback must have been refused exactly once"
-    );
-
     // The receipt is terminal: a same-key retry replays it instead of
     // re-running the (9.7 s on dev) generation.
     let replay = add_internal_actor_headers(
@@ -5243,4 +5233,14 @@ async fn hosted_plain_deploy_with_declared_pod_groups_reproduces_the_masked_409(
     replay.assert_status(StatusCode::CONFLICT);
     let replay_body: Value = replay.json();
     assert_eq!(replay_body["error"], "idempotency_recovery_required");
+
+    // The refusal was reached exactly once and the replay did NOT re-run
+    // /sign: the first request was refused by the deployed-behavior fake
+    // (a transport error on /agent-policy would leave the counter at zero),
+    // and the terminal receipt replays without a second refusal.
+    assert_eq!(
+        sign_refusals.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one /sign refusal: the first request, never the replay"
+    );
 }
