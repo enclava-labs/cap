@@ -82,13 +82,23 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
                 println!("  Name:      {cname_name}");
                 println!("  Points at: {cname_target}");
             }
+            // The challenge records prove ownership and delegate the
+            // certificate; neither one sends traffic to the app. Best
+            // effort: the challenge itself is already created.
+            if let Ok(summary) = api.get_domain(&app_name).await {
+                println!();
+                println!("To send traffic to the app, point the domain itself at it:");
+                println!("  Name:      {domain}");
+                println!("  Points at: {}", summary.platform_domain);
+                println!("  (a CNAME record; on an apex domain use your provider's ALIAS/ANAME)");
+            }
             println!();
             println!("Expires at: {}", resp.expires_at);
             println!();
             if needs_cname {
-                println!("Once BOTH records are published, run:");
+                println!("Once the TXT and the certificate CNAME are published, run:");
             } else {
-                println!("Once the record is published, run:");
+                println!("Once the TXT record is published, run:");
             }
             println!("  enclava domains verify {domain} --app {app_name}");
         }
