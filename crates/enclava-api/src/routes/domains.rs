@@ -23,6 +23,7 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{CLOUDFLARE, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::NetError;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RData;
 use rand::RngCore;
@@ -30,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+use crate::acme::DnsLookupError;
 use crate::auth::middleware::AuthContext;
 use crate::auth::scopes;
 use crate::models::App;
@@ -121,7 +123,9 @@ pub enum DomainError {
     InsidePlatformZone(String),
     #[error("DNS lookup failed: {0}")]
     Lookup(String),
-    #[error("TXT record at {0} did not match stored challenge")]
+    #[error(
+        "TXT record at {0} was not found or did not match the stored challenge; DNS changes can take a few minutes to become visible"
+    )]
     MismatchedToken(String),
     #[error("no challenge for this domain")]
     NoChallenge,
@@ -1102,7 +1106,14 @@ async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
         .build()
         .map_err(|e| e.to_string())?,
     };
-    let response = resolver.txt_lookup(name).await.map_err(|e| e.to_string())?;
+    let response = match resolver.txt_lookup(name).await {
+        Ok(response) => response,
+        // A name with no TXT record yet is the ordinary "not published or
+        // not propagated" case, not a resolver failure: report it as an
+        // empty answer so verify refuses with the precise 412 instead of a
+        // 502 the idempotency layer turns into `idempotency_recovery_required`.
+        Err(e) => return absent_txt_or_lookup_error(e),
+    };
     let mut out = Vec::new();
     for record in response.answers() {
         let RData::TXT(rdata) = &record.data else {
@@ -1117,9 +1128,43 @@ async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// NXDOMAIN and NODATA mean "no TXT record here" and become an empty answer;
+/// every other resolver error (SERVFAIL, timeout, transport) stays a failure.
+fn absent_txt_or_lookup_error(error: NetError) -> Result<Vec<String>, String> {
+    let error = DnsLookupError::from(error);
+    if error.is_record_absent() {
+        Ok(Vec::new())
+    } else {
+        Err(error.into_message())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn txt_lookup_treats_absent_records_as_empty_and_failures_as_errors() {
+        use hickory_resolver::net::{DnsError, NoRecords};
+        use hickory_resolver::proto::op::{Query, ResponseCode};
+        use hickory_resolver::proto::rr::{Name, RecordType};
+        let query = Query::query(
+            Name::from_ascii("_enclava-challenge.example.com.").unwrap(),
+            RecordType::TXT,
+        );
+        for code in [ResponseCode::NXDomain, ResponseCode::NoError] {
+            let error = NetError::from(NoRecords::new(query.clone(), code));
+            assert_eq!(absent_txt_or_lookup_error(error), Ok(Vec::new()));
+        }
+        for error in [
+            NetError::from(NoRecords::new(query, ResponseCode::ServFail)),
+            NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail)),
+            NetError::Timeout,
+            NetError::NoConnections,
+        ] {
+            assert!(absent_txt_or_lookup_error(error).is_err());
+        }
+    }
 
     #[test]
     fn rejects_inside_platform_zone() {
