@@ -61,6 +61,13 @@ pub struct ConfidentialApp {
     /// egress, only platform-required routes and explicit FQDN allowlist rules.
     #[serde(default)]
     pub egress_mode: EgressMode,
+    /// Declared pod-level supplemental groups (contract v1,
+    /// policy-templates#23): the descriptor's signed list, rendered into
+    /// the real StatefulSet's pod securityContext so the CRI passes the
+    /// DECLARED groups into the OCI spec regardless of pull mode. Absent
+    /// = legacy: the platform baseline [0, 6].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_supplemental_groups: Option<Vec<i64>>,
     /// Additional IPv4 CIDRs excluded from `public_internet` egress. Operators
     /// use this to block cluster/node public ranges that are not covered by
     /// private RFC1918 exclusions.

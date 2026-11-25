@@ -279,7 +279,10 @@ pub(crate) fn deploy_preflight_needs_claim(
 mod signing;
 pub(crate) use enclava_cli::descriptor::TrustedDeploymentExpectation;
 #[cfg(test)]
-pub(crate) use signing::{ConfidentialAppForCcHash, confidential_app_for_cc_hash};
+pub(crate) use signing::{
+    ConfidentialAppForCcHash, apply_discovered_pod_groups, confidential_app_for_cc_hash,
+    fetch_policy_with_group_discovery,
+};
 pub(crate) use signing::{
     SignedDeployBlobParams, build_signed_deploy_blobs, ensure_manual_deploy_keyring,
     fetch_verified_platform_release, load_or_derive_bootstrap_private_key,

@@ -3155,6 +3155,7 @@ async fn apply_claimed_job(
                 sigstore_material: validated.sigstore_material,
                 provenance_oci_material: validated.provenance_oci_material,
                 log_encryption: payload.log_encryption.clone(),
+                pod_supplemental_groups: validated.pod_supplemental_groups,
             },
             &state.kube_client,
             &mutation,
@@ -3596,6 +3597,9 @@ struct ValidatedApplyArtifacts {
     local_trustee_policy_json: Option<String>,
     sigstore_material: Vec<u8>,
     provenance_oci_material: Vec<u8>,
+    /// Contract v1 (policy-templates#23): the signed descriptor's
+    /// declared pod-level supplemental groups (fail-closed validated).
+    pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 async fn validate_apply_artifacts(
@@ -3637,6 +3641,7 @@ async fn validate_apply_artifacts(
             local_trustee_policy_json: None,
             sigstore_material,
             provenance_oci_material,
+            pod_supplemental_groups: None,
         });
     };
     let loaded = crate::signing_service::load_workload_artifacts_exact(
@@ -3675,6 +3680,13 @@ async fn validate_apply_artifacts(
         )
         .await
         .map_err(|_| DeploymentJobError::Artifact)?;
+    // Contract v1 (policy-templates#23): the declared groups ride the
+    // signed descriptor; an invalid list fails closed rather than
+    // rendering a StatefulSet genpolicy will reject at runtime.
+    enclava_common::descriptor::validate_pod_supplemental_groups(
+        loaded.descriptor.pod_supplemental_groups.as_ref(),
+    )
+    .map_err(|_| DeploymentJobError::Artifact)?;
     let mut binding = loaded.binding.clone();
     validate_signed_render(job, payload, &loaded, &mut binding)?;
     Ok(ValidatedApplyArtifacts {
@@ -3684,6 +3696,7 @@ async fn validate_apply_artifacts(
         local_trustee_policy_json: Some(loaded.trustee_policy_json),
         sigstore_material,
         provenance_oci_material,
+        pod_supplemental_groups: loaded.descriptor.pod_supplemental_groups.clone(),
     })
 }
 
@@ -5369,6 +5382,7 @@ pub(crate) mod tests {
         let agent_policy_hash: [u8; 32] = Sha256::digest(agent_policy_text.as_bytes()).into();
         let rego_hash: [u8; 32] = Sha256::digest(rego_text.as_bytes()).into();
         let mut descriptor = DeploymentDescriptor {
+            pod_supplemental_groups: None,
             schema_version: "v1".to_string(),
             org_id: payload.app.org_id,
             org_slug: payload.app.tenant_id.clone(),

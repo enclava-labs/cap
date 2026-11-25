@@ -174,7 +174,17 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
                     security_context: Some(PodSecurityContext {
                         fs_group: Some(10001),
                         fs_group_change_policy: Some("OnRootMismatch".to_string()),
-                        supplemental_groups: Some(vec![0, 6]),
+                        // Contract v1 (policy-templates#23): the descriptor's
+                        // DECLARED list when present, else the platform
+                        // baseline. Pod-level only — genpolicy 4.3.1 rejects
+                        // container-level supplementalGroups, and fsGroup
+                        // and the container-level runAsUser/runAsGroup
+                        // profiles stay untouched.
+                        supplemental_groups: Some(
+                            app.pod_supplemental_groups
+                                .clone()
+                                .unwrap_or_else(|| vec![0, 6]),
+                        ),
                         ..Default::default()
                     }),
                     init_containers,

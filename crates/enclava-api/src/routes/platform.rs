@@ -23,6 +23,12 @@ pub struct DeploymentContextResponse {
     /// tells signers to render claim-less cc_init_data. Deployment-context
     /// JSON tolerates unknown fields, so older CLIs ignore it.
     pub log_spool_state_bind_supported: bool,
+    /// Contract v1 (policy-templates#23): this API understands the
+    /// descriptor's pod_supplemental_groups field and relays the signing
+    /// service's guest-pull discovery response. True from this API version
+    /// on; older APIs omit the field and signers default to the legacy
+    /// single-call flow (their signing service cannot discover anyway).
+    pub pod_supplemental_groups_supported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_platform_release_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,6 +56,7 @@ pub(crate) fn deployment_context_response(state: &AppState) -> DeploymentContext
             enclava_engine::manifest::cc_init_data::tls_certificate_trust_anchors_pem(),
         log_spool_state_bind_supported:
             enclava_engine::manifest::cc_init_data::log_spool_bind_supported(),
+        pod_supplemental_groups_supported: true,
         current_platform_release_id: state
             .platform_release_envelope
             .as_ref()
@@ -103,6 +110,10 @@ mod tests {
             response.log_spool_state_bind_supported,
             enclava_engine::manifest::cc_init_data::log_spool_bind_supported(),
             "the deployment-context gate must mirror the API's installed claim"
+        );
+        assert!(
+            response.pod_supplemental_groups_supported,
+            "contract v1: this API version understands the descriptor field"
         );
     }
 

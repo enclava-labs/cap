@@ -50,8 +50,44 @@ struct TestPolicyService {
     signing_key: Arc<SigningKey>,
 }
 
+/// Contract v1 (policy-templates#23) fixture: records the upstream request
+/// and answers with the given discovered groups, so the CLI-facing broker's
+/// pass-through can be asserted in both directions.
+async fn recording_agent_policy(
+    AxumState(recorder): AxumState<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+    body: String,
+) -> (StatusCode, String) {
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let supports = payload["supports_pod_supplemental_groups"]
+        .as_bool()
+        .unwrap_or(false);
+    recorder.lock().unwrap().push(payload);
+    if supports {
+        let text = "package agent_policy\n\ndefault CreateContainerRequest := true\n";
+        (
+            StatusCode::OK,
+            serde_json::json!({
+                "agent_policy_text": text,
+                "agent_policy_sha256": hex::encode(Sha256::digest(text.as_bytes())),
+                "genpolicy_version_pin": TEST_GENPOLICY_PIN,
+                "pod_supplemental_groups": [27, 6, 0, 27],
+            })
+            .to_string(),
+        )
+    } else {
+        // The typed legacy error shape the signing service emits for a
+        // guest-pull group failure without the capability.
+        (
+            StatusCode::BAD_REQUEST,
+            "genpolicy_guest_pull_groups_required: missing pod supplemental groups [27]"
+                .to_string(),
+        )
+    }
+}
+
 async fn test_agent_policy() -> AxumJson<AgentPolicyResponse> {
     AxumJson(AgentPolicyResponse {
+        pod_supplemental_groups: None,
         agent_policy_text: TEST_AGENT_POLICY.to_string(),
         agent_policy_sha256: hex::encode(Sha256::digest(TEST_AGENT_POLICY.as_bytes())),
         genpolicy_version_pin: TEST_GENPOLICY_PIN.to_string(),
@@ -443,6 +479,7 @@ fn signed_deployment_descriptor(
     api_signing_pubkey: &str,
 ) -> DeploymentDescriptor {
     DeploymentDescriptor {
+        pod_supplemental_groups: None,
         schema_version: "v1".to_string(),
         org_id: app.org_id,
         org_slug: app.tenant_id.clone(),
@@ -3197,6 +3234,7 @@ async fn paas_internal_agent_policy_route_reaches_cap_policy_broker() {
         .try_into()
         .expect("identity hash length");
     let descriptor = DeploymentDescriptor {
+        pod_supplemental_groups: None,
         schema_version: "v1".to_string(),
         org_id: cap_org_id,
         org_slug,
@@ -4669,4 +4707,166 @@ async fn deployment_diagnostics_reports_foreign_lease_blocker() {
     );
     assert_eq!(body["blocking_operation"], "app_delete");
     assert!(body["blocked_until"].is_string());
+}
+
+#[tokio::test]
+async fn agent_policy_broker_relays_the_capability_and_discovered_groups_both_ways() {
+    // Contract v1 (policy-templates#23): the CLI-facing /agent-policy
+    // broker relays supports_pod_supplemental_groups to the signing service
+    // and pod_supplemental_groups back to the caller; without the capability
+    // the flag is NOT sent (legacy bytes) and the service's typed
+    // guest-pull error maps to a structured 4xx carrying the missing
+    // groups — never a 502.
+    let (mut state, pool) = setup_paas_managed_test_state().await;
+    let recorder: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let policy_service = Router::new()
+        .route("/agent-policy", post(recording_agent_policy))
+        .with_state(recorder.clone());
+    let policy_server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(policy_service);
+    state.signing_service = Some(
+        enclava_api::signing_service::SigningServiceClient::new(
+            policy_server
+                .server_url("/")
+                .expect("policy service URL")
+                .to_string(),
+            None,
+        )
+        .expect("policy signing service client"),
+    );
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("groups-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("groups-app-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "signer_identity_subject": github_signer_subject(),
+        "signer_identity_issuer": github_signer_issuer(),
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let (cap_org_id, org_slug, cap_app_id, domain, tee_domain, namespace, service_account, identity_hash_hex): (
+        Uuid, String, Uuid, String, Option<String>, String, String, String,
+    ) = sqlx::query_as(
+        "SELECT o.id, o.cust_slug, a.id, a.domain, a.tee_domain, a.namespace, a.service_account, a.tenant_instance_identity_hash
+           FROM apps a JOIN organizations o ON o.id = a.org_id WHERE a.name = $1",
+    )
+    .bind(&app_name)
+    .fetch_one(&pool)
+    .await
+    .expect("app descriptor inputs");
+
+    let descriptor = serde_json::json!({
+        "schema_version": "v1",
+        "org_id": cap_org_id,
+        "org_slug": org_slug,
+        "app_id": cap_app_id,
+        "app_name": app_name,
+        "deploy_id": Uuid::new_v4(),
+        "created_at": Utc::now().to_rfc3339(),
+        "nonce": "07".repeat(32),
+        "app_domain": domain,
+        "tee_domain": tee_domain,
+        "custom_domains": [],
+        "namespace": namespace,
+        "service_account": service_account,
+        "identity_hash": identity_hash_hex,
+        "image_ref": "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "signer_identity": {"subject": github_signer_subject(), "issuer": github_signer_issuer()},
+        "oci_runtime_spec": {
+            "command": [], "args": [], "env": [], "ports": [], "mounts": [],
+            "capabilities": {"add": [], "drop": []},
+            "security_context": {"run_as_user": 10001, "run_as_group": 10001, "read_only_root_fs": true, "allow_privilege_escalation": false, "privileged": false},
+            "resources": {}
+        },
+        "sidecars": {
+            "attestation_proxy_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "caddy_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "api_signing_pubkey": "test-api-signing-pubkey",
+        "independent_verification": true,
+        "expected_firmware_measurement": "03".repeat(32),
+        "expected_runtime_class": "kata-qemu-snp",
+        "kbs_resource_path": format!("default/{namespace}-{app_name}-owner/seed-encrypted"),
+        "unlock_mode": "password",
+        "policy_template_id": "enclava-kbs-policy-v1",
+        "policy_template_sha256": "04".repeat(32),
+        "platform_release_version": "cap-test",
+        "expected_agent_policy_hash": "05".repeat(32),
+        "expected_cc_init_data_hash": "06".repeat(32),
+        "expected_kbs_policy_hash": "07".repeat(32),
+    });
+
+    // Capability direction: the request flag reaches the signing service.
+    let response = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/agent-policy"
+        )),
+        &format!("groups-agent-policy-capable-{suffix}"),
+        &paas_user_id,
+    )
+    .json(
+        &serde_json::json!({ "descriptor": descriptor, "supports_pod_supplemental_groups": true }),
+    )
+    .await;
+    response.assert_status(StatusCode::OK);
+    let body: Value = response.json();
+    assert_eq!(
+        body["pod_supplemental_groups"],
+        serde_json::json!([27, 6, 0, 27])
+    );
+
+    // Legacy direction: no flag on the wire at all, and the typed error
+    // maps to a structured 4xx with the missing groups.
+    let response = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/agent-policy"
+        )),
+        &format!("groups-agent-policy-legacy-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&serde_json::json!({ "descriptor": descriptor }))
+    .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = response.json();
+    assert_eq!(body["error"], "genpolicy_guest_pull_groups_required");
+    assert_eq!(
+        body["missing_pod_supplemental_groups"],
+        serde_json::json!([27])
+    );
+
+    let requests = recorder.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0]["supports_pod_supplemental_groups"],
+        serde_json::json!(true)
+    );
+    assert!(
+        requests[1]
+            .get("supports_pod_supplemental_groups")
+            .is_none(),
+        "false is OMITTED on the relay wire (legacy bytes): {}",
+        requests[1]
+    );
+    // The descriptor itself round-trips through the relay unchanged.
+    assert_eq!(
+        requests[0]["descriptor"]["policy_template_id"],
+        serde_json::json!("enclava-kbs-policy-v1")
+    );
 }

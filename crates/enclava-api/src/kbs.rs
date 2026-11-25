@@ -9233,6 +9233,7 @@ resource_bindings := {
             };
             let dummy_digest = format!("sha256:{}", "a".repeat(64));
             let engine_app = ConfidentialApp {
+                pod_supplemental_groups: None,
                 app_id: Uuid::new_v4(),
                 deployment_id: Uuid::new_v4(),
                 name: "mirror".into(),
