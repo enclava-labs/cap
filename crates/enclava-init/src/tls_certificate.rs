@@ -24,8 +24,12 @@
 //! certificate and key are regular files and the full anchored validation
 //! passes. Anything else — non-regular files, symlinks (including dangling
 //! ones), unreadable state, malformed/expired-otherwise-invalid/untrusted
-//! chains, key mismatches — aborts provisioning without ordering a
-//! replacement certificate and without replacing the retained private key.
+//! chains, key mismatches, and un-parseable configured hostnames — aborts
+//! provisioning without ordering a replacement certificate and without
+//! replacing the retained private key. A pure hostname-coverage miss on an
+//! otherwise-trustworthy chain re-orders with the retained key (the
+//! configured set can grow after the first deploy; see
+//! `TLS_CERTIFICATE_VALIDATION.md`).
 //! Only an actually absent certificate (ENOENT) starts issuance; a
 //! certificate-less retained key is reused for the new CSR so an
 //! interrupted first issuance retries with the same key.
@@ -551,10 +555,11 @@ fn provision_with_policy(
     {
         // Retained state stays fail-closed: an incomplete, malformed,
         // untrusted, or mismatched certificate never reaches the broker and
-        // the retained private key is never replaced. The only new exit
-        // from this branch is renewal: a certificate that is expired but
-        // otherwise valid, or valid but inside its last third of lifetime,
-        // is reordered with the retained key instead of wedging the boot.
+        // the retained private key is never replaced. Two legitimate exits
+        // re-order with the retained key: renewal (expired but otherwise
+        // valid, or valid inside its last third of lifetime), and a pure
+        // hostname-coverage miss — the configured set grew after the first
+        // deploy (custom domain on an already-deployed app).
         if !retained_path_is_regular_file(&key_path)
             .with_context(|| format!("checking retained TLS private key {}", key_path.display()))?
         {
@@ -597,6 +602,7 @@ fn provision_with_policy(
             trust_anchors,
             at,
         );
+        let mut coverage_reissue = false;
         let due = match (validated, validity) {
             (Ok(()), Ok((not_before, not_after))) => {
                 let now_secs = (wait.now)().timestamp();
@@ -607,7 +613,35 @@ fn provision_with_policy(
                     "validated TLS certificate leaf validity could not be re-parsed"
                 ));
             }
-            (Err(err), _) => {
+            (Err(err), Ok(_)) => {
+                // A retained chain that is otherwise trustworthy — PEM
+                // shape, key binding, anchored path at the same instant —
+                // but does not cover the configured hostname set is a
+                // legitimate re-order with the retained key: the set can
+                // legitimately change after the first deploy (a custom
+                // domain verified on an already-deployed app rides the
+                // next redeploy's descriptor). Re-validate with the
+                // hostname check removed: only a pure coverage miss
+                // re-orders; any other defect keeps the original error
+                // and fails closed.
+                let hostnames_parse = cfg
+                    .tls_certificate_hostnames
+                    .iter()
+                    .all(|hostname| ServerName::try_from(hostname.as_str()).is_ok());
+                let coverage_only_miss = hostnames_parse
+                    && validate_certificate_chain(&chain_pem, &key_pair, &[], trust_anchors, at)
+                        .is_ok();
+                if !coverage_only_miss {
+                    return Err(err.context("validating retained static TLS certificate"));
+                }
+                tracing::info!(
+                    cert = %cert_path.display(),
+                    "retained static TLS certificate does not cover the configured hostname set; re-ordering with the retained key"
+                );
+                coverage_reissue = true;
+                true
+            }
+            (Err(err), Err(_)) => {
                 return Err(err.context("validating retained static TLS certificate"));
             }
         };
@@ -649,7 +683,11 @@ fn provision_with_policy(
                 return Ok(());
             }
             Err(err) => {
-                return Err(err.context("renewing expired retained static TLS certificate"));
+                return Err(err.context(if coverage_reissue {
+                    "re-ordering retained static TLS certificate for the grown hostname set"
+                } else {
+                    "renewing expired retained static TLS certificate"
+                }));
             }
         }
     }
@@ -1848,9 +1886,15 @@ hkdf-info = "tls-state-luks-key"
     }
 
     #[test]
-    fn retained_hostname_mismatch_fails_closed() {
+    fn retained_hostname_mismatch_reorders_and_keeps_retained_on_broker_failure() {
+        // F-D changed this contract: an otherwise-trustworthy retained
+        // chain that does not cover a configured hostname is a legitimate
+        // re-order with the retained key (the configured set can grow
+        // after the first deploy), NOT a fail-closed abort. The broker
+        // here is unroutable, so the re-order fails and provisioning keeps
+        // the retained certificate (renewal-failure semantics: it still
+        // serves the hostnames it covers; the next boot retries).
         let dir = tempdir().unwrap();
-        let cfg = broker_config(dir.path(), &["app.example.test"]);
         let (root, chain) = mint_test_chain(&["other.example.test"], |_| {});
         let anchors = [root.anchor()];
         let persistent = write_retained_state(
@@ -1858,13 +1902,31 @@ hkdf-info = "tls-state-luks-key"
             &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
             &chain.leaf_key_pem,
         );
+        let cert_before = std::fs::read(cert_path(&persistent)).unwrap();
+        let key_before = std::fs::read(key_path(&persistent)).unwrap();
 
-        let error = provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap_err();
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("does not cover configured hostname app.example.test"),
-            "unexpected error: {message}"
+        // The re-order must reach the BROKER (not die at token resolution):
+        // a scripted broker that answers 500 proves the POST happened and
+        // the failure keeps the retained certificate.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (base, _server) = spawn_scripted_broker(
+            vec![("500 Internal Server Error".to_string(), String::new())],
+            events.clone(),
         );
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            &["app.example.test"],
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["post"],
+            "the re-order must reach the broker POST"
+        );
+        assert_eq!(std::fs::read(cert_path(&persistent)).unwrap(), cert_before);
+        assert_eq!(std::fs::read(key_path(&persistent)).unwrap(), key_before);
     }
 
     #[test]
@@ -3530,5 +3592,149 @@ hkdf-info = "tls-state-luks-key"
                 "retry_after_unix": deadline.timestamp(),
             })
         );
+    }
+
+    #[test]
+    fn retained_certificate_reissues_when_hostname_set_grows() {
+        // F-D: the retained chain covers only the first deploy's platform
+        // hostname, but the configured set now includes the custom domain
+        // verified on the already-deployed app. The otherwise-trustworthy
+        // chain (key binding + anchored path) re-orders with the retained
+        // key: the broker is called, tls.crt is replaced, the key never is.
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (root, chain) = mint_test_chain(&["app.example.test"], |_| {});
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let retained_key = KeyPair::from_pem(&chain.leaf_key_pem).unwrap();
+        // The broker's replacement covers the FULL configured list.
+        let full_set: [&str; 2] = ["app.example.test", "www.example.test"];
+        let renewed_pem = mint_leaf_for_key(&root.params, &root.key, &retained_key, &full_set);
+        let renewed_chain = full_chain_pem(&[&renewed_pem, &root.cert.pem()]);
+        let success_body = json!({"certificate_chain_pem": renewed_chain}).to_string();
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), success_body)], events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            &full_set,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (wait, _clock) = fake_wait(
+            dir.path().join("init-acme-cooldown"),
+            Utc::now(),
+            events.clone(),
+        );
+
+        provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap();
+
+        assert_eq!(*events.lock().unwrap(), vec!["post"]);
+        assert_eq!(
+            std::fs::read_to_string(cert_path(&persistent)).unwrap(),
+            renewed_chain
+        );
+        assert_eq!(
+            std::fs::read_to_string(key_path(&persistent)).unwrap(),
+            chain.leaf_key_pem,
+            "the retained private key is never replaced"
+        );
+    }
+
+    #[test]
+    fn retained_key_mismatched_chain_stays_fail_closed_on_hostname_growth() {
+        // A coverage miss alone re-orders; a chain whose leaf does not
+        // match the retained key never reaches the broker, even when the
+        // configured set also grew.
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (root, chain) = mint_test_chain(&["app.example.test"], |_| {});
+        let anchors = [root.anchor()];
+        // Retain a DIFFERENT private key than the leaf was minted for.
+        let foreign_key = KeyPair::generate().unwrap();
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &foreign_key.serialize_pem(),
+        );
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), String::new())], events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            &["app.example.test", "www.example.test"],
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (wait, _clock) = fake_wait(
+            dir.path().join("init-acme-cooldown"),
+            Utc::now(),
+            events.clone(),
+        );
+
+        let error = provision_with_policy(&cfg, &persistent, &anchors, &wait)
+            .expect_err("a key-mismatched retained chain must abort provisioning");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("validating retained static TLS certificate"),
+            "error context: {rendered}"
+        );
+        assert!(
+            !rendered.contains("re-ordering"),
+            "the coverage re-order path must not run for a key mismatch: {rendered}"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no broker call may happen"
+        );
+    }
+
+    #[test]
+    fn uncovered_then_malformed_hostname_stays_fail_closed() {
+        // Devin 4686759885: validate_certificate_chain stops at the first
+        // uncovered hostname, so [uncovered, un-parseable] must still abort
+        // — the hostnames_parse gate runs BEFORE the coverage-only
+        // re-check, and a malformed configured hostname can never ride the
+        // coverage path. No broker POST; retained state byte-identical.
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (root, chain) = mint_test_chain(&["app.example.test"], |_| {});
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let cert_before = std::fs::read(cert_path(&persistent)).unwrap();
+        let key_before = std::fs::read(key_path(&persistent)).unwrap();
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), String::new())], events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            &["www.example.test", "not a server name"],
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (wait, _clock) = fake_wait(
+            dir.path().join("init-acme-cooldown"),
+            Utc::now(),
+            events.clone(),
+        );
+
+        let error = provision_with_policy(&cfg, &persistent, &anchors, &wait)
+            .expect_err("a malformed configured hostname must abort provisioning");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("validating retained static TLS certificate"),
+            "error context: {rendered}"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no broker POST may happen"
+        );
+        assert_eq!(std::fs::read(cert_path(&persistent)).unwrap(), cert_before);
+        assert_eq!(std::fs::read(key_path(&persistent)).unwrap(), key_before);
     }
 }
