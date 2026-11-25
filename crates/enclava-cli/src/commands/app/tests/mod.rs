@@ -549,43 +549,93 @@ fn lost_destroy_lookup_error(status: u16) -> ApiError {
     }
 }
 
-#[tokio::test]
-async fn lost_destroy_response_counts_as_destroyed_only_once_the_app_is_gone() {
-    // Still there, then a server error, then gone: destroyed on the third check.
-    let mut answers = VecDeque::from([
-        Ok(()),
-        Err(lost_destroy_lookup_error(503)),
-        Err(lost_destroy_lookup_error(404)),
-    ]);
+async fn lost_destroy_outcome(
+    answers: Vec<Result<(), ApiError>>,
+    checks: u32,
+) -> (LostDestroyOutcome, u32) {
+    let mut answers = VecDeque::from(answers);
     let mut asked = 0;
-    let destroyed = app_gone_after_lost_destroy_response(
+    let outcome = outcome_after_lost_destroy_response(
         || {
             asked += 1;
-            let answer = answers
-                .pop_front()
-                .expect("no lookup after the app is gone");
+            let answer = answers.pop_front().unwrap_or(Ok(()));
             async move { answer }
         },
-        5,
+        checks,
         Duration::ZERO,
+        Duration::from_secs(5),
     )
     .await;
-    assert!(destroyed);
+    (outcome, asked)
+}
+
+#[tokio::test]
+async fn lost_destroy_response_is_resolved_only_by_what_the_server_says() {
+    // Still there, then a server error, then gone: resolved on the third check.
+    let (outcome, asked) = lost_destroy_outcome(
+        vec![
+            Ok(()),
+            Err(lost_destroy_lookup_error(503)),
+            Err(lost_destroy_lookup_error(404)),
+        ],
+        5,
+    )
+    .await;
+    assert_eq!(outcome, LostDestroyOutcome::Gone);
     assert_eq!(asked, 3);
 
-    // An app that never goes away is not reported destroyed, and the checks stop.
-    let mut asked = 0;
-    let destroyed = app_gone_after_lost_destroy_response(
-        || {
-            asked += 1;
-            async { Ok(()) }
-        },
-        4,
-        Duration::ZERO,
+    // An app that never goes away is reported as still present once the checks run out.
+    let (outcome, asked) = lost_destroy_outcome(Vec::new(), 4).await;
+    assert_eq!(outcome, LostDestroyOutcome::StillPresent);
+    assert_eq!(asked, 4);
+
+    // Checks that never produce an answer leave the outcome unverified.
+    let (outcome, asked) = lost_destroy_outcome(
+        vec![
+            Err(lost_destroy_lookup_error(503)),
+            Err(lost_destroy_lookup_error(502)),
+        ],
+        2,
     )
     .await;
-    assert!(!destroyed);
-    assert_eq!(asked, 4);
+    assert_eq!(outcome, LostDestroyOutcome::Unverified);
+    assert_eq!(asked, 2);
+
+    // A credential that cannot read the app stops the checks at once.
+    for refused in [
+        lost_destroy_lookup_error(403),
+        lost_destroy_lookup_error(401),
+        ApiError::NotAuthenticated,
+    ] {
+        let (outcome, asked) = lost_destroy_outcome(vec![Ok(()), Err(refused)], 9).await;
+        assert_eq!(outcome, LostDestroyOutcome::Unverified);
+        assert_eq!(asked, 2);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_destroy_check_that_hangs_is_cut_off() {
+    let mut asked = 0;
+    let outcome = outcome_after_lost_destroy_response(
+        || {
+            asked += 1;
+            std::future::pending::<Result<(), ApiError>>()
+        },
+        3,
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(outcome, LostDestroyOutcome::Unverified);
+    assert_eq!(asked, 3);
+}
+
+#[test]
+fn lost_destroy_hint_only_claims_the_app_exists_when_the_server_said_so() {
+    let present = lost_destroy_hint(&LostDestroyOutcome::StillPresent, "shell");
+    assert!(present.contains("'shell' still existed"));
+    let unverified = lost_destroy_hint(&LostDestroyOutcome::Unverified, "shell");
+    assert!(unverified.contains("could not confirm whether 'shell' still exists"));
 }
 
 #[test]
