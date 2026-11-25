@@ -55,6 +55,57 @@ fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_js
     )
 }
 
+/// Typed, code-shaped backend-unavailable error (cap#422): no provider
+/// text, no bare 500.
+fn edge_route_unavailable() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({"error": "edge_route_backend_unavailable"})),
+    )
+}
+
+/// Release the claimed mutation leases and commit the lane so no error
+/// path after `mutation_leases::claim` strands the rows until
+/// `reclaim_after` (cap#422: the leaked leases kept reporting
+/// `idempotency_request_in_progress` for nine minutes on dev).
+async fn release_mutation_and_lane(
+    mutation: &mut crate::mutation_leases::AppMutationLease,
+    app_lane: sqlx::Transaction<'static, sqlx::Postgres>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let mut app_lane = app_lane;
+    mutation
+        .finish_in_tx(&mut app_lane)
+        .await
+        .map_err(|_| internal_error())?;
+    app_lane.commit().await.map_err(|_| internal_error())?;
+    Ok(())
+}
+
+/// The same-domain re-verification's decision on the app's backend
+/// resolution (cap#422): deploy the route, skip the publish (the
+/// first-verification rule — the app was never deployed), or surface a
+/// typed backend-unavailable failure.
+#[derive(Debug, PartialEq, Eq)]
+enum SameDomainBackend {
+    Deployed,
+    NotDeployed,
+    Unavailable,
+}
+
+/// cap#422: Kubernetes NotFound on the Service lookup means "not
+/// deployed" — skip the route publish (the first deploy publishes it),
+/// mirroring the first-verification rule. Every OTHER backend error is
+/// a real failure: typed and code-shaped, never a bare 500.
+fn same_domain_backend_verdict(
+    resolution: &Result<String, crate::edge::EdgeRouteError>,
+) -> SameDomainBackend {
+    match resolution {
+        Ok(_) => SameDomainBackend::Deployed,
+        Err(error) if crate::edge::is_kube_not_found(error) => SameDomainBackend::NotDeployed,
+        Err(_) => SameDomainBackend::Unavailable,
+    }
+}
+
 fn internal_error() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -87,10 +138,10 @@ async fn ensure_custom_domain_haproxy_route(
         crate::edge::resolve_backend_target(&state.kube_client, &app.name, &app.namespace, 443)
             .await
             .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("resolve backend: {e}")})),
-                )
+                // cap#422: typed and code-shaped, never a bare 500 with
+                // provider text (the cause is logged by the caller).
+                tracing::error!(error = %e, "backend resolution failed for custom domain route");
+                edge_route_unavailable()
             })?;
     let route = crate::edge::SniRoute::new(domain, &app_backend, &app_target).map_err(|e| {
         (
@@ -561,31 +612,62 @@ pub async fn verify_challenge(
         }
         Err(_) => return Err(internal_error()),
     };
-    let edge_config_generation = mutation
-        .resource_generation(&crate::mutation_leases::ResourceFence::edge_config())
-        .ok_or_else(internal_error)?;
-    let kubernetes_mutation_generation = mutation
-        .resource_generation(&crate::mutation_leases::ResourceFence::new(
-            "kubernetes_namespace",
-            &app.namespace,
-        ))
-        .ok_or_else(internal_error)?;
+    // cap#422: every error path from here on releases the claimed rows —
+    // a stranded lease reports as idempotency_request_in_progress until
+    // reclaim_after (observed 9 minutes on dev).
+    let edge_config_generation =
+        match mutation.resource_generation(&crate::mutation_leases::ResourceFence::edge_config()) {
+            Some(generation) => generation,
+            None => {
+                let lane = state.db.begin().await.map_err(|_| internal_error())?;
+                release_mutation_and_lane(&mut mutation, lane).await?;
+                return Err(internal_error());
+            }
+        };
+    let kubernetes_mutation_generation = match mutation.resource_generation(
+        &crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &app.namespace),
+    ) {
+        Some(generation) => generation,
+        None => {
+            let lane = state.db.begin().await.map_err(|_| internal_error())?;
+            release_mutation_and_lane(&mut mutation, lane).await?;
+            return Err(internal_error());
+        }
+    };
 
     let mut app_lane = state.db.begin().await.map_err(|_| internal_error())?;
-    crate::entitlements::lock_org_entitlement_lane(&mut app_lane, auth.org_id)
+    if crate::entitlements::lock_org_entitlement_lane(&mut app_lane, auth.org_id)
         .await
-        .map_err(|_| internal_error())?;
-    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        .is_err()
+    {
+        release_mutation_and_lane(&mut mutation, app_lane).await?;
+        return Err(internal_error());
+    }
+    let current_role = match crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
         &mut app_lane,
         auth.org_id,
         auth.user_id,
     )
-    .await?;
-    crate::auth::scopes::require_admin_role(current_role)?;
-    crate::deploy::lock_app_deployment_lane(&mut app_lane, app.id)
+    .await
+    {
+        Ok(role) => role,
+        Err(response) => {
+            release_mutation_and_lane(&mut mutation, app_lane).await?;
+            return Err(response);
+        }
+    };
+    if let Err(response) = crate::auth::scopes::require_admin_role(current_role) {
+        release_mutation_and_lane(&mut mutation, app_lane).await?;
+        return Err(response);
+    }
+    if crate::deploy::lock_app_deployment_lane(&mut app_lane, app.id)
         .await
-        .map_err(|_| internal_error())?;
-    let current_app: Option<App> = sqlx::query_as(
+        .is_err()
+    {
+        release_mutation_and_lane(&mut mutation, app_lane).await?;
+        return Err(internal_error());
+    }
+    let current_app: Option<App> = match sqlx::query_as(
         "SELECT * FROM apps
           WHERE id = $1
             AND org_id = $2
@@ -599,7 +681,13 @@ pub async fn verify_challenge(
     .bind(&expected_namespace)
     .fetch_optional(&mut *app_lane)
     .await
-    .map_err(|_| internal_error())?;
+    {
+        Ok(app) => app,
+        Err(_) => {
+            release_mutation_and_lane(&mut mutation, app_lane).await?;
+            return Err(internal_error());
+        }
+    };
     let Some(current_app) = current_app else {
         mutation
             .finish_in_tx(&mut app_lane)
@@ -681,38 +769,103 @@ pub async fn verify_challenge(
     }
 
     // Commit proof and domain assignment together, only after restart admission.
-    if needs_persist {
-        sqlx::query("UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2")
+    if needs_persist
+        && sqlx::query("UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2")
             .bind(verified_at)
             .bind(challenge_id)
             .execute(&mut *app_lane)
             .await
-            .map_err(|_| internal_error())?;
+            .is_err()
+    {
+        release_mutation_and_lane(&mut mutation, app_lane).await?;
+        return Err(internal_error());
     }
 
-    mutation
+    let dns_record = match mutation
         .guard_provider(crate::dns::record_custom_domain(&state.db, app.id, &domain))
         .await
-        .map_err(|_| internal_error())?
-        .map_err(dns_error_response)?;
+    {
+        Ok(result) => result,
+        Err(_) => {
+            release_mutation_and_lane(&mut mutation, app_lane).await?;
+            return Err(internal_error());
+        }
+    };
+    if let Err(dns_error) = dns_record {
+        release_mutation_and_lane(&mut mutation, app_lane).await?;
+        return Err(dns_error_response(dns_error));
+    }
 
     if app.custom_domain.as_deref() == Some(domain.as_str()) {
-        mutation
-            .guard_provider(ensure_custom_domain_haproxy_route(
-                &state,
-                auth.org_id,
-                &app,
-                &domain,
-                edge_config_generation,
-            ))
-            .await
-            .map_err(|_| internal_error())??;
+        // cap#422: same-domain re-verification used to publish the HAProxy
+        // route unconditionally, which resolves the app Service — with no
+        // live workload the lookup 500s AND (pre-fix) the just-claimed
+        // mutation leases were never released. Apply the first-verification
+        // rule instead: a missing Service (Kubernetes NotFound) skips the
+        // route publish — the first deploy publishes it — and the verify
+        // returns 200 with ingress_ready=false. Any OTHER backend error
+        // stays a typed, code-shaped 502, with the mutation released.
+        let backend_resolution =
+            crate::edge::resolve_backend_target(&state.kube_client, &app.name, &app.namespace, 443)
+                .await;
+        let backend_deployed = match same_domain_backend_verdict(&backend_resolution) {
+            SameDomainBackend::Deployed => true,
+            SameDomainBackend::NotDeployed => {
+                tracing::info!(
+                    app_id = %app.id,
+                    %domain,
+                    "same-domain re-verification skipped the edge route publish: app not yet deployed"
+                );
+                false
+            }
+            SameDomainBackend::Unavailable => {
+                tracing::error!(
+                    app_id = %app.id,
+                    %domain,
+                    error = %backend_resolution.as_ref().expect_err("the verdict guarantees an error"),
+                    "same-domain re-verification backend resolution failed"
+                );
+                release_mutation_and_lane(&mut mutation, app_lane).await?;
+                return Err(edge_route_unavailable());
+            }
+        };
+        if backend_deployed {
+            let route_publish = match mutation
+                .guard_provider(ensure_custom_domain_haproxy_route(
+                    &state,
+                    auth.org_id,
+                    &app,
+                    &domain,
+                    edge_config_generation,
+                ))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    // Durable renewal was lost mid-publish: release the
+                    // claimed rows on the way out (cap#422).
+                    release_mutation_and_lane(&mut mutation, app_lane).await?;
+                    return Err(internal_error());
+                }
+            };
+            if let Err(response) = route_publish {
+                release_mutation_and_lane(&mut mutation, app_lane).await?;
+                return Err(response);
+            }
+        }
         mutation
             .finish_in_tx(&mut app_lane)
             .await
             .map_err(|_| internal_error())?;
         app_lane.commit().await.map_err(|_| internal_error())?;
         drop(apply_permit);
+        if !backend_deployed {
+            return Ok(Json(VerifyResponse {
+                domain,
+                verified_at,
+                ingress_ready: false,
+            }));
+        }
         // Same-domain re-verification repairs DNS/edge only — but the
         // ingress is only provably serving when the live StatefulSet has
         // converged (a restart scheduled by an earlier verify may still be
@@ -805,6 +958,7 @@ pub async fn verify_challenge(
                 error = %e,
                 "failed to regenerate tenant ingress for verified custom domain"
             );
+            release_mutation_and_lane(&mut mutation, app_lane).await?;
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 // Code-shaped, provider-text-free (the DeployError display
@@ -818,7 +972,7 @@ pub async fn verify_challenge(
         // backend exists and serves once the rollout converges), while the
         // response's ingress_ready stays false so the client knows serving
         // is converging rather than established.
-        mutation
+        match mutation
             .guard_provider(ensure_custom_domain_haproxy_route(
                 &state,
                 auth.org_id,
@@ -827,35 +981,57 @@ pub async fn verify_challenge(
                 edge_config_generation,
             ))
             .await
-            .map_err(|_| internal_error())??
+        {
+            Ok(Ok(backend)) => backend,
+            Ok(Err(response)) => {
+                release_mutation_and_lane(&mut mutation, app_lane).await?;
+                return Err(response);
+            }
+            Err(_) => {
+                release_mutation_and_lane(&mut mutation, app_lane).await?;
+                return Err(internal_error());
+            }
+        }
     } else {
         let org_slug: String =
-            sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
+            match sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
                 .bind(auth.org_id)
                 .fetch_one(&state.db)
                 .await
-                .map_err(|_| internal_error())?;
-        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App).map_err(
-            |e| {
-                (
+            {
+                Ok(slug) => slug,
+                Err(_) => {
+                    release_mutation_and_lane(&mut mutation, app_lane).await?;
+                    return Err(internal_error());
+                }
+            };
+        match crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App) {
+            Ok(backend) => backend,
+            Err(e) => {
+                release_mutation_and_lane(&mut mutation, app_lane).await?;
+                return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": format!("invalid app name: {e}")})),
-                )
-            },
-        )?
+                ));
+            }
+        }
     };
 
-    sqlx::query("UPDATE apps SET custom_domain = $1, updated_at = now() WHERE id = $2")
+    if sqlx::query("UPDATE apps SET custom_domain = $1, updated_at = now() WHERE id = $2")
         .bind(&domain)
         .bind(app.id)
         .execute(&mut *app_lane)
         .await
-        .map_err(|_| internal_error())?;
+        .is_err()
+    {
+        release_mutation_and_lane(&mut mutation, app_lane).await?;
+        return Err(internal_error());
+    }
 
     if let Some(old) = previous_custom.as_deref()
         && old != domain
     {
-        mutation
+        let dns_delete = match mutation
             .guard_provider(crate::dns::delete_dns_record(
                 &state.db,
                 &state.http_client,
@@ -864,9 +1040,18 @@ pub async fn verify_challenge(
                 old,
             ))
             .await
-            .map_err(|_| internal_error())?
-            .map_err(dns_error_response)?;
-        if mutation
+        {
+            Ok(result) => result,
+            Err(_) => {
+                release_mutation_and_lane(&mut mutation, app_lane).await?;
+                return Err(internal_error());
+            }
+        };
+        if let Err(dns_error) = dns_delete {
+            release_mutation_and_lane(&mut mutation, app_lane).await?;
+            return Err(dns_error_response(dns_error));
+        }
+        let edge_removal = match mutation
             .guard_provider(crate::edge::remove_haproxy_routes(
                 &state.kube_client,
                 &state.db,
@@ -875,9 +1060,15 @@ pub async fn verify_challenge(
                 &[(app_backend.clone(), old.to_string())],
             ))
             .await
-            .map_err(|_| internal_error())?
-            .is_err()
         {
+            Ok(result) => result,
+            Err(_) => {
+                release_mutation_and_lane(&mut mutation, app_lane).await?;
+                return Err(internal_error());
+            }
+        };
+        if edge_removal.is_err() {
+            release_mutation_and_lane(&mut mutation, app_lane).await?;
             return Err((
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({"error": "previous edge route reconciliation failed"})),
@@ -1434,5 +1625,127 @@ mod tests {
         .await
         .expect("the bound cuts the hung probe off");
         assert!(!hung);
+    }
+
+    /// cap#422: the NotFound classifier that separates "app not deployed"
+    /// (skip the route publish, first-verification rule) from real backend
+    /// failures.
+    fn kube_err(code: u16, reason: &str) -> crate::edge::EdgeRouteError {
+        crate::edge::EdgeRouteError::Kube(kube::Error::Api(Box::new(kube::core::Status {
+            code,
+            reason: reason.to_string(),
+            message: "test".to_string(),
+            ..Default::default()
+        })))
+    }
+
+    #[test]
+    fn is_kube_not_found_separates_missing_from_other_backend_errors() {
+        let not_found = kube_err(404, "NotFound");
+        assert!(crate::edge::is_kube_not_found(&not_found));
+        let forbidden = kube_err(403, "Forbidden");
+        assert!(!crate::edge::is_kube_not_found(&forbidden));
+        // A database error must never read as NotFound.
+        let database = crate::edge::EdgeRouteError::Database(sqlx::Error::RowNotFound);
+        assert!(!crate::edge::is_kube_not_found(&database));
+    }
+
+    /// cap#422: the same-domain re-verification decision — a resolved
+    /// backend deploys the route, Kubernetes NotFound skips the publish
+    /// (the first-verification rule), every other backend error is a
+    /// typed failure, never a bare 500.
+    #[test]
+    fn same_domain_backend_verdict_deploys_skips_or_fails() {
+        assert_eq!(
+            same_domain_backend_verdict(&Ok("10.0.0.1:443".to_string())),
+            SameDomainBackend::Deployed
+        );
+        assert_eq!(
+            same_domain_backend_verdict(&Err(kube_err(404, "NotFound"))),
+            SameDomainBackend::NotDeployed
+        );
+        for other in [
+            kube_err(403, "Forbidden"),
+            kube_err(500, "InternalError"),
+            crate::edge::EdgeRouteError::Database(sqlx::Error::RowNotFound),
+        ] {
+            assert_eq!(
+                same_domain_backend_verdict(&Err(other)),
+                SameDomainBackend::Unavailable,
+                "only Kubernetes NotFound may skip the route publish"
+            );
+        }
+    }
+
+    /// cap#422: `release_mutation_and_lane` — the error-path release used by
+    /// every failure after `mutation_leases::claim` in verify_challenge —
+    /// clears the claimed rows so no stranded lease reports
+    /// `idempotency_request_in_progress` until `reclaim_after`.
+    #[sqlx::test]
+    async fn release_mutation_and_lane_clears_claimed_rows(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::lazy_state();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        state.db = pool.clone();
+        // Reuse the deployment-jobs fixture for a schema-accurate app row.
+        let (app, _deployment_id, _lease, _payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        let app_id = app.id;
+        let domain = "release-test.example.com";
+        let operation_id = Uuid::new_v4();
+        let resources = vec![
+            crate::mutation_leases::ResourceFence::dns(domain),
+            crate::mutation_leases::ResourceFence::edge(domain),
+            crate::mutation_leases::ResourceFence::edge_config(),
+            crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &app.namespace),
+        ];
+        let mut mutation = crate::mutation_leases::claim(
+            &state,
+            app_id,
+            crate::mutation_leases::CUSTOM_DOMAIN_SET_OPERATION,
+            operation_id,
+            false,
+            resources.clone(),
+        )
+        .await
+        .expect("claim the domain mutation");
+        // Verify the rows are owned before the release (the claim owns one
+        // row per fence: dns_hostname, edge_route, edge_config and the
+        // namespace fence).
+        let owned: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM external_resource_mutation_leases
+              WHERE operation_id = $1",
+        )
+        .bind(operation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count owned rows");
+        assert!(owned >= 4, "the claim must own the fence rows first");
+        let mut lane = state.db.begin().await.expect("begin lane");
+        crate::entitlements::lock_org_entitlement_lane(&mut lane, app.org_id)
+            .await
+            .expect("lock entitlement lane");
+        crate::deploy::lock_app_deployment_lane(&mut lane, app_id)
+            .await
+            .expect("lock deployment lane");
+        release_mutation_and_lane(&mut mutation, lane)
+            .await
+            .expect("release on the error path");
+        let still_owned: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM external_resource_mutation_leases
+              WHERE operation_id = $1",
+        )
+        .bind(operation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count owned rows after release");
+        assert_eq!(still_owned, 0, "no fence rows remain owned after release");
+        let app_lease_free: bool = sqlx::query_scalar(
+            "SELECT owner_token IS NULL FROM app_mutation_leases WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the app mutation lease");
+        assert!(app_lease_free, "the app mutation lease is released too");
     }
 }
