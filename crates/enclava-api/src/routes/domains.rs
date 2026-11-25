@@ -65,14 +65,20 @@ fn edge_route_unavailable() -> (StatusCode, Json<serde_json::Value>) {
 }
 
 /// Release the claimed mutation leases durably, in the release's OWN
-/// transaction: the caller's lane may be aborted (a failed statement
-/// makes every later query on it fail) or may carry staged business
-/// writes that must NOT be committed by an error path.
+/// transaction, under the app deployment lane lock (the same discipline
+/// `AppMutationLease::finish` uses): the caller's lane may be aborted (a
+/// failed statement makes every later query on it fail) or may carry
+/// staged business writes that must NOT be committed by an error path, so
+/// it is rolled back first.
 async fn release_mutation(
     state: &AppState,
     mutation: &mut crate::mutation_leases::AppMutationLease,
+    app_id: Uuid,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let mut release_lane = state.db.begin().await.map_err(|_| internal_error())?;
+    crate::deploy::lock_app_deployment_lane(&mut release_lane, app_id)
+        .await
+        .map_err(|_| internal_error())?;
     mutation
         .finish_in_tx(&mut release_lane)
         .await
@@ -87,16 +93,35 @@ async fn release_mutation(
 /// ROLLED BACK first, and only then are the claimed rows released
 /// durably (a PostgreSQL statement abort in the lane would make
 /// finish_in_tx fail inside it, so the release runs in its own
-/// transaction). This closes every post-claim error path: a stranded
-/// lease reported `idempotency_request_in_progress` until
-/// `reclaim_after` on dev.
+/// transaction). This closes every post-claim error path with a SETTLED
+/// outcome: a stranded lease reported `idempotency_request_in_progress`
+/// until `reclaim_after` on dev.
 async fn release_mutation_and_rollback_lane(
     state: &AppState,
     mutation: &mut crate::mutation_leases::AppMutationLease,
+    app_id: Uuid,
     app_lane: sqlx::Transaction<'static, sqlx::Postgres>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     app_lane.rollback().await.map_err(|_| internal_error())?;
-    release_mutation(state, mutation).await
+    release_mutation(state, mutation, app_id).await
+}
+
+/// cap#422: renewal lost mid-provider-call — the provider write's outcome
+/// is UNRESOLVED: `guard_provider` drops the local future, but a request
+/// already issued to Kubernetes or the DNS provider can still complete on
+/// the server, and a missing ConfigMap create has no existing version to
+/// fence it. The reclaim quarantine (RECLAIM_QUARANTINE_SECONDS) exists
+/// to keep the next durable generation off these resources during exactly
+/// that window, so the fences are deliberately NOT released: the business
+/// lane is rolled back (no staged write survives) and the leases stay
+/// quarantined until reclaim, which frees them only after the quarantine
+/// bound. Used only on the guard's renewal-loss arms; provider failures
+/// that RETURNED (settled) release normally.
+async fn quarantine_mutation_and_rollback_lane(
+    app_lane: sqlx::Transaction<'static, sqlx::Postgres>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    app_lane.rollback().await.map_err(|_| internal_error())?;
+    Ok(())
 }
 
 /// The same-domain re-verification's decision on the app's backend
@@ -637,7 +662,7 @@ pub async fn verify_challenge(
         match mutation.resource_generation(&crate::mutation_leases::ResourceFence::edge_config()) {
             Some(generation) => generation,
             None => {
-                release_mutation(&state, &mut mutation).await?;
+                release_mutation(&state, &mut mutation, app.id).await?;
                 return Err(internal_error());
             }
         };
@@ -646,7 +671,7 @@ pub async fn verify_challenge(
     ) {
         Some(generation) => generation,
         None => {
-            release_mutation(&state, &mut mutation).await?;
+            release_mutation(&state, &mut mutation, app.id).await?;
             return Err(internal_error());
         }
     };
@@ -656,7 +681,7 @@ pub async fn verify_challenge(
         .await
         .is_err()
     {
-        release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+        release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
         return Err(internal_error());
     }
     let current_role = match crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
@@ -668,19 +693,19 @@ pub async fn verify_challenge(
     {
         Ok(role) => role,
         Err(response) => {
-            release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+            release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
             return Err(response);
         }
     };
     if let Err(response) = crate::auth::scopes::require_admin_role(current_role) {
-        release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+        release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
         return Err(response);
     }
     if crate::deploy::lock_app_deployment_lane(&mut app_lane, app.id)
         .await
         .is_err()
     {
-        release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+        release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
         return Err(internal_error());
     }
     let current_app: Option<App> = match sqlx::query_as(
@@ -700,7 +725,7 @@ pub async fn verify_challenge(
     {
         Ok(app) => app,
         Err(_) => {
-            release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+            release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
             return Err(internal_error());
         }
     };
@@ -793,7 +818,7 @@ pub async fn verify_challenge(
             .await
             .is_err()
     {
-        release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+        release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
         return Err(internal_error());
     }
 
@@ -803,12 +828,14 @@ pub async fn verify_challenge(
     {
         Ok(result) => result,
         Err(_) => {
-            release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+            // Renewal lost mid-DNS-write: the request may still land
+            // server-side, so the fences stay quarantined (cap#422).
+            quarantine_mutation_and_rollback_lane(app_lane).await?;
             return Err(internal_error());
         }
     };
     if let Err(dns_error) = dns_record {
-        release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+        release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
         return Err(dns_error_response(dns_error));
     }
 
@@ -841,7 +868,7 @@ pub async fn verify_challenge(
                     error = %backend_resolution.as_ref().expect_err("the verdict guarantees an error"),
                     "same-domain re-verification backend resolution failed"
                 );
-                release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+                release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
                 return Err(edge_route_unavailable());
             }
         };
@@ -858,14 +885,15 @@ pub async fn verify_challenge(
             {
                 Ok(result) => result,
                 Err(_) => {
-                    // Durable renewal was lost mid-publish: release the
-                    // claimed rows on the way out (cap#422).
-                    release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+                    // Durable renewal was lost mid-publish: the HAProxy
+                    // write may still land, so the fences stay quarantined
+                    // (cap#422).
+                    quarantine_mutation_and_rollback_lane(app_lane).await?;
                     return Err(internal_error());
                 }
             };
             if let Err(response) = route_publish {
-                release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+                release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
                 return Err(response);
             }
         }
@@ -934,9 +962,11 @@ pub async fn verify_challenge(
     {
         Ok(outcome) => outcome,
         Err(_) => {
-            // cap#422: durable renewal was lost mid-reapply — release what
-            // is still claimable instead of stranding the rows.
-            release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+            // cap#422: durable renewal was lost mid-reapply. The ingress
+            // ConfigMap write may still land server-side (a missing-object
+            // create has no version to fence it), so the namespace fence
+            // stays quarantined until reclaim instead of being released.
+            quarantine_mutation_and_rollback_lane(app_lane).await?;
             return Err(internal_error());
         }
     };
@@ -982,7 +1012,7 @@ pub async fn verify_challenge(
                 error = %e,
                 "failed to regenerate tenant ingress for verified custom domain"
             );
-            release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+            release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 // Code-shaped, provider-text-free (the DeployError display
@@ -1008,11 +1038,13 @@ pub async fn verify_challenge(
         {
             Ok(Ok(backend)) => backend,
             Ok(Err(response)) => {
-                release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+                release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
                 return Err(response);
             }
             Err(_) => {
-                release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+                // Renewal lost mid-publish: the write may still land, so
+                // the fences stay quarantined (cap#422).
+                quarantine_mutation_and_rollback_lane(app_lane).await?;
                 return Err(internal_error());
             }
         }
@@ -1025,14 +1057,15 @@ pub async fn verify_challenge(
             {
                 Ok(slug) => slug,
                 Err(_) => {
-                    release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+                    release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane)
+                        .await?;
                     return Err(internal_error());
                 }
             };
         match crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App) {
             Ok(backend) => backend,
             Err(e) => {
-                release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+                release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": format!("invalid app name: {e}")})),
@@ -1048,7 +1081,7 @@ pub async fn verify_challenge(
         .await
         .is_err()
     {
-        release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+        release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
         return Err(internal_error());
     }
 
@@ -1067,12 +1100,14 @@ pub async fn verify_challenge(
         {
             Ok(result) => result,
             Err(_) => {
-                release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+                // Renewal lost mid-delete: the deletion may still land,
+                // so the fences stay quarantined (cap#422).
+                quarantine_mutation_and_rollback_lane(app_lane).await?;
                 return Err(internal_error());
             }
         };
         if let Err(dns_error) = dns_delete {
-            release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+            release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
             return Err(dns_error_response(dns_error));
         }
         let edge_removal = match mutation
@@ -1087,12 +1122,14 @@ pub async fn verify_challenge(
         {
             Ok(result) => result,
             Err(_) => {
-                release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+                // Renewal lost mid-removal: the route removal may still
+                // land, so the fences stay quarantined (cap#422).
+                quarantine_mutation_and_rollback_lane(app_lane).await?;
                 return Err(internal_error());
             }
         };
         if edge_removal.is_err() {
-            release_mutation_and_rollback_lane(&state, &mut mutation, app_lane).await?;
+            release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
             return Err((
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({"error": "previous edge route reconciliation failed"})),
@@ -1762,7 +1799,7 @@ mod tests {
             .execute(&mut *lane)
             .await
             .expect("stage the domain assignment");
-        release_mutation_and_rollback_lane(&state, &mut mutation, lane)
+        release_mutation_and_rollback_lane(&state, &mut mutation, app_id, lane)
             .await
             .expect("release on the error path");
         // The staged write is rolled back, not committed by the release.
@@ -1846,7 +1883,7 @@ mod tests {
         // release the leases inside it.
         let aborted = sqlx::query("SELECT 1/0").execute(&mut *lane).await;
         assert!(aborted.is_err(), "1/0 must abort the lane");
-        release_mutation_and_rollback_lane(&state, &mut mutation, lane)
+        release_mutation_and_rollback_lane(&state, &mut mutation, app_id, lane)
             .await
             .expect("release on the aborted-lane error path");
         let still_owned: i64 = sqlx::query_scalar(
@@ -1866,5 +1903,86 @@ mod tests {
         .await
         .expect("read the app mutation lease");
         assert!(app_lease_free, "the app mutation lease is released too");
+    }
+
+    /// cap#422: renewal lost mid-provider-call — the provider write's
+    /// outcome is UNRESOLVED, so the fences must stay quarantined until
+    /// reclaim (RECLAIM_QUARANTINE_SECONDS) instead of being released
+    /// while a Kubernetes/DNS request can still land server-side. The
+    /// staged business writes are still rolled back.
+    #[sqlx::test]
+    async fn quarantine_on_renewal_loss_keeps_the_fences_and_rolls_back(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::lazy_state();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        state.db = pool.clone();
+        let (app, _deployment_id, _lease, _payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        let app_id = app.id;
+        let domain = "quarantine-test.example.com";
+        let operation_id = Uuid::new_v4();
+        let resources = vec![
+            crate::mutation_leases::ResourceFence::dns(domain),
+            crate::mutation_leases::ResourceFence::edge(domain),
+            crate::mutation_leases::ResourceFence::edge_config(),
+            crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &app.namespace),
+        ];
+        let mutation = crate::mutation_leases::claim(
+            &state,
+            app_id,
+            crate::mutation_leases::CUSTOM_DOMAIN_SET_OPERATION,
+            operation_id,
+            false,
+            resources.clone(),
+        )
+        .await
+        .expect("claim the domain mutation");
+        let mut lane = state.db.begin().await.expect("begin lane");
+        crate::entitlements::lock_org_entitlement_lane(&mut lane, app.org_id)
+            .await
+            .expect("lock entitlement lane");
+        crate::deploy::lock_app_deployment_lane(&mut lane, app_id)
+            .await
+            .expect("lock deployment lane");
+        // Stage a business write in the lane, then simulate the renewal-loss
+        // error path: the lane is rolled back, the fences stay quarantined.
+        sqlx::query("UPDATE apps SET custom_domain = $1, updated_at = now() WHERE id = $2")
+            .bind("quarantined.example.com")
+            .bind(app_id)
+            .execute(&mut *lane)
+            .await
+            .expect("stage the domain assignment");
+        quarantine_mutation_and_rollback_lane(lane)
+            .await
+            .expect("roll the lane back on renewal loss");
+        drop(mutation);
+        let staged: Option<String> =
+            sqlx::query_scalar("SELECT custom_domain FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the app row");
+        assert_eq!(staged, None, "no staged business write survives");
+        // The fences stay owned: a newer mutation cannot claim the
+        // namespace while the unresolved write may still land.
+        let still_owned: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM external_resource_mutation_leases
+              WHERE operation_id = $1",
+        )
+        .bind(operation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count owned rows after quarantine");
+        assert!(
+            still_owned >= 4,
+            "the fences stay quarantined, not released"
+        );
+        let app_lease_held: bool = sqlx::query_scalar(
+            "SELECT owner_token IS NOT NULL FROM app_mutation_leases WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the app mutation lease");
+        assert!(app_lease_held, "the app mutation lease stays quarantined");
     }
 }

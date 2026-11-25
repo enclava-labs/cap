@@ -1106,6 +1106,13 @@ fn compose_api_error(status_code: u16, body: ApiErrorBody) -> ComposedApiError {
     if let Some(cause) = body.cause {
         message = format!("{message} (cause: {cause})");
     }
+    // The masked upstream failure behind a recovery-required receipt
+    // (cap#422): the status and code-shaped error the API kept when the
+    // 5xx was converted. Old servers omit the field entirely.
+    if let Some(upstream) = body.outcome_cause {
+        let code = upstream.error.as_deref().unwrap_or("unavailable");
+        message = format!("{message} (upstream: {code}, HTTP {})", upstream.status);
+    }
     // Carry the lane hints in-band so every surface
     // (deploy, destroy, config, domains) shows them without
     // per-command plumbing; old servers simply omit them.
@@ -1259,6 +1266,50 @@ mod tests {
         let ComposedApiError { code, message, .. } = compose_api_error(409, body);
         assert_eq!(code.as_deref(), Some("idempotency_request_in_progress"));
         assert_eq!(message, "idempotency_request_in_progress");
+    }
+
+    #[test]
+    fn recovery_required_receipt_carries_the_masked_upstream_cause() {
+        // cap#422: the API's recovery-required 409 carries the masked 5xx's
+        // status and code-shaped error; the CLI renders it so the user can
+        // act on the real failure.
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "idempotency_recovery_required",
+            "retryable": false,
+            "disposition": "reconcile_then_retry_with_new_key",
+            "idempotency_disposition": "completed",
+            "outcome_cause": {
+                "status": 502,
+                "error": "edge_route_backend_unavailable"
+            }
+        }))
+        .expect("recovery receipt decodes");
+        let ComposedApiError { code, message, .. } = compose_api_error(409, body);
+        assert_eq!(code.as_deref(), Some("idempotency_recovery_required"));
+        assert_eq!(
+            message,
+            "idempotency_recovery_required (upstream: edge_route_backend_unavailable, HTTP 502)"
+        );
+
+        // A degraded cause (no code-shaped error) still renders a fixed code.
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "idempotency_recovery_required",
+            "outcome_cause": { "status": 500 }
+        }))
+        .expect("degraded cause decodes");
+        let ComposedApiError { message, .. } = compose_api_error(409, body);
+        assert_eq!(
+            message,
+            "idempotency_recovery_required (upstream: unavailable, HTTP 500)"
+        );
+
+        // An old server without the field: the bare code still composes.
+        let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "idempotency_recovery_required"
+        }))
+        .expect("legacy receipt decodes");
+        let ComposedApiError { message, .. } = compose_api_error(409, body);
+        assert_eq!(message, "idempotency_recovery_required");
     }
 
     #[test]
