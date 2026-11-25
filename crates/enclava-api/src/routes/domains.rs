@@ -23,6 +23,7 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{CLOUDFLARE, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::NetError;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RData;
 use rand::RngCore;
@@ -30,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+use crate::acme::DnsLookupError;
 use crate::auth::middleware::AuthContext;
 use crate::auth::scopes;
 use crate::models::App;
@@ -1110,8 +1112,7 @@ async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
         // not propagated" case, not a resolver failure: report it as an
         // empty answer so verify refuses with the precise 412 instead of a
         // 502 the idempotency layer turns into `idempotency_recovery_required`.
-        Err(e) if e.is_no_records_found() || e.is_nx_domain() => return Ok(Vec::new()),
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return absent_txt_or_lookup_error(e),
     };
     let mut out = Vec::new();
     for record in response.answers() {
@@ -1127,9 +1128,43 @@ async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// NXDOMAIN and NODATA mean "no TXT record here" and become an empty answer;
+/// every other resolver error (SERVFAIL, timeout, transport) stays a failure.
+fn absent_txt_or_lookup_error(error: NetError) -> Result<Vec<String>, String> {
+    let error = DnsLookupError::from(error);
+    if error.is_record_absent() {
+        Ok(Vec::new())
+    } else {
+        Err(error.into_message())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn txt_lookup_treats_absent_records_as_empty_and_failures_as_errors() {
+        use hickory_resolver::net::{DnsError, NoRecords};
+        use hickory_resolver::proto::op::{Query, ResponseCode};
+        use hickory_resolver::proto::rr::{Name, RecordType};
+        let query = Query::query(
+            Name::from_ascii("_enclava-challenge.example.com.").unwrap(),
+            RecordType::TXT,
+        );
+        for code in [ResponseCode::NXDomain, ResponseCode::NoError] {
+            let error = NetError::from(NoRecords::new(query.clone(), code));
+            assert_eq!(absent_txt_or_lookup_error(error), Ok(Vec::new()));
+        }
+        for error in [
+            NetError::from(NoRecords::new(query, ResponseCode::ServFail)),
+            NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail)),
+            NetError::Timeout,
+            NetError::NoConnections,
+        ] {
+            assert!(absent_txt_or_lookup_error(error).is_err());
+        }
+    }
 
     #[test]
     fn rejects_inside_platform_zone() {

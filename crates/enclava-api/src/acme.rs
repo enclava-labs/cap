@@ -827,6 +827,21 @@ impl From<NetError> for DnsLookupError {
     }
 }
 
+impl DnsLookupError {
+    /// The resolver answered and the name has no such record (NXDOMAIN or
+    /// NODATA) -- as opposed to a lookup that failed to produce an answer.
+    pub(crate) fn is_record_absent(&self) -> bool {
+        matches!(
+            self.category,
+            DnsErrorCategory::NxDomain | DnsErrorCategory::NoData
+        )
+    }
+
+    pub(crate) fn into_message(self) -> String {
+        self.message
+    }
+}
+
 impl From<String> for DnsLookupError {
     fn from(message: String) -> Self {
         Self {

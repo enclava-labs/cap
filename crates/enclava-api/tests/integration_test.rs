@@ -3601,9 +3601,10 @@ async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
 async fn custom_domain_verified_challenge_rechecks_txt_within_window() {
     // Regression guard against re-introducing a verified-skip: a challenge that
     // already holds `verified_at` but is still within its window MUST re-run the
-    // live TXT lookup -- it may not skip straight to applying the domain. This
-    // env has no DNS, so the lookup surfaces as a 502 lookup error (not a 200
-    // skip-to-apply), and no domain is attached.
+    // live TXT lookup -- it may not skip straight to applying the domain. The
+    // test domain has no TXT record, so the lookup either finds nothing (412)
+    // or, with no working resolver, fails (502) -- never a 200 skip-to-apply --
+    // and no domain is attached.
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);
@@ -3653,9 +3654,14 @@ async fn custom_domain_verified_challenge_rechecks_txt_within_window() {
         .add_header("x-forwarded-for", "127.0.0.1")
         .authorization_bearer(&session_token)
         .await;
-    // The live TXT lookup ran and failed (no DNS in this env) -- proof that a
-    // captured `verified_at` did not bypass it.
-    verify.assert_status(StatusCode::BAD_GATEWAY);
+    // The live TXT lookup ran and did not find the token -- proof that a
+    // captured `verified_at` did not bypass it. A resolver that answers
+    // NXDOMAIN gives 412; an environment with no resolver gives 502.
+    let status = verify.status_code();
+    assert!(
+        status == StatusCode::PRECONDITION_FAILED || status == StatusCode::BAD_GATEWAY,
+        "expected 412 or 502 from the live TXT recheck, got {status}"
+    );
 
     // No apply, no re-persist: the domain is not attached and the proof stands
     // unchanged.
