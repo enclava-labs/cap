@@ -46,13 +46,14 @@ fn captured_warn_text(logs: &Arc<Mutex<Vec<u8>>>) -> String {
 fn signing_service_5xx_responses_log_the_refusal_body() {
     // The exact shape of the 2026-11-25 outage: the service refused /sign
     // before generation (descriptor signature verification failed against
-    // its canonical bytes), CAP masked the 422 as 502
+    // its canonical bytes — a 400 at 2c83d1ea, whose AppError mapping is
+    // (StatusCode::BAD_REQUEST, message)), CAP masked the refusal as 502
     // signing_service_unavailable, and the idempotency layer turned that
     // into 409 idempotency_recovery_required. The WARN is the only place
     // the service's refusal body survives.
     let (logs, _guard) = captured_warn_logs();
     let (status, body) = signing_error_response(SigningServiceError::Upstream {
-        status: reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        status: reqwest::StatusCode::BAD_REQUEST,
         body: "descriptor signature verification failed: ed25519 signature".to_string(),
     });
     assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -70,6 +71,27 @@ fn signing_service_5xx_responses_log_the_refusal_body() {
         text.contains("idempotency_recovery_required"),
         "the masking is named so the operator knows to look here: {text}"
     );
+}
+
+#[test]
+fn upstream_4xx_of_any_shape_logs_the_refusal_body() {
+    // The masking does not depend on the service's exact status code: any
+    // non-2xx /sign answer becomes Upstream and is masked the same way.
+    for status in [
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        reqwest::StatusCode::FORBIDDEN,
+    ] {
+        let (logs, _guard) = captured_warn_logs();
+        let (mapped, _) = signing_error_response(SigningServiceError::Upstream {
+            status,
+            body: "descriptor signature verification failed: ed25519 signature".to_string(),
+        });
+        assert_eq!(mapped, StatusCode::BAD_GATEWAY);
+        assert!(
+            captured_warn_text(&logs).contains("descriptor signature verification failed"),
+            "the refusal body is logged for {status}"
+        );
+    }
 }
 
 #[test]

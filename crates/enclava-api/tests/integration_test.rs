@@ -49,6 +49,9 @@ const TEST_GENPOLICY_PIN: &str = "kata-containers/genpolicy@3.28.0+test";
 #[derive(Clone)]
 struct TestPolicyService {
     signing_key: Arc<SigningKey>,
+    /// How many /sign requests the deployed-behavior fake refused —
+    /// lets the reproduction test prove the refusal path was reached.
+    sign_refusals: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Contract v1 (policy-templates#23) fixture: records the upstream request
@@ -195,8 +198,13 @@ async fn deployed_service_sign_policy(
             // over the stripped bytes would sign normally).
             Ok(()) => {}
             Err(_) => {
+                service
+                    .sign_refusals
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // 2c83d1ea maps any AppError to (400, message): the real
+                // refusal is a 400, not a 422.
                 return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
+                    StatusCode::BAD_REQUEST,
                     "descriptor signature verification failed: ed25519 signature",
                 )
                     .into_response();
@@ -3091,6 +3099,7 @@ async fn rejected_signed_deployments_leave_existing_and_candidate_container_rows
         .route("/sign", post(test_sign_policy))
         .with_state(TestPolicyService {
             signing_key: policy_signing_key.clone(),
+            sign_refusals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
     let policy_server = axum_test::TestServer::builder()
         .http_transport()
@@ -4993,11 +5002,13 @@ async fn hosted_plain_deploy_with_declared_pod_groups_reproduces_the_masked_409(
     let (mut state, pool) = setup_paas_managed_test_state().await;
     // The policy service behaves exactly like the deployed 2c83d1ea build.
     let policy_signing_key = Arc::new(SigningKey::from_bytes(&[0x33; 32]));
+    let sign_refusals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let policy_service = Router::new()
         .route("/agent-policy", post(test_agent_policy))
         .route("/sign", post(deployed_service_sign_policy))
         .with_state(TestPolicyService {
             signing_key: policy_signing_key.clone(),
+            sign_refusals: sign_refusals.clone(),
         });
     let policy_server = axum_test::TestServer::builder()
         .http_transport()
@@ -5202,6 +5213,16 @@ async fn hosted_plain_deploy_with_declared_pod_groups_reproduces_the_masked_409(
         .await
         .expect("app status");
     assert_eq!(status, "creating");
+
+    // The refusal was reached and counted exactly once: the /sign fallback
+    // ran and the deployed-behavior fake refused it (a transport error on
+    // /agent-policy would produce the same receipt without any /sign call —
+    // the counter is the discriminator).
+    assert_eq!(
+        sign_refusals.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the /sign fallback must have been refused exactly once"
+    );
 
     // The receipt is terminal: a same-key retry replays it instead of
     // re-running the (9.7 s on dev) generation.

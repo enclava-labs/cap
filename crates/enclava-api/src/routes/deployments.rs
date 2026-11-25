@@ -345,18 +345,20 @@ pub(crate) fn signing_error_response(
         }
     };
 
-    // A 5xx here is masked by the idempotency layer into 409
-    // idempotency_recovery_required with nothing else on the wire — the
-    // plain-deploy 409 outage on dev (2026-11-25) spent hours on exactly
-    // that blind spot. Log the code plus the error's Display (for Upstream
-    // it carries the service's status and refusal body) so the real cause
-    // is reachable from the api log. The typed guest-pull 4xx above is NOT
-    // masked and stays unlogged.
+    // On the idempotent routes a 5xx here is masked by the idempotency
+    // layer into 409 idempotency_recovery_required with nothing else on
+    // the wire — the plain-deploy 409 outage on dev (2026-11-25) spent
+    // hours on exactly that blind spot. (Non-idempotent callers, e.g.
+    // the hosted policy preflight, surface the 5xx directly.) Log the
+    // code plus the error's Display (for Upstream it carries the
+    // service's status and refusal body) so the real cause is reachable
+    // from the api log. The typed guest-pull 4xx above is NOT masked and
+    // stays unlogged.
     if status.is_server_error() {
         tracing::warn!(
             code = code,
             error = %error,
-            "signed-policy resolution failed with a server error; the idempotency layer masks this as 409 idempotency_recovery_required"
+            "signed-policy resolution failed with a server error; idempotent routes mask this as 409 idempotency_recovery_required"
         );
     }
 
