@@ -374,6 +374,13 @@ Until phase 3, the API fails group-bearing descriptors closed at both
 admission entrances (the agent-policy preflight and the apply path), so
 a descriptor can never reach a pre-change init that would reject it.
 
+The hosted relay (enclava-paas) ships the same contract — the request
+flag `supports_pod_supplemental_groups` and the typed 4xx relay
+(enclava-labs/enclava-paas#443, merged) — and must be live before
+`ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED` is enabled. With an older
+PaaS, hosted signers stay on the legacy flow and typed signing errors
+surface as the generic 502.
+
 ### Rotating the production root
 
 The committed profile bundle uses a well-known public fixture root. Publishing
