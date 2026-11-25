@@ -1123,6 +1123,21 @@ fn compose_api_error(status_code: u16, body: ApiErrorBody) -> ComposedApiError {
     {
         message = format!("{message} (publish CNAME {name} -> {target})");
     }
+    // Contract v1 (policy-templates#23): the typed guest-pull group
+    // errors carry the missing groups — actionable remediation text, not
+    // hostile provider output.
+    if matches!(
+        code.as_deref(),
+        Some("genpolicy_guest_pull_groups_required") | Some("pod_supplemental_groups_insufficient")
+    ) && let Some(groups) = &body.missing_pod_supplemental_groups
+    {
+        let rendered = groups
+            .iter()
+            .map(|g| g.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        message = format!("{message} (missing pod supplemental groups: {rendered})");
+    }
     // The hosted sanitizer drops provider message text by design, so this one
     // known code carries its remediation client-side.
     if code.as_deref() == Some("stale_owner_seed") {

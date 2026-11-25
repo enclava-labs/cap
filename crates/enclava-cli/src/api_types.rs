@@ -1261,6 +1261,13 @@ pub struct ApiErrorBody {
     pub acme_cname_name: Option<String>,
     #[serde(default)]
     pub acme_cname_target: Option<String>,
+    /// Missing pod supplemental groups carried by the API's typed
+    /// guest-pull errors (genpolicy_guest_pull_groups_required /
+    /// pod_supplemental_groups_insufficient, contract v1,
+    /// policy-templates#23) so the CLI can print the exact remediation.
+    /// Absent on older servers and other errors.
+    #[serde(default)]
+    pub missing_pod_supplemental_groups: Option<Vec<i64>>,
     /// CAP/PaaS idempotency completion stamp. `completed` means this key is
     /// consumed for the replay window; `deferred` means retry the same key.
     /// Absent on pre-handler and legacy bodies. PaaS keeps only those two

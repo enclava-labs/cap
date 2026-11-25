@@ -3706,6 +3706,15 @@ async fn validate_apply_artifacts(
         loaded.descriptor.pod_supplemental_groups.as_ref(),
     )
     .map_err(|_| DeploymentJobError::Artifact)?;
+    // Init-first rollout guard: fail the apply closed when this API
+    // deployment has not enabled pod supplemental groups — a
+    // group-bearing descriptor under a pre-change ENCLAVA_INIT_IMAGE pin
+    // would fail guest verification on every start (deny_unknown_fields).
+    if loaded.descriptor.pod_supplemental_groups.is_some()
+        && !crate::routes::platform::pod_supplemental_groups_supported()
+    {
+        return Err(DeploymentJobError::Artifact);
+    }
     let mut binding = loaded.binding.clone();
     validate_signed_render(job, payload, &loaded, &mut binding)?;
     Ok(ValidatedApplyArtifacts {

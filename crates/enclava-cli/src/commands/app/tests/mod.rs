@@ -4498,6 +4498,48 @@ fn pod_groups_descriptor_fixture() -> enclava_cli::descriptor::DeploymentDescrip
     .expect("parse descriptor fixture")
 }
 
+/// Read one full HTTP request: headers, then exactly Content-Length body
+/// bytes. A single `read` can return a partial request, which would make
+/// the JSON assertions pass vacuously.
+async fn read_full_http_request(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    let mut byte_buf = [0u8; 4096];
+    let headers_end = loop {
+        let n = stream.read(&mut byte_buf).await.unwrap();
+        assert!(n > 0, "the client must send a request");
+        request.extend_from_slice(&byte_buf[..n]);
+        if let Some(pos) = find_subsequence(&request, b"\r\n\r\n") {
+            break pos;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..headers_end]).to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let total = headers_end + 4 + content_length;
+    while request.len() < total {
+        let n = stream.read(&mut byte_buf).await.unwrap();
+        assert!(n > 0, "the request body must arrive complete");
+        request.extend_from_slice(&byte_buf[..n]);
+    }
+    String::from_utf8_lossy(&request).to_string()
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 /// A single-request HTTP fixture for /agent-policy: records the raw request
 /// body, replies with `policy_text` (hash computed locally) plus optional
 /// discovered groups, and returns the captured request for assertions.
@@ -4506,7 +4548,6 @@ async fn agent_policy_fixture(
     pod_supplemental_groups: Option<Vec<i64>>,
 ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
     use sha2::Digest;
-    use tokio::io::AsyncReadExt;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -4514,9 +4555,7 @@ async fn agent_policy_fixture(
     let text = policy_text.to_string();
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).await.unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let request = read_full_http_request(&mut stream).await;
             let _ = tx.send(request);
             let mut policy = text.clone();
             let sha: String = hex::encode(sha2::Sha256::digest(policy.as_bytes()));
@@ -4558,8 +4597,6 @@ async fn discovery_merges_canonicalizes_and_re_calls_before_any_hash() {
     // duplicated); the CLI canonicalizes to [0, 6, 27], sets it on the
     // descriptor, and RE-CALLS; only the re-call's policy is used. The
     // request bodies prove the re-call carried the declared groups.
-    use tokio::io::AsyncReadExt;
-
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
@@ -4571,9 +4608,7 @@ async fn discovery_merges_canonicalizes_and_re_calls_before_any_hash() {
     tokio::spawn(async move {
         let mut round = 0;
         while let Ok((mut stream, _)) = listener.accept().await {
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).await.unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let request = read_full_http_request(&mut stream).await;
             let body = request.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
             let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
             let _ = tx.send(payload.clone());

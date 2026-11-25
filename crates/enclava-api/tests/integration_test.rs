@@ -4813,6 +4813,34 @@ async fn agent_policy_broker_relays_the_capability_and_discovered_groups_both_wa
         "expected_kbs_policy_hash": "07".repeat(32),
     });
 
+    // Gate OFF (the env is unset): the relay never asks the service for
+    // discovery even when the caller declares the capability — the typed
+    // legacy error surfaces instead, mapped to the structured 4xx.
+    let response = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/agent-policy"
+        )),
+        &format!("groups-agent-policy-gate-off-{suffix}"),
+        &paas_user_id,
+    )
+    .json(
+        &serde_json::json!({ "descriptor": descriptor, "supports_pod_supplemental_groups": true }),
+    )
+    .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = response.json();
+    assert_eq!(body["error"], "genpolicy_guest_pull_groups_required");
+    assert_eq!(
+        body["missing_pod_supplemental_groups"],
+        serde_json::json!([27])
+    );
+
+    // Gate ON: ops enabled the deployment capability atomically with the
+    // field-tolerant init image pin.
+    unsafe {
+        std::env::set_var("ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED", "1");
+    }
+
     // Capability direction: the request flag reaches the signing service.
     let response = add_internal_actor_headers(
         server.post(&format!(
@@ -4852,21 +4880,29 @@ async fn agent_policy_broker_relays_the_capability_and_discovered_groups_both_wa
     );
 
     let requests = recorder.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    // gate-off request, capable request, legacy request.
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[0]
+            .get("supports_pod_supplemental_groups")
+            .is_none(),
+        "gate off: the relay forces the capability off: {}",
+        requests[0]
+    );
     assert_eq!(
-        requests[0]["supports_pod_supplemental_groups"],
+        requests[1]["supports_pod_supplemental_groups"],
         serde_json::json!(true)
     );
     assert!(
-        requests[1]
+        requests[2]
             .get("supports_pod_supplemental_groups")
             .is_none(),
         "false is OMITTED on the relay wire (legacy bytes): {}",
-        requests[1]
+        requests[2]
     );
     // The descriptor itself round-trips through the relay unchanged.
     assert_eq!(
-        requests[0]["descriptor"]["policy_template_id"],
+        requests[1]["descriptor"]["policy_template_id"],
         serde_json::json!("enclava-kbs-policy-v1")
     );
 }
