@@ -394,15 +394,29 @@ pub async fn inspect_ready_pod_mounts_all_claims(
     namespace: &str,
     workload: &str,
 ) -> Result<bool, ApplyError> {
-    use k8s_openapi::api::core::v1::Pod;
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
     use kube::api::{Api, ListParams};
 
     let pod_api: Api<Pod> = Api::namespaced(engine.client().clone(), namespace);
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(engine.client().clone(), namespace);
     let pod_name = crate::manifest::volumes::provisioned_pod_name(workload);
     let params = ListParams::default()
         .fields(&format!("metadata.name={pod_name}"))
         .limit(1);
     let pod = pod_api.list(&params).await?.items.pop();
+    // The CLAIM objects must also exist and not be terminating (Devin
+    // review on this change): a pod mounting a claim NAME proves nothing
+    // about a claim that is gone or mid-delete — the restart would land
+    // on a recreated, never-initialized volume. Fail closed on either.
+    for vct in ["state", "tls-state"] {
+        let claim_name = crate::manifest::volumes::provisioned_claim_name(vct, workload);
+        let Some(pvc) = pvc_api.get_opt(&claim_name).await? else {
+            return Ok(false);
+        };
+        if pvc.metadata.deletion_timestamp.is_some() {
+            return Ok(false);
+        }
+    }
     Ok(pod
         .as_ref()
         .is_some_and(|pod| pod_proves_restart_admission(pod, workload)))

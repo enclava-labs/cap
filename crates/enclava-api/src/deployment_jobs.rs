@@ -1820,6 +1820,18 @@ pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::
                     "failed to repair orphaned deployment namespace mutation leases"
                 ),
             }
+            match crate::mutation_leases::reconcile_orphaned_custom_domain_fences(&repair_state.db)
+                .await
+            {
+                Ok(repaired) if repaired > 0 => {
+                    tracing::warn!(repaired, "bounded orphaned custom-domain namespace fences")
+                }
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    error_code = "orphaned_custom_domain_fence_repair_failed",
+                    "failed to repair orphaned custom-domain namespace fences"
+                ),
+            }
             match expire_customer_config_holds(&repair_state.db).await {
                 Ok(expired) if expired > 0 => tracing::warn!(
                     expired,
