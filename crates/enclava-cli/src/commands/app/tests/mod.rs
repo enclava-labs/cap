@@ -546,6 +546,104 @@ fn deploy_preflight_gate_fails_closed_on_unresolved_ownership() {
     ));
 }
 
+fn lost_destroy_lookup_error(status: u16) -> ApiError {
+    ApiError::Api {
+        status,
+        code: None,
+        message: String::new(),
+        idempotency_disposition: None,
+    }
+}
+
+/// Runs the checks on paused time: one check per second for `seconds`.
+async fn lost_destroy_outcome(
+    answers: Vec<Result<(), ApiError>>,
+    seconds: u64,
+) -> (LostDestroyOutcome, u32) {
+    let mut answers = VecDeque::from(answers);
+    let mut asked = 0;
+    let outcome = outcome_after_lost_destroy_response(
+        || {
+            asked += 1;
+            let answer = answers.pop_front().unwrap_or(Ok(()));
+            async move { answer }
+        },
+        Duration::from_secs(seconds),
+        Duration::from_secs(1),
+        Duration::from_secs(5),
+    )
+    .await;
+    (outcome, asked)
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_destroy_response_is_resolved_only_by_what_the_server_says() {
+    // Still there, then a server error, then gone: resolved on the third check.
+    let (outcome, asked) = lost_destroy_outcome(
+        vec![
+            Ok(()),
+            Err(lost_destroy_lookup_error(503)),
+            Err(lost_destroy_lookup_error(404)),
+        ],
+        10,
+    )
+    .await;
+    assert_eq!(outcome, LostDestroyOutcome::Gone);
+    assert_eq!(asked, 3);
+
+    // An app that never goes away is reported as still present when the window ends.
+    let (outcome, asked) = lost_destroy_outcome(Vec::new(), 4).await;
+    assert_eq!(outcome, LostDestroyOutcome::StillPresent);
+    assert_eq!(asked, 4);
+
+    // Seen once, but the final check got no answer: presence is not claimed.
+    let (outcome, asked) =
+        lost_destroy_outcome(vec![Ok(()), Err(lost_destroy_lookup_error(503))], 2).await;
+    assert_eq!(outcome, LostDestroyOutcome::Unverified);
+    assert_eq!(asked, 2);
+
+    // A credential that cannot read the app stops the checks at once.
+    for refused in [
+        lost_destroy_lookup_error(403),
+        lost_destroy_lookup_error(401),
+        ApiError::NotAuthenticated,
+    ] {
+        let (outcome, asked) = lost_destroy_outcome(vec![Ok(()), Err(refused)], 9).await;
+        assert_eq!(outcome, LostDestroyOutcome::Unverified);
+        assert_eq!(asked, 2);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_destroy_checks_that_hang_end_with_the_window() {
+    let started = tokio::time::Instant::now();
+    let mut asked = 0;
+    let outcome = outcome_after_lost_destroy_response(
+        || {
+            asked += 1;
+            std::future::pending::<Result<(), ApiError>>()
+        },
+        Duration::from_secs(300),
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(outcome, LostDestroyOutcome::Unverified);
+    // 15 s per hung check plus 5 s between them: 15 checks, and never past the window.
+    assert_eq!(asked, 15);
+    assert!(started.elapsed() <= Duration::from_secs(300));
+}
+
+#[test]
+fn lost_destroy_hint_only_claims_the_app_exists_when_the_server_said_so() {
+    let present = lost_destroy_hint(&LostDestroyOutcome::StillPresent, "shell");
+    assert!(present.contains("'shell' still existed"));
+    assert!(present.contains("`enclava destroy --app shell`"));
+    let unverified = lost_destroy_hint(&LostDestroyOutcome::Unverified, "shell");
+    assert!(unverified.contains("could not confirm whether 'shell' still exists"));
+    assert!(unverified.contains("`enclava status --app shell`"));
+}
+
 #[test]
 fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
     let busy = destroy_failure_hint(

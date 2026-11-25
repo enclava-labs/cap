@@ -1,6 +1,6 @@
 use clap::Subcommand;
 
-use enclava_cli::api_client::ApiClient;
+use enclava_cli::api_client::{ApiClient, ApiError};
 use enclava_cli::api_types::CreateChallengeRequest;
 use enclava_cli::app_config::AppConfig;
 use enclava_cli::config::{self, CliPaths};
@@ -107,7 +107,15 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             let app_name = resolve_app_name(&app)?;
             let api = build_api_client()?;
 
-            let resp = api.verify_domain(&app_name, &domain).await?;
+            let resp = match api.verify_domain(&app_name, &domain).await {
+                Ok(resp) => resp,
+                Err(error) => {
+                    if let Some(hint) = verify_refusal_hint(&error, &domain) {
+                        eprintln!("Hint: {hint}");
+                    }
+                    return Err(error.into());
+                }
+            };
             println!(
                 "Domain '{}' verified for {app_name} at {}.",
                 resp.domain, resp.verified_at,
@@ -161,4 +169,47 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
     Ok(())
+}
+
+/// What to tell the user when verify is refused because the ownership TXT
+/// record was not found or did not match (HTTP 412). The hosted API reduces
+/// the refusal to a generic code, so the CLI names the record itself.
+fn verify_refusal_hint(error: &ApiError, domain: &str) -> Option<String> {
+    match error {
+        ApiError::Api { status: 412, .. } => Some(format!(
+            "the TXT record at _enclava-challenge.{domain} was not found or does not match the challenge. DNS changes can take a few minutes to become visible; check the record's name and value, then run verify again."
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refusal(status: u16) -> ApiError {
+        ApiError::Api {
+            status,
+            code: Some("cap_operation_rejected".to_string()),
+            message: "cap_operation_rejected".to_string(),
+            idempotency_disposition: None,
+        }
+    }
+
+    #[test]
+    fn verify_refusal_hint_names_the_txt_record_only_for_a_412() {
+        let hint = verify_refusal_hint(&refusal(412), "app.example.com").expect("412 has a hint");
+        assert!(hint.contains("_enclava-challenge.app.example.com"));
+        assert!(hint.contains("can take a few minutes"));
+        for other in [409, 422, 500] {
+            assert_eq!(
+                verify_refusal_hint(&refusal(other), "app.example.com"),
+                None
+            );
+        }
+        assert_eq!(
+            verify_refusal_hint(&ApiError::NotAuthenticated, "app.example.com"),
+            None
+        );
+    }
 }

@@ -3986,6 +3986,33 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
         spinner.finish_with_message(format!("Destroy of '{app_name}' did not complete."));
         eprintln!("Hint: {hint}");
     }
+    // A destroy can outlast a connection: when the response is lost in
+    // transit the server still finishes the teardown. Ask the server what
+    // happened instead of reporting a failure for an app that is gone.
+    let result = match result {
+        Err(ApiError::Http(error)) => {
+            spinner.set_message(format!(
+                "Lost the connection while destroying {app_name}; checking whether it finished..."
+            ));
+            let outcome = outcome_after_lost_destroy_response(
+                || async { api.get_app(&app_name).await.map(|_| ()) },
+                DESTROY_LOST_RESPONSE_WINDOW,
+                DESTROY_LOST_RESPONSE_INTERVAL,
+                DESTROY_LOST_RESPONSE_CHECK_TIMEOUT,
+            )
+            .await;
+            if outcome == LostDestroyOutcome::Gone {
+                Ok(())
+            } else {
+                spinner.finish_with_message(format!(
+                    "Destroy of '{app_name}' was sent, but its outcome is unknown."
+                ));
+                eprintln!("Hint: {}", lost_destroy_hint(&outcome, &app_name));
+                Err(ApiError::Http(error))
+            }
+        }
+        other => other,
+    };
     let already_gone = matches!(&result, Err(ApiError::Api { status: 404, .. }));
     if let Err(error) = result {
         if !already_gone {
@@ -4058,6 +4085,72 @@ fn forget_destroyed_app_template_deploy(
         scope,
         &template_resume_instance_name(app_name),
     )
+}
+
+/// What to tell the user when a lost destroy response could not be resolved.
+fn lost_destroy_hint(outcome: &LostDestroyOutcome, app_name: &str) -> String {
+    match outcome {
+        LostDestroyOutcome::StillPresent => format!(
+            "the connection dropped before the server answered, and '{app_name}' still existed after 5 minutes of checking. The teardown may still be running: check `enclava status --app {app_name}`, and run `enclava destroy --app {app_name}` again if the app is still there."
+        ),
+        _ => format!(
+            "the connection dropped before the server answered, and the CLI could not confirm whether '{app_name}' still exists. Check `enclava status --app {app_name}`; if the app is still there, run `enclava destroy --app {app_name}` again."
+        ),
+    }
+}
+
+/// How long destroy keeps asking whether the app is gone after the delete
+/// response was lost: a check every 5 seconds for 5 minutes in total, the time
+/// the hosted route allows a delete to run. Each check is cut off after 15
+/// seconds, and the 5 minutes include the time the checks themselves take.
+const DESTROY_LOST_RESPONSE_WINDOW: Duration = Duration::from_secs(300);
+const DESTROY_LOST_RESPONSE_INTERVAL: Duration = Duration::from_secs(5);
+const DESTROY_LOST_RESPONSE_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What the server says about an app whose destroy response never arrived.
+#[derive(Debug, PartialEq, Eq)]
+enum LostDestroyOutcome {
+    /// The server answered "no such app" (404).
+    Gone,
+    /// The final check got an answer, and it still showed the app.
+    StillPresent,
+    /// The final check produced no answer, or the credential cannot read the app.
+    Unverified,
+}
+
+/// After a destroy whose response never arrived, ask the server whether the
+/// app is gone. Only a 404 counts as gone. A lookup the credential is not
+/// allowed to make (a delete-only key, an expired session) ends the checks at
+/// once, since repeating it cannot answer the question.
+async fn outcome_after_lost_destroy_response<F, Fut>(
+    mut lookup: F,
+    window: Duration,
+    interval: Duration,
+    check_timeout: Duration,
+) -> LostDestroyOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ApiError>>,
+{
+    let deadline = tokio::time::Instant::now() + window;
+    let mut outcome;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(check_timeout.min(remaining), lookup()).await {
+            Ok(Ok(())) => outcome = LostDestroyOutcome::StillPresent,
+            Ok(Err(ApiError::Api { status: 404, .. })) => return LostDestroyOutcome::Gone,
+            Ok(Err(ApiError::NotAuthenticated))
+            | Ok(Err(ApiError::Api {
+                status: 401 | 403, ..
+            })) => return LostDestroyOutcome::Unverified,
+            // A failed or timed-out check says nothing about the app now.
+            Ok(Err(_)) | Err(_) => outcome = LostDestroyOutcome::Unverified,
+        }
+        if tokio::time::Instant::now() + interval >= deadline {
+            return outcome;
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Operator guidance for a failed destroy, keyed on the stable API code (or
