@@ -523,6 +523,11 @@ pub struct ManagedConfigDeliveryStatusResponse {
 #[derive(Debug, Serialize)]
 pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,
+    /// Contract v1 (policy-templates#23): sent only when the API declared
+    /// the capability (deployment-context), so requests against older APIs
+    /// stay byte-for-byte legacy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_pod_supplemental_groups: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -532,6 +537,11 @@ pub struct AgentPolicyResponse {
     pub genpolicy_version_pin: String,
     #[serde(default)]
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): present only when the signing
+    /// service ran the guest-pull group discovery. The CLI canonicalizes
+    /// (sorted unique), sets it on the descriptor, and re-calls.
+    #[serde(default)]
+    pub pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -549,6 +559,12 @@ pub struct DeploymentContextResponse {
     /// they keep producing claim-less signed renders.
     #[serde(default)]
     pub log_spool_state_bind_supported: bool,
+    /// Contract v1 (policy-templates#23): this API understands the
+    /// descriptor's pod_supplemental_groups field and relays the signing
+    /// service's discovery response. Absent on older APIs, which default
+    /// to false so the CLI keeps the single-call legacy flow.
+    #[serde(default)]
+    pub pod_supplemental_groups_supported: bool,
     #[serde(default)]
     pub current_platform_release_id: Option<String>,
     #[serde(default)]
@@ -1245,6 +1261,13 @@ pub struct ApiErrorBody {
     pub acme_cname_name: Option<String>,
     #[serde(default)]
     pub acme_cname_target: Option<String>,
+    /// Missing pod supplemental groups carried by the API's typed
+    /// guest-pull errors (genpolicy_guest_pull_groups_required /
+    /// pod_supplemental_groups_insufficient, contract v1,
+    /// policy-templates#23) so the CLI can print the exact remediation.
+    /// Absent on older servers and other errors.
+    #[serde(default)]
+    pub missing_pod_supplemental_groups: Option<Vec<i64>>,
     /// CAP/PaaS idempotency completion stamp. `completed` means this key is
     /// consumed for the replay window; `deferred` means retry the same key.
     /// Absent on pre-handler and legacy bodies. PaaS keeps only those two

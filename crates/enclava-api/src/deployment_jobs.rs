@@ -1820,6 +1820,18 @@ pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::
                     "failed to repair orphaned deployment namespace mutation leases"
                 ),
             }
+            match crate::mutation_leases::reconcile_orphaned_custom_domain_fences(&repair_state.db)
+                .await
+            {
+                Ok(repaired) if repaired > 0 => {
+                    tracing::warn!(repaired, "bounded orphaned custom-domain namespace fences")
+                }
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    error_code = "orphaned_custom_domain_fence_repair_failed",
+                    "failed to repair orphaned custom-domain namespace fences"
+                ),
+            }
             match expire_customer_config_holds(&repair_state.db).await {
                 Ok(expired) if expired > 0 => tracing::warn!(
                     expired,
@@ -3162,6 +3174,7 @@ async fn apply_claimed_job(
                 sigstore_material: validated.sigstore_material,
                 provenance_oci_material: validated.provenance_oci_material,
                 log_encryption: payload.log_encryption.clone(),
+                pod_supplemental_groups: validated.pod_supplemental_groups,
             },
             &state.kube_client,
             &mutation,
@@ -3603,6 +3616,9 @@ struct ValidatedApplyArtifacts {
     local_trustee_policy_json: Option<String>,
     sigstore_material: Vec<u8>,
     provenance_oci_material: Vec<u8>,
+    /// Contract v1 (policy-templates#23): the signed descriptor's
+    /// declared pod-level supplemental groups (fail-closed validated).
+    pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 async fn validate_apply_artifacts(
@@ -3644,6 +3660,7 @@ async fn validate_apply_artifacts(
             local_trustee_policy_json: None,
             sigstore_material,
             provenance_oci_material,
+            pod_supplemental_groups: None,
         });
     };
     let loaded = crate::signing_service::load_workload_artifacts_exact(
@@ -3682,6 +3699,22 @@ async fn validate_apply_artifacts(
         )
         .await
         .map_err(|_| DeploymentJobError::Artifact)?;
+    // Contract v1 (policy-templates#23): the declared groups ride the
+    // signed descriptor; an invalid list fails closed rather than
+    // rendering a StatefulSet genpolicy will reject at runtime.
+    enclava_common::descriptor::validate_pod_supplemental_groups(
+        loaded.descriptor.pod_supplemental_groups.as_ref(),
+    )
+    .map_err(|_| DeploymentJobError::Artifact)?;
+    // Init-first rollout guard: fail the apply closed when this API
+    // deployment has not enabled pod supplemental groups — a
+    // group-bearing descriptor under a pre-change ENCLAVA_INIT_IMAGE pin
+    // would fail guest verification on every start (deny_unknown_fields).
+    if loaded.descriptor.pod_supplemental_groups.is_some()
+        && !crate::routes::platform::pod_supplemental_groups_supported()
+    {
+        return Err(DeploymentJobError::Artifact);
+    }
     let mut binding = loaded.binding.clone();
     validate_signed_render(job, payload, &loaded, &mut binding)?;
     Ok(ValidatedApplyArtifacts {
@@ -3691,6 +3724,7 @@ async fn validate_apply_artifacts(
         local_trustee_policy_json: Some(loaded.trustee_policy_json),
         sigstore_material,
         provenance_oci_material,
+        pod_supplemental_groups: loaded.descriptor.pod_supplemental_groups.clone(),
     })
 }
 
@@ -5376,6 +5410,7 @@ pub(crate) mod tests {
         let agent_policy_hash: [u8; 32] = Sha256::digest(agent_policy_text.as_bytes()).into();
         let rego_hash: [u8; 32] = Sha256::digest(rego_text.as_bytes()).into();
         let mut descriptor = DeploymentDescriptor {
+            pod_supplemental_groups: None,
             schema_version: "v1".to_string(),
             org_id: payload.app.org_id,
             org_slug: payload.app.tenant_id.clone(),

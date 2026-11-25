@@ -388,6 +388,11 @@ pub struct AgentPolicyRequest {
     pub descriptor: DeploymentDescriptor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): relayed unchanged from the CLI
+    /// request. False is omitted on the wire so a legacy relay against an
+    /// older signing service stays byte-for-byte.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_pod_supplemental_groups: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +402,12 @@ pub struct AgentPolicyResponse {
     pub genpolicy_version_pin: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): present only when the signing
+    /// service ran the guest-pull group discovery — the effective
+    /// sorted-unique list for the CLI to merge into the descriptor and
+    /// re-call. Absent on legacy services (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 #[derive(Debug, Serialize)]

@@ -272,6 +272,31 @@ fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_js
     (status, Json(serde_json::json!({"error": code})))
 }
 
+/// Parse the signing service's typed guest-pull group error body
+/// (contract v1, policy-templates#23): "<code>: missing pod supplemental
+/// groups [a, b]". Returns the code and the missing groups.
+pub(crate) fn parse_guest_pull_groups_error_body(body: &str) -> Option<(&'static str, Vec<i64>)> {
+    let code = if body.starts_with("genpolicy_guest_pull_groups_required") {
+        "genpolicy_guest_pull_groups_required"
+    } else if body.starts_with("pod_supplemental_groups_insufficient") {
+        "pod_supplemental_groups_insufficient"
+    } else {
+        return None;
+    };
+    let open = body.rfind('[')?;
+    let close = body[open..].find(']')? + open;
+    let groups = body[open + 1..close]
+        .split(',')
+        .map(|entry| entry.trim())
+        .map(str::parse::<i64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if groups.is_empty() {
+        return None;
+    }
+    Some((code, groups))
+}
+
 pub(crate) fn signing_error_response(
     error: crate::signing_service::SigningServiceError,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -289,9 +314,27 @@ pub(crate) fn signing_error_response(
         SigningServiceError::InvalidSignature => {
             (StatusCode::BAD_REQUEST, "signed_artifact_signature_invalid")
         }
-        SigningServiceError::Upstream { .. } | SigningServiceError::Http(_) => {
+        SigningServiceError::Upstream { status, body } => {
+            // Contract v1 (policy-templates#23): the signing service's
+            // typed guest-pull group failures arrive as 4xx plain-text
+            // bodies ("genpolicy_guest_pull_groups_required: missing pod
+            // supplemental groups [27]" or the insufficient-declared
+            // variant). Map them to a structured 4xx carrying the missing
+            // groups so the CLI can surface the remediation instead of a
+            // blanket signing_service_unavailable.
+            if let Some((code, groups)) = parse_guest_pull_groups_error_body(body) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": code,
+                        "missing_pod_supplemental_groups": groups,
+                    })),
+                );
+            }
+            let _ = status;
             (StatusCode::BAD_GATEWAY, "signing_service_unavailable")
         }
+        SigningServiceError::Http(_) => (StatusCode::BAD_GATEWAY, "signing_service_unavailable"),
         SigningServiceError::InvalidUrl(_) | SigningServiceError::InvalidTimeout(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "signing_service_configuration_invalid",
@@ -356,10 +399,15 @@ pub(crate) async fn resolve_signed_policy_artifact(
         })),
     ))?;
 
+    // The hosted preflight carries no CLI capability signal (the CLI
+    // broker route is the discovery entrypoint), so it requests the
+    // legacy generation: a guest-pull group failure surfaces the typed
+    // structured error through signing_error_response.
     let generated = signing_service
         .agent_policy(&crate::signing_service::AgentPolicyRequest {
             descriptor: artifacts.descriptor.clone(),
             log_encryption: log_encryption.clone(),
+            supports_pod_supplemental_groups: false,
         })
         .await
         .map_err(signing_error_response)?;
@@ -552,6 +600,11 @@ pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,
     #[serde(default)]
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): the caller understands the
+    /// pod_supplemental_groups response field and will merge + re-call.
+    /// Absent on older CLIs (serde default false).
+    #[serde(default)]
+    pub supports_pod_supplemental_groups: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -561,6 +614,11 @@ pub struct AgentPolicyResponse {
     pub genpolicy_version_pin: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): the effective pod-level
+    /// supplemental groups when the signing service ran the guest-pull
+    /// discovery. The CLI merges this into the descriptor and re-calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 fn validate_log_encryption_config(
@@ -3890,5 +3948,85 @@ mod tests {
             .await
             .expect("drop audit failure function");
         delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    /// Contract v1 (policy-templates#23): the signing service's typed
+    /// guest-pull group errors map to a structured 4xx carrying the
+    /// missing groups — never a blanket 502 signing_service_unavailable.
+    #[test]
+    fn guest_pull_group_errors_map_to_structured_4xx() {
+        use crate::signing_service::SigningServiceError;
+
+        let cases = [
+            (
+                "genpolicy_guest_pull_groups_required: missing pod supplemental groups [27]",
+                "genpolicy_guest_pull_groups_required",
+                vec![27],
+            ),
+            (
+                "pod_supplemental_groups_insufficient: missing pod supplemental groups [55, 27]",
+                "pod_supplemental_groups_insufficient",
+                vec![55, 27],
+            ),
+        ];
+        for (body, code, groups) in cases {
+            let (status, Json(value)) = signing_error_response(SigningServiceError::Upstream {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                body: body.to_string(),
+            });
+            assert_eq!(status, StatusCode::BAD_REQUEST, "4xx, not 502: {body}");
+            assert_eq!(value["error"], code);
+            assert_eq!(
+                value["missing_pod_supplemental_groups"],
+                serde_json::json!(groups)
+            );
+        }
+        // Unrelated upstream bodies keep today's mapping.
+        let (status, Json(value)) = signing_error_response(SigningServiceError::Upstream {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "internal signing service error".to_string(),
+        });
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(value["error"], "signing_service_unavailable");
+    }
+
+    /// The typed-body parser: exact codes, bracketed integer lists, and
+    /// everything else parses to None (fail-closed to the legacy mapping).
+    #[test]
+    fn guest_pull_groups_error_body_parser_is_strict() {
+        assert_eq!(
+            parse_guest_pull_groups_error_body(
+                "genpolicy_guest_pull_groups_required: missing pod supplemental groups [27]"
+            ),
+            Some(("genpolicy_guest_pull_groups_required", vec![27]))
+        );
+        assert_eq!(
+            parse_guest_pull_groups_error_body(
+                "pod_supplemental_groups_insufficient: missing pod supplemental groups [0, 6, 55]"
+            ),
+            Some(("pod_supplemental_groups_insufficient", vec![0, 6, 55]))
+        );
+        // Not a typed body.
+        assert_eq!(
+            parse_guest_pull_groups_error_body("genpolicy failed with status 1"),
+            None
+        );
+        assert_eq!(
+            parse_guest_pull_groups_error_body("something genpolicy_guest_pull_groups_required"),
+            None
+        );
+        // Malformed group lists parse to None (no silent empty mapping).
+        assert_eq!(
+            parse_guest_pull_groups_error_body(
+                "genpolicy_guest_pull_groups_required: missing pod supplemental groups []"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_guest_pull_groups_error_body(
+                "genpolicy_guest_pull_groups_required: missing pod supplemental groups [abc]"
+            ),
+            None
+        );
     }
 }

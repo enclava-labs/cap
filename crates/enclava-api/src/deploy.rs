@@ -5877,6 +5877,10 @@ pub struct ApplyDeploymentManifestsRequest {
     pub sigstore_material: Vec<u8>,
     pub provenance_oci_material: Vec<u8>,
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): the signed descriptor's declared
+    /// pod-level supplemental groups, rendered into the real StatefulSet.
+    /// None for unsigned/legacy renders (platform baseline [0, 6]).
+    pub pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 /// Immutable database-row inputs captured for one queued deployment apply.
@@ -6298,6 +6302,7 @@ pub(crate) fn build_confidential_app_from_rows(
         },
         attestation: attestation_config.clone(),
         egress_mode,
+        pod_supplemental_groups: None,
         public_internet_egress_excluded_cidrs: public_internet_egress_excluded_cidrs_from_env(),
         allow_internal_egress: crate::routes::apps::internal_egress_allowlist_enabled()
             && app.egress_allowlist.0.iter().any(|rule| {
@@ -6939,15 +6944,18 @@ pub async fn reapply_tenant_ingress(
     let ledger = crate::deployment_failure_cleanup::load_creation_ledger(pool, app.id).await?;
     let engine =
         ApplyEngine::new(client.clone(), ApplyConfig::default()).with_creation_ledger(ledger);
-    // Domain-only reapply: the pod restart re-opens existing volumes, so the
-    // base rollout budget applies — the fresh-initialization allowance is
-    // reserved for renders that provision a new claim.
-    let rollout_timeout = engine.config().rollout_timeout;
     ensure_statefulset_exists(&engine, &app_spec.namespace, &app_spec.name).await?;
     let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
-    mutation
-        .arm_resource_scope_until_reconciled("kubernetes_namespace")
-        .await?;
+    // No infinite namespace fence here, unlike a real deployment apply.
+    // This domain-only reapply never deletes the namespace and its only
+    // Kubernetes writes are generation-CAS'd and idempotent (the ConfigMap
+    // SSA apply and the rollout-restart annotation patch below), so a
+    // cancelled request leaves desired state applied and the ordinary
+    // finite fence from the lease claim self-heals on the normal
+    // expiry/quarantine clock. Arming `until_reconciled` here — the tool
+    // for precondition-less provider writes and namespace-delete races —
+    // wedged apps forever when the request was cancelled mid-rollout (the
+    // retained-fence reconciler did not cover custom_domain_set).
     let step = apply_namespaced_resource(&engine, &app_spec.namespace, &cm, generation).await;
     complete_creation_step(
         step,
@@ -6964,22 +6972,13 @@ pub async fn reapply_tenant_ingress(
     restart_statefulset_for_ingress(&engine, &app_spec.namespace, &app_spec.name, generation)
         .await?;
 
-    let status = watch_rollout(
-        &engine,
-        &app_spec.namespace,
-        &app_spec.name,
-        rollout_timeout,
-    )
-    .await?;
-    if status.phase != DeployPhase::Running {
-        return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
-            status
-                .message
-                .unwrap_or_else(|| format!("tenant ingress rollout ended in {:?}", status.phase)),
-        )
-        .into());
-    }
-
+    // The restart is SCHEDULED, not waited on: the replacement pod becomes
+    // Ready on its own clock — in password mode only after the owner's
+    // unlock — and the verify request must return well inside the hosted
+    // proxy timeout instead of holding the app lease through a rollout
+    // that cannot converge (F-C). The annotation patch above is
+    // generation-pinned, so the restart happens exactly once; convergence
+    // is observed by the app's normal readiness path.
     Ok(())
 }
 
@@ -7940,6 +7939,7 @@ pub async fn apply_deployment_manifests(
         sigstore_material,
         provenance_oci_material,
         log_encryption,
+        pod_supplemental_groups,
     } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
 
@@ -7954,6 +7954,7 @@ pub async fn apply_deployment_manifests(
     )?;
     app_spec.workload_artifact_binding = workload_artifact_binding;
     app_spec.log_encryption = log_encryption;
+    app_spec.pod_supplemental_groups = pod_supplemental_groups;
     if let (Some(workload_artifacts), Some(trustee_policy)) = (
         local_workload_artifacts_json.as_ref(),
         local_trustee_policy_json.as_ref(),

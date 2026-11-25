@@ -159,6 +159,7 @@ fn test_deployment_context() -> DeploymentContextResponse {
         current_platform_release_id: None,
         platform_release_envelope: None,
         log_spool_state_bind_supported: false,
+        pod_supplemental_groups_supported: false,
     }
 }
 
@@ -228,6 +229,7 @@ fn deployment_context_platform_release_is_verified_and_selected() {
         current_platform_release_id: Some(expected_release_id.clone()),
         platform_release_envelope: Some(envelope),
         log_spool_state_bind_supported: false,
+        pod_supplemental_groups_supported: false,
     };
 
     let release =
@@ -254,6 +256,7 @@ fn deployment_context_platform_release_tampering_fails_closed() {
         current_platform_release_id: Some(envelope.payload.platform_release_version.clone()),
         platform_release_envelope: Some(envelope),
         log_spool_state_bind_supported: false,
+        pod_supplemental_groups_supported: false,
     };
 
     let err =
@@ -275,6 +278,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
             &test_app_response(),
             &test_app_config(),
             ConfidentialAppForCcHash {
+                pod_supplemental_groups: None,
                 image: enclava_common::image::ImageRef::parse(
                     "ghcr.io/acme/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 )
@@ -343,12 +347,14 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
         current_platform_release_id: None,
         platform_release_envelope: None,
         log_spool_state_bind_supported: false,
+        pod_supplemental_groups_supported: false,
     };
 
     let app = confidential_app_for_cc_hash(
             &test_app_response(),
             &test_app_config(),
             ConfidentialAppForCcHash {
+                pod_supplemental_groups: None,
                 image: enclava_common::image::ImageRef::parse(
                     "ghcr.io/acme/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 )
@@ -538,6 +544,104 @@ fn deploy_preflight_gate_fails_closed_on_unresolved_ownership() {
         Some("locked"),
         "failed"
     ));
+}
+
+fn lost_destroy_lookup_error(status: u16) -> ApiError {
+    ApiError::Api {
+        status,
+        code: None,
+        message: String::new(),
+        idempotency_disposition: None,
+    }
+}
+
+/// Runs the checks on paused time: one check per second for `seconds`.
+async fn lost_destroy_outcome(
+    answers: Vec<Result<(), ApiError>>,
+    seconds: u64,
+) -> (LostDestroyOutcome, u32) {
+    let mut answers = VecDeque::from(answers);
+    let mut asked = 0;
+    let outcome = outcome_after_lost_destroy_response(
+        || {
+            asked += 1;
+            let answer = answers.pop_front().unwrap_or(Ok(()));
+            async move { answer }
+        },
+        Duration::from_secs(seconds),
+        Duration::from_secs(1),
+        Duration::from_secs(5),
+    )
+    .await;
+    (outcome, asked)
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_destroy_response_is_resolved_only_by_what_the_server_says() {
+    // Still there, then a server error, then gone: resolved on the third check.
+    let (outcome, asked) = lost_destroy_outcome(
+        vec![
+            Ok(()),
+            Err(lost_destroy_lookup_error(503)),
+            Err(lost_destroy_lookup_error(404)),
+        ],
+        10,
+    )
+    .await;
+    assert_eq!(outcome, LostDestroyOutcome::Gone);
+    assert_eq!(asked, 3);
+
+    // An app that never goes away is reported as still present when the window ends.
+    let (outcome, asked) = lost_destroy_outcome(Vec::new(), 4).await;
+    assert_eq!(outcome, LostDestroyOutcome::StillPresent);
+    assert_eq!(asked, 4);
+
+    // Seen once, but the final check got no answer: presence is not claimed.
+    let (outcome, asked) =
+        lost_destroy_outcome(vec![Ok(()), Err(lost_destroy_lookup_error(503))], 2).await;
+    assert_eq!(outcome, LostDestroyOutcome::Unverified);
+    assert_eq!(asked, 2);
+
+    // A credential that cannot read the app stops the checks at once.
+    for refused in [
+        lost_destroy_lookup_error(403),
+        lost_destroy_lookup_error(401),
+        ApiError::NotAuthenticated,
+    ] {
+        let (outcome, asked) = lost_destroy_outcome(vec![Ok(()), Err(refused)], 9).await;
+        assert_eq!(outcome, LostDestroyOutcome::Unverified);
+        assert_eq!(asked, 2);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_destroy_checks_that_hang_end_with_the_window() {
+    let started = tokio::time::Instant::now();
+    let mut asked = 0;
+    let outcome = outcome_after_lost_destroy_response(
+        || {
+            asked += 1;
+            std::future::pending::<Result<(), ApiError>>()
+        },
+        Duration::from_secs(300),
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(outcome, LostDestroyOutcome::Unverified);
+    // 15 s per hung check plus 5 s between them: 15 checks, and never past the window.
+    assert_eq!(asked, 15);
+    assert!(started.elapsed() <= Duration::from_secs(300));
+}
+
+#[test]
+fn lost_destroy_hint_only_claims_the_app_exists_when_the_server_said_so() {
+    let present = lost_destroy_hint(&LostDestroyOutcome::StillPresent, "shell");
+    assert!(present.contains("'shell' still existed"));
+    assert!(present.contains("`enclava destroy --app shell`"));
+    let unverified = lost_destroy_hint(&LostDestroyOutcome::Unverified, "shell");
+    assert!(unverified.contains("could not confirm whether 'shell' still exists"));
+    assert!(unverified.contains("`enclava status --app shell`"));
 }
 
 #[test]
@@ -4440,6 +4544,321 @@ fn log_key_json_entries_share_one_stable_shape_across_scopes() {
     assert_eq!(org_entry["active_for_app"], serde_json::Value::Null);
     assert_eq!(org_entry["selected_at"], serde_json::Value::Null);
     assert_eq!(org_entry["selected_by_count"], serde_json::json!(2));
+}
+
+// ---------------------------------------------------------------------------
+// Contract v1 (policy-templates#23): guest-pull pod-supplemental-group
+// discovery in the CLI signing flow.
+// ---------------------------------------------------------------------------
+
+fn pod_groups_descriptor_fixture() -> enclava_cli::descriptor::DeploymentDescriptor {
+    serde_json::from_value(serde_json::json!({
+        "schema_version": "v1",
+        "org_id": "11111111-1111-1111-1111-111111111111",
+        "org_slug": "golden-org",
+        "app_id": "22222222-2222-2222-2222-222222222222",
+        "app_name": "golden-app",
+        "deploy_id": "33333333-3333-3333-3333-333333333333",
+        "created_at": "2026-01-01T00:00:00Z",
+        "nonce": "00".repeat(32),
+        "app_domain": "golden.example",
+        "tee_domain": "tee.golden.example",
+        "custom_domains": [],
+        "namespace": "ns",
+        "service_account": "sa",
+        "identity_hash": "11".repeat(32),
+        "image_ref": "ghcr.io/acme/golden",
+        "image_digest": format!("sha256:{}", "22".repeat(32)),
+        "signer_identity": {"subject": "s", "issuer": "i"},
+        "oci_runtime_spec": {
+            "command": [], "args": [], "env": [], "ports": [], "mounts": [],
+            "capabilities": {"add": [], "drop": []},
+            "security_context": {"run_as_user": 10001, "run_as_group": 10001, "read_only_root_fs": true, "allow_privilege_escalation": false, "privileged": false},
+            "resources": {}
+        },
+        "sidecars": {
+            "attestation_proxy_digest": format!("sha256:{}", "33".repeat(32)),
+            "caddy_digest": format!("sha256:{}", "44".repeat(32))
+        },
+        "api_signing_pubkey": "pub",
+        "independent_verification": true,
+        "expected_firmware_measurement": "55".repeat(32),
+        "expected_runtime_class": "rc",
+        "kbs_resource_path": "default/x/seed",
+        "unlock_mode": "password",
+        "policy_template_id": "pt",
+        "policy_template_sha256": "66".repeat(32),
+        "platform_release_version": "v9",
+        "expected_agent_policy_hash": "77".repeat(32),
+        "expected_cc_init_data_hash": "88".repeat(32),
+        "expected_kbs_policy_hash": "99".repeat(32),
+    }))
+    .expect("parse descriptor fixture")
+}
+
+/// Read one full HTTP request: headers, then exactly Content-Length body
+/// bytes. A single `read` can return a partial request, which would make
+/// the JSON assertions pass vacuously.
+async fn read_full_http_request(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    let mut byte_buf = [0u8; 4096];
+    let headers_end = loop {
+        let n = stream.read(&mut byte_buf).await.unwrap();
+        assert!(n > 0, "the client must send a request");
+        request.extend_from_slice(&byte_buf[..n]);
+        if let Some(pos) = find_subsequence(&request, b"\r\n\r\n") {
+            break pos;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..headers_end]).to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let total = headers_end + 4 + content_length;
+    while request.len() < total {
+        let n = stream.read(&mut byte_buf).await.unwrap();
+        assert!(n > 0, "the request body must arrive complete");
+        request.extend_from_slice(&byte_buf[..n]);
+    }
+    String::from_utf8_lossy(&request).to_string()
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// A single-request HTTP fixture for /agent-policy: records the raw request
+/// body, replies with `policy_text` (hash computed locally) plus optional
+/// discovered groups, and returns the captured request for assertions.
+async fn agent_policy_fixture(
+    policy_text: &str,
+    pod_supplemental_groups: Option<Vec<i64>>,
+) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    use sha2::Digest;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let text = policy_text.to_string();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_full_http_request(&mut stream).await;
+            let _ = tx.send(request);
+            let mut policy = text.clone();
+            let sha: String = hex::encode(sha2::Sha256::digest(policy.as_bytes()));
+            if let Some(groups) = &pod_supplemental_groups {
+                policy = serde_json::json!({
+                    "agent_policy_text": policy,
+                    "agent_policy_sha256": sha,
+                    "genpolicy_version_pin": "test-genpolicy",
+                    "log_encryption": null,
+                    "pod_supplemental_groups": groups,
+                })
+                .to_string();
+            } else {
+                policy = serde_json::json!({
+                    "agent_policy_text": policy,
+                    "agent_policy_sha256": sha,
+                    "genpolicy_version_pin": "test-genpolicy",
+                })
+                .to_string();
+            }
+            let body = policy;
+            use tokio::io::AsyncWriteExt;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    // The first request is drained by the CALLER after the fetch: awaiting
+    // it here would deadlock (nothing has sent a request yet).
+    (format!("http://{addr}"), rx)
+}
+
+#[tokio::test]
+async fn discovery_merges_canonicalizes_and_re_calls_before_any_hash() {
+    // (e) The discovery loop: first call reports [27, 6, 0, 27] (unsorted,
+    // duplicated); the CLI canonicalizes to [0, 6, 27], sets it on the
+    // descriptor, and RE-CALLS; only the re-call's policy is used. The
+    // request bodies prove the re-call carried the declared groups.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let first_policy = "package agent_policy\n// first\n".to_string();
+    let second_policy = "package agent_policy\n// final (re-call)\n".to_string();
+    let discovered = vec![27, 6, 0, 27];
+    let first_policy_wire = first_policy.clone();
+    let second_policy_wire = second_policy.clone();
+    tokio::spawn(async move {
+        let mut round = 0;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_full_http_request(&mut stream).await;
+            let body = request.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let _ = tx.send(payload.clone());
+            round += 1;
+            let policy_text = if round == 1 {
+                first_policy_wire.clone()
+            } else {
+                second_policy_wire.clone()
+            };
+            let groups = if round == 1 {
+                Some(discovered.clone())
+            } else {
+                None
+            };
+            let sha: String = hex::encode(sha2::Sha256::digest(policy_text.as_bytes()));
+            let mut response = serde_json::json!({
+                "agent_policy_text": policy_text,
+                "agent_policy_sha256": sha,
+                "genpolicy_version_pin": "test-genpolicy",
+            });
+            if let Some(groups) = groups {
+                response["pod_supplemental_groups"] = serde_json::json!(groups);
+            }
+            let body = response.to_string();
+            use tokio::io::AsyncWriteExt;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let release = test_release();
+    let mut descriptor = pod_groups_descriptor_fixture();
+    let pre_hash = enclava_cli::descriptor::descriptor_core_hash(&descriptor);
+
+    // Bounded: fail fast instead of hanging if a mock never answers.
+    let (policy, log_encryption) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fetch_policy_with_group_discovery(&api, &release, &mut descriptor, true),
+    )
+    .await
+    .expect("the discovery flow must complete")
+    .expect("discovery flow");
+
+    let first_request = rx.recv().await.expect("first request");
+    let second_request = rx.recv().await.expect("re-call request");
+    assert_eq!(
+        first_request["supports_pod_supplemental_groups"],
+        serde_json::json!(true)
+    );
+    assert!(
+        first_request["descriptor"]
+            .get("pod_supplemental_groups")
+            .is_none(),
+        "the FIRST call carries no declared groups"
+    );
+    assert_eq!(
+        second_request["descriptor"]["pod_supplemental_groups"],
+        serde_json::json!([0, 6, 27]),
+        "the re-call carries the CANONICAL declared groups"
+    );
+    assert_eq!(
+        second_request["supports_pod_supplemental_groups"],
+        serde_json::json!(true)
+    );
+    assert_eq!(descriptor.pod_supplemental_groups, Some(vec![0, 6, 27]));
+    assert_eq!(policy.policy_text, second_policy);
+    assert!(log_encryption.is_none());
+    // (e) The hash is computed AFTER the merge: the descriptor mutated by
+    // the loop is the one the caller hashes, and it differs from the
+    // pre-discovery hash.
+    let post_hash = enclava_cli::descriptor::descriptor_core_hash(&descriptor);
+    assert_ne!(
+        pre_hash, post_hash,
+        "the merged groups change the core hash"
+    );
+    assert_eq!(
+        policy.policy_sha256.as_slice(),
+        &sha2::Sha256::digest(second_policy.as_bytes())[..]
+    );
+}
+
+#[tokio::test]
+async fn discovery_is_disabled_without_the_capability() {
+    // (f) Capability false: a single call, the request carries NEITHER the
+    // capability flag NOR the descriptor field (legacy bytes), and a
+    // response with discovered groups is ignored (no merge, no re-call).
+    let (base, mut captured_rx) =
+        agent_policy_fixture("package agent_policy\n// legacy\n", Some(vec![27])).await;
+    let api = ApiClient::new(&base, Some("test-token".to_string()));
+    let release = test_release();
+    let mut descriptor = pod_groups_descriptor_fixture();
+    // Bounded: a mock that never answers must fail fast, not hang.
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fetch_policy_with_group_discovery(&api, &release, &mut descriptor, false),
+    )
+    .await
+    .expect("the legacy single call must complete");
+    let (policy, _) = fetched.expect("legacy single call");
+    let captured = captured_rx
+        .recv()
+        .await
+        .expect("the fixture captured exactly one request");
+    assert!(!captured.contains("supports_pod_supplemental_groups"));
+    assert!(!captured.contains("pod_supplemental_groups"));
+    // The fixture's server task keeps the sender alive, so "no second
+    // request" is asserted with a bounded wait, not an unbounded recv.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), captured_rx.recv())
+            .await
+            .is_err(),
+        "exactly ONE request, no re-call"
+    );
+    assert_eq!(policy.policy_text, "package agent_policy\n// legacy\n");
+    assert_eq!(descriptor.pod_supplemental_groups, None);
+}
+
+#[tokio::test]
+async fn discovery_fails_closed_on_invalid_discovered_groups() {
+    // A discovered list missing the platform baseline 6 fails closed; the
+    // descriptor is NOT mutated.
+    let (base, _captured) =
+        agent_policy_fixture("package agent_policy\n// x\n", Some(vec![0, 27])).await;
+    let api = ApiClient::new(&base, Some("test-token".to_string()));
+    let release = test_release();
+    let mut descriptor = pod_groups_descriptor_fixture();
+    // Bounded: fail fast instead of hanging if the fixture never answers.
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fetch_policy_with_group_discovery(&api, &release, &mut descriptor, true),
+    )
+    .await
+    .expect("the invalid-groups call must complete")
+    .expect_err("invalid discovered groups fail closed");
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("discovered pod_supplemental_groups"));
+    assert_eq!(descriptor.pod_supplemental_groups, None);
+}
+
+#[test]
+fn apply_discovered_pod_groups_canonicalizes_and_validates() {
+    let mut descriptor = pod_groups_descriptor_fixture();
+    apply_discovered_pod_groups(&mut descriptor, vec![27, 6, 0, 27]).unwrap();
+    assert_eq!(descriptor.pod_supplemental_groups, Some(vec![0, 6, 27]));
+    // Invalid lists (missing 6) fail without mutating.
+    let mut invalid = pod_groups_descriptor_fixture();
+    assert!(apply_discovered_pod_groups(&mut invalid, vec![0, 27]).is_err());
+    assert_eq!(invalid.pod_supplemental_groups, None);
 }
 
 #[test]

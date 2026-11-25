@@ -756,6 +756,7 @@ fn signed_deploy_with_local_artifacts_still_reconciles_global_kbs_policy() {
 
 fn customer_app_descriptor() -> DeploymentDescriptor {
     DeploymentDescriptor {
+        pod_supplemental_groups: None,
             schema_version: "v1".to_string(),
             org_id: uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
             org_slug: "8f346820".to_string(),
@@ -852,6 +853,7 @@ fn signed_descriptor_runtime_fields_match_descriptor_expectations() {
 fn descriptor_runtime_overrides_stale_primary_container_fields() {
     let descriptor = customer_app_descriptor();
     let mut app = ConfidentialApp {
+        pod_supplemental_groups: None,
             app_id: descriptor.app_id,
             deployment_id: descriptor.deploy_id,
             name: descriptor.app_name.clone(),
@@ -937,6 +939,7 @@ fn signed_descriptor_without_subpath_mounts_clears_stale_storage_paths() {
         .mounts
         .retain(|mount| mount.destination == "/state");
     let mut app = ConfidentialApp {
+        pod_supplemental_groups: None,
             app_id: descriptor.app_id,
             deployment_id: descriptor.deploy_id,
             name: descriptor.app_name.clone(),
