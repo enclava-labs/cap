@@ -121,7 +121,9 @@ pub enum DomainError {
     InsidePlatformZone(String),
     #[error("DNS lookup failed: {0}")]
     Lookup(String),
-    #[error("TXT record at {0} did not match stored challenge")]
+    #[error(
+        "TXT record at {0} was not found or did not match the stored challenge; DNS changes can take a few minutes to become visible"
+    )]
     MismatchedToken(String),
     #[error("no challenge for this domain")]
     NoChallenge,
@@ -1102,7 +1104,15 @@ async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
         .build()
         .map_err(|e| e.to_string())?,
     };
-    let response = resolver.txt_lookup(name).await.map_err(|e| e.to_string())?;
+    let response = match resolver.txt_lookup(name).await {
+        Ok(response) => response,
+        // A name with no TXT record yet is the ordinary "not published or
+        // not propagated" case, not a resolver failure: report it as an
+        // empty answer so verify refuses with the precise 412 instead of a
+        // 502 the idempotency layer turns into `idempotency_recovery_required`.
+        Err(e) if e.is_no_records_found() || e.is_nx_domain() => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
     let mut out = Vec::new();
     for record in response.answers() {
         let RData::TXT(rdata) = &record.data else {
