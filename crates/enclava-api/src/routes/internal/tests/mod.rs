@@ -9613,10 +9613,25 @@ fn outcome_unknown_cause_code_is_bounded_and_code_shaped() {
         })),
         "edge_route_backend_unavailable"
     );
-    // Over-long provider text is cut, not passed through wholesale.
+    // Over-long code-shaped tokens are cut at 128, not passed through
+    // wholesale.
     let long = "x".repeat(300);
     let bounded = outcome_unknown_cause_code(&serde_json::json!({ "error": long }));
     assert_eq!(bounded.chars().count(), 128);
+    // Provider text — free-form strings, kube object names — is never
+    // carried into the stored receipt; it degrades to `unavailable`.
+    for text in [
+        "internal error",
+        "sni route: InvalidBackendTag",
+        "haproxy update: configmaps \"cap-edge\" not found",
+        "resolve backend: service not found in namespace",
+    ] {
+        assert_eq!(
+            outcome_unknown_cause_code(&serde_json::json!({ "error": text })),
+            "unavailable",
+            "provider text must not reach the receipt: {text}"
+        );
+    }
     // No error key, or a non-string one, degrades to a fixed code.
     assert_eq!(
         outcome_unknown_cause_code(&serde_json::json!({})),
@@ -9655,12 +9670,17 @@ async fn outcome_unknown_5xx_is_logged_and_carries_the_cause() {
     .expect_err("the 5xx converts into the fail-closed 409 receipt");
     assert_eq!(masked.0, StatusCode::CONFLICT);
     assert_eq!(masked.1.0["error"], "idempotency_recovery_required");
-    // The cause is strictly additive: the upstream status + code-shaped
-    // error, nothing else.
-    assert_eq!(masked.1.0["cause"]["status"], 502);
+    // The outcome cause is strictly additive: the upstream status + a
+    // code-shaped error, nothing else. It is `outcome_cause`, not `cause`:
+    // the PaaS relay reads the existing `cause` field as a plain string.
+    assert_eq!(masked.1.0["outcome_cause"]["status"], 502);
     assert_eq!(
-        masked.1.0["cause"]["error"],
+        masked.1.0["outcome_cause"]["error"],
         "edge_route_backend_unavailable"
+    );
+    assert!(
+        masked.1.0.get("cause").is_none(),
+        "the string-typed cause field is untouched"
     );
     let expected_base = idempotency_recovery_required_body();
     let masked_object = masked.1.0.as_object().expect("the receipt is an object");

@@ -1049,18 +1049,29 @@ fn idempotency_recovery_required_body() -> serde_json::Value {
     })
 }
 
-/// cap#422: the code-shaped error carried by the 5xx body — only the
-/// bounded `error` string, never provider text or the raw body.
+/// cap#422: the code-shaped error carried by the receipt — a single
+/// snake-case token, bounded at 128 chars. Provider text (free-form error
+/// strings, kube object names) is never carried: it degrades to
+/// `unavailable`, so the stored and replayed receipt cannot expose
+/// internal details.
 fn outcome_unknown_cause_code(body: &serde_json::Value) -> String {
+    fn is_code_shaped(code: &str) -> bool {
+        let mut chars = code.chars();
+        matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }
     body.get("error")
         .and_then(serde_json::Value::as_str)
-        .map(|code| code.chars().take(128).collect())
+        .map(|code| code.chars().take(128).collect::<String>())
+        .filter(|code| is_code_shaped(code))
         .unwrap_or_else(|| "unavailable".to_string())
 }
 
-/// cap#422: the recovery-required 409 body with an additive `cause` field
-/// (upstream status + error code) so the CLI user and support can act.
-/// The existing keys are unchanged.
+/// cap#422: the recovery-required 409 body with an additive
+/// `outcome_cause` field (upstream status + error code) so the CLI user
+/// and support can act. The existing keys are unchanged; the field is
+/// named `outcome_cause`, not `cause`, because the PaaS relay reads the
+/// existing `cause` field as a plain string (cap_proxy deferral causes).
 fn idempotency_recovery_required_body_with_cause(
     status: StatusCode,
     code: &str,
@@ -1068,7 +1079,7 @@ fn idempotency_recovery_required_body_with_cause(
     let mut body = idempotency_recovery_required_body();
     if let Some(map) = body.as_object_mut() {
         map.insert(
-            "cause".to_string(),
+            "outcome_cause".to_string(),
             serde_json::json!({
                 "status": status.as_u16(),
                 "error": code,
