@@ -37,6 +37,7 @@ fn signing_service_timeout_rejects_invalid_values() {
 
 fn descriptor() -> DeploymentDescriptor {
     DeploymentDescriptor {
+        pod_supplemental_groups: None,
             schema_version: "v1".to_string(),
             org_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
             org_slug: "abcd1234".to_string(),
@@ -230,6 +231,7 @@ fn signed_policy_artifact(
 
 fn agent_policy_response_for(artifact: &SignedPolicyArtifact) -> AgentPolicyResponse {
     AgentPolicyResponse {
+        pod_supplemental_groups: None,
         agent_policy_text: artifact.agent_policy_text.clone(),
         agent_policy_sha256: artifact.agent_policy_sha256.clone(),
         genpolicy_version_pin: artifact.metadata.genpolicy_version_pin.clone(),
@@ -1421,6 +1423,7 @@ fn rejects_customer_artifact_when_descriptor_policy_hash_is_stale() {
     let agent_policy_text =
         "package agent_policy\n\ndefault CreateContainerRequest := false\n".to_string();
     let generated = AgentPolicyResponse {
+        pod_supplemental_groups: None,
         agent_policy_sha256: hex::encode(Sha256::digest(agent_policy_text.as_bytes())),
         agent_policy_text,
         genpolicy_version_pin: artifact.metadata.genpolicy_version_pin.clone(),
@@ -1542,6 +1545,7 @@ fn rejects_rendered_cc_init_data_hash_mismatch() {
 fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> ConfidentialApp {
     let image = format!("ghcr.io/enclava-labs/demo@{}", descriptor.image_digest);
     ConfidentialApp {
+        pod_supplemental_groups: None,
         app_id: descriptor.app_id,
         deployment_id: descriptor.deploy_id,
         name: descriptor.app_name.clone(),

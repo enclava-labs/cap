@@ -23,6 +23,15 @@ pub struct DeploymentContextResponse {
     /// tells signers to render claim-less cc_init_data. Deployment-context
     /// JSON tolerates unknown fields, so older CLIs ignore it.
     pub log_spool_state_bind_supported: bool,
+    /// Contract v1 (policy-templates#23): this API deployment may
+    /// discover and admit pod supplemental groups. An API DEPLOYMENT
+    /// capability (cap#290 pattern): ops enables it atomically with the
+    /// ENCLAVA_INIT_IMAGE pin whose descriptor parser tolerates the
+    /// field — pre-change init rejects group-bearing descriptors with
+    /// deny_unknown_fields, which would brick guest startup. Absent or
+    /// false: signers keep the legacy single-call flow and admission
+    /// rejects group-bearing descriptors.
+    pub pod_supplemental_groups_supported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_platform_release_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,6 +48,32 @@ pub async fn deployment_context(
     Ok(Json(deployment_context_response(&state)))
 }
 
+/// Contract v1 (policy-templates#23): whether THIS API deployment may
+/// discover and admit pod supplemental groups. An API DEPLOYMENT
+/// capability, not a version constant — the cap#290
+/// `log_spool_state_bind_supported` pattern: pre-change enclava-init
+/// images parse the descriptor with `deny_unknown_fields`, so a
+/// group-bearing descriptor would fail guest verification on every start
+/// under an old ENCLAVA_INIT_IMAGE pin. Ops enables this gate atomically
+/// with the field-tolerant init image pin (init-first rollout per
+/// AGENTS.md); absent/false keeps signers on the legacy single-call flow
+/// and admission rejects group-bearing descriptors.
+pub(crate) fn pod_supplemental_groups_supported() -> bool {
+    pod_supplemental_groups_supported_from(
+        std::env::var("ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED")
+            .as_deref()
+            .ok(),
+    )
+}
+
+/// Pure parse so the gate's truth table is testable without env mutation.
+pub(crate) fn pod_supplemental_groups_supported_from(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        None => false,
+    }
+}
+
 pub(crate) fn deployment_context_response(state: &AppState) -> DeploymentContextResponse {
     DeploymentContextResponse {
         api_signing_pubkey: crate::auth::jwt::public_key_base64(&state.signing_key),
@@ -50,6 +85,7 @@ pub(crate) fn deployment_context_response(state: &AppState) -> DeploymentContext
             enclava_engine::manifest::cc_init_data::tls_certificate_trust_anchors_pem(),
         log_spool_state_bind_supported:
             enclava_engine::manifest::cc_init_data::log_spool_bind_supported(),
+        pod_supplemental_groups_supported: pod_supplemental_groups_supported(),
         current_platform_release_id: state
             .platform_release_envelope
             .as_ref()
@@ -104,6 +140,26 @@ mod tests {
             enclava_engine::manifest::cc_init_data::log_spool_bind_supported(),
             "the deployment-context gate must mirror the API's installed claim"
         );
+        assert_eq!(
+            response.pod_supplemental_groups_supported,
+            pod_supplemental_groups_supported(),
+            "the deployment-context gate must mirror the API's installed capability"
+        );
+    }
+
+    #[test]
+    fn pod_supplemental_groups_gate_defaults_off_and_parses_explicit_enablement() {
+        // Off unless the deployment explicitly opts in: pre-change
+        // enclava-init rejects group-bearing descriptors, so the default
+        // must keep every signer on the legacy flow.
+        assert!(!pod_supplemental_groups_supported_from(None));
+        assert!(!pod_supplemental_groups_supported_from(Some("")));
+        assert!(!pod_supplemental_groups_supported_from(Some("0")));
+        assert!(!pod_supplemental_groups_supported_from(Some("false")));
+        assert!(!pod_supplemental_groups_supported_from(Some("yes")));
+        assert!(pod_supplemental_groups_supported_from(Some("1")));
+        assert!(pod_supplemental_groups_supported_from(Some("true")));
+        assert!(pod_supplemental_groups_supported_from(Some("TRUE")));
     }
 
     #[tokio::test]
