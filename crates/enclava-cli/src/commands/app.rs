@@ -1979,6 +1979,23 @@ fn template_deployment_failure_message(
         .error_message
         .as_deref()
         .unwrap_or("deployment failed");
+    // The durable apply job publishes the pre-claim cc_init_data render skew
+    // (#392, named by #377) as the bare `signed_artifact_mismatch` code —
+    // the public projection redacts any non-code string, so the hashes stay
+    // in the operator log. Name the skew family and the remedy here, the
+    // same way compose_api_error does for the sync 400 path.
+    if detail == "signed_artifact_mismatch" {
+        let pinned = enclava_engine::manifest::cc_init_data::CC_INIT_DATA_CONTRACT_VERSION;
+        return format!(
+            "deployment {deployment_id} failed: {detail} \
+             (the signed workload artifact does not match the platform's \
+             cc_init_data render; this CLI pins cc_init_data contract \
+             {pinned}. If this deploy failed after a CLI or platform \
+             upgrade, the usual cause is engine-contract skew: upgrade this \
+             CLI from a trusted source if the platform was upgraded, or wait \
+             for the platform rollout if you upgraded the CLI first)"
+        );
+    }
     format!("deployment {deployment_id} failed: {detail}")
 }
 

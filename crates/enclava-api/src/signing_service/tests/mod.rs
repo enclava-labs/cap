@@ -1535,7 +1535,10 @@ fn rejects_rendered_cc_init_data_hash_mismatch() {
         .unwrap_err();
 
     assert!(
-        matches!(err, SigningServiceError::Mismatch(field) if field == "expected_cc_init_data_hash")
+        matches!(err, SigningServiceError::Mismatch(field) if field.contains("expected_cc_init_data_hash")
+            && field.contains(&"00".repeat(32))
+            && field.contains("platform rendered")
+            && field.contains("cc_init_data contract"))
     );
 }
 
@@ -1969,7 +1972,7 @@ fn spool_gate_unsupported_rejects_claim_bearing_artifacts() {
     )
     .expect_err("claim-bearing artifact must be rejected while the gate is unsupported");
     assert!(
-        matches!(&err, SigningServiceError::Mismatch(msg) if msg.contains("log_spool_storage") && msg.contains("re-sign")),
+        matches!(&err, SigningServiceError::Mismatch(msg) if msg.contains("log_spool_storage") && msg.contains("re-sign") && msg.contains("platform rendered") && msg.contains("cc_init_data contract")),
         "expected a re-sign diagnostic naming log_spool_storage, got: {err:?}"
     );
     assert!(
