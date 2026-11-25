@@ -540,6 +540,54 @@ fn deploy_preflight_gate_fails_closed_on_unresolved_ownership() {
     ));
 }
 
+fn lost_destroy_lookup_error(status: u16) -> ApiError {
+    ApiError::Api {
+        status,
+        code: None,
+        message: String::new(),
+        idempotency_disposition: None,
+    }
+}
+
+#[tokio::test]
+async fn lost_destroy_response_counts_as_destroyed_only_once_the_app_is_gone() {
+    // Still there, then a server error, then gone: destroyed on the third check.
+    let mut answers = VecDeque::from([
+        Ok(()),
+        Err(lost_destroy_lookup_error(503)),
+        Err(lost_destroy_lookup_error(404)),
+    ]);
+    let mut asked = 0;
+    let destroyed = app_gone_after_lost_destroy_response(
+        || {
+            asked += 1;
+            let answer = answers
+                .pop_front()
+                .expect("no lookup after the app is gone");
+            async move { answer }
+        },
+        5,
+        Duration::ZERO,
+    )
+    .await;
+    assert!(destroyed);
+    assert_eq!(asked, 3);
+
+    // An app that never goes away is not reported destroyed, and the checks stop.
+    let mut asked = 0;
+    let destroyed = app_gone_after_lost_destroy_response(
+        || {
+            asked += 1;
+            async { Ok(()) }
+        },
+        4,
+        Duration::ZERO,
+    )
+    .await;
+    assert!(!destroyed);
+    assert_eq!(asked, 4);
+}
+
 #[test]
 fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
     let busy = destroy_failure_hint(

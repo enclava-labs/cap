@@ -3983,6 +3983,34 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
         spinner.finish_with_message(format!("Destroy of '{app_name}' did not complete."));
         eprintln!("Hint: {hint}");
     }
+    // A destroy can outlast a connection: when the response is lost in
+    // transit the server still finishes the teardown. Ask the server what
+    // happened instead of reporting a failure for an app that is gone.
+    let result = match result {
+        Err(ApiError::Http(error)) => {
+            spinner.set_message(format!(
+                "Lost the connection while destroying {app_name}; checking whether it finished..."
+            ));
+            let destroyed = app_gone_after_lost_destroy_response(
+                || async { api.get_app(&app_name).await.map(|_| ()) },
+                DESTROY_LOST_RESPONSE_CHECKS,
+                DESTROY_LOST_RESPONSE_INTERVAL,
+            )
+            .await;
+            if destroyed {
+                Ok(())
+            } else {
+                spinner.finish_with_message(format!(
+                    "Destroy of '{app_name}' was sent, but its outcome is unknown."
+                ));
+                eprintln!(
+                    "Hint: the connection dropped before the server answered and '{app_name}' still exists. The teardown may still be running: check `enclava status`, and run `enclava destroy` again if the app is still there in a few minutes."
+                );
+                Err(ApiError::Http(error))
+            }
+        }
+        other => other,
+    };
     let already_gone = matches!(&result, Err(ApiError::Api { status: 404, .. }));
     if let Err(error) = result {
         if !already_gone {
@@ -4060,6 +4088,34 @@ fn forget_destroyed_app_template_deploy(
 /// Operator guidance for a failed destroy, keyed on the stable API code (or
 /// the in-band cause text hosted deferrals carry). Pure so the prose mapping
 /// stays pinned by unit tests before other surfaces match on it.
+/// How long destroy keeps asking whether the app is gone after the delete
+/// response was lost: 24 checks, 5 seconds apart.
+const DESTROY_LOST_RESPONSE_CHECKS: u32 = 24;
+const DESTROY_LOST_RESPONSE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// After a destroy whose response never arrived, report whether the app is
+/// gone. Only the server saying "no such app" (404) counts; a lookup that
+/// succeeds or fails any other way is retried until the checks run out.
+async fn app_gone_after_lost_destroy_response<F, Fut>(
+    mut lookup: F,
+    checks: u32,
+    interval: Duration,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ApiError>>,
+{
+    for check in 0..checks {
+        if check > 0 {
+            tokio::time::sleep(interval).await;
+        }
+        if matches!(lookup().await, Err(ApiError::Api { status: 404, .. })) {
+            return true;
+        }
+    }
+    false
+}
+
 fn destroy_failure_hint(code: Option<&str>, message: &str, app_name: &str) -> Option<String> {
     // Teardown failures either restore the app to its pre-delete state (the
     // delete is atomic) or leave it marked deleting when restoring would
