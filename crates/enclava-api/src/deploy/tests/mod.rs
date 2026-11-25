@@ -1601,6 +1601,21 @@ impl GateCluster {
     /// ordering satisfied), mounting both claims, with configurable
     /// readiness — a still-formatting initializer reports `ready=false`.
     fn with_pod(&mut self, namespace: &str, workload: &str, ready: bool) {
+        // Claims are created at 00:00:00Z; the default pod at 00:01:00Z —
+        // strictly later, the shape the whole-second waiver rule accepts.
+        self.with_pod_created_at(namespace, workload, ready, "2025-01-01T00:01:00Z");
+    }
+
+    /// Ordinal-0 pod at an explicit creation timestamp; pass the claims'
+    /// own second ("2025-01-01T00:00:00Z") to reproduce the normal
+    /// StatefulSet first-deploy flow (claim + pod within one second).
+    fn with_pod_created_at(
+        &mut self,
+        namespace: &str,
+        workload: &str,
+        ready: bool,
+        created_at: &str,
+    ) {
         let pod_name = format!("{workload}-0");
         let state_claim = format!("state-{workload}-0");
         let tls_claim = format!("tls-state-{workload}-0");
@@ -1611,7 +1626,7 @@ impl GateCluster {
                 "metadata": {
                     "name": pod_name,
                     "namespace": namespace,
-                    "creationTimestamp": "2025-01-01T00:01:00Z",
+                    "creationTimestamp": created_at,
                 },
                 "spec": {
                     "containers": [],
@@ -1628,6 +1643,45 @@ impl GateCluster {
                         "status": ready_status,
                     }],
                 },
+        });
+        self.put(
+            format!("/api/v1/namespaces/{namespace}/pods"),
+            200,
+            serde_json::json!({"apiVersion": "v1", "kind": "PodList", "items": [pod]}),
+        );
+    }
+
+    /// Ordinal-0 pod mounting a SUBSET of the claims, to prove the relaxed
+    /// admission requires both volumes.
+    fn with_pod_mounting(
+        &mut self,
+        namespace: &str,
+        workload: &str,
+        ready: bool,
+        claims: &[&str],
+        created_at: &str,
+    ) {
+        let pod_name = format!("{workload}-0");
+        let ready_status = if ready { "True" } else { "False" };
+        let volumes: Vec<serde_json::Value> = claims
+            .iter()
+            .map(|vct| {
+                serde_json::json!({
+                    "name": vct,
+                    "persistentVolumeClaim": {"claimName": format!("{vct}-{workload}-0")},
+                })
+            })
+            .collect();
+        let pod = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": pod_name,
+                    "namespace": namespace,
+                    "creationTimestamp": created_at,
+                },
+                "spec": {"containers": [], "volumes": volumes},
+                "status": {"conditions": [{"type": "Ready", "status": ready_status}]},
         });
         self.put(
             format!("/api/v1/namespaces/{namespace}/pods"),
@@ -1683,6 +1737,70 @@ fn gate_engine(cluster: GateCluster) -> ApplyEngine {
         cluster.client(),
         enclava_engine::apply::types::ApplyConfig::default(),
     )
+}
+
+#[tokio::test]
+async fn ingress_restart_unproven_when_pod_shares_claims_second() {
+    // The normal StatefulSet first-deploy flow: the controller creates the
+    // ordinal-0 PVCs and then the pod within one whole second (observed on
+    // dev for every fresh app). The strict verdict stays Unproven — the
+    // whole-second rule exists to defend the size-floor waiver against a
+    // pod predating a REPLACED claim — which is exactly the case the
+    // domains route's first-add admission relaxes with
+    // inspect_ready_pod_mounts_all_claims.
+    let mut cluster = GateCluster::deployed("cap-app", "app");
+    cluster.with_pod_created_at("cap-app", "app", true, "2025-01-01T00:00:00Z");
+    let engine = gate_engine(cluster);
+    let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+        .await
+        .expect("live cluster proof must resolve");
+    assert_eq!(verdict, IngressRestartVerdict::Unproven);
+    assert!(
+        enclava_engine::apply::orchestrator::inspect_ready_pod_mounts_all_claims(
+            &engine, "cap-app", "app"
+        )
+        .await
+        .expect("relaxed admission probe must resolve"),
+        "a same-second Ready pod mounting both claims proves first-boot completed: the first domain verify must be admitted"
+    );
+}
+
+#[tokio::test]
+async fn relaxed_restart_admission_requires_ready_pod_mounting_both_claims() {
+    // Not Ready (first-boot still running): no admission.
+    let mut cluster = GateCluster::deployed("cap-app", "app");
+    cluster.with_pod_created_at("cap-app", "app", false, "2025-01-01T00:00:00Z");
+    let engine = gate_engine(cluster);
+    assert!(
+        !enclava_engine::apply::orchestrator::inspect_ready_pod_mounts_all_claims(
+            &engine, "cap-app", "app"
+        )
+        .await
+        .expect("probe must resolve")
+    );
+
+    // No pod at all: no admission.
+    let engine = gate_engine(GateCluster::deployed("cap-app", "app"));
+    assert!(
+        !enclava_engine::apply::orchestrator::inspect_ready_pod_mounts_all_claims(
+            &engine, "cap-app", "app"
+        )
+        .await
+        .expect("probe must resolve")
+    );
+
+    // Pod mounting only one of the two claims: no admission (the restart
+    // re-opens both volumes).
+    let mut cluster = GateCluster::deployed("cap-app", "app");
+    cluster.with_pod_mounting("cap-app", "app", true, &["state"], "2025-01-01T00:00:00Z");
+    let engine = gate_engine(cluster);
+    assert!(
+        !enclava_engine::apply::orchestrator::inspect_ready_pod_mounts_all_claims(
+            &engine, "cap-app", "app"
+        )
+        .await
+        .expect("probe must resolve")
+    );
 }
 
 #[tokio::test]
@@ -9675,7 +9793,7 @@ fn live_workload_publication_reads_the_applied_spec_identity() {
         "spec": {
             "template": {
                 "metadata": {
-                    "labels": { "enclava.dev/deployment-id": deployment_id.to_string() }
+                    "labels": { (enclava_engine::manifest::DEPLOYMENT_ID_LABEL): deployment_id.to_string() }
                 }
             }
         }
@@ -9731,7 +9849,7 @@ pub(crate) fn publication_statefulset_client(deployment_id: Uuid, fail: bool) ->
                     "replicas": 1,
                     "template": {
                         "metadata": {
-                            "labels": { "enclava.dev/deployment-id": deployment_id.to_string() }
+                            "labels": { (enclava_engine::manifest::DEPLOYMENT_ID_LABEL): deployment_id.to_string() }
                         }
                     }
                 }

@@ -1,10 +1,17 @@
 name: CI
 
 on:
+  # Changes that touch only Markdown skip this workflow. No job reads a
+  # Markdown file. Path filters are not evaluated for tag pushes, so release
+  # tags always run. If a job here becomes a required status check, replace
+  # these filters with a job-level skip, or Markdown-only PRs will wait on it
+  # forever.
   push:
     branches: ["main", "develop"]
     tags: ["v*"]
+    paths-ignore: ["**/*.md"]
   pull_request:
+    paths-ignore: ["**/*.md"]
   workflow_dispatch:
 
 permissions:
@@ -107,6 +114,12 @@ jobs:
 
       - name: Run fmt check
         run: cargo fmt --all -- --check
+
+      - name: Check template-deployment status vocabulary
+        # cap#402: drift-checks the owning servers' status sources against
+        # the pinned fixture (the fixture <-> classifier contract is enforced
+        # by the enclava-cli and enclava-api unit tests).
+        run: bash scripts/gen-template-deployment-status-vocabulary.sh
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings

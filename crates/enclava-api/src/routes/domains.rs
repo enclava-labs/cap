@@ -181,8 +181,55 @@ pub struct ChallengeResponse {
     pub domain: String,
     pub txt_record_name: String,
     pub txt_record_value: String,
+    /// The CNAME record a tenant must ALSO publish when the domain is
+    /// outside the platform's managed DNS zone, so ACME DNS-01 challenges
+    /// can be answered through delegation. `null` for in-zone domains
+    /// (they are answered directly and need no delegation).
+    pub acme_cname_name: Option<String>,
+    /// The in-zone target `acme_cname_name` must point at
+    /// (`<domain>.acme.<zone>`). `null` for in-zone domains.
+    pub acme_cname_target: Option<String>,
     pub expires_at: chrono::DateTime<Utc>,
     pub instructions: String,
+}
+
+/// The ACME delegation record pair for a custom domain, or `(None, None)`
+/// when no pair applies: in-zone domains (answered directly), and
+/// deployments where the DNS-01 certificate broker is not the issuer (no
+/// broker configured -- e.g. Caddy TLS-ALPN mode -- or no managed DNS
+/// provider, where no DNS-01 certificate can be issued either). Demanding
+/// the CNAME there would block domains a TLS-ALPN deployment serves
+/// without it.
+fn acme_cname_fields(
+    dns: Option<&crate::dns::DnsConfig>,
+    broker: Option<&crate::acme::AcmeConfig>,
+    domain: &str,
+) -> (Option<String>, Option<String>) {
+    match (dns, broker) {
+        (Some(dns), Some(_)) if !dns.manages_hostname(domain) => {
+            let (name, target) =
+                crate::acme::expected_acme_cname_pair(domain, &dns.cloudflare_zone_name);
+            (Some(name), Some(target))
+        }
+        _ => (None, None),
+    }
+}
+
+/// The 422 body for a missing ACME delegation on verify: the actionable
+/// expected record pair travels with the error code. Provider text and
+/// resolver details never appear.
+fn delegation_missing_response(
+    acme_cname_name: &str,
+    acme_cname_target: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "error": "acme_delegation_missing",
+            "acme_cname_name": acme_cname_name,
+            "acme_cname_target": acme_cname_target,
+        })),
+    )
 }
 
 /// POST /apps/{name}/domains -- create a verification challenge.
@@ -235,21 +282,62 @@ pub async fn create_challenge(
     .await
     .map_err(|_| internal_error())?;
 
+    let (acme_cname_name, acme_cname_target) =
+        acme_cname_fields(state.dns.as_ref(), state.acme.as_ref(), &domain);
+    let instructions = match (&acme_cname_name, &acme_cname_target) {
+        (Some(cname_name), Some(cname_target)) => format!(
+            "Publish BOTH records at your DNS provider: the ownership TXT record at the listed name with the listed value, and a CNAME record named {cname_name} pointing at {cname_target}, then call POST /apps/{app_name}/domains/<domain>/verify",
+        ),
+        _ => format!(
+            "Publish a TXT record at the listed name with the listed value, then call POST /apps/{app_name}/domains/<domain>/verify",
+        ),
+    };
     Ok(Json(ChallengeResponse {
         txt_record_name: format!("{CHALLENGE_PREFIX}{domain}"),
         txt_record_value: format!("enclava-domain-verification={token}"),
+        acme_cname_name,
+        acme_cname_target,
         domain,
         expires_at,
-        instructions: format!(
-            "Publish a TXT record at the listed name with the listed value, then call POST /apps/{app_name}/domains/<domain>/verify",
-        ),
+        instructions,
     }))
+}
+
+/// Total-time bound for the same-domain re-verify readiness probe. The
+/// kube client carries no default total timeout, and the receipt must not
+/// be delayed behind one hung StatefulSet GET (the residual the finite
+/// lease + reconciler already bound; this keeps the request path fast
+/// too).
+const VERIFY_ROLLOUT_PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Map a rollout-settled probe outcome to the verify receipt's
+/// `ingress_ready`, failing closed on every shape but a positively
+/// settled rollout: probe error, missing workload (None), an in-flight
+/// rollout (Some(false)), and a probe that exceeds `bound` all read as
+/// not-ready.
+async fn ingress_ready_from_probe<F>(probe: F, bound: std::time::Duration) -> bool
+where
+    F: std::future::Future<Output = Result<Option<bool>, crate::deploy::DeployError>>,
+{
+    match tokio::time::timeout(bound, probe).await {
+        Ok(Ok(Some(true))) => true,
+        Ok(Ok(Some(false))) | Ok(Ok(None)) | Ok(Err(_)) | Err(_) => false,
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct VerifyResponse {
     pub domain: String,
     pub verified_at: chrono::DateTime<Utc>,
+    /// Whether the tenant ingress is provably serving this domain. `false`
+    /// after a verify that SCHEDULED the restart (the pod converges on its
+    /// own clock — in password mode only after the owner's unlock), for an
+    /// app not yet deployed, and on same-domain re-verification while the
+    /// live StatefulSet rollout has not settled. Clients learn convergence
+    /// from the app's readiness surfaces (a re-verify consults the live
+    /// rollout; a deploy re-renders the signed descriptor); this field is
+    /// the verify-time snapshot, not a subscription.
+    pub ingress_ready: bool,
 }
 
 /// Refuse the verify when this app's apply is still in progress: restarting
@@ -278,7 +366,10 @@ async fn ensure_no_apply_in_progress(
     if apply_in_progress {
         Err((
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "app deployment in progress"})),
+            Json(serde_json::json!({
+                "error": "deployment_in_progress",
+                "message": "app deployment in progress"
+            })),
         ))
     } else {
         Ok(())
@@ -381,6 +472,37 @@ pub async fn verify_challenge(
             Json(serde_json::json!({"error": e.to_string()})),
         ));
     }
+
+    // Every verify also re-proves the ACME CNAME delegation for out-of-zone
+    // domains with a live lookup (the same shared predicate the certificate
+    // pre-flight uses, so the proof and issuance cannot drift). The check
+    // applies only where the DNS-01 broker is the certificate issuer:
+    // in-zone domains (answered directly), broker-less deployments (e.g.
+    // Caddy TLS-ALPN, which never queries _acme-challenge), and
+    // deployments with no managed DNS provider are unaffected.
+    if let (Some(dns), Some(acme_config)) = (state.dns.as_ref(), state.acme.as_ref())
+        && !dns.manages_hostname(&domain)
+        && crate::acme::verify_acme_delegation(
+            &domain,
+            &dns.cloudflare_zone_name,
+            &crate::acme::live_cname_lookup(Some(acme_config)),
+        )
+        .await
+        .is_err()
+    {
+        // Mirror the issuance path's bounded warn so an operator can see
+        // refused verifies in diagnostics; no hostname or provider text.
+        tracing::warn!(
+            code = "acme_delegation_missing",
+            "custom domain verify refused: ACME CNAME delegation missing"
+        );
+        // Out-of-zone with the broker configured always derives a pair;
+        // the match keeps the invariant explicit instead of defaulting.
+        match acme_cname_fields(Some(dns), Some(acme_config), &domain) {
+            (Some(name), Some(target)) => return Err(delegation_missing_response(&name, &target)),
+            _ => return Err(internal_error()),
+        }
+    }
     // Reuse the captured timestamp or stage a new one; it is persisted inside
     // the apply transaction below.
     let (verified_at, needs_persist) = match verified_at {
@@ -419,7 +541,7 @@ pub async fn verify_challenge(
     let mutation = crate::mutation_leases::claim(
         &state,
         app.id,
-        "custom_domain_set",
+        crate::mutation_leases::CUSTOM_DOMAIN_SET_OPERATION,
         challenge_id,
         false,
         resources.clone(),
@@ -503,12 +625,38 @@ pub async fn verify_challenge(
         {
             Ok(crate::deploy::IngressRestartVerdict::NotDeployed)
             | Ok(crate::deploy::IngressRestartVerdict::Ready) => None,
-            Ok(crate::deploy::IngressRestartVerdict::Unproven) => Some((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "volume initialization has not proven complete; recover the deployment before changing domains"
-                })),
-            )),
+            Ok(crate::deploy::IngressRestartVerdict::Unproven) => {
+                // The strict whole-second rule exists to defend the
+                // size-floor waiver against a pod predating a REPLACED
+                // claim; as restart admission it refuses the FIRST domain
+                // verify of every fresh app, because a StatefulSet's
+                // ordinal-0 pod is normally created in the same whole
+                // second as its claims (observed on dev). Adding the first
+                // domain admits on the timestamp-agnostic proof instead: a
+                // Ready pod that mounts both claims completed first-boot on
+                // these volumes, and the residual same-second replacement
+                // ambiguity is healed by the very rollout restart this
+                // admits. Domain CHANGES keep the strict rule.
+                if previous_custom.is_none()
+                    && enclava_engine::apply::orchestrator::inspect_ready_pod_mounts_all_claims(
+                        engine,
+                        &app.namespace,
+                        &app.name,
+                    )
+                    .await
+                    .unwrap_or(false)
+                {
+                    None
+                } else {
+                    Some((
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "volume_init_unproven",
+                            "message": "volume initialization has not proven complete; recover the deployment before changing domains"
+                        })),
+                    ))
+                }
+            }
             Err(error) => {
                 tracing::error!(
                     app_id = %app.id,
@@ -561,9 +709,21 @@ pub async fn verify_challenge(
             .map_err(|_| internal_error())?;
         app_lane.commit().await.map_err(|_| internal_error())?;
         drop(apply_permit);
+        // Same-domain re-verification repairs DNS/edge only — but the
+        // ingress is only provably serving when the live StatefulSet has
+        // converged (a restart scheduled by an earlier verify may still be
+        // replacing a locked password-mode pod). Fail closed on probe
+        // errors, a missing workload, or an in-flight rollout.
+        let engine = enclava_engine::apply::engine::ApplyEngine::new(
+            state.kube_client.clone(),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        );
+        let probe = crate::deploy::workload_rollout_settled(&engine, &app.namespace, &app.name);
+        let ingress_ready = ingress_ready_from_probe(probe, VERIFY_ROLLOUT_PROBE_BOUND).await;
         return Ok(Json(VerifyResponse {
             domain,
             verified_at,
+            ingress_ready,
         }));
     }
 
@@ -571,15 +731,22 @@ pub async fn verify_challenge(
 
     // Re-render the tenant-ingress ConfigMap before publishing the HAProxy
     // route. Caddy does not watch its ConfigMap, so reapply_tenant_ingress
-    // also restarts the StatefulSet and waits for the new pod to become ready.
-    // If the app has not been deployed yet, persist the verified custom domain
-    // and let the first deploy publish the route.
+    // also restarts the StatefulSet; the restart is scheduled, not waited
+    // on — the pod becomes Ready on its own clock (in password mode only
+    // after the owner's unlock), and the request returns well inside the
+    // hosted proxy timeout. If the app has not been deployed yet, persist
+    // the verified custom domain and let the first deploy publish the route.
     let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
     let next_app = App {
         custom_domain: Some(domain.clone()),
         ..app.clone()
     };
-    let ingress_ready = match mutation
+    // `false` for the scheduled-restart and not-deployed paths: the custom
+    // domain is verified and routed, but the serving ingress converges on
+    // the pod's own readiness clock (the route below still publishes — the
+    // backend exists in both cases; only the not-deployed path defers it).
+    let mut ingress_scheduled = false;
+    match mutation
         .guard_provider(crate::deploy::reapply_tenant_ingress(
             &state.kube_client,
             &state.db,
@@ -593,7 +760,9 @@ pub async fn verify_challenge(
         .await
         .map_err(|_| internal_error())?
     {
-        Ok(()) => true,
+        Ok(()) => {
+            ingress_scheduled = true;
+        }
         Err(crate::deploy::DeployError::NoContainers)
         | Err(crate::deploy::DeployError::NotDeployed(_)) => {
             tracing::info!(
@@ -601,7 +770,6 @@ pub async fn verify_challenge(
                 %domain,
                 "tenant ingress regeneration skipped: app not yet deployed"
             );
-            false
         }
         Err(e) => {
             // Codex P2: an ingress reapply whose accepted write lost CAP
@@ -635,11 +803,17 @@ pub async fn verify_challenge(
             );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("tenant ingress update failed: {e}")})),
+                // Code-shaped, provider-text-free (the DeployError display
+                // carries internals); the full cause is in the log line above.
+                Json(serde_json::json!({"error": "tenant_ingress_update_failed"})),
             ));
         }
     };
-    let app_backend = if ingress_ready {
+    let app_backend = if ingress_scheduled {
+        // The restart is scheduled: the edge route publishes now (the
+        // backend exists and serves once the rollout converges), while the
+        // response's ingress_ready stays false so the client knows serving
+        // is converging rather than established.
         mutation
             .guard_provider(ensure_custom_domain_haproxy_route(
                 &state,
@@ -717,6 +891,9 @@ pub async fn verify_challenge(
     Ok(Json(VerifyResponse {
         domain,
         verified_at,
+        // Scheduled restart (or not-yet-deployed): verified and routed, but
+        // serving converges with the rollout.
+        ingress_ready: false,
     }))
 }
 
@@ -1052,5 +1229,165 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    // --- cap#412: ACME delegation response shapes ---
+
+    fn test_dns_config(zone: &str) -> crate::dns::DnsConfig {
+        crate::dns::DnsConfig {
+            cloudflare_api_token: "token".to_string(),
+            cloudflare_api_base_url: "https://synthetic.invalid".to_string(),
+            cloudflare_zone_id: None,
+            cloudflare_zone_name: zone.to_string(),
+            target: "192.0.2.10".to_string(),
+            required: true,
+        }
+    }
+
+    fn test_acme_config() -> crate::acme::AcmeConfig {
+        crate::acme::AcmeConfig {
+            directory_url: "https://synthetic.invalid/dir".to_string(),
+            account_credentials_path: None,
+            dns_propagation_wait: std::time::Duration::from_secs(30),
+            dns_lookup_prefer_system: false,
+            dns_lookup_timeout: None,
+        }
+    }
+
+    #[test]
+    fn acme_cname_fields_pair_by_zone_membership() {
+        let dns = test_dns_config("managed.test");
+        let acme = test_acme_config();
+        let (name, target) = acme_cname_fields(Some(&dns), Some(&acme), "app.example.com");
+        assert_eq!(name.as_deref(), Some("_acme-challenge.app.example.com"));
+        assert_eq!(target.as_deref(), Some("app.example.com.acme.managed.test"));
+
+        // In-zone domains (exact or suffix) need no delegation: null pair.
+        for in_zone in ["managed.test", "app.managed.test"] {
+            let (name, target) = acme_cname_fields(Some(&dns), Some(&acme), in_zone);
+            assert!(name.is_none(), "{in_zone}");
+            assert!(target.is_none(), "{in_zone}");
+        }
+
+        // No DNS provider configured: pair stays null (no certificate can
+        // be issued there either).
+        let (name, target) = acme_cname_fields(None, Some(&acme), "app.example.com");
+        assert!(name.is_none());
+        assert!(target.is_none());
+
+        // Broker not configured (e.g. Caddy TLS-ALPN deployments): no
+        // CNAME is demanded of the tenant even with managed DNS -- the
+        // ownership TXT alone remains the proof, matching that mode's
+        // certificate path, which never queries _acme-challenge.
+        let (name, target) = acme_cname_fields(Some(&dns), None, "app.example.com");
+        assert!(name.is_none(), "TLS-ALPN mode must not demand a CNAME");
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn delegation_targets_strip_dotted_zone_names() {
+        // A zone configured with leading/trailing dots (tolerated by
+        // manages_hostname) must still derive a publishable target.
+        for zone in [".managed.test", "managed.test.", ".managed.test."] {
+            let (name, target) = crate::acme::expected_acme_cname_pair("app.example.com", zone);
+            assert_eq!(name, "_acme-challenge.app.example.com", "{zone}");
+            assert_eq!(target, "app.example.com.acme.managed.test", "{zone}");
+            assert!(!target.contains(".."), "{zone}");
+        }
+    }
+
+    #[test]
+    fn challenge_response_serializes_the_delegation_pair_as_null_in_zone() {
+        let dns = test_dns_config("managed.test");
+        let acme = test_acme_config();
+        let in_zone = ChallengeResponse {
+            domain: "app.managed.test".to_string(),
+            txt_record_name: "_enclava-challenge.app.managed.test".to_string(),
+            txt_record_value: "enclava-domain-verification=tok".to_string(),
+            acme_cname_name: acme_cname_fields(Some(&dns), Some(&acme), "app.managed.test").0,
+            acme_cname_target: acme_cname_fields(Some(&dns), Some(&acme), "app.managed.test").1,
+            expires_at: Utc::now(),
+            instructions: "publish".to_string(),
+        };
+        let value = serde_json::to_value(&in_zone).unwrap();
+        // Keys are always present; in-zone values are null, not omitted.
+        assert_eq!(value["acme_cname_name"], serde_json::json!(null));
+        assert_eq!(value["acme_cname_target"], serde_json::json!(null));
+
+        let (name, target) = acme_cname_fields(Some(&dns), Some(&acme), "app.example.com");
+        let out_zone = ChallengeResponse {
+            domain: "app.example.com".to_string(),
+            txt_record_name: "_enclava-challenge.app.example.com".to_string(),
+            txt_record_value: "enclava-domain-verification=tok".to_string(),
+            acme_cname_name: name.clone(),
+            acme_cname_target: target.clone(),
+            expires_at: Utc::now(),
+            instructions: "publish".to_string(),
+        };
+        let value = serde_json::to_value(&out_zone).unwrap();
+        assert_eq!(
+            value["acme_cname_name"],
+            serde_json::json!(*name.as_deref().unwrap())
+        );
+        assert_eq!(
+            value["acme_cname_target"],
+            serde_json::json!(*target.as_deref().unwrap())
+        );
+    }
+
+    #[test]
+    fn delegation_missing_response_carries_the_actionable_pair() {
+        let (status, Json(body)) = delegation_missing_response(
+            "_acme-challenge.app.example.com",
+            "app.example.com.acme.managed.test",
+        );
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], serde_json::json!("acme_delegation_missing"));
+        assert_eq!(
+            body["acme_cname_name"],
+            serde_json::json!("_acme-challenge.app.example.com")
+        );
+        assert_eq!(
+            body["acme_cname_target"],
+            serde_json::json!("app.example.com.acme.managed.test")
+        );
+        // Bounded shape: no detail/reason fields ever.
+        let serialized = body.to_string();
+        assert!(!serialized.contains("detail"));
+        assert!(!serialized.contains("reason"));
+    }
+
+    // The verify receipt's ingress_ready contract (review MUST-FIX 2):
+    // fail closed on every probe shape but a positively settled rollout,
+    // including a probe that exceeds its bound. Run with
+    // --test-threads=1 (the repo's ci.yml convention for DB-backed
+    // suites; these are pure but keep the convention).
+    #[tokio::test]
+    async fn ingress_ready_is_true_only_for_a_settled_rollout() {
+        use crate::deploy::DeployError;
+
+        let settled = std::future::ready(Ok(Some(true)));
+        assert!(ingress_ready_from_probe(settled, VERIFY_ROLLOUT_PROBE_BOUND).await);
+
+        for not_ready in [
+            std::future::ready(Ok(Some(false))),
+            std::future::ready(Ok(None)),
+            std::future::ready(Err(DeployError::MissingAttestationConfig)),
+        ] {
+            assert!(
+                !ingress_ready_from_probe(not_ready, VERIFY_ROLLOUT_PROBE_BOUND).await,
+                "unsettled / missing / errored probes must read not-ready"
+            );
+        }
+
+        // A probe that never resolves is cut off by the bound: not-ready,
+        // and the helper returns within it.
+        let hung = tokio::time::timeout(
+            VERIFY_ROLLOUT_PROBE_BOUND + std::time::Duration::from_secs(5),
+            ingress_ready_from_probe(std::future::pending(), std::time::Duration::from_millis(20)),
+        )
+        .await
+        .expect("the bound cuts the hung probe off");
+        assert!(!hung);
     }
 }

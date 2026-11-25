@@ -346,6 +346,10 @@ pub struct HostedTemplateConfigKey {
     pub input_type: String,
     pub required: bool,
     pub secret: bool,
+    /// Platform-generated value (e.g. the reserved stable SSH endpoint):
+    /// delivered through its dedicated flag, never customer config.
+    #[serde(default)]
+    pub generated: bool,
     #[serde(default)]
     pub default_value: Option<String>,
     #[serde(default)]
@@ -1060,6 +1064,15 @@ pub struct ChallengeResponse {
     pub domain: String,
     pub txt_record_name: String,
     pub txt_record_value: String,
+    /// CNAME record the tenant must also publish when the domain is
+    /// outside the platform's managed DNS zone (ACME DNS-01 delegation).
+    /// Absent on older API responses; `null` for in-zone domains.
+    #[serde(default)]
+    pub acme_cname_name: Option<String>,
+    /// The in-zone target `acme_cname_name` must point at. Absent on older
+    /// API responses; `null` for in-zone domains.
+    #[serde(default)]
+    pub acme_cname_target: Option<String>,
     pub expires_at: String,
     pub instructions: String,
 }
@@ -1241,6 +1254,13 @@ pub struct ApiErrorBody {
     pub held_by: Option<String>,
     #[serde(default)]
     pub retry_after: Option<i64>,
+    /// Expected ACME delegation records carried by the API's
+    /// `acme_delegation_missing` error so the CLI can print the exact
+    /// pair to publish. Absent on older servers and other errors.
+    #[serde(default)]
+    pub acme_cname_name: Option<String>,
+    #[serde(default)]
+    pub acme_cname_target: Option<String>,
     /// CAP/PaaS idempotency completion stamp. `completed` means this key is
     /// consumed for the replay window; `deferred` means retry the same key.
     /// Absent on pre-handler and legacy bodies. PaaS keeps only those two
@@ -1251,6 +1271,54 @@ pub struct ApiErrorBody {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn challenge_response_acme_cname_fields_are_backward_compatible() {
+        use super::ChallengeResponse;
+        let legacy: ChallengeResponse = serde_json::from_value(serde_json::json!({
+            "domain": "app.example.com",
+            "txt_record_name": "_enclava-challenge.app.example.com",
+            "txt_record_value": "enclava-domain-verification=tok",
+            "expires_at": "2026-11-23T12:00:00Z",
+            "instructions": "publish"
+        }))
+        .unwrap();
+        assert!(legacy.acme_cname_name.is_none());
+        assert!(legacy.acme_cname_target.is_none());
+
+        let delegated: ChallengeResponse = serde_json::from_value(serde_json::json!({
+            "domain": "app.example.com",
+            "txt_record_name": "_enclava-challenge.app.example.com",
+            "txt_record_value": "enclava-domain-verification=tok",
+            "acme_cname_name": "_acme-challenge.app.example.com",
+            "acme_cname_target": "app.example.com.acme.managed.test",
+            "expires_at": "2026-11-23T12:00:00Z",
+            "instructions": "publish BOTH"
+        }))
+        .unwrap();
+        assert_eq!(
+            delegated.acme_cname_name.as_deref(),
+            Some("_acme-challenge.app.example.com")
+        );
+        assert_eq!(
+            delegated.acme_cname_target.as_deref(),
+            Some("app.example.com.acme.managed.test")
+        );
+
+        // In-zone: keys present but null.
+        let in_zone: ChallengeResponse = serde_json::from_value(serde_json::json!({
+            "domain": "app.managed.test",
+            "txt_record_name": "_enclava-challenge.app.managed.test",
+            "txt_record_value": "enclava-domain-verification=tok",
+            "acme_cname_name": null,
+            "acme_cname_target": null,
+            "expires_at": "2026-11-23T12:00:00Z",
+            "instructions": "publish"
+        }))
+        .unwrap();
+        assert!(in_zone.acme_cname_name.is_none());
+        assert!(in_zone.acme_cname_target.is_none());
+    }
+
     use super::{ConfigKeysResponse, ConfigTokenResponse, SshCommandResponse};
 
     #[test]

@@ -378,6 +378,20 @@ mod tests {
                     "retry_after": null,
                 }),
             ),
+            (
+                IssuanceFailure {
+                    code: IssuanceFailureCode::DelegationMissing,
+                    retry_after: None,
+                },
+                // A missing CNAME delegation is terminal with no provider
+                // retry deadline: the tenant must publish the record (the
+                // actionable pair comes from the domains routes).
+                json!({
+                    "error": "acme_delegation_missing",
+                    "terminal": true,
+                    "retry_after": null,
+                }),
+            ),
         ];
         for (failure, expected) in cases {
             let (status, Json(body)) = issuance_failure_response(&failure);

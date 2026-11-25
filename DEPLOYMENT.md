@@ -4,7 +4,14 @@ This guide covers the CAP API service in this repository. It is intended for
 operators packaging CAP for a Kubernetes environment, not for hosted Enclava
 console users.
 
-For local development, see [README.md](README.md) and [DEV.md](DEV.md).
+For local development, see [README.md](README.md) and [DEV.md](DEV.md). If
+you are deploying CAP outside Enclava's own environments, start with
+[docs/self-hosting.md](docs/self-hosting.md): the published binaries and images
+trust Enclava's installations only, so an independent deployment builds from a
+fork.
+
+Installation and configuration come first. Upgrade, recovery, and rollout
+notes for existing installations are grouped at the end.
 
 ## Local API
 
@@ -37,152 +44,6 @@ CAP API is a stateless HTTP service backed by PostgreSQL. At startup it:
 
 The API can start without every optional integration, but real confidential
 workload deploys require the platform services below.
-
-## Owner Rotation Recovery
-
-Owner-rotation state spans five append-only migrations:
-
-| Migration | Purpose |
-| --- | --- |
-| `0062_org_rotation_directives.sql` | Consume-once ledger of accepted rotation-directive digests. |
-| `0063_org_keyrings_created_at_clock.sql` | `org_keyrings.created_at` defaults to `clock_timestamp()` so freshness bounds measure real insertion time, not transaction start. |
-| `0064_org_rotation_intents.sql` | Presentation record for each authenticated, signature-verified directive; proof of presentation only, never of upstream success. |
-| `0065_org_keyrings_created_at_watermark.sql` | Floors directive version-recency checks for pre-0063 rows with legacy `created_at` semantics. |
-| `0066_org_rotation_upstream_receipts.sql` | Receipts binding a validated signing-service `rotate-owner` response (owner version, `rotated_at`) to the exact directive and normalized keyring digests. |
-
-Note on `0064`'s in-file comment: the SQL comment inside
-`0064_org_rotation_intents.sql` is historical and byte-frozen (sqlx
-checksums applied migration bytes, and this file's checksum is already
-recorded in databases), and it describes the earlier intent-row waiver that
-`0066` superseded. Do not read it as current semantics. An intent row is
-proof of presentation only: it never grants an authority or freshness waiver.
-New distinct presentations are capped at 50 per org per rolling hour (HTTP
-429); exact replays of recorded directive/keyring digests remain exempt, so
-the quota does not block retrying an already-recorded recovery. The
-expired-retry waiver is granted exclusively by a matching
-`org_rotation_upstream_receipts` row (see `expired_rotation_waived_by_receipt`
-in `routes/orgs.rs`); a captured or unactioned presentation is inert.
-
-Recovery semantics: a rotation directive is first-use bounded by its
-`signed_at` max-age. An expired retry of a new-version rotation is accepted
-only when a committed upstream receipt proves that this exact request's
-`rotate-owner` RPC succeeded and the signing service's current owner
-(replacement pubkey, version, `last_changed_at`) still matches the receipt.
-Rotations whose upstream response was lost before this deployment -- or any
-drift without a matching receipt -- are not waived; the owner must sign and
-present a fresh directive.
-If the initiator loses owner access after the upstream RPC, another current
-org owner can finish the exact receipt-bound request while the replacement
-key still has an active registration. The removed owner remains denied;
-fresh rotations still require the caller's own active signing-key
-registration.
-
-Successor-version keyring writes are fenced on the live owner authority:
-after an org has a configured signing service or any recorded rotation
-history, a `PUT` keyring request for a new version requires the service to
-be reachable and to report either no owner (`not_configured`) or exactly the
-current pinned owner. An unreachable, malformed, or owner-mismatched
-authority rejects the write (502/409), and an org with rotation history but
-no service configuration rejects with 503 until the configuration is
-restored. New keyring versions therefore depend on signing-service
-availability once owner rotation is in play; exact same-version replays and
-rotation receipt retries are unaffected.
-
-Cutover notes for `0066`:
-
-- Migrations run at API startup. During rollout, old API pods never mint
-  receipts; drain old pods cleanly (let in-flight requests finish before
-  terminating them) rather than leaving a mixed fleet serving rotations.
-- Never backfill `org_rotation_upstream_receipts`: presentation alone is
-  not proof of upstream success.
-- Keep historical intent/directive/keyring rows and applied migration files
-  unchanged; do not repair recovery by rewriting ledgers or checksums.
-
-## Quarantined Org Reinitialization
-
-Migration `0061_org_keyring_payload_shape.sql` archives removed keyrings in
-`org_keyring_repairs`. If the CURRENT keyring is malformed, it removes every
-keyring version of that org; a clean current version that survives retains
-its authority. Migration `0085_org_keyring_shape_recoveries.sql` records orgs
-that lost all versions in the durable `org_keyring_shape_recoveries` table,
-including the highest quarantined version needed to resolve the displaced
-signer. The archive is provenance, not the recovery gate: removing archive
-rows does not remove the marker or make the org a fresh initialization.
-
-For a marked org, `PUT .../keyring` with version 1 must pass the fenced
-recovery path under the org signing-authority lane:
-
-- When a live signing-service owner exists, the replacement keyring signer
-  must match that owner. A different signer receives HTTP `409`.
-- With no live owner registration, or with no configured service and no
-  rotation history, the signer must match the highest quarantined version's
-  signing key, resolved through `org_keyring_repairs.signing_key_id` and
-  `user_signing_keys`. A mismatch receives `409`; unavailable provenance
-  receives `503`.
-- A configured but unreachable or malformed service fails closed rather
-  than falling back to the archive. Rotation history without a configured
-  service also fails closed (`503`); restore the service configuration first.
-- The caller must still be an active org owner, and the replacement envelope
-  must be validly signed by an active signing key registered to that caller.
-
-The accepted recovery deletes the **marker**, not the archive, in the same
-transaction immediately before inserting the replacement version 1. A failed
-insert rolls the marker deletion back. Migration `0085` installs the database
-`BEFORE INSERT` fence `org_keyrings_fence_quarantine_recovery`, which rejects
-any keyring insertion while the marker remains. Older binaries cannot bypass
-recovery by uploading an unrestricted first version after the migration.
-
-`0085` checks both remaining markers and live/archive version collisions,
-regardless of whether the earlier divergent `0061` marker table exists. It
-removes every live generation of an affected org and restores or retains its
-marker from the original archive. Marker absence is not proof of authorization:
-earlier successor handlers could consume a marker after an unfenced version-1
-capture. Even legitimate recoveries with archive-colliding versions must repeat
-the fenced upload, because this migration cannot distinguish them from those
-captures. Clean survivors without a marker or archive collision remain intact.
-Inspect migration notices and expect affected orgs to need a fresh fenced
-version-1 upload.
-Drain old API replicas before resuming writes; the database fence is a
-fail-closed guard, not support for mixed-version operation or reader rollback.
-
-Preserve the archive, marker, signing-key provenance, and applied migration
-bytes. Do not manually delete recovery state or disable the trigger to force
-initialization. If the required signing key is lost or no active caller-owned
-registration is available, normal reinitialization cannot proceed. Escalate
-for operator-assisted recovery based on verified out-of-band owner intent;
-there is no supported archive-deletion bypass.
-
-## Internal Keyring API Deferred Responses
-
-The internal keyring endpoints (`PUT /internal/paas/orgs/{org}/keyring`,
-`POST /internal/paas/orgs/{org}/keyring/rotate-owner`) now defer a
-publication-pending failure instead of failing the request outright. When
-the keyring mutation is committed but KBS policy reconciliation cannot be
-confirmed (503 `keyring_policy_reconciliation_pending`), the request's
-idempotency record is checkpointed and the caller receives
-409 `idempotency_request_in_progress` with `retryable: true`,
-`disposition: retry_same_key`, `idempotency_disposition: "deferred"` and
-`cause: keyring_policy_reconciliation_pending`. A retry with the same
-idempotency key resumes the deferred request -- the checkpoint keeps that
-pending code out of the fail-closed disposition -- and re-confirms publication
-instead of repeating the mutation. An unrelated 5xx on that reclaim is not
-rewritten as publication-pending. Authority mismatches and uncertain upstream
-writes terminalize as `idempotency_recovery_required`
-(`reconcile_then_retry_with_new_key`) so the same key cannot re-issue the
-mutation. The checkpointed lease is the short (~5 s) retry interval, not a
-terminal outcome.
-
-Cross-project rollout gate (AGENTS.md): the CAP internal API response shape
-changed, so update and test enclava-paas against this response **before**
-deploying CAP API. Retries must keep the original idempotency key:
-enclava-paas forwards a caller-supplied `Idempotency-Key` deterministically
-(namespaced `paas:{org}:sha256(key)`), but when the caller sends none it
-derives a per-attempt random key (`cli_cap_idempotency_key`), so a plain
-retry would open a new CAP idempotency record instead of resuming the
-deferred one. Hosted keyring flows must therefore carry a stable
-`Idempotency-Key` (caller-supplied, or a PaaS-derived deterministic key as
-the template config-token retry already does) before CAP API with this
-change is deployed.
 
 ## Required Services
 
@@ -344,6 +205,36 @@ require Fulcio CA trust. P-256 key-pin policies instead require the exact key
 and Rekor evidence; certificate identities enter the audit record only after
 independent CA validation.
 
+## Additional Variables
+
+The API also reads the variables below. The tables in this guide are not an
+exhaustive reference: the source of truth is the startup code in
+`crates/enclava-api/src/main.rs` and the modules it calls.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CAP_DEPLOYMENT_DISPATCH_ENABLED` | `false` | Enables the deployment dispatcher. Must be exactly `true` or `false`. While `false`, every write is rejected with HTTP 503 `deploy_blocked` (reason `deployment_dispatch_disabled`) and is not queued, except sign-up, login, API-key creation and deletion, organization creation, invitations, member removal, app deletion, and the `/internal/paas` organization, entitlement, and member synchronization writes. Public-key registration and organization keyring changes are among the rejected writes. The allow-list is `is_workload_authority_mutation` in `crates/enclava-api/src/lib.rs`. |
+| `ENCLAVA_INIT_IMAGE` | none | Digest-pinned `enclava-init` image rendered into every workload. Required in release builds, which panic at render time if it is unset or lacks `@sha256:`. The signed platform release does not supply it. |
+| `ATTESTATION_PROXY_SIGNER_SUBJECT` and `ATTESTATION_PROXY_SIGNER_ISSUER`, or `ATTESTATION_PROXY_SIGNER_PUBLIC_KEY_PEM` | none | Keyless identity, or a pinned public key, that the API verifies the `attestation-proxy` image signature against. Required whenever that image is configured. |
+| `CADDY_INGRESS_SIGNER_SUBJECT` and `CADDY_INGRESS_SIGNER_ISSUER`, or `CADDY_INGRESS_SIGNER_PUBLIC_KEY_PEM` | none | The same for the `caddy-ingress` image. |
+| `DATABASE_MIGRATION_MODE` | `apply` | `apply` runs pending migrations at API startup. `verify` only checks that the schema is current, so migrations must be applied first with the `cap-migrate` binary shipped in the API image (it needs only `DATABASE_URL`). |
+| `ENCLAVA_USE_PLATFORM_RELEASE` | unset | Loads the signed platform release even when `TRUSTEE_POLICY_READ_AVAILABLE` is not set. |
+| `ENCLAVA_LUKS2_HEADER_SEAL` | unset | Optional restatement of the signed release's `luks2_header_seal` value. Startup is refused if it disagrees with the release. |
+| `ENCLAVA_LOG_SPOOL_STORAGE` | unset | Enables the `log_spool_storage` claim; see the two-phase enablement under [Platform Release](#platform-release). |
+| `API_KEY_HMAC_PEPPER_PREVIOUS` | unset | Comma-separated hex peppers (at least 32 bytes each) still accepted for existing API keys during pepper rotation. |
+| `PLATFORM_SIGNING_SERVICE_TOKEN` | unset | Bearer token the API sends to the policy signing service. |
+| `PLATFORM_SIGNING_SERVICE_TIMEOUT_SECONDS` | `120` | Request timeout for the policy signing service. |
+| `REQUIRE_CUSTOMER_SIGNED_POLICY_ARTIFACT` | unset | Requires customer-signed policy artifacts on deploy even when no signing service is configured. |
+| `SIGSTORE_TUF_ROOT_PATH` | unset | Path to the pinned Sigstore trusted root. Release images ship it at `/etc/enclava/sigstore/trusted_root.json`; an empty value fails closed. |
+| `TENANT_HAPROXY_NAMESPACE` | `tenant-envoy` | Namespace of the tenant edge HAProxy that CAP reconciles. |
+| `TENANT_HAPROXY_CONFIGMAP` | `haproxy-tenant` | ConfigMap holding the tenant edge HAProxy configuration. |
+| `TENANT_HAPROXY_DAEMONSET` | `haproxy-tenant` | DaemonSet restarted when the tenant edge configuration changes. |
+| `TENANT_TEE_CA_CERT_PEM` or `TENANT_TEE_CA_CERT_PATH` | unset | Additional root certificates for the API's tenant TEE client. |
+| `TLS_CERTIFICATE_TRUST_ANCHORS_PEM` | unset | Fallback TLS trust anchors rendered into `cc_init_data` when the signed release installs none. Absent, the guest uses the public WebPKI roots. |
+| `CLUSTER_POD_CIDR`, `CLUSTER_SERVICE_CIDR` | unset | Comma-separated CIDRs added to the outbound-request blocklist, so tenant-chosen registry hosts cannot resolve into the cluster. |
+| `CLOUDFLARE_API_BASE_URL` | `https://api.cloudflare.com/client/v4` | Cloudflare API endpoint. |
+| `CAP_CREATION_LEDGER_ACTIVATED_AT` | unset | Legacy-resource trust cutoff; see [docs/creation-ledger-rollout.md](docs/creation-ledger-rollout.md) before setting it. |
+
 ## Release-Build Safety Gates
 
 Release builds refuse to start when dangerous development settings are enabled:
@@ -365,26 +256,6 @@ CAP_EGRESS_ALLOW_INTERNAL_HOSTS (without CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS=tr
 
 Release builds also require `API_KEY_HMAC_PEPPER` or
 `API_KEY_HMAC_PEPPER_BASE64`, and `TRUSTEE_POLICY_READ_AVAILABLE=true`.
-
-## Noninteractive CLI ownership claims
-
-Agents and CI can use `enclava deploy --storage-password-file PATH`,
-`enclava template deploy --storage-password-file PATH`, or
-`enclava claim --password-file PATH` without terminal stdin or stderr.
-Without a password file, password prompts require both streams to be terminals.
-
-Keep `ENCLAVA_STATE_DIR` on persistent private storage. Before claiming, the CLI
-validates the protected recovery-mnemonic destination; after claiming, it stores
-the mnemonic atomically with owner-only permissions and filesystem syncs. It
-never prints the mnemonic. `--no-store-mnemonic` remains invalid for claims.
-Export an encrypted backup with `enclava key backup` and retain it off-machine.
-
-The TEE still returns the recovery mnemonic only once. A lost claim response or
-failed mnemonic write exits nonzero and halts dependent actions; when ownership
-is known to have committed, the error is
-`ownership_committed_recovery_backup_incomplete`. Ownership is not rolled back.
-Do not blindly retry a claim or treat this as a completed backup. A terminal
-does not provide response-loss recovery either.
 
 ## Platform Release
 
@@ -535,14 +406,17 @@ Deploy the digest reference from that artifact, not a mutable tag.
 
 ## Kubernetes
 
-The checked-in overlay is intentionally minimal:
+The checked-in `deploy/api` overlay is the reference API deployment. It carries
+values for Enclava's own installation and is incomplete on its own;
+[deploy/api/README.md](deploy/api/README.md) lists each value to replace and
+what the overlay leaves out.
 
 ```bash
 kubectl apply -k deploy/api/
 kubectl -n enclava-platform rollout status deploy/enclava-api
 ```
 
-Before using it outside local experimentation:
+Before applying it to any cluster:
 
 - replace placeholder secret references with your secret-management system;
 - pin the API image digest in `deploy/api/kustomization.yaml`;
@@ -553,6 +427,235 @@ Before using it outside local experimentation:
 - configure network policy for PostgreSQL, Trustee/KBS, policy signing,
   registry metadata, DNS, and tenant TEE callbacks;
 - decide whether CAP-managed DNS and KBS policy management are required.
+
+## Smoke Checks
+
+After rollout:
+
+```bash
+kubectl -n enclava-platform get deploy enclava-api
+kubectl -n enclava-platform exec deploy/enclava-api -- wget -q -O- http://127.0.0.1:3000/health
+```
+
+## Upgrade, Recovery, and Rollout Notes
+
+The remaining sections describe behavior that matters when upgrading an
+existing installation, recovering from a partial failure, or sequencing a
+rollout. A first installation can skip them.
+
+## CLI and Runtime Behavior Notes
+
+### Encrypted log spool recovery
+
+For an encrypted-state-backed spool, restart recovery removes an incomplete EOF
+from the writer's bounded spool before appending new frames, preserving complete
+retained records. Abrupt guest loss can still lose unflushed newest logs.
+Already malformed, newline-terminated records are not silently discarded;
+preserve diagnostic evidence rather than clearing the spool or its PVC.
+
+### CLI tag resolution
+
+CLI tag resolution uses direct HTTPS requests with TLS verification and no
+redirects or system HTTP proxies. Registry and permitted bearer-auth endpoints
+cannot resolve to loopback, private, link-local, metadata, or CGNAT addresses,
+including IPv4-compatible and IPv4-mapped IPv6 addresses. `CLUSTER_POD_CIDR` and
+`CLUSTER_SERVICE_CIDR` add comma-separated IPv4/IPv6 CIDRs to the blocklist.
+Literal IP destinations are checked against the same ranges. Digest-pinned
+references skip the CLI registry lookup, including when registry access requires
+an HTTP proxy. Bearer-auth failures do not print realm URLs or query credentials.
+
+### Template rollout retries
+
+An interrupted first template deployment can be retried with the same command.
+For CAP's single-replica automatic rollouts, applying changed init data replaces
+only an unready Pod owned by a ledger-recorded StatefulSet and still using the
+old init data. Deletion checks the live StatefulSet generation and the Pod UID
+and resource version, retains PVCs, and uses normal graceful termination.
+The CLI requires the signed deployment's attested launch identity both while
+waiting for bootstrap and on the client that submits the ownership claim.
+
+### Routes during teardown
+
+Apps awaiting required confidential teardown retain their public routes even if
+every deployment has failed or a failed delete restored the app's prior status.
+Routes are removed after teardown completes; deleting a failed app does not
+bypass its storage or ownership checks.
+
+### Namespace mutation fence after a failed delete
+
+If an app delete errors after its namespace deletion begins, the app's
+namespace mutation fence stays armed instead of risking name reuse. The
+periodic fence reconciler releases it automatically once Kubernetes reports
+the namespace gone — no manual lease edits — while a live or still-Terminating
+namespace keeps it fenced. Other stranded `kubernetes_namespace` fences
+remain an operator path; see
+[runbooks/kubernetes-mutation-fence-recovery.md](runbooks/kubernetes-mutation-fence-recovery.md).
+
+## Owner Rotation Recovery
+
+Owner-rotation state spans five append-only migrations:
+
+| Migration | Purpose |
+| --- | --- |
+| `0062_org_rotation_directives.sql` | Consume-once ledger of accepted rotation-directive digests. |
+| `0063_org_keyrings_created_at_clock.sql` | `org_keyrings.created_at` defaults to `clock_timestamp()` so freshness bounds measure real insertion time, not transaction start. |
+| `0064_org_rotation_intents.sql` | Presentation record for each authenticated, signature-verified directive; proof of presentation only, never of upstream success. |
+| `0065_org_keyrings_created_at_watermark.sql` | Floors directive version-recency checks for pre-0063 rows with legacy `created_at` semantics. |
+| `0066_org_rotation_upstream_receipts.sql` | Receipts binding a validated signing-service `rotate-owner` response (owner version, `rotated_at`) to the exact directive and normalized keyring digests. |
+
+Note on `0064`'s in-file comment: the SQL comment inside
+`0064_org_rotation_intents.sql` is historical and byte-frozen (sqlx
+checksums applied migration bytes, and this file's checksum is already
+recorded in databases), and it describes the earlier intent-row waiver that
+`0066` superseded. Do not read it as current semantics. An intent row is
+proof of presentation only: it never grants an authority or freshness waiver.
+New distinct presentations are capped at 50 per org per rolling hour (HTTP
+429); exact replays of recorded directive/keyring digests remain exempt, so
+the quota does not block retrying an already-recorded recovery. The
+expired-retry waiver is granted exclusively by a matching
+`org_rotation_upstream_receipts` row (see `expired_rotation_waived_by_receipt`
+in `routes/orgs.rs`); a captured or unactioned presentation is inert.
+
+Recovery semantics: a rotation directive is first-use bounded by its
+`signed_at` max-age. An expired retry of a new-version rotation is accepted
+only when a committed upstream receipt proves that this exact request's
+`rotate-owner` RPC succeeded and the signing service's current owner
+(replacement pubkey, version, `last_changed_at`) still matches the receipt.
+Rotations whose upstream response was lost before this deployment -- or any
+drift without a matching receipt -- are not waived; the owner must sign and
+present a fresh directive.
+If the initiator loses owner access after the upstream RPC, another current
+org owner can finish the exact receipt-bound request while the replacement
+key still has an active registration. The removed owner remains denied;
+fresh rotations still require the caller's own active signing-key
+registration.
+
+Successor-version keyring writes are fenced on the live owner authority:
+after an org has a configured signing service or any recorded rotation
+history, a `PUT` keyring request for a new version requires the service to
+be reachable and to report either no owner (`not_configured`) or exactly the
+current pinned owner. An unreachable, malformed, or owner-mismatched
+authority rejects the write (502/409), and an org with rotation history but
+no service configuration rejects with 503 until the configuration is
+restored. New keyring versions therefore depend on signing-service
+availability once owner rotation is in play; exact same-version replays and
+rotation receipt retries are unaffected.
+
+Cutover notes for `0066`:
+
+- Migrations run at API startup. During rollout, old API pods never mint
+  receipts; drain old pods cleanly (let in-flight requests finish before
+  terminating them) rather than leaving a mixed fleet serving rotations.
+- Never backfill `org_rotation_upstream_receipts`: presentation alone is
+  not proof of upstream success.
+- Keep historical intent/directive/keyring rows and applied migration files
+  unchanged; do not repair recovery by rewriting ledgers or checksums.
+
+## Quarantined Org Reinitialization
+
+Migration `0061_org_keyring_payload_shape.sql` archives removed keyrings in
+`org_keyring_repairs`. If the CURRENT keyring is malformed, it removes every
+keyring version of that org; a clean current version that survives retains
+its authority. Migration `0085_org_keyring_shape_recoveries.sql` records orgs
+that lost all versions in the durable `org_keyring_shape_recoveries` table,
+including the highest quarantined version needed to resolve the displaced
+signer. The archive is provenance, not the recovery gate: removing archive
+rows does not remove the marker or make the org a fresh initialization.
+
+For a marked org, `PUT .../keyring` with version 1 must pass the fenced
+recovery path under the org signing-authority lane:
+
+- When a live signing-service owner exists, the replacement keyring signer
+  must match that owner. A different signer receives HTTP `409`.
+- With no live owner registration, or with no configured service and no
+  rotation history, the signer must match the highest quarantined version's
+  signing key, resolved through `org_keyring_repairs.signing_key_id` and
+  `user_signing_keys`. A mismatch receives `409`; unavailable provenance
+  receives `503`.
+- A configured but unreachable or malformed service fails closed rather
+  than falling back to the archive. Rotation history without a configured
+  service also fails closed (`503`); restore the service configuration first.
+- The caller must still be an active org owner, and the replacement envelope
+  must be validly signed by an active signing key registered to that caller.
+
+The accepted recovery deletes the **marker**, not the archive, in the same
+transaction immediately before inserting the replacement version 1. A failed
+insert rolls the marker deletion back. Migration `0085` installs the database
+`BEFORE INSERT` fence `org_keyrings_fence_quarantine_recovery`, which rejects
+any keyring insertion while the marker remains. Older binaries cannot bypass
+recovery by uploading an unrestricted first version after the migration.
+
+`0085` checks both remaining markers and live/archive version collisions,
+regardless of whether the earlier divergent `0061` marker table exists. It
+removes every live generation of an affected org and restores or retains its
+marker from the original archive. Marker absence is not proof of authorization:
+earlier successor handlers could consume a marker after an unfenced version-1
+capture. Even legitimate recoveries with archive-colliding versions must repeat
+the fenced upload, because this migration cannot distinguish them from those
+captures. Clean survivors without a marker or archive collision remain intact.
+Inspect migration notices and expect affected orgs to need a fresh fenced
+version-1 upload.
+Drain old API replicas before resuming writes; the database fence is a
+fail-closed guard, not support for mixed-version operation or reader rollback.
+
+Preserve the archive, marker, signing-key provenance, and applied migration
+bytes. Do not manually delete recovery state or disable the trigger to force
+initialization. If the required signing key is lost or no active caller-owned
+registration is available, normal reinitialization cannot proceed. Escalate
+for operator-assisted recovery based on verified out-of-band owner intent;
+there is no supported archive-deletion bypass.
+
+## Internal Keyring API Deferred Responses
+
+The internal keyring endpoints (`PUT /internal/paas/orgs/{org}/keyring`,
+`POST /internal/paas/orgs/{org}/keyring/rotate-owner`) now defer a
+publication-pending failure instead of failing the request outright. When
+the keyring mutation is committed but KBS policy reconciliation cannot be
+confirmed (503 `keyring_policy_reconciliation_pending`), the request's
+idempotency record is checkpointed and the caller receives
+409 `idempotency_request_in_progress` with `retryable: true`,
+`disposition: retry_same_key`, `idempotency_disposition: "deferred"` and
+`cause: keyring_policy_reconciliation_pending`. A retry with the same
+idempotency key resumes the deferred request -- the checkpoint keeps that
+pending code out of the fail-closed disposition -- and re-confirms publication
+instead of repeating the mutation. An unrelated 5xx on that reclaim is not
+rewritten as publication-pending. Authority mismatches and uncertain upstream
+writes terminalize as `idempotency_recovery_required`
+(`reconcile_then_retry_with_new_key`) so the same key cannot re-issue the
+mutation. The checkpointed lease is the short (~5 s) retry interval, not a
+terminal outcome.
+
+Cross-project rollout gate (AGENTS.md): the CAP internal API response shape
+changed, so update and test enclava-paas against this response **before**
+deploying CAP API. Retries must keep the original idempotency key:
+enclava-paas forwards a caller-supplied `Idempotency-Key` deterministically
+(namespaced `paas:{org}:sha256(key)`), but when the caller sends none it
+derives a per-attempt random key (`cli_cap_idempotency_key`), so a plain
+retry would open a new CAP idempotency record instead of resuming the
+deferred one. Hosted keyring flows must therefore carry a stable
+`Idempotency-Key` (caller-supplied, or a PaaS-derived deterministic key as
+the template config-token retry already does) before CAP API with this
+change is deployed.
+
+## Noninteractive CLI ownership claims
+
+Agents and CI can use `enclava deploy --storage-password-file PATH`,
+`enclava template deploy --storage-password-file PATH`, or
+`enclava claim --password-file PATH` without terminal stdin or stderr.
+Without a password file, password prompts require both streams to be terminals.
+
+Keep `ENCLAVA_STATE_DIR` on persistent private storage. Before claiming, the CLI
+validates the protected recovery-mnemonic destination; after claiming, it stores
+the mnemonic atomically with owner-only permissions and filesystem syncs. It
+never prints the mnemonic. `--no-store-mnemonic` remains invalid for claims.
+Export an encrypted backup with `enclava key backup` and retain it off-machine.
+
+The TEE still returns the recovery mnemonic only once. A lost claim response or
+failed mnemonic write exits nonzero and halts dependent actions; when ownership
+is known to have committed, the error is
+`ownership_committed_recovery_backup_incomplete`. Ownership is not rolled back.
+Do not blindly retry a claim or treat this as a completed backup. A terminal
+does not provide response-loss recovery either.
 
 ## Customer-config roll holds
 
@@ -754,13 +857,3 @@ stored, retries wait for that rollout without creating another generation.
 Both legacy and signed publication wait for old replicas to leave and all
 updated replicas to become available. Changed policy content or a signed-authority
 handoff during confirmation must be reconciled before success is returned.
-
-## Smoke Checks
-
-After rollout:
-
-```bash
-kubectl -n enclava-platform get deploy enclava-api
-kubectl -n enclava-platform exec deploy/enclava-api -- wget -q -O- http://127.0.0.1:3000/health
-```
-

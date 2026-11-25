@@ -73,10 +73,33 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             println!("Publish this TXT record at your DNS provider:");
             println!("  Name:  {}", resp.txt_record_name);
             println!("  Value: {}", resp.txt_record_value);
+            let needs_cname = resp.acme_cname_name.is_some() && resp.acme_cname_target.is_some();
+            if let (Some(cname_name), Some(cname_target)) =
+                (&resp.acme_cname_name, &resp.acme_cname_target)
+            {
+                println!();
+                println!("Also publish this CNAME record (required for the TLS certificate):");
+                println!("  Name:      {cname_name}");
+                println!("  Points at: {cname_target}");
+            }
+            // The challenge records prove ownership and delegate the
+            // certificate; neither one sends traffic to the app. Best
+            // effort: the challenge itself is already created.
+            if let Ok(summary) = api.get_domain(&app_name).await {
+                println!();
+                println!("To send traffic to the app, point the domain itself at it:");
+                println!("  Name:      {domain}");
+                println!("  Points at: {}", summary.platform_domain);
+                println!("  (a CNAME record; on an apex domain use your provider's ALIAS/ANAME)");
+            }
             println!();
             println!("Expires at: {}", resp.expires_at);
             println!();
-            println!("Once published, run:");
+            if needs_cname {
+                println!("Once the TXT and the certificate CNAME are published, run:");
+            } else {
+                println!("Once the TXT record is published, run:");
+            }
             println!("  enclava domains verify {domain} --app {app_name}");
         }
 
@@ -88,6 +111,18 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             println!(
                 "Domain '{}' verified for {app_name} at {}.",
                 resp.domain, resp.verified_at,
+            );
+            // Verify routes the hostname; the certificate's hostname list is
+            // part of the signed deployment, so it only reaches the workload
+            // with the next deploy.
+            println!();
+            println!("To serve HTTPS on {}:", resp.domain);
+            println!("  - Not deployed yet: run `enclava deploy`.");
+            println!(
+                "  - Already deployed: the app restarts to pick up the route (unlock it again if it"
+            );
+            println!(
+                "    uses password unlock), then run `enclava deploy` to issue the certificate."
             );
         }
 

@@ -6944,15 +6944,18 @@ pub async fn reapply_tenant_ingress(
     let ledger = crate::deployment_failure_cleanup::load_creation_ledger(pool, app.id).await?;
     let engine =
         ApplyEngine::new(client.clone(), ApplyConfig::default()).with_creation_ledger(ledger);
-    // Domain-only reapply: the pod restart re-opens existing volumes, so the
-    // base rollout budget applies — the fresh-initialization allowance is
-    // reserved for renders that provision a new claim.
-    let rollout_timeout = engine.config().rollout_timeout;
     ensure_statefulset_exists(&engine, &app_spec.namespace, &app_spec.name).await?;
     let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
-    mutation
-        .arm_resource_scope_until_reconciled("kubernetes_namespace")
-        .await?;
+    // No infinite namespace fence here, unlike a real deployment apply.
+    // This domain-only reapply never deletes the namespace and its only
+    // Kubernetes writes are generation-CAS'd and idempotent (the ConfigMap
+    // SSA apply and the rollout-restart annotation patch below), so a
+    // cancelled request leaves desired state applied and the ordinary
+    // finite fence from the lease claim self-heals on the normal
+    // expiry/quarantine clock. Arming `until_reconciled` here — the tool
+    // for precondition-less provider writes and namespace-delete races —
+    // wedged apps forever when the request was cancelled mid-rollout (the
+    // retained-fence reconciler did not cover custom_domain_set).
     let step = apply_namespaced_resource(&engine, &app_spec.namespace, &cm, generation).await;
     complete_creation_step(
         step,
@@ -6969,22 +6972,13 @@ pub async fn reapply_tenant_ingress(
     restart_statefulset_for_ingress(&engine, &app_spec.namespace, &app_spec.name, generation)
         .await?;
 
-    let status = watch_rollout(
-        &engine,
-        &app_spec.namespace,
-        &app_spec.name,
-        rollout_timeout,
-    )
-    .await?;
-    if status.phase != DeployPhase::Running {
-        return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
-            status
-                .message
-                .unwrap_or_else(|| format!("tenant ingress rollout ended in {:?}", status.phase)),
-        )
-        .into());
-    }
-
+    // The restart is SCHEDULED, not waited on: the replacement pod becomes
+    // Ready on its own clock — in password mode only after the owner's
+    // unlock — and the verify request must return well inside the hosted
+    // proxy timeout instead of holding the app lease through a rollout
+    // that cannot converge (F-C). The annotation patch above is
+    // generation-pinned, so the restart happens exactly once; convergence
+    // is observed by the app's normal readiness path.
     Ok(())
 }
 
@@ -7126,6 +7120,13 @@ const ROLLOUT_OBSERVATION_SLICE: std::time::Duration = std::time::Duration::from
 /// trip, and probes run on their own bounded dispatch lane
 /// (`MAX_OWNER_WAIT_PROBE_WORKERS` in deployment_jobs.rs), never on a shared
 /// apply-worker slot (#231, #387).
+///
+/// The one-poll property is pinned against `ApplyConfig::default().poll_interval`
+/// only (`extended_owner_wait_probe_slice_covers_a_single_poll`): a runtime
+/// `poll_interval` configured at or below this slice silently degrades a probe
+/// to repeated polls. That shape is deliberately tolerated (the rollout tests
+/// run a 5 ms poll interval under the full slice), so this stays a documented
+/// coupling instead of a debug assertion (#402).
 const EXTENDED_OWNER_WAIT_PROBE_SLICE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// A rollout handle returned after Kubernetes accepted the rendered manifests.
@@ -7276,7 +7277,7 @@ fn app_status_label(status: AppStatus) -> &'static str {
 /// carrying this label has had that operation's spec accepted by the API
 /// server — the fact `workload_spec_published_at` records, and the fact a
 /// crash between `apply_statefulset` and the stamp can lose.
-const WORKLOAD_DEPLOYMENT_ID_LABEL: &str = "enclava.dev/deployment-id";
+const WORKLOAD_DEPLOYMENT_ID_LABEL: &str = enclava_engine::manifest::DEPLOYMENT_ID_LABEL;
 
 /// Bound for the publication-recovery GET. Matches the rollout-settling
 /// probe: a hung API server must not hold the deployment lane forever.

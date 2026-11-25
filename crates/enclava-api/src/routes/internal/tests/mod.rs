@@ -3412,9 +3412,39 @@ async fn whitelisted_known_not_applied_outcomes_preserve_binding_and_re_execute(
     let messages: Vec<&str> = TRANSIENT_RETRY_CONFLICT_MESSAGES.to_vec();
     assert_eq!(
         messages.len(),
-        7,
+        8,
         "whitelist drift: update this count when editing the constant"
     );
+    // Hand-written literals pinning BOTH directions against the hosted
+    // verification guards (Devin T2): every refusal code the verify path
+    // can return is either transient-whitelisted (re-execute on retry) or
+    // deliberately surfaced as-is (cached and replayed).
+    // - deployment_in_progress (the apply-lane guard, domains.rs
+    //   ensure_no_apply_in_progress): transient — whitelisted above.
+    // - volume_init_unproven (the restart-admission refusal, domains.rs
+    //   verify_challenge): recovery-needed, NOT whitelisted — a same-key
+    //   retry replays the refusal with its code + message instead of
+    //   hiding behind idempotency_request_in_progress.
+    // - acme_delegation_missing (the CNAME gate): a 422, not a conflict —
+    //   cached as the completed refusal and surfaced the same way.
+    assert_eq!(
+        idempotency_error_disposition(
+            StatusCode::CONFLICT,
+            &serde_json::json!({"error": "deployment_in_progress"}),
+        ),
+        IdempotencyErrorDisposition::KnownNotApplied,
+        "the transient apply-lane guard code re-executes on same-key retry"
+    );
+    for surfaced in ["volume_init_unproven", "custom_domain_limit_exceeded"] {
+        assert_eq!(
+            idempotency_error_disposition(
+                StatusCode::CONFLICT,
+                &serde_json::json!({"error": surfaced}),
+            ),
+            IdempotencyErrorDisposition::Completed,
+            "{surfaced} stays cached and surfaced: recovery guidance must reach the caller"
+        );
+    }
     for (i, message) in messages.iter().enumerate() {
         let key = format!("transient-retry-cancel-{suffix}-{i}");
         let path = format!("/internal/test/transient-retry-cancel-{suffix}/{i}");
@@ -3514,6 +3544,12 @@ async fn permanent_conflicts_are_stamped_completed_and_cached() {
         "app changed while unlock mode transition was validating; retry",
         "app runtime changed while unlock mode transition was validating; retry",
         "deployment generation changed while unlock mode transition was validating; retry",
+        // The recovery-needed verify refusal (Devin on #415/#416): same
+        // terminal treatment, and the assertions below prove its code AND
+        // message survive completion stamping and the same-key replay —
+        // the hosted caller always sees the recovery guidance, never the
+        // generic in-progress shape.
+        "volume_init_unproven",
     ];
     for (i, message) in messages.iter().enumerate() {
         let key = format!("permanent-stamp-{suffix}-{i}");
@@ -3523,13 +3559,16 @@ async fn permanent_conflicts_are_stamped_completed_and_cached() {
                 .await
                 .expect("reserve permanent-conflict handler"),
         );
-        let result: Result<IdempotencyResponse, InternalRouteError> = async {
-            Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": message})),
-            ))
-        }
-        .await;
+        let message_value = if *message == "volume_init_unproven" {
+            serde_json::json!({
+                "error": message,
+                "message": "volume initialization has not proven complete; recover the deployment before changing domains",
+            })
+        } else {
+            serde_json::json!({"error": message})
+        };
+        let result: Result<IdempotencyResponse, InternalRouteError> =
+            async { Err((StatusCode::CONFLICT, Json(message_value.clone()))) }.await;
         let stamped = complete_idempotent_result(lease, result)
             .await
             .expect_err("permanent 409 is stamped completed and returned");
@@ -3537,6 +3576,13 @@ async fn permanent_conflicts_are_stamped_completed_and_cached() {
         assert_eq!(stamped.1["error"], *message);
         assert_eq!(stamped.1["idempotency_disposition"], "completed");
         assert_eq!(stamped.1["retryable"], false);
+        if *message == "volume_init_unproven" {
+            assert_eq!(
+                stamped.1["message"],
+                "volume initialization has not proven complete; recover the deployment before changing domains",
+                "the recovery guidance survives the completion stamping"
+            );
+        }
 
         // Cached as completed: a same-key retry replays the stamped body.
         let replay = expect_idempotency_replay(
@@ -3547,6 +3593,13 @@ async fn permanent_conflicts_are_stamped_completed_and_cached() {
         assert_eq!(replay.0, StatusCode::CONFLICT);
         assert_eq!(replay.1["error"], *message);
         assert_eq!(replay.1["idempotency_disposition"], "completed");
+        if *message == "volume_init_unproven" {
+            assert_eq!(
+                replay.1["message"],
+                "volume initialization has not proven complete; recover the deployment before changing domains",
+                "the same-key replay still carries the recovery guidance"
+            );
+        }
     }
 }
 

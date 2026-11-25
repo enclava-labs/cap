@@ -1820,6 +1820,18 @@ pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::
                     "failed to repair orphaned deployment namespace mutation leases"
                 ),
             }
+            match crate::mutation_leases::reconcile_orphaned_custom_domain_fences(&repair_state.db)
+                .await
+            {
+                Ok(repaired) if repaired > 0 => {
+                    tracing::warn!(repaired, "bounded orphaned custom-domain namespace fences")
+                }
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    error_code = "orphaned_custom_domain_fence_repair_failed",
+                    "failed to repair orphaned custom-domain namespace fences"
+                ),
+            }
             match expire_customer_config_holds(&repair_state.db).await {
                 Ok(expired) if expired > 0 => tracing::warn!(
                     expired,
@@ -2076,6 +2088,13 @@ async fn claim_job_candidate(
         // apply lane passes false and the probe lane true over the exact
         // same expression, so the lanes partition the candidate set with no
         // gap a job could fall through (#387).
+        //
+        // Cost note (#402): the EXISTS runs per head-of-queue candidate row,
+        // so a shared-lane claim with N past-budget rows pays N probes
+        // before reaching a fresh deploy. The bound is the backlog size, not
+        // the claim rate; the probe-lane queue-depth metric named on
+        // `MAX_OWNER_WAIT_PROBE_WORKERS` must land before signup widens the
+        // backlog.
         "WITH candidate AS (
              SELECT deployment_id
                FROM deployment_apply_jobs
@@ -5948,6 +5967,12 @@ pub(crate) mod tests {
         // while leaving fresh deploys alone. Bounded claim loops keep the
         // assertions stable against rows a previously failed run left
         // behind in a shared test database.
+        //
+        // Those loops are drain-and-ignore (#402): they may lease foreign
+        // leftover rows before reaching this run's fixtures, which is
+        // harmless only because the shared test database serializes runs
+        // (`--test-threads=1`). Filter to fixture orgs before ever running
+        // this suite concurrently.
         let pool = database_test_pool().await;
         let (app_a1, deployment_a1) = insert_owner_wait_probe_fixture(&pool).await;
         let (app_b1, deployment_b1) = insert_fresh_apply_fixture(&pool).await;

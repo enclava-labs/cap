@@ -146,6 +146,8 @@ fn test_app_config() -> AppConfig {
             memory: "1Gi".to_string(),
         },
         health: None,
+        egress: Default::default(),
+        unknown: HashMap::new(),
     }
 }
 
@@ -664,8 +666,10 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
         &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
             unlock_mode: "password".to_string(),
             paas_managed_config_keys: Vec::new(),
+            customer_config_keys: Vec::new(),
             log_key_id: None,
             log_private_key_file: None,
+            signed_log_key_id: None,
         },
     )
     .unwrap();
@@ -678,8 +682,10 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
         &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
             unlock_mode: "password".to_string(),
             paas_managed_config_keys: Vec::new(),
+            customer_config_keys: Vec::new(),
             log_key_id: None,
             log_private_key_file: None,
+            signed_log_key_id: None,
         },
     )
     .unwrap();
@@ -710,8 +716,10 @@ fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
         &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
             unlock_mode: "password".to_string(),
             paas_managed_config_keys: Vec::new(),
+            customer_config_keys: Vec::new(),
             log_key_id: None,
             log_private_key_file: None,
+            signed_log_key_id: None,
         },
     )
     .unwrap();
@@ -4718,4 +4726,15 @@ fn apply_discovered_pod_groups_canonicalizes_and_validates() {
     let mut invalid = pod_groups_descriptor_fixture();
     assert!(apply_discovered_pod_groups(&mut invalid, vec![0, 27]).is_err());
     assert_eq!(invalid.pod_supplemental_groups, None);
+
+#[test]
+fn deploy_config_load_reports_invalid_file_instead_of_missing() {
+    let invalid = AppConfig::parse("[app]\nname = \"demo\"\nport = 1\n\n[extra]\nkey = 1\n");
+    let err = load_deploy_app_config(invalid).unwrap_err().to_string();
+    assert!(err.contains("'extra'"), "{err}");
+    assert!(!err.contains("no enclava.toml found"), "{err}");
+
+    let missing = AppConfig::load(std::path::Path::new("/nonexistent-dir/enclava.toml"));
+    let err = load_deploy_app_config(missing).unwrap_err().to_string();
+    assert!(err.contains("no enclava.toml found"), "{err}");
 }
