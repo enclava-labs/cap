@@ -1323,6 +1323,49 @@ mod tests {
     }
 
     #[test]
+    fn api_error_message_carries_missing_pod_group_remediation() {
+        // Contract v1 (policy-templates#23): both typed guest-pull codes
+        // render the missing groups the API sent for remediation.
+        for code in [
+            "genpolicy_guest_pull_groups_required",
+            "pod_supplemental_groups_insufficient",
+        ] {
+            let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
+                "error": code,
+                "missing_pod_supplemental_groups": [0, 6, 27]
+            }))
+            .expect("typed guest-pull body decodes");
+            let ComposedApiError {
+                code: parsed,
+                message,
+                ..
+            } = compose_api_error(400, body);
+            assert_eq!(parsed.as_deref(), Some(code));
+            assert!(message.starts_with(code), "{message}");
+            assert!(
+                message.contains("missing pod supplemental groups: 0, 6, 27"),
+                "the remediation names the groups: {message}"
+            );
+        }
+        // Negatives: the bare code without the field, and an unrelated
+        // code carrying the field — no remediation text either way.
+        let bare: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "genpolicy_guest_pull_groups_required"
+        }))
+        .expect("bare body decodes");
+        let ComposedApiError { message, .. } = compose_api_error(400, bare);
+        assert_eq!(message, "genpolicy_guest_pull_groups_required");
+
+        let unrelated: ApiErrorBody = serde_json::from_value(serde_json::json!({
+            "error": "app_delete_teardown_unavailable",
+            "missing_pod_supplemental_groups": [27]
+        }))
+        .expect("unrelated body decodes");
+        let ComposedApiError { message, .. } = compose_api_error(502, unrelated);
+        assert_eq!(message, "app_delete_teardown_unavailable");
+    }
+
+    #[test]
     fn api_error_message_prefixes_distinct_message_text() {
         let body: ApiErrorBody = serde_json::from_value(serde_json::json!({
             "code": "app_delete_teardown_unavailable",

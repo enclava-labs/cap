@@ -346,6 +346,34 @@ the gate in the same step that first ships the bind-capable init:
 
 Until phase 3, claim-bearing artifacts are rejected for re-signing.
 
+### Enabling pod supplemental groups (policy-templates#23, contract v1)
+
+`pod_supplemental_groups` is gated by the API deployment, not the signed
+release (the same two-phase pattern as `log_spool_storage` above), and
+enablement is init-first — never flip the gate in the same step that
+first ships the field-tolerant init:
+
+1. Deploy the signing service with the discovery R1 (the
+   `supports_pod_supplemental_groups` / `pod_supplemental_groups` wire
+   contract), then deploy enclava-api with the init image from the same
+   cap tag (its `parse_descriptor` tolerates the field) and
+   `ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED` **unset**. The relay
+   never asks the service for discovery, admission rejects
+   group-bearing descriptors, and every signer stays on the legacy
+   single-call flow.
+2. Verify the field-tolerant init digest is the one actually running in
+   a live workload's manifest/pod (`imageID`), per the init-first rule
+   above.
+3. Only then set `ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED=1` on
+   enclava-api and restart it. From that point the API reports the
+   capability in deployment-context, signers discover and declare the
+   groups, and the engine renders them into the pod-level
+   `securityContext.supplementalGroups` of every new deployment.
+
+Until phase 3, the API fails group-bearing descriptors closed at both
+admission entrances (the agent-policy preflight and the apply path), so
+a descriptor can never reach a pre-change init that would reject it.
+
 ### Rotating the production root
 
 The committed profile bundle uses a well-known public fixture root. Publishing

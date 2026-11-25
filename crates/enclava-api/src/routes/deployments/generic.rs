@@ -241,7 +241,8 @@ pub async fn generate_agent_policy(
     {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
-            "pod_supplemental_groups requires an init image that tolerates the field:              this API deployment has not enabled pod supplemental groups",
+            "pod_supplemental_groups requires an init image that tolerates the field, \
+             which this API deployment has not enabled",
         ));
     }
     let expected_identity_hash = hex::decode(&app.tenant_instance_identity_hash).map_err(|_| {
