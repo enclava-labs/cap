@@ -3993,7 +3993,7 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
             ));
             let outcome = outcome_after_lost_destroy_response(
                 || async { api.get_app(&app_name).await.map(|_| ()) },
-                DESTROY_LOST_RESPONSE_CHECKS,
+                DESTROY_LOST_RESPONSE_WINDOW,
                 DESTROY_LOST_RESPONSE_INTERVAL,
                 DESTROY_LOST_RESPONSE_CHECK_TIMEOUT,
             )
@@ -4088,19 +4088,19 @@ fn forget_destroyed_app_template_deploy(
 fn lost_destroy_hint(outcome: &LostDestroyOutcome, app_name: &str) -> String {
     match outcome {
         LostDestroyOutcome::StillPresent => format!(
-            "the connection dropped before the server answered, and '{app_name}' still existed after 5 minutes of checking. The teardown may still be running: check `enclava status`, and run `enclava destroy` again if the app is still there."
+            "the connection dropped before the server answered, and '{app_name}' still existed after 5 minutes of checking. The teardown may still be running: check `enclava status --app {app_name}`, and run `enclava destroy --app {app_name}` again if the app is still there."
         ),
         _ => format!(
-            "the connection dropped before the server answered, and the CLI could not confirm whether '{app_name}' still exists. Check `enclava status`; if the app is still there, run `enclava destroy` again."
+            "the connection dropped before the server answered, and the CLI could not confirm whether '{app_name}' still exists. Check `enclava status --app {app_name}`; if the app is still there, run `enclava destroy --app {app_name}` again."
         ),
     }
 }
 
 /// How long destroy keeps asking whether the app is gone after the delete
-/// response was lost: 60 checks 5 seconds apart, the 5 minutes the hosted
-/// route allows a delete to run. Each check is cut off after 15 seconds so a
-/// dead network cannot stretch the wait.
-const DESTROY_LOST_RESPONSE_CHECKS: u32 = 60;
+/// response was lost: a check every 5 seconds for 5 minutes in total, the time
+/// the hosted route allows a delete to run. Each check is cut off after 15
+/// seconds, and the 5 minutes include the time the checks themselves take.
+const DESTROY_LOST_RESPONSE_WINDOW: Duration = Duration::from_secs(300);
 const DESTROY_LOST_RESPONSE_INTERVAL: Duration = Duration::from_secs(5);
 const DESTROY_LOST_RESPONSE_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -4109,9 +4109,9 @@ const DESTROY_LOST_RESPONSE_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 enum LostDestroyOutcome {
     /// The server answered "no such app" (404).
     Gone,
-    /// The last answer the server gave still showed the app.
+    /// The final check got an answer, and it still showed the app.
     StillPresent,
-    /// No check produced an answer, or the credential cannot read the app.
+    /// The final check produced no answer, or the credential cannot read the app.
     Unverified,
 }
 
@@ -4121,7 +4121,7 @@ enum LostDestroyOutcome {
 /// once, since repeating it cannot answer the question.
 async fn outcome_after_lost_destroy_response<F, Fut>(
     mut lookup: F,
-    checks: u32,
+    window: Duration,
     interval: Duration,
     check_timeout: Duration,
 ) -> LostDestroyOutcome
@@ -4129,23 +4129,25 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(), ApiError>>,
 {
-    let mut outcome = LostDestroyOutcome::Unverified;
-    for check in 0..checks {
-        if check > 0 {
-            tokio::time::sleep(interval).await;
-        }
-        match tokio::time::timeout(check_timeout, lookup()).await {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut outcome;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(check_timeout.min(remaining), lookup()).await {
             Ok(Ok(())) => outcome = LostDestroyOutcome::StillPresent,
             Ok(Err(ApiError::Api { status: 404, .. })) => return LostDestroyOutcome::Gone,
             Ok(Err(ApiError::NotAuthenticated))
             | Ok(Err(ApiError::Api {
                 status: 401 | 403, ..
             })) => return LostDestroyOutcome::Unverified,
-            // A failed or timed-out check says nothing new about the app.
-            Ok(Err(_)) | Err(_) => {}
+            // A failed or timed-out check says nothing about the app now.
+            Ok(Err(_)) | Err(_) => outcome = LostDestroyOutcome::Unverified,
         }
+        if tokio::time::Instant::now() + interval >= deadline {
+            return outcome;
+        }
+        tokio::time::sleep(interval).await;
     }
-    outcome
 }
 
 /// Operator guidance for a failed destroy, keyed on the stable API code (or
