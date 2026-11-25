@@ -4726,6 +4726,7 @@ fn apply_discovered_pod_groups_canonicalizes_and_validates() {
     let mut invalid = pod_groups_descriptor_fixture();
     assert!(apply_discovered_pod_groups(&mut invalid, vec![0, 27]).is_err());
     assert_eq!(invalid.pod_supplemental_groups, None);
+}
 
 #[test]
 fn deploy_config_load_reports_invalid_file_instead_of_missing() {

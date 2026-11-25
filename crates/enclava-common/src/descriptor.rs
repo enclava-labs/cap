@@ -303,6 +303,16 @@ pub fn validate_pod_supplemental_groups(groups: Option<&Vec<i64>>) -> Result<(),
             "pod_supplemental_groups must contain the platform baseline 0 and 6".to_string(),
         );
     }
+    // Reserved gids the platform itself assigns: 10001 is the workload
+    // owner (runAsUser/runAsGroup/fsGroup), 10002 the SSH-relay profile,
+    // 65535 the nobody-legacy range. A declared pod-level list carrying
+    // one of these would grant EVERY container in the pod that identity,
+    // so admission rejects them by name.
+    if let Some(reserved) = groups.iter().find(|g| matches!(*g, 10001 | 10002 | 65535)) {
+        return Err(format!(
+            "pod_supplemental_groups must not contain the reserved gid {reserved}              (10001 workload owner, 10002 ssh-relay, 65535 nobody-legacy)"
+        ));
+    }
     Ok(())
 }
 
@@ -646,6 +656,15 @@ mod tests {
         many.extend(std::iter::repeat_n(27, 31));
         assert_eq!(many.len(), 33);
         assert!(validate_pod_supplemental_groups(Some(&many)).is_err());
+        // Reserved gids: each rejected by name.
+        for reserved in [10001, 10002, 65535] {
+            let err = validate_pod_supplemental_groups(Some(&vec![0, 6, reserved]))
+                .expect_err("reserved gids must be rejected");
+            assert!(
+                err.contains(&format!("reserved gid {reserved}")),
+                "the error names the reserved gid: {err}"
+            );
+        }
         // Out of range.
         assert!(validate_pod_supplemental_groups(Some(&vec![0, 6, -1])).is_err());
         assert!(validate_pod_supplemental_groups(Some(&vec![0, 6, 2147483647])).is_err());
