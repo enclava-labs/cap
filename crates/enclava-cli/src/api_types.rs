@@ -1251,6 +1251,11 @@ pub struct ApiErrorBody {
     /// values; anything else is ignored by the client.
     #[serde(default)]
     pub idempotency_disposition: Option<String>,
+    /// Largest application CPU limit the server accepts, sent with
+    /// `unsupported_cpu_shape` (e.g. `1500m`). Absent when a hosted
+    /// sanitizer dropped it.
+    #[serde(default)]
+    pub max_cpu: Option<String>,
 }
 
 #[cfg(test)]
