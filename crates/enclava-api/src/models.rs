@@ -200,3 +200,46 @@ pub struct ConfigMetadata {
     pub updated_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// cap#402: the CLI classifies template-deployment rows by status, so a
+    /// new CAP deploy status must reach the pinned vocabulary fixture and the
+    /// CLI classifier sets together. This test pins the enum against the
+    /// fixture; `deployment_status_vocabulary_stays_classified` in enclava-cli
+    /// pins the fixture against the classifier.
+    #[test]
+    fn deploy_status_vocabulary_is_pinned_against_the_cli_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../enclava-cli/tests/fixtures/template_deployment_status_vocabulary.json"
+        ))
+        .expect("the pinned status vocabulary fixture parses");
+        let statuses = fixture["statuses"]
+            .as_array()
+            .expect("the fixture lists statuses");
+        for (variant, class) in [
+            (DeployStatus::Pending, "in_flight"),
+            (DeployStatus::Applying, "in_flight"),
+            (DeployStatus::Watching, "in_flight"),
+            (DeployStatus::Healthy, "terminal"),
+            (DeployStatus::Failed, "terminal"),
+            (DeployStatus::RolledBack, "terminal"),
+        ] {
+            let name = serde_json::to_value(variant).expect("status serializes");
+            let name = name.as_str().expect("status serializes to a string");
+            let entry = statuses
+                .iter()
+                .find(|entry| entry["status"].as_str() == Some(name))
+                .unwrap_or_else(|| {
+                    panic!("deploy status `{name}` is not pinned in the vocabulary fixture")
+                });
+            assert_eq!(
+                entry["class"].as_str(),
+                Some(class),
+                "deploy status `{name}` classification drifted"
+            );
+        }
+    }
+}

@@ -73,38 +73,57 @@ When no header is found, `blank=true` would authorize `luksFormat`, so the
 device must be proven all-zero before the first format: the entire device is
 read in 1 MiB chunks (a short or failed read never counts as blank).
 The scan is O(device size). Progress is logged every 30 s with scanned/total
-bytes and a completion duration. Initialization time depends on actual guest
-and Longhorn throughput; do not infer it from the raw volume's zero contents.
-this fresh-format floor for unproven claims. Existing ordinal-zero claims are
-grandfathered per volume only with positive LIVE initialization evidence: the
-exact ordinal-0 pod non-terminating, Ready, mounting the exact claim, and
-created in a later whole second than it — the workload observably running on
-the initialized device. Deployment history is deliberately not consulted:
-database and Kubernetes clocks cannot order a row against a claim, and a
-password-timeout redeploy can publish healthy without opening storage, so no
-historical status is proof. The availability cost is deliberate: a genuinely
-initialized legacy sub-floor volume with no live proof is refused until the
-workload regains readiness (or the volume is resized above the floor), never
-formatted. Missing or terminating claims, wrong ordinals, same-second pairs,
-and bare PVC existence cannot grant the exemption. External Kubernetes-admin
-claim deletions are outside CAP's mutation-fence serialization and read as
-fresh — the in-guest blank-scan still refuses to format a non-zero device, and
-CAP does not offer atomic cross-resource guarantees. Existing LUKS2 volumes
-are opened without reformatting; orchestration evidence never authorizes
-formatting.
+bytes and a completion duration. Initialization time depends on the guest and
+the selected storage backend (currently Longhorn on qualified guests). Do not
+infer it from the raw volume's zero contents, and do not treat the rollout
+budget below as a universal throughput SLA.
 
-The rollout budget adds two sequential passes to the configured base
-timeout only for claims that lack positive initialization evidence —
-already-initialized volumes only open, so ordinary redeploys and
-domain-only reapplies keep the base deadline. The allowance assumes at
-least 32 MiB/s per pass for scanning and integrity-tag initialization.
-This is a bounded estimate, not a throughput guarantee: qualify the
-intended storage sizes and lower that assumption if measurements are
-slower. The API computes the budget once, before the first provider
-apply, and persists it next to the observation anchor; durable observers
-resume that recorded deadline verbatim across restarts and release worker
-slots after each 90-second observation slice. Password owner wait remains
-separately nonterminal.
+Devices below 32 MiB are refused before scanning. The API and engine enforce
+this fresh-format floor for unproven claims. The admission signal the
+security review called `expects_fresh_volume` is a `true` bit of
+`FreshVolumeClaims` (`app_data` for the `state` claim, `tls_data` for
+`tls-state`), produced by `inspect_fresh_volume_claims`. It is set for a new
+(absent) claim, an unproven claim (present, including Bound, but without
+live proof), a terminating claim, a claim with no creation timestamp, and a
+same-second pod/claim pair. A replacement claim is fresh only until that
+same live proof exists for it; recreation does not keep the bit set forever.
+State and TLS are independent, so a mixed render can mark only one claim
+fresh. Positive live evidence clears the bit: the exact surviving
+ordinal-zero PVC `<vct>-<workload>-0` with a creation timestamp, and the
+live ordinal-zero pod non-terminating and Ready, mounting that exact claim,
+created in a later whole second than the claim — the workload observably
+running on the initialized device.
+Deployment history is deliberately not consulted: database and Kubernetes
+clocks cannot order a row against a claim, and a password-timeout redeploy
+can publish healthy without opening storage, so no historical status is
+proof. The availability cost is deliberate: a genuinely initialized legacy
+sub-floor volume with no live proof is refused until the workload regains
+readiness (or the volume is resized above the floor), never formatted.
+Wrong ordinals and bare PVC existence cannot grant the exemption. External
+Kubernetes-admin claim deletions are outside CAP's mutation-fence
+serialization and read as fresh — the in-guest blank-scan still refuses to
+format a non-zero device, and CAP does not offer atomic cross-resource
+guarantees. Existing LUKS2 volumes are opened without reformatting;
+orchestration evidence never authorizes formatting. This signal is not the
+signed volume-provenance claim proposed in cap#249, which would let the
+guest skip the zero scan. The scan remains authoritative for destructive
+formatting; the signal only controls the size floor and the rollout budget.
+
+The default rollout baseline is 600s (`ApplyConfig::rollout_timeout`). A
+fresh claim adds a capacity-derived allowance on top of that baseline: two
+sequential passes at 32 MiB/s. Selected claims are converted to MiB (each
+rounded up) and summed, then rounded up once (`ceil(total_fresh_MiB / 16)`
+seconds) — not a per-claim ceil. An already-initialized redeploy,
+including a domain-only reapply, keeps the ordinary 600s budget and
+does not inherit the allowance. The 32 MiB/s figure
+is a qualified estimate for the selected backend, not a universal SLA: lower
+the assumption if measurements on that backend are slower. The API computes
+the budget once, before the first provider apply, and persists it as
+`deployments.rollout_timeout_millis` next to `observing_since`. Observer
+restarts reuse that recorded generation deadline verbatim — they do not
+recompute it from later pod or volume state — and release worker slots after
+each 90-second observation slice. Password owner wait remains separately
+nonterminal.
 
 ### Numeric volume profiling
 

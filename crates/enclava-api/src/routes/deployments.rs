@@ -73,6 +73,67 @@ fn resource_limit_error_response(
     }
 }
 
+/// Reject a CPU limit that would boot a confidential VM with an unapproved
+/// SNP launch measurement (cap#392).
+///
+/// Kata sizes the guest from the pod's CPU limits, and the platform approves
+/// the launch measurement of exactly one vCPU count. Outside it the workload
+/// still attests, but the KBS resource policy denies every key release with a
+/// bare `PolicyDeny`, so the deploy wedges at the first owner-seed fetch with
+/// no named cause. Refuse the shape at admission instead.
+pub(crate) fn validate_vm_cpu_shape(
+    resources: &AppResources,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    // Startup already refused an invalid runtime class; treat a late failure
+    // as the measured default rather than skipping the check.
+    let default_runtime_class = enclava_engine::manifest::cc_init_data::try_runtime_class()
+        .unwrap_or_else(|_| {
+            enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS.to_string()
+        });
+    vm_cpu_shape_for_default_class(
+        resources,
+        &default_runtime_class,
+        enclava_engine::manifest::containers::legacy_bootstrap_enabled(),
+    )
+    .map_err(vm_cpu_shape_error_response)
+}
+
+/// Check the CPU shape against the RuntimeClass the pod will actually bind,
+/// not the deployment default: a small-memory app always binds the measured
+/// small SNP class, even on a deployment whose default is the unmeasured
+/// simulated class, so it must not inherit that class's exemption.
+fn vm_cpu_shape_for_default_class(
+    resources: &AppResources,
+    default_runtime_class: &str,
+    legacy_bootstrap: bool,
+) -> Result<(), enclava_engine::manifest::shape::UnapprovedVmCpuShape> {
+    let bound_runtime_class = enclava_engine::manifest::shape::runtime_class_for(
+        &resources.memory_limit,
+        default_runtime_class,
+    );
+    enclava_engine::manifest::shape::check_vm_cpu_shape(
+        &resources.cpu_limit,
+        &bound_runtime_class,
+        legacy_bootstrap,
+    )
+}
+
+fn vm_cpu_shape_error_response(
+    error: enclava_engine::manifest::shape::UnapprovedVmCpuShape,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "unsupported_cpu_shape",
+            "message": error.to_string(),
+            "cpu": error.cpu_limit,
+            "vm_vcpus": error.vm_vcpus,
+            "approved_vm_vcpus": error.approved_vm_vcpus,
+            "max_cpu": format!("{}m", error.max_cpu_inclusive_millis),
+        })),
+    )
+}
+
 pub(crate) async fn enforce_authoritative_entitlement(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: Uuid,
@@ -102,6 +163,7 @@ pub(crate) async fn enforce_authoritative_entitlement(
     })?;
     crate::entitlements::validate_resource_limits(resources, limits)
         .map_err(resource_limit_error_response)?;
+    validate_vm_cpu_shape(resources)?;
     // The 32 MiB LUKS2 fresh-format floor (shared with enclava-init's
     // MIN_VOLUME_BYTES), enforced per claim: only sizes that would
     // provision a NEW PVC are checked. Surviving sub-floor claims are
@@ -210,6 +272,31 @@ fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_js
     (status, Json(serde_json::json!({"error": code})))
 }
 
+/// Parse the signing service's typed guest-pull group error body
+/// (contract v1, policy-templates#23): "<code>: missing pod supplemental
+/// groups [a, b]". Returns the code and the missing groups.
+pub(crate) fn parse_guest_pull_groups_error_body(body: &str) -> Option<(&'static str, Vec<i64>)> {
+    let code = if body.starts_with("genpolicy_guest_pull_groups_required") {
+        "genpolicy_guest_pull_groups_required"
+    } else if body.starts_with("pod_supplemental_groups_insufficient") {
+        "pod_supplemental_groups_insufficient"
+    } else {
+        return None;
+    };
+    let open = body.rfind('[')?;
+    let close = body[open..].find(']')? + open;
+    let groups = body[open + 1..close]
+        .split(',')
+        .map(|entry| entry.trim())
+        .map(str::parse::<i64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if groups.is_empty() {
+        return None;
+    }
+    Some((code, groups))
+}
+
 pub(crate) fn signing_error_response(
     error: crate::signing_service::SigningServiceError,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -227,9 +314,27 @@ pub(crate) fn signing_error_response(
         SigningServiceError::InvalidSignature => {
             (StatusCode::BAD_REQUEST, "signed_artifact_signature_invalid")
         }
-        SigningServiceError::Upstream { .. } | SigningServiceError::Http(_) => {
+        SigningServiceError::Upstream { status, body } => {
+            // Contract v1 (policy-templates#23): the signing service's
+            // typed guest-pull group failures arrive as 4xx plain-text
+            // bodies ("genpolicy_guest_pull_groups_required: missing pod
+            // supplemental groups [27]" or the insufficient-declared
+            // variant). Map them to a structured 4xx carrying the missing
+            // groups so the CLI can surface the remediation instead of a
+            // blanket signing_service_unavailable.
+            if let Some((code, groups)) = parse_guest_pull_groups_error_body(body) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": code,
+                        "missing_pod_supplemental_groups": groups,
+                    })),
+                );
+            }
+            let _ = status;
             (StatusCode::BAD_GATEWAY, "signing_service_unavailable")
         }
+        SigningServiceError::Http(_) => (StatusCode::BAD_GATEWAY, "signing_service_unavailable"),
         SigningServiceError::InvalidUrl(_) | SigningServiceError::InvalidTimeout(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "signing_service_configuration_invalid",
@@ -239,6 +344,23 @@ pub(crate) fn signing_error_response(
             (StatusCode::INTERNAL_SERVER_ERROR, "signed_artifact_invalid")
         }
     };
+
+    // On the idempotent routes a 5xx here is masked by the idempotency
+    // layer into 409 idempotency_recovery_required with nothing else on
+    // the wire — the plain-deploy 409 outage on dev (2026-11-25) spent
+    // hours on exactly that blind spot. (Non-idempotent callers, e.g.
+    // the hosted policy preflight, surface the 5xx directly.) Log the
+    // code plus the error's Display (for Upstream it carries the
+    // service's status and refusal body) so the real cause is reachable
+    // from the api log. The typed guest-pull 4xx above is NOT masked and
+    // stays unlogged.
+    if status.is_server_error() {
+        tracing::warn!(
+            code = code,
+            error = %error,
+            "signed-policy resolution failed with a server error; idempotent routes mask this as 409 idempotency_recovery_required"
+        );
+    }
 
     (status, Json(serde_json::json!({"error": code})))
 }
@@ -294,10 +416,15 @@ pub(crate) async fn resolve_signed_policy_artifact(
         })),
     ))?;
 
+    // The hosted preflight carries no CLI capability signal (the CLI
+    // broker route is the discovery entrypoint), so it requests the
+    // legacy generation: a guest-pull group failure surfaces the typed
+    // structured error through signing_error_response.
     let generated = signing_service
         .agent_policy(&crate::signing_service::AgentPolicyRequest {
             descriptor: artifacts.descriptor.clone(),
             log_encryption: log_encryption.clone(),
+            supports_pod_supplemental_groups: false,
         })
         .await
         .map_err(signing_error_response)?;
@@ -311,18 +438,29 @@ pub(crate) async fn resolve_signed_policy_artifact(
                         crate::signing_service::SigningServiceError::ArtifactWithoutBlobs,
                     )
                 })?;
-        if artifacts
-            .validate_signed_artifact(&artifact, policy_authority_pubkey_hex)
-            .is_ok()
-        {
-            artifacts
-                .validate_canonical_agent_policy(&artifact, &generated)
-                .map_err(signing_error_response)?;
-            artifacts
-                .attach_customer_authority(&mut artifact)
-                .map_err(signing_error_response)?;
-            validate_proof_bundle_budget(artifacts, &artifact).map_err(signing_error_response)?;
-            return Ok(artifact);
+        match artifacts.validate_signed_artifact(&artifact, policy_authority_pubkey_hex) {
+            Ok(()) => {
+                artifacts
+                    .validate_canonical_agent_policy(&artifact, &generated)
+                    .map_err(signing_error_response)?;
+                artifacts
+                    .attach_customer_authority(&mut artifact)
+                    .map_err(signing_error_response)?;
+                validate_proof_bundle_budget(artifacts, &artifact)
+                    .map_err(signing_error_response)?;
+                return Ok(artifact);
+            }
+            // The artifact did not verify (customer-key-signed CLI
+            // artifacts never verify against the platform key); the
+            // platform /sign call below re-runs. This used to be silent
+            // — the plain-deploy 409 outage on dev (2026-11-25) needed
+            // this fork visible to diagnose.
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "provided signed_policy_artifact did not verify; falling back to the platform signing service"
+                );
+            }
         }
     }
 
@@ -370,6 +508,10 @@ fn classify_signer_identity(subject: &str, issuer: &str) -> crate::cosign::Verif
 #[cfg(test)]
 #[path = "deployments/tests/classifier.rs"]
 mod classifier_tests;
+
+#[cfg(test)]
+#[path = "deployments/tests/signing_errors.rs"]
+mod signing_error_logging_tests;
 
 fn validate_workload_security_profile(
     value: Option<&str>,
@@ -490,6 +632,11 @@ pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,
     #[serde(default)]
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): the caller understands the
+    /// pod_supplemental_groups response field and will merge + re-call.
+    /// Absent on older CLIs (serde default false).
+    #[serde(default)]
+    pub supports_pod_supplemental_groups: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -499,6 +646,11 @@ pub struct AgentPolicyResponse {
     pub genpolicy_version_pin: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): the effective pod-level
+    /// supplemental groups when the signing service ran the guest-pull
+    /// discovery. The CLI merges this into the descriptor and re-calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 fn validate_log_encryption_config(
@@ -1287,6 +1439,7 @@ async fn deploy_app_candidate(
     })?;
     crate::entitlements::validate_resource_limits(&candidate_resources, early_limits)
         .map_err(resource_limit_error_response)?;
+    validate_vm_cpu_shape(&candidate_resources)?;
     let candidate_container = if let Some(container) = candidate_containers
         .iter_mut()
         .find(|row| row.name == container_name)
@@ -1875,6 +2028,22 @@ async fn deploy_app_candidate(
                 ));
             }
         };
+    crate::deploy::recover_unpublished_workload_spec(
+        &state.db,
+        &state.kube_client,
+        app.id,
+        &app.namespace,
+        &app.name,
+        crate::deploy::PublicationRecoveryMode::BeforeSupersession,
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(app_id = %app.id, error = %error, "refusing supersession until workload publication can be classified");
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "live workload publication could not be verified; retry the deployment",
+        )
+    })?;
     crate::deploy::supersede_incomplete_deployments(&mut tx, app.id)
         .await
         .map_err(|error| match error {
@@ -2535,6 +2704,75 @@ mod tests {
             validate_log_encryption_config(Some(config)).expect_err("algorithm rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "unsupported log_encryption.algorithm");
+    }
+
+    #[test]
+    fn vm_cpu_shape_exemption_follows_the_bound_runtime_class() {
+        let resources = |cpu: &str, memory: &str| crate::models::AppResources {
+            app_id: Uuid::nil(),
+            cpu_limit: cpu.to_string(),
+            memory_limit: memory.to_string(),
+            app_data_size: "5Gi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        };
+        let dev = enclava_engine::manifest::cc_init_data::COCO_DEV_RUNTIME_CLASS;
+        let snp = enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS;
+
+        // On a simulated-CoCo deployment a standard-memory app binds the
+        // unmeasured dev class, so any CPU limit is fine.
+        super::vm_cpu_shape_for_default_class(&resources("2", "1Gi"), dev, false)
+            .expect("the simulated dev class has no launch measurement");
+
+        // A small-memory app binds kata-qemu-snp-small regardless of the
+        // deployment default, so it is measured and must be checked.
+        let rejected = super::vm_cpu_shape_for_default_class(&resources("2", "128Mi"), dev, false)
+            .expect_err("a small-shape app binds the measured small SNP class");
+        assert_eq!(rejected.vm_vcpus, Some(5));
+        super::vm_cpu_shape_for_default_class(&resources("1", "128Mi"), dev, false)
+            .expect("the approved vCPU count passes under the small class");
+
+        // The measured default is checked for both shapes.
+        for memory in ["1Gi", "128Mi"] {
+            super::vm_cpu_shape_for_default_class(&resources("2", memory), snp, false)
+                .expect_err("SNP classes are always checked");
+        }
+    }
+
+    #[test]
+    fn unapproved_vm_cpu_shape_is_a_named_rejection() {
+        let resources = |cpu: &str| crate::models::AppResources {
+            app_id: Uuid::nil(),
+            cpu_limit: cpu.to_string(),
+            memory_limit: "512Mi".to_string(),
+            app_data_size: "5Gi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        };
+
+        // The default band boots the approved vCPU count on the runtime
+        // baseline; lower limits are padded up to it (cap#392: hello-tee
+        // ships cpu = "0.5").
+        for cpu in ["1", "1.5", "0.5", "250m", "50m"] {
+            super::validate_vm_cpu_shape(&resources(cpu))
+                .unwrap_or_else(|_| panic!("cpu {cpu} boots the approved vCPU count"));
+        }
+
+        // A limit that needs more vCPUs than the approved measurement covers
+        // would attest and then be denied its keys; refuse it by name before
+        // anything is signed or applied.
+        let (status, Json(body)) = super::validate_vm_cpu_shape(&resources("2"))
+            .expect_err("a high cpu limit boots an unapproved vCPU count");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "unsupported_cpu_shape");
+        assert_eq!(body["cpu"], "2");
+        assert_eq!(body["vm_vcpus"], 5);
+        assert_eq!(body["approved_vm_vcpus"], 4);
+        assert_eq!(body["max_cpu"], "1500m");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("at most 1500m")),
+            "{body}"
+        );
     }
 
     #[tokio::test]
@@ -3742,5 +3980,85 @@ mod tests {
             .await
             .expect("drop audit failure function");
         delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    /// Contract v1 (policy-templates#23): the signing service's typed
+    /// guest-pull group errors map to a structured 4xx carrying the
+    /// missing groups — never a blanket 502 signing_service_unavailable.
+    #[test]
+    fn guest_pull_group_errors_map_to_structured_4xx() {
+        use crate::signing_service::SigningServiceError;
+
+        let cases = [
+            (
+                "genpolicy_guest_pull_groups_required: missing pod supplemental groups [27]",
+                "genpolicy_guest_pull_groups_required",
+                vec![27],
+            ),
+            (
+                "pod_supplemental_groups_insufficient: missing pod supplemental groups [55, 27]",
+                "pod_supplemental_groups_insufficient",
+                vec![55, 27],
+            ),
+        ];
+        for (body, code, groups) in cases {
+            let (status, Json(value)) = signing_error_response(SigningServiceError::Upstream {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                body: body.to_string(),
+            });
+            assert_eq!(status, StatusCode::BAD_REQUEST, "4xx, not 502: {body}");
+            assert_eq!(value["error"], code);
+            assert_eq!(
+                value["missing_pod_supplemental_groups"],
+                serde_json::json!(groups)
+            );
+        }
+        // Unrelated upstream bodies keep today's mapping.
+        let (status, Json(value)) = signing_error_response(SigningServiceError::Upstream {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "internal signing service error".to_string(),
+        });
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(value["error"], "signing_service_unavailable");
+    }
+
+    /// The typed-body parser: exact codes, bracketed integer lists, and
+    /// everything else parses to None (fail-closed to the legacy mapping).
+    #[test]
+    fn guest_pull_groups_error_body_parser_is_strict() {
+        assert_eq!(
+            parse_guest_pull_groups_error_body(
+                "genpolicy_guest_pull_groups_required: missing pod supplemental groups [27]"
+            ),
+            Some(("genpolicy_guest_pull_groups_required", vec![27]))
+        );
+        assert_eq!(
+            parse_guest_pull_groups_error_body(
+                "pod_supplemental_groups_insufficient: missing pod supplemental groups [0, 6, 55]"
+            ),
+            Some(("pod_supplemental_groups_insufficient", vec![0, 6, 55]))
+        );
+        // Not a typed body.
+        assert_eq!(
+            parse_guest_pull_groups_error_body("genpolicy failed with status 1"),
+            None
+        );
+        assert_eq!(
+            parse_guest_pull_groups_error_body("something genpolicy_guest_pull_groups_required"),
+            None
+        );
+        // Malformed group lists parse to None (no silent empty mapping).
+        assert_eq!(
+            parse_guest_pull_groups_error_body(
+                "genpolicy_guest_pull_groups_required: missing pod supplemental groups []"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_guest_pull_groups_error_body(
+                "genpolicy_guest_pull_groups_required: missing pod supplemental groups [abc]"
+            ),
+            None
+        );
     }
 }

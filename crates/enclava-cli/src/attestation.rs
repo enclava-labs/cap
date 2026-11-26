@@ -502,6 +502,7 @@ mod tests {
 
     fn fixed_descriptor() -> DeploymentDescriptor {
         DeploymentDescriptor {
+        pod_supplemental_groups: None,
             schema_version: "v1".to_string(),
             org_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
             org_slug: "abcd1234".to_string(),

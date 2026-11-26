@@ -14,6 +14,10 @@ Enclava CAP is the open-source control plane core for running OCI images as conf
 | `crates/enclava-wait-exec` | Small wrapper that blocks app and ingress processes until `enclava-init` is ready |
 | `crates/enclava-common` | Shared descriptor, image-reference, validation, encoding, and crypto helpers |
 | `crates/enclava-snp` | SNP-attested TLS channel to a TEE (evidence, AMD KDS, collateral policy), shared with the hosted PaaS |
+| `crates/enclava-verifier` | Deterministic, I/O-free verification of proof bundles against a trust policy |
+| `crates/enclava-verifier-wasm` and `web/verifier` | WebAssembly build of the verifier and the static page that runs it locally |
+| `crates/enclava-appraiser` | Stateless appraiser service exposing the same verifier over HTTP |
+| `fuzz` | `cargo-fuzz` targets for the verifier's parsers |
 | `deploy/api` | Minimal Kubernetes overlay for the CAP API service |
 | `scripts` and `runbooks` | Release manifest rendering, smoke-test helpers, and operator runbooks |
 
@@ -29,9 +33,18 @@ CAP deploys immutable OCI images by digest and validates the deployment before i
   encrypted app/TLS volumes, and releases runtime state only after verification.
 
 This repository is useful for developing the CAP runtime, API contracts, CLI
-flows, and confidential-workload deployment machinery. A real deployment still
-requires the surrounding platform services described in
-[DEPLOYMENT.md](DEPLOYMENT.md).
+flows, and confidential-workload deployment machinery.
+
+## Running Your Own Installation
+
+The released CLI binaries and container images are built for Enclava's own
+installations: the trust roots and API origins they accept are compiled in.
+Deploying CAP independently means building from a fork with your own trust
+bundle, and providing the surrounding platform (SEV-SNP hosts with Kata, Trustee
+KBS, the policy signing service, and the tenant edge). See
+[docs/self-hosting.md](docs/self-hosting.md) for the prerequisites and the list
+of values a fork replaces, then [DEPLOYMENT.md](DEPLOYMENT.md) for API
+configuration.
 
 ## Install
 
@@ -47,10 +60,21 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/enclava-labs/cap/main/scripts/install.ps1 | iex
 ```
 
+These installers fetch the CLI released by Enclava, which connects to
+Enclava-operated APIs only. For your own installation, build the CLI from your
+fork (see [docs/self-hosting.md](docs/self-hosting.md)).
+
 Installs the latest release to `~/.enclava/bin` (`%USERPROFILE%\.enclava\bin` on
 Windows) and adds it to your PATH. Set `ENCLAVA_VERSION=vX.Y.Z` for a specific
 release, `ENCLAVA_INSTALL_DIR` to change the destination. Other platforms:
 `cargo install --locked --git https://github.com/enclava-labs/cap enclava-cli`.
+
+To upgrade an installed CLI, run `enclava update`: it checks for a newer release
+and, after confirmation, replaces the binary in place with the same checksum and
+cosign checks as the installer (`--check` only reports, `--yes` skips the prompt). To go
+back to an earlier release, rerun the installer with `ENCLAVA_VERSION=vX.Y.Z`,
+plus `ENCLAVA_INSTALL_DIR` if the CLI is not in the default directory
+(`enclava update` prints the path it replaced).
 
 ## CLI Flow
 
@@ -64,6 +88,12 @@ enclava deploy --image <registry>/<image>@sha256:<digest>
 enclava status
 enclava key backup --out enclava-recovery.json
 ```
+
+Every entry in `[storage]` `paths` (default `/data`) must be a directory the
+image already contains: the restricted profile runs a read-only root
+filesystem, so the init's bind stage cannot create it. Template images ship
+`/state/app-data`; deploy those with `enclava template deploy` instead of
+listing them in `paths`.
 
 New apps and deployments are password-only. Auto-unlock creation, enable requests
 and `enclava auto-unlock enable` fail with `auto_unlock_disabled`; the guest never
@@ -87,26 +117,11 @@ and ordinary API requests remain bounded.
 Blank-line keepalives preserve idle streams without printing fake log messages.
 Each encrypted record is size-bounded before decoding.
 
-For an encrypted-state-backed spool, restart recovery removes an incomplete EOF
-from the writer's bounded spool before appending new frames, preserving complete
-retained records. Abrupt guest loss can still lose unflushed newest logs.
-Already malformed, newline-terminated records are not silently discarded;
-preserve diagnostic evidence rather than clearing the spool or its PVC.
-
 Images may be digest-pinned or tagged (`enclava deploy --image
 <registry>/<image>:<tag>`). The CLI resolves tags to a content digest before
 signing; CAP independently resolves the image and checks that the digests agree.
 The signer subject should match the identity that signs the image, such as a
 GitHub Actions keyless cosign subject.
-
-CLI tag resolution uses direct HTTPS requests with TLS verification and no
-redirects or system HTTP proxies. Registry and permitted bearer-auth endpoints
-cannot resolve to loopback, private, link-local, metadata, or CGNAT addresses,
-including IPv4-compatible and IPv4-mapped IPv6 addresses. `CLUSTER_POD_CIDR` and
-`CLUSTER_SERVICE_CIDR` add comma-separated IPv4/IPv6 CIDRs to the blocklist.
-Literal IP destinations are checked against the same ranges. Digest-pinned
-references skip the CLI registry lookup, including when registry access requires
-an HTTP proxy. Bearer-auth failures do not print realm URLs or query credentials.
 
 The CLI also contains hosted-template commands used by Enclava-hosted API mode:
 
@@ -119,31 +134,10 @@ enclava template ssh-command --name shell --wait
 Those commands are convenience flows for hosted templates. They are not required
 for the core manual deploy path.
 
-An interrupted first template deployment can be retried with the same command.
-For CAP's single-replica automatic rollouts, applying changed init data replaces
-only an unready Pod owned by a ledger-recorded StatefulSet and still using the
-old init data. Deletion checks the live StatefulSet generation and the Pod UID
-and resource version, retains PVCs, and uses normal graceful termination.
-The CLI requires the signed deployment's attested launch identity both while
-waiting for bootstrap and on the client that submits the ownership claim.
-
 If a deploy or template rollout fails terminally at startup (for example a
 guest start error), the CLI reports the typed failure and exits promptly
 instead of timing out; run `enclava status --app <name>` for the recorded
 detail.
-
-Apps awaiting required confidential teardown retain their public routes even if
-every deployment has failed or a failed delete restored the app's prior status.
-Routes are removed after teardown completes; deleting a failed app does not
-bypass its storage or ownership checks.
-
-If an app delete errors after its namespace deletion begins, the app's
-namespace mutation fence stays armed instead of risking name reuse. The
-periodic fence reconciler releases it automatically once Kubernetes reports
-the namespace gone — no manual lease edits — while a live or still-Terminating
-namespace keeps it fenced. Other stranded `kubernetes_namespace` fences
-remain an operator path; see
-[runbooks/kubernetes-mutation-fence-recovery.md](runbooks/kubernetes-mutation-fence-recovery.md).
 
 ## Local Development
 
@@ -213,14 +207,17 @@ DATABASE_URL=postgresql://enclava:enclava@localhost:5432/enclava \
 
 ## Deployment
 
-The checked-in `deploy/api` overlay is a minimal starting point for the CAP API.
-Production deployments must provide durable key material, PostgreSQL,
+The checked-in `deploy/api` overlay is the reference Kubernetes deployment of
+the CAP API. It contains values for Enclava's installation and omits secrets,
+most required environment, and tenant-resource RBAC; see
+[deploy/api/README.md](deploy/api/README.md). Production deployments must provide durable key material, PostgreSQL,
 digest-pinned platform images, Trustee/KBS access, policy-signing service
 access, DNS credentials when CAP manages tenant DNS, and tightly scoped
 Kubernetes permissions.
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for the runtime environment and production
-configuration checklist.
+See [docs/self-hosting.md](docs/self-hosting.md) for what an independent
+installation needs, and [DEPLOYMENT.md](DEPLOYMENT.md) for the runtime
+environment and production configuration checklist.
 
 ## Security
 
@@ -237,11 +234,19 @@ Security-relevant behavior is built into both the API and runtime path:
 - `enclava-init` verifies the in-TEE trust chain before releasing app secrets or
   mounted state.
 
-See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the current security snapshot.
+To report a vulnerability, see [SECURITY.md](.github/SECURITY.md).
 
 ## More Documentation
 
-- [DEPLOYMENT.md](DEPLOYMENT.md) - API runtime and production configuration.
+- [docs/self-hosting.md](docs/self-hosting.md) - prerequisites and fork
+  checklist for an independent installation.
+- [DEPLOYMENT.md](DEPLOYMENT.md) - API runtime and production configuration,
+  plus upgrade, recovery, and CLI behavior notes.
+- [deploy/api/README.md](deploy/api/README.md) - what the reference overlay
+  contains and omits.
+- [CONTRIBUTING.md](.github/CONTRIBUTING.md) - how to propose changes.
+- [docs/verification/contracts-v1.md](docs/verification/contracts-v1.md) -
+  proof-bundle and trust-policy contracts for independent verification.
 - [DEV.md](DEV.md) - local development commands and workflow notes.
 - [crates/enclava-init/README.md](crates/enclava-init/README.md) - in-TEE init
   sidecar contract.

@@ -1340,6 +1340,7 @@ async fn stale_owner_and_pre_upgrade_completion_are_fenced_after_reclaim() {
     );
 
     let stale_lease = IdempotencyLease {
+        path: "/internal/test".to_string(),
         pool: pool.clone(),
         key: key.clone(),
         token: stale_token,
@@ -1811,21 +1812,50 @@ async fn config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authori
 
     // Initial completion is also fenced. Even if its route future
     // succeeds, CAP must not hand a bearer across the final 30 seconds.
+    // Sit at the midpoint of that window so sub-second truncation and a
+    // slow completion cannot fall out of the cutoff or cross absolute
+    // expiry. A 1-second placement races the serialized suite (#277).
     let initial_key = format!("safe-return-initial-{suffix}");
     let initial = expect_idempotency_execution(
         begin_test_config_token_receipt(&state, &initial_key, &path, &hash, &binding)
             .await
             .expect("reserve initial safe-return receipt"),
     );
-    sqlx::query(
+    let cutoff_remaining = CONFIG_TOKEN_SAFE_RETURN_SECONDS / 2;
+    let cutoff_age = crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS - cutoff_remaining;
+    let (inside_cutoff, not_expired, remaining_seconds): (bool, bool, i64) = sqlx::query_as(
         "UPDATE cap_internal_idempotency
-                SET created_at = date_trunc('second', clock_timestamp()) - interval '271 seconds'
-              WHERE idempotency_key = $1",
+                SET created_at = date_trunc('second', clock_timestamp())
+                    - ($2::bigint * interval '1 second')
+              WHERE idempotency_key = $1
+             RETURNING
+                date_trunc('second', created_at)
+                    + ($3::bigint * interval '1 second')
+                    <= clock_timestamp() + ($4::bigint * interval '1 second'),
+                date_trunc('second', created_at)
+                    + ($3::bigint * interval '1 second')
+                    > clock_timestamp(),
+                EXTRACT(EPOCH FROM (
+                    date_trunc('second', created_at)
+                        + ($3::bigint * interval '1 second')
+                        - clock_timestamp()
+                ))::bigint",
     )
     .bind(&initial_key)
-    .execute(&pool)
+    .bind(cutoff_age)
+    .bind(crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS)
+    .bind(CONFIG_TOKEN_SAFE_RETURN_SECONDS)
+    .fetch_one(&pool)
     .await
     .expect("move initial receipt inside safe-return cutoff");
+    assert!(
+        inside_cutoff && not_expired,
+        "cutoff fixture must be inside the no-return window and not expired"
+    );
+    assert!(
+        (10..=cutoff_remaining).contains(&remaining_seconds),
+        "cutoff fixture remaining={remaining_seconds}s must keep slack on both boundaries"
+    );
     let initial_error = complete_deterministic_config_token_result_with_timeout(
         initial,
         async {
@@ -1857,6 +1887,10 @@ async fn config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authori
 
     // A paused regeneration that crosses absolute expiry must observe the
     // concurrently committed terminal proof, never return its bearer.
+    // Take the lease while the receipt is still comfortably unexpired, then
+    // force expiry only after the handler is paused. Backdating to TTL-1
+    // before begin leaves a sub-second window a slow serialized run crosses,
+    // and begin returns the terminal replay instead of an execution lease (#277).
     let replay_key = format!("safe-return-replay-{suffix}");
     let first = expect_idempotency_execution(
         begin_test_config_token_receipt(&state, &replay_key, &path, &hash, &binding)
@@ -1871,21 +1905,17 @@ async fn config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authori
     )
     .await
     .expect("complete replay cutoff receipt");
-    sqlx::query(
-        "UPDATE cap_internal_idempotency
-                SET created_at = date_trunc('second', clock_timestamp()) - interval '299 seconds'
-              WHERE idempotency_key = $1",
-    )
-    .bind(&replay_key)
-    .execute(&pool)
-    .await
-    .expect("move replay receipt next to expiry");
     let replay = expect_idempotency_execution(
         begin_test_config_token_receipt(&state, &replay_key, &path, &hash, &binding)
             .await
-            .expect("begin near-expiry regeneration"),
+            .expect("begin regeneration before expiry"),
     );
     let expires_at = replay.config_token_receipt().unwrap().expires_at;
+    let margin = expires_at - database_clock(&pool).await.expect("read DB clock");
+    assert!(
+        margin >= chrono::Duration::seconds(CONFIG_TOKEN_SAFE_RETURN_SECONDS),
+        "regeneration must start with at least the safe-return margin; got {margin:?}"
+    );
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let paused = tokio::spawn(async move {
         complete_deterministic_config_token_result_with_timeout(
@@ -1897,21 +1927,24 @@ async fn config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authori
                     serde_json::json!({"token": "must-not-cross-expiry"}),
                 ))
             },
-            std::time::Duration::from_secs(5),
+            // Hang guard only. The handler is held until expiry is forced
+            // and the terminal proof is committed; this must not race the TTL.
+            std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(1),
         )
         .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            if database_clock(&pool).await.expect("read DB clock") >= expires_at {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
+    sqlx::query(
+        "UPDATE cap_internal_idempotency
+                SET created_at = date_trunc('second', clock_timestamp())
+                    - ($2::bigint * interval '1 second')
+              WHERE idempotency_key = $1",
+    )
+    .bind(&replay_key)
+    .bind(crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS + 1)
+    .execute(&pool)
     .await
-    .expect("receipt reaches DB-authored expiry");
+    .expect("force receipt past absolute expiry while regeneration is paused");
     let terminal = expect_idempotency_replay(
         begin_test_config_token_receipt(&state, &replay_key, &path, &hash, &binding)
             .await
@@ -3412,9 +3445,39 @@ async fn whitelisted_known_not_applied_outcomes_preserve_binding_and_re_execute(
     let messages: Vec<&str> = TRANSIENT_RETRY_CONFLICT_MESSAGES.to_vec();
     assert_eq!(
         messages.len(),
-        7,
+        8,
         "whitelist drift: update this count when editing the constant"
     );
+    // Hand-written literals pinning BOTH directions against the hosted
+    // verification guards (Devin T2): every refusal code the verify path
+    // can return is either transient-whitelisted (re-execute on retry) or
+    // deliberately surfaced as-is (cached and replayed).
+    // - deployment_in_progress (the apply-lane guard, domains.rs
+    //   ensure_no_apply_in_progress): transient — whitelisted above.
+    // - volume_init_unproven (the restart-admission refusal, domains.rs
+    //   verify_challenge): recovery-needed, NOT whitelisted — a same-key
+    //   retry replays the refusal with its code + message instead of
+    //   hiding behind idempotency_request_in_progress.
+    // - acme_delegation_missing (the CNAME gate): a 422, not a conflict —
+    //   cached as the completed refusal and surfaced the same way.
+    assert_eq!(
+        idempotency_error_disposition(
+            StatusCode::CONFLICT,
+            &serde_json::json!({"error": "deployment_in_progress"}),
+        ),
+        IdempotencyErrorDisposition::KnownNotApplied,
+        "the transient apply-lane guard code re-executes on same-key retry"
+    );
+    for surfaced in ["volume_init_unproven", "custom_domain_limit_exceeded"] {
+        assert_eq!(
+            idempotency_error_disposition(
+                StatusCode::CONFLICT,
+                &serde_json::json!({"error": surfaced}),
+            ),
+            IdempotencyErrorDisposition::Completed,
+            "{surfaced} stays cached and surfaced: recovery guidance must reach the caller"
+        );
+    }
     for (i, message) in messages.iter().enumerate() {
         let key = format!("transient-retry-cancel-{suffix}-{i}");
         let path = format!("/internal/test/transient-retry-cancel-{suffix}/{i}");
@@ -3514,6 +3577,12 @@ async fn permanent_conflicts_are_stamped_completed_and_cached() {
         "app changed while unlock mode transition was validating; retry",
         "app runtime changed while unlock mode transition was validating; retry",
         "deployment generation changed while unlock mode transition was validating; retry",
+        // The recovery-needed verify refusal (Devin on #415/#416): same
+        // terminal treatment, and the assertions below prove its code AND
+        // message survive completion stamping and the same-key replay —
+        // the hosted caller always sees the recovery guidance, never the
+        // generic in-progress shape.
+        "volume_init_unproven",
     ];
     for (i, message) in messages.iter().enumerate() {
         let key = format!("permanent-stamp-{suffix}-{i}");
@@ -3523,13 +3592,16 @@ async fn permanent_conflicts_are_stamped_completed_and_cached() {
                 .await
                 .expect("reserve permanent-conflict handler"),
         );
-        let result: Result<IdempotencyResponse, InternalRouteError> = async {
-            Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": message})),
-            ))
-        }
-        .await;
+        let message_value = if *message == "volume_init_unproven" {
+            serde_json::json!({
+                "error": message,
+                "message": "volume initialization has not proven complete; recover the deployment before changing domains",
+            })
+        } else {
+            serde_json::json!({"error": message})
+        };
+        let result: Result<IdempotencyResponse, InternalRouteError> =
+            async { Err((StatusCode::CONFLICT, Json(message_value.clone()))) }.await;
         let stamped = complete_idempotent_result(lease, result)
             .await
             .expect_err("permanent 409 is stamped completed and returned");
@@ -3537,6 +3609,13 @@ async fn permanent_conflicts_are_stamped_completed_and_cached() {
         assert_eq!(stamped.1["error"], *message);
         assert_eq!(stamped.1["idempotency_disposition"], "completed");
         assert_eq!(stamped.1["retryable"], false);
+        if *message == "volume_init_unproven" {
+            assert_eq!(
+                stamped.1["message"],
+                "volume initialization has not proven complete; recover the deployment before changing domains",
+                "the recovery guidance survives the completion stamping"
+            );
+        }
 
         // Cached as completed: a same-key retry replays the stamped body.
         let replay = expect_idempotency_replay(
@@ -3547,6 +3626,13 @@ async fn permanent_conflicts_are_stamped_completed_and_cached() {
         assert_eq!(replay.0, StatusCode::CONFLICT);
         assert_eq!(replay.1["error"], *message);
         assert_eq!(replay.1["idempotency_disposition"], "completed");
+        if *message == "volume_init_unproven" {
+            assert_eq!(
+                replay.1["message"],
+                "volume initialization has not proven complete; recover the deployment before changing domains",
+                "the same-key replay still carries the recovery guidance"
+            );
+        }
     }
 }
 
@@ -4461,6 +4547,26 @@ async fn app_delete_retry_finishes_after_namespace_removal() {
     assert_eq!(
         retained, 0,
         "confirmed cleanup must be durably released before KBS failure"
+    );
+    // The KBS failure sent no write (no provider is configured), so the
+    // failed delete hands the global fence back at once instead of holding
+    // every other deployment behind it for the reclaim quarantine; the
+    // app's own lane keeps its quarantine.
+    let (kbs_fence_owned, app_lane_owned): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'
+                    AND owner_token IS NOT NULL),
+                (SELECT count(*) FROM app_mutation_leases
+                  WHERE app_id = $1 AND owner_token IS NOT NULL)",
+    )
+    .bind(app_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        (kbs_fence_owned, app_lane_owned),
+        (0, 1),
+        "a write-free KBS failure releases only the global kbs_policy fence"
     );
     // Advance only finite quarantine. This must never hide an infinite-fence bug.
     sqlx::query("UPDATE app_mutation_leases SET locked_until = clock_timestamp() - interval '2 seconds', reclaim_after = clock_timestamp() - interval '1 second' WHERE app_id = $1")
@@ -9490,4 +9596,157 @@ async fn idempotency_reaper_terminalizes_only_long_abandoned_reservations() {
         "a recent deferred reservation must stay reclaimable"
     );
     drop(live_lease);
+}
+
+// --- cap#422: a 5xx masked as idempotency_recovery_required logs and
+// carries the upstream cause ---
+
+struct CapturedErrorLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedErrorLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("captured log mutex").extend(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn captured_error_logs() -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer({
+            let logs = std::sync::Arc::clone(&logs);
+            move || CapturedErrorLogWriter(std::sync::Arc::clone(&logs))
+        })
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (logs, guard)
+}
+
+fn captured_error_log_text(logs: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+    String::from_utf8(logs.lock().expect("captured log mutex").clone())
+        .expect("captured logs are UTF-8")
+}
+
+#[test]
+fn outcome_unknown_cause_code_is_bounded_and_code_shaped() {
+    assert_eq!(
+        outcome_unknown_cause_code(&serde_json::json!({
+            "error": "edge_route_backend_unavailable"
+        })),
+        "edge_route_backend_unavailable"
+    );
+    // Over-long code-shaped tokens are cut at 128, not passed through
+    // wholesale.
+    let long = "x".repeat(300);
+    let bounded = outcome_unknown_cause_code(&serde_json::json!({ "error": long }));
+    assert_eq!(bounded.chars().count(), 128);
+    // Provider text — free-form strings, kube object names — is never
+    // carried into the stored receipt; it degrades to `unavailable`.
+    for text in [
+        "internal error",
+        "sni route: InvalidBackendTag",
+        "haproxy update: configmaps \"cap-edge\" not found",
+        "resolve backend: service not found in namespace",
+    ] {
+        assert_eq!(
+            outcome_unknown_cause_code(&serde_json::json!({ "error": text })),
+            "unavailable",
+            "provider text must not reach the receipt: {text}"
+        );
+    }
+    // No error key, or a non-string one, degrades to a fixed code.
+    assert_eq!(
+        outcome_unknown_cause_code(&serde_json::json!({})),
+        "unavailable"
+    );
+    assert_eq!(
+        outcome_unknown_cause_code(&serde_json::json!({ "error": 5 })),
+        "unavailable"
+    );
+}
+
+#[tokio::test]
+async fn outcome_unknown_5xx_is_logged_and_carries_the_cause() {
+    let pool = database_test_pool().await;
+    let state = idempotency_test_state(pool.clone());
+    let suffix = Uuid::new_v4().simple().to_string();
+    let key = format!("outcome-unknown-cause-{suffix}");
+    let path = format!("/internal/test/outcome-unknown-cause/{suffix}");
+    let hash = Sha256::digest(b"outcome-unknown-cause").to_vec();
+    let lease = expect_idempotency_execution(
+        begin_idempotent_request(&state, &key, "POST", &path, &hash)
+            .await
+            .expect("reserve the idempotent lease"),
+    );
+    let operation_id = lease.operation_id;
+
+    let (logs, _guard) = captured_error_logs();
+    let masked = complete_idempotent_result(
+        lease,
+        Err((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": "edge_route_backend_unavailable"})),
+        )),
+    )
+    .await
+    .expect_err("the 5xx converts into the fail-closed 409 receipt");
+    assert_eq!(masked.0, StatusCode::CONFLICT);
+    assert_eq!(masked.1.0["error"], "idempotency_recovery_required");
+    // The outcome cause is strictly additive: the upstream status + a
+    // code-shaped error, nothing else. It is `outcome_cause`, not `cause`:
+    // the PaaS relay reads the existing `cause` field as a plain string.
+    assert_eq!(masked.1.0["outcome_cause"]["status"], 502);
+    assert_eq!(
+        masked.1.0["outcome_cause"]["error"],
+        "edge_route_backend_unavailable"
+    );
+    assert!(
+        masked.1.0.get("cause").is_none(),
+        "the string-typed cause field is untouched"
+    );
+    let expected_base = idempotency_recovery_required_body();
+    let masked_object = masked.1.0.as_object().expect("the receipt is an object");
+    for (field, value) in expected_base
+        .as_object()
+        .expect("the base receipt is an object")
+    {
+        assert_eq!(masked_object.get(field), Some(value), "{field} unchanged");
+    }
+    assert_eq!(
+        masked_object.len(),
+        expected_base.as_object().expect("object").len() + 1
+    );
+
+    // The ERROR record names the operation id, the path, the upstream
+    // status and the code-shaped error — no provider text, no secrets.
+    let text = captured_error_log_text(&logs);
+    assert!(
+        text.contains(&operation_id.to_string()),
+        "names the operation id"
+    );
+    assert!(text.contains(&path), "names the request path");
+    assert!(text.contains("502"), "names the upstream status");
+    assert!(
+        text.contains("edge_route_backend_unavailable"),
+        "names the code-shaped error"
+    );
+
+    // Terminal: a same-key retry replays the receipt, never in-progress.
+    let replay = expect_idempotency_replay(
+        begin_idempotent_request(&state, &key, "POST", &path, &hash)
+            .await
+            .expect("replay the terminal receipt"),
+    );
+    assert_eq!(replay.0, StatusCode::CONFLICT);
+    assert_eq!(replay.1, masked.1.0);
 }

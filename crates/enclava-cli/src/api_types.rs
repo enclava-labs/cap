@@ -346,6 +346,10 @@ pub struct HostedTemplateConfigKey {
     pub input_type: String,
     pub required: bool,
     pub secret: bool,
+    /// Platform-generated value (e.g. the reserved stable SSH endpoint):
+    /// delivered through its dedicated flag, never customer config.
+    #[serde(default)]
+    pub generated: bool,
     #[serde(default)]
     pub default_value: Option<String>,
     #[serde(default)]
@@ -366,7 +370,7 @@ pub struct HostedTemplateConfigValidation {
     pub allowed_algorithms: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CreateTemplateInstanceRequest {
     pub template_slug: String,
     pub instance_name: String,
@@ -519,6 +523,11 @@ pub struct ManagedConfigDeliveryStatusResponse {
 #[derive(Debug, Serialize)]
 pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,
+    /// Contract v1 (policy-templates#23): sent only when the API declared
+    /// the capability (deployment-context), so requests against older APIs
+    /// stay byte-for-byte legacy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_pod_supplemental_groups: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -528,6 +537,11 @@ pub struct AgentPolicyResponse {
     pub genpolicy_version_pin: String,
     #[serde(default)]
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): present only when the signing
+    /// service ran the guest-pull group discovery. The CLI canonicalizes
+    /// (sorted unique), sets it on the descriptor, and re-calls.
+    #[serde(default)]
+    pub pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -545,6 +559,12 @@ pub struct DeploymentContextResponse {
     /// they keep producing claim-less signed renders.
     #[serde(default)]
     pub log_spool_state_bind_supported: bool,
+    /// Contract v1 (policy-templates#23): this API understands the
+    /// descriptor's pod_supplemental_groups field and relays the signing
+    /// service's discovery response. Absent on older APIs, which default
+    /// to false so the CLI keeps the single-call legacy flow.
+    #[serde(default)]
+    pub pod_supplemental_groups_supported: bool,
     #[serde(default)]
     pub current_platform_release_id: Option<String>,
     #[serde(default)]
@@ -1044,6 +1064,15 @@ pub struct ChallengeResponse {
     pub domain: String,
     pub txt_record_name: String,
     pub txt_record_value: String,
+    /// CNAME record the tenant must also publish when the domain is
+    /// outside the platform's managed DNS zone (ACME DNS-01 delegation).
+    /// Absent on older API responses; `null` for in-zone domains.
+    #[serde(default)]
+    pub acme_cname_name: Option<String>,
+    /// The in-zone target `acme_cname_name` must point at. Absent on older
+    /// API responses; `null` for in-zone domains.
+    #[serde(default)]
+    pub acme_cname_target: Option<String>,
     pub expires_at: String,
     pub instructions: String,
 }
@@ -1093,6 +1122,10 @@ pub struct DeploymentEntry {
     pub template_expected: TemplateExpected,
     pub created_at: String,
     pub completed_at: Option<String>,
+    /// Stored deployment-row status, when the server sends it. Distinct from
+    /// `status`, which may be a freshness projection (`stale`, `partial`).
+    #[serde(default)]
+    pub reconciled_status: Option<String>,
 }
 
 // --- Orgs ---
@@ -1221,10 +1254,94 @@ pub struct ApiErrorBody {
     pub held_by: Option<String>,
     #[serde(default)]
     pub retry_after: Option<i64>,
+    /// Expected ACME delegation records carried by the API's
+    /// `acme_delegation_missing` error so the CLI can print the exact
+    /// pair to publish. Absent on older servers and other errors.
+    #[serde(default)]
+    pub acme_cname_name: Option<String>,
+    #[serde(default)]
+    pub acme_cname_target: Option<String>,
+    /// Missing pod supplemental groups carried by the API's typed
+    /// guest-pull errors (genpolicy_guest_pull_groups_required /
+    /// pod_supplemental_groups_insufficient, contract v1,
+    /// policy-templates#23) so the CLI can print the exact remediation.
+    /// Absent on older servers and other errors.
+    #[serde(default)]
+    pub missing_pod_supplemental_groups: Option<Vec<i64>>,
+    /// CAP/PaaS idempotency completion stamp. `completed` means this key is
+    /// consumed for the replay window; `deferred` means retry the same key.
+    /// Absent on pre-handler and legacy bodies. PaaS keeps only those two
+    /// values; anything else is ignored by the client.
+    #[serde(default)]
+    pub idempotency_disposition: Option<String>,
+    /// CAP's upstream-failure receipt (cap#422): the status and code-shaped
+    /// error of the 5xx that the idempotency layer converted into a
+    /// recovery-required 409. Absent on older servers and on errors that
+    /// were not masked.
+    #[serde(default)]
+    pub outcome_cause: Option<ApiOutcomeCause>,
+}
+
+/// The upstream cause carried by an `idempotency_recovery_required` body:
+/// the masked 5xx's status plus its code-shaped error. Provider text never
+/// travels here (the API degrades it to a fixed code).
+#[derive(Debug, Deserialize)]
+pub struct ApiOutcomeCause {
+    pub status: u16,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn challenge_response_acme_cname_fields_are_backward_compatible() {
+        use super::ChallengeResponse;
+        let legacy: ChallengeResponse = serde_json::from_value(serde_json::json!({
+            "domain": "app.example.com",
+            "txt_record_name": "_enclava-challenge.app.example.com",
+            "txt_record_value": "enclava-domain-verification=tok",
+            "expires_at": "2026-11-23T12:00:00Z",
+            "instructions": "publish"
+        }))
+        .unwrap();
+        assert!(legacy.acme_cname_name.is_none());
+        assert!(legacy.acme_cname_target.is_none());
+
+        let delegated: ChallengeResponse = serde_json::from_value(serde_json::json!({
+            "domain": "app.example.com",
+            "txt_record_name": "_enclava-challenge.app.example.com",
+            "txt_record_value": "enclava-domain-verification=tok",
+            "acme_cname_name": "_acme-challenge.app.example.com",
+            "acme_cname_target": "app.example.com.acme.managed.test",
+            "expires_at": "2026-11-23T12:00:00Z",
+            "instructions": "publish BOTH"
+        }))
+        .unwrap();
+        assert_eq!(
+            delegated.acme_cname_name.as_deref(),
+            Some("_acme-challenge.app.example.com")
+        );
+        assert_eq!(
+            delegated.acme_cname_target.as_deref(),
+            Some("app.example.com.acme.managed.test")
+        );
+
+        // In-zone: keys present but null.
+        let in_zone: ChallengeResponse = serde_json::from_value(serde_json::json!({
+            "domain": "app.managed.test",
+            "txt_record_name": "_enclava-challenge.app.managed.test",
+            "txt_record_value": "enclava-domain-verification=tok",
+            "acme_cname_name": null,
+            "acme_cname_target": null,
+            "expires_at": "2026-11-23T12:00:00Z",
+            "instructions": "publish"
+        }))
+        .unwrap();
+        assert!(in_zone.acme_cname_name.is_none());
+        assert!(in_zone.acme_cname_target.is_none());
+    }
+
     use super::{ConfigKeysResponse, ConfigTokenResponse, SshCommandResponse};
 
     #[test]

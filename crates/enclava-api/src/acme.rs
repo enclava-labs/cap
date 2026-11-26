@@ -15,7 +15,7 @@ use hickory_resolver::config::{CLOUDFLARE, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::op::ResponseCode;
-use hickory_resolver::proto::rr::RData;
+use hickory_resolver::proto::rr::{RData, RecordType};
 use http::header::RETRY_AFTER;
 use http::{HeaderMap, Request, StatusCode};
 use http_body_util::BodyExt;
@@ -49,6 +49,8 @@ pub enum AcmeError {
     OrderStatus(OrderStatus),
     #[error("DNS challenge TXT did not propagate for {record_name}")]
     DnsPropagation { record_name: String },
+    #[error("ACME DNS delegation missing")]
+    DelegationMissing,
     #[error("account credential persistence failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("account credential serialization failed: {0}")]
@@ -73,6 +75,11 @@ pub enum IssuanceFailureCode {
     /// The terminal ACME API problem type was exactly
     /// `urn:ietf:params:acme:error:rateLimited`.
     RateLimited,
+    /// A requested hostname outside the managed DNS zone had no usable
+    /// CNAME delegation (`_acme-challenge.<hostname>` did not resolve,
+    /// through CNAME hops only, to `<hostname>.acme.<zone>`). Refused at
+    /// pre-flight, before any ACME or DNS provider write.
+    DelegationMissing,
     /// Every other terminal issuance failure: transport errors, DNS
     /// failures, unexpected statuses, and non-rate-limited or untyped ACME
     /// problems.
@@ -83,6 +90,7 @@ impl IssuanceFailureCode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RateLimited => "acme_rate_limited",
+            Self::DelegationMissing => "acme_delegation_missing",
             Self::Failed => "acme_certificate_issuance_failed",
         }
     }
@@ -114,6 +122,7 @@ impl IssuanceFailure {
             {
                 IssuanceFailureCode::RateLimited
             }
+            AcmeError::DelegationMissing => IssuanceFailureCode::DelegationMissing,
             _ => IssuanceFailureCode::Failed,
         };
         Self {
@@ -268,6 +277,238 @@ impl instant_acme::HttpClient for IssuanceHttpClient {
     }
 }
 
+/// Maximum CNAME hops the delegation check follows from
+/// `_acme-challenge.<hostname>` before refusing. Eight is the classic
+/// resolver bound (RFC 1034 resolver algorithm); a longer chain is a loop
+/// or a misconfiguration, and every hop must itself be a CNAME.
+const DELEGATION_MAX_HOPS: usize = 8;
+
+/// Total attempts (first try plus one retry) before the delegation check
+/// refuses. The retry rides transient resolver flakes only: DNS
+/// propagation is not waited for here, and the refusal is total either
+/// way.
+const DELEGATION_ATTEMPTS: u32 = 2;
+
+/// Pause between delegation attempts.
+const DELEGATION_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// The CNAME record a tenant must publish for an out-of-zone `hostname`,
+/// and the in-zone target it must point at:
+/// `_acme-challenge.<hostname>` -> `<hostname>.acme.<zone>`.
+pub(crate) fn expected_acme_cname_pair(hostname: &str, zone: &str) -> (String, String) {
+    // A configured zone name may carry leading (or trailing) dots that
+    // zone-membership checks tolerate; the derived target must be a
+    // publishable DNS name, so the dots are stripped here just as
+    // `manages_hostname` strips them.
+    let zone = zone.trim_matches('.');
+    (
+        format!("_acme-challenge.{hostname}"),
+        format!("{hostname}.acme.{zone}"),
+    )
+}
+
+/// Case-insensitive, trailing-dot-insensitive comparison form for DNS
+/// names on both sides of the delegation check.
+fn normalize_dns_name(name: &str) -> String {
+    name.trim_end_matches('.').to_lowercase()
+}
+
+/// Follow the CNAME chain for `_acme-challenge.<hostname>` and decide
+/// whether it terminates at exactly the delegated target.
+///
+/// `cname_of` answers one CNAME query: `Ok(None)` is a definitive "no
+/// CNAME here" (including NXDOMAIN/NODATA), `Err` any lookup failure, and
+/// `Ok(Some(target))` a CNAME record whose target is returned verbatim.
+/// Every hop must be a CNAME, the chain may not exceed
+/// [`DELEGATION_MAX_HOPS`] hops, and the terminal target must equal
+/// `<hostname>.acme.<zone>` after normalization. Anything else -- no
+/// CNAME, a wrong target, a chain that ends early, an over-long chain, or
+/// a lookup error mid-chain -- is a refusal.
+async fn delegation_chain_valid_with<F, Fut>(hostname: &str, zone: &str, mut cname_of: F) -> bool
+where
+    F: FnMut(&str) -> Fut,
+    Fut: Future<Output = Result<Option<String>, DnsLookupError>>,
+{
+    let (start, target) = expected_acme_cname_pair(hostname, zone);
+    let target = normalize_dns_name(&target);
+    let mut current = normalize_dns_name(&start);
+    for _ in 0..DELEGATION_MAX_HOPS {
+        match cname_of(&current).await {
+            Ok(Some(next)) => {
+                let next = normalize_dns_name(&next);
+                if next == target {
+                    return true;
+                }
+                current = next;
+            }
+            Ok(None) => return false,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Injectable CNAME lookup: tests drive the delegation check without a
+/// real resolver; production uses [`lookup_cname`].
+pub(crate) type CnameLookupFn = std::sync::Arc<
+    dyn Fn(&str) -> Pin<Box<dyn Future<Output = Result<Option<String>, DnsLookupError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Build the live CNAME lookup honouring the ACME resolver policy when
+/// one is configured (preferred resolver order and per-lookup timeout,
+/// the same knobs `lookup_txt` honours). Without a config (the domains
+/// verify route on a deployment without the broker) external-first with
+/// the resolver family's own default timeouts applies.
+pub(crate) fn live_cname_lookup(config: Option<&AcmeConfig>) -> CnameLookupFn {
+    let config = config.cloned();
+    std::sync::Arc::new(move |name: &str| {
+        let name = name.to_string();
+        let config = config.clone();
+        Box::pin(async move { lookup_cname(&name, config.as_ref()).await })
+    })
+}
+
+/// Prove the CNAME delegation for one out-of-zone hostname, retrying once
+/// on resolver flakes. The refusal is total: `Err(AcmeError::DelegationMissing)`
+/// carries no hostname and no provider text.
+pub(crate) async fn verify_acme_delegation(
+    hostname: &str,
+    zone: &str,
+    lookup: &CnameLookupFn,
+) -> Result<(), AcmeError> {
+    for attempt in 0..DELEGATION_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(DELEGATION_RETRY_DELAY).await;
+        }
+        if delegation_chain_valid_with(hostname, zone, |name| lookup(name)).await {
+            return Ok(());
+        }
+    }
+    Err(AcmeError::DelegationMissing)
+}
+
+fn first_cname(lookup: hickory_resolver::lookup::Lookup) -> Option<String> {
+    lookup
+        .answers()
+        .iter()
+        .find_map(|record| match &record.data {
+            RData::CNAME(cname) => Some(cname.0.to_string()),
+            _ => None,
+        })
+}
+
+/// Query the CNAME (if any) at `name`, external-first with a system
+/// fallback (or the configured order), each attempt bounded by the
+/// configured lookup timeout when one is set. A successful
+/// no-such-record answer is `Ok(None)`, not an error: the refusal total
+/// does not depend on which resolver answered.
+/// One bounded resolver attempt: a timeout becomes this resolver's error
+/// answer (so the caller's fallback loop still runs) rather than ending
+/// the whole lookup.
+async fn bounded_cname_attempt<F>(
+    attempt: F,
+    timeout: Option<Duration>,
+) -> Result<Option<String>, DnsLookupError>
+where
+    F: Future<Output = Result<Option<String>, DnsLookupError>>,
+{
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, attempt)
+            .await
+            .unwrap_or_else(|_| {
+                Err(DnsLookupError {
+                    message: "DNS CNAME lookup timed out".to_string(),
+                    category: DnsErrorCategory::Timeout,
+                })
+            }),
+        None => attempt.await,
+    }
+}
+
+async fn lookup_cname(
+    name: &str,
+    config: Option<&AcmeConfig>,
+) -> Result<Option<String>, DnsLookupError> {
+    lookup_cname_with_resolvers(config, |system| async move {
+        if system {
+            lookup_cname_system(name).await
+        } else {
+            lookup_cname_external(name).await
+        }
+    })
+    .await
+}
+
+/// The CNAME order loop, mirroring `lookup_txt_with_resolvers`' injection
+/// seam so the fallback behaviour is testable without live DNS: the
+/// preferred resolver runs first, its failure (including a configured
+/// timeout, which is that resolver's answer -- never the lookup's end)
+/// falls through to the other resolver with its own full budget, and a
+/// code-only warn marks the fallback so a stalled preferred resolver is
+/// visible in logs (diagnostics policy: no hostname, no provider text).
+async fn lookup_cname_with_resolvers<F>(
+    config: Option<&AcmeConfig>,
+    mut lookup: impl FnMut(bool) -> F,
+) -> Result<Option<String>, DnsLookupError>
+where
+    F: Future<Output = Result<Option<String>, DnsLookupError>>,
+{
+    let prefer_system = config.map(|c| c.dns_lookup_prefer_system).unwrap_or(false);
+    let mut last = None;
+    for system in [prefer_system, !prefer_system] {
+        let result =
+            bounded_cname_attempt(lookup(system), config.and_then(|c| c.dns_lookup_timeout)).await;
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) => last = Some(error),
+        }
+        if system == prefer_system {
+            tracing::warn!(
+                "{}; falling back to the other DNS resolver for the ACME CNAME check",
+                if system {
+                    "system DNS CNAME lookup failed"
+                } else {
+                    "external DNS CNAME lookup failed"
+                }
+            );
+        }
+    }
+    Err(last.unwrap_or_else(|| DnsLookupError {
+        message: "no DNS resolver available".to_string(),
+        category: DnsErrorCategory::Other,
+    }))
+}
+
+async fn lookup_cname_external(name: &str) -> Result<Option<String>, DnsLookupError> {
+    let resolver = TokioResolver::builder_with_config(
+        ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+        TokioRuntimeProvider::default(),
+    )
+    .with_options(ResolverOpts::default())
+    .build()
+    .map_err(DnsLookupError::from)?;
+    cname_query_result(resolver.lookup(name, RecordType::CNAME).await)
+}
+
+async fn lookup_cname_system(name: &str) -> Result<Option<String>, DnsLookupError> {
+    let resolver = TokioResolver::builder_tokio()
+        .and_then(|builder| builder.build())
+        .map_err(DnsLookupError::from)?;
+    cname_query_result(resolver.lookup(name, RecordType::CNAME).await)
+}
+
+fn cname_query_result(
+    result: Result<hickory_resolver::lookup::Lookup, NetError>,
+) -> Result<Option<String>, DnsLookupError> {
+    match result {
+        Ok(lookup) => Ok(first_cname(lookup)),
+        Err(NetError::Dns(DnsError::NoRecordsFound(_))) => Ok(None),
+        Err(error) => Err(DnsLookupError::from(error)),
+    }
+}
+
 pub async fn issue_dns01_certificate(
     http_client: &reqwest::Client,
     dns_config: &DnsConfig,
@@ -310,11 +551,16 @@ pub(crate) async fn issue_dns01_certificate_timed(
         hostnames,
         csr_der,
         timing,
+        live_cname_lookup(Some(acme_config)),
     )
     .await
     .map_err(|error| IssuanceFailure::diagnose(&error, &failures))
 }
 
+// Eight arguments, all distinct concerns the issuance attempt owns; the
+// alternative (a params struct) would churn PR #367's overlapping diff
+// further for no behavioural gain.
+#[allow(clippy::too_many_arguments)]
 async fn issue_dns01_certificate_attempt(
     http_client: &reqwest::Client,
     acme_http: Box<dyn instant_acme::HttpClient>,
@@ -323,7 +569,24 @@ async fn issue_dns01_certificate_attempt(
     hostnames: &[String],
     csr_der: &[u8],
     timing: RequestTiming,
+    delegation_lookup: CnameLookupFn,
 ) -> Result<String, AcmeError> {
+    // Delegation pre-flight: refuse the WHOLE request before any ACME
+    // account, order, or DNS provider write when an out-of-zone hostname
+    // lacks its `_acme-challenge.<hostname>` CNAME delegation into the
+    // managed zone. In-zone hostnames write their TXT records directly and
+    // are not checked here.
+    for hostname in hostnames {
+        if !dns_config.manages_hostname(hostname) {
+            verify_acme_delegation(
+                hostname,
+                &dns_config.cloudflare_zone_name,
+                &delegation_lookup,
+            )
+            .await?;
+        }
+    }
+
     let account = timing
         .measure(
             Phase::AcmeAccount,
@@ -341,68 +604,134 @@ async fn issue_dns01_certificate_attempt(
         )
         .await?;
 
-    let mut challenge_records = Vec::new();
-    {
-        let mut authorizations = order.authorizations();
-        loop {
-            let mut authorization = timing.start(Phase::AcmeAuthorization);
-            let result = authorizations.next().await;
-            authorization.finish(result.as_ref().is_none_or(Result::is_ok));
-            drop(authorization);
-            let Some(result) = result else {
-                break;
-            };
-            let mut authz = result?;
-            match authz.status {
-                AuthorizationStatus::Pending => {}
-                AuthorizationStatus::Valid => continue,
-                other => return Err(AcmeError::AuthorizationStatus(other)),
-            }
-            let mut challenge = authz.challenge(ChallengeType::Dns01).ok_or_else(|| {
-                AcmeError::AccountLoad("ACME order has no DNS-01 challenge".into())
-            })?;
-            let hostname = challenge.identifier().to_string();
-            let record_name = format!("_acme-challenge.{hostname}");
-            let record_value = challenge.key_authorization().dns_value();
-            let record = timing
-                .measure(
-                    Phase::DnsCreate,
-                    dns::create_txt_record(http_client, dns_config, &record_name, &record_value),
+    // One cleanup guard over the whole post-create body: every exit after
+    // the first TXT record is created -- a later create, the propagation
+    // wait, set_ready, poll_ready, finalize, or poll_certificate -- runs
+    // the same cleanup over the records created so far, as does success.
+    let mut challenges = ChallengeCleanup::arm(http_client.clone(), dns_config.clone());
+    let outcome = async {
+        {
+            let mut authorizations = order.authorizations();
+            loop {
+                let mut authorization = timing.start(Phase::AcmeAuthorization);
+                let result = authorizations.next().await;
+                authorization.finish(result.as_ref().is_none_or(Result::is_ok));
+                drop(authorization);
+                let Some(result) = result else {
+                    break;
+                };
+                let mut authz = result?;
+                match authz.status {
+                    AuthorizationStatus::Pending => {}
+                    AuthorizationStatus::Valid => continue,
+                    other => return Err(AcmeError::AuthorizationStatus(other)),
+                }
+                let mut challenge = authz.challenge(ChallengeType::Dns01).ok_or_else(|| {
+                    AcmeError::AccountLoad("ACME order has no DNS-01 challenge".into())
+                })?;
+                let hostname = challenge.identifier().to_string();
+                // Out-of-zone hostnames write their challenge TXT at the
+                // delegated in-zone target (`<hostname>.acme.<zone>`, proven by
+                // the pre-flight above); in-zone hostnames keep the direct
+                // `_acme-challenge.<hostname>` name. Either way the record is
+                // in-zone by construction and dns::create_txt_record is
+                // unchanged. The propagation wait polls the same name it wrote.
+                let record_name = if dns_config.manages_hostname(&hostname) {
+                    format!("_acme-challenge.{hostname}")
+                } else {
+                    let (_, target) =
+                        expected_acme_cname_pair(&hostname, &dns_config.cloudflare_zone_name);
+                    target
+                };
+                let record_value = challenge.key_authorization().dns_value();
+                let record = timing
+                    .measure(
+                        Phase::DnsCreate,
+                        dns::create_txt_record(
+                            http_client,
+                            dns_config,
+                            &record_name,
+                            &record_value,
+                        ),
+                    )
+                    .await?;
+                challenges.push(record);
+                await_propagation_then_ready(
+                    wait_for_txt_record(&record_name, &record_value, acme_config, timing),
+                    || async { challenge.set_ready().await },
+                    || async { challenges.cleanup(timing).await },
+                    timing,
                 )
                 .await?;
-            challenge_records.push(record);
-            await_propagation_then_ready(
-                wait_for_txt_record(&record_name, &record_value, acme_config, timing),
-                || async { challenge.set_ready().await },
-                || cleanup_challenges(http_client, dns_config, &challenge_records, timing),
-                timing,
+            }
+        }
+
+        let status = timing
+            .measure(
+                Phase::AcmeOrderReady,
+                order.poll_ready(&RetryPolicy::default()),
             )
             .await?;
+        if status != OrderStatus::Ready {
+            return Err(AcmeError::OrderStatus(status));
+        }
+
+        timing
+            .measure(Phase::AcmeFinalize, order.finalize_csr(csr_der))
+            .await?;
+        let cert_chain = timing
+            .measure(
+                Phase::AcmeCertificate,
+                order.poll_certificate(&RetryPolicy::default()),
+            )
+            .await?;
+        Ok(cert_chain)
+    }
+    .await;
+    challenges.cleanup(timing).await;
+    outcome
+}
+
+/// The single ACME DNS-01 cleanup guard: armed before the first TXT record
+/// is created, it deletes every record created so far (draining them, so a
+/// cleanup triggered by an inner error path cannot double-delete) whenever
+/// it is called -- and [`issue_dns01_certificate_attempt`] calls it on
+/// every exit, error or success.
+struct ChallengeCleanup {
+    http_client: reqwest::Client,
+    dns_config: DnsConfig,
+    records: Vec<dns::DnsRecordHandle>,
+}
+
+impl ChallengeCleanup {
+    fn arm(http_client: reqwest::Client, dns_config: DnsConfig) -> Self {
+        Self {
+            http_client,
+            dns_config,
+            records: Vec::new(),
         }
     }
 
-    let status = timing
-        .measure(
-            Phase::AcmeOrderReady,
-            order.poll_ready(&RetryPolicy::default()),
-        )
-        .await?;
-    if status != OrderStatus::Ready {
-        cleanup_challenges(http_client, dns_config, &challenge_records, timing).await;
-        return Err(AcmeError::OrderStatus(status));
+    fn push(&mut self, record: dns::DnsRecordHandle) {
+        self.records.push(record);
     }
 
-    timing
-        .measure(Phase::AcmeFinalize, order.finalize_csr(csr_der))
-        .await?;
-    let cert_chain = timing
-        .measure(
-            Phase::AcmeCertificate,
-            order.poll_certificate(&RetryPolicy::default()),
-        )
-        .await?;
-    cleanup_challenges(http_client, dns_config, &challenge_records, timing).await;
-    Ok(cert_chain)
+    async fn cleanup(&mut self, timing: RequestTiming) {
+        for record in std::mem::take(&mut self.records) {
+            if timing
+                .measure(
+                    Phase::DnsCleanup,
+                    dns::delete_txt_record(&self.http_client, &self.dns_config, &record),
+                )
+                .await
+                .is_err()
+            {
+                // DNS provider error details and challenge record names stay out
+                // of broker diagnostics.
+                tracing::warn!("failed to clean up ACME DNS-01 TXT record");
+            }
+        }
+    }
 }
 
 async fn wait_for_txt_record(
@@ -471,7 +800,7 @@ async fn lookup_txt(
 }
 
 #[derive(Clone, Debug)]
-struct DnsLookupError {
+pub(crate) struct DnsLookupError {
     message: String,
     category: DnsErrorCategory,
 }
@@ -495,6 +824,21 @@ impl From<NetError> for DnsLookupError {
             message: error.to_string(),
             category,
         }
+    }
+}
+
+impl DnsLookupError {
+    /// The resolver answered and the name has no such record (NXDOMAIN or
+    /// NODATA) -- as opposed to a lookup that failed to produce an answer.
+    pub(crate) fn is_record_absent(&self) -> bool {
+        matches!(
+            self.category,
+            DnsErrorCategory::NxDomain | DnsErrorCategory::NoData
+        )
+    }
+
+    pub(crate) fn into_message(self) -> String {
+        self.message
     }
 }
 
@@ -615,28 +959,6 @@ fn collect_txt_values(response: hickory_resolver::lookup::Lookup) -> Result<Vec<
         }
     }
     Ok(out)
-}
-
-async fn cleanup_challenges(
-    http_client: &reqwest::Client,
-    dns_config: &DnsConfig,
-    records: &[dns::DnsRecordHandle],
-    timing: RequestTiming,
-) {
-    for record in records {
-        if timing
-            .measure(
-                Phase::DnsCleanup,
-                dns::delete_txt_record(http_client, dns_config, record),
-            )
-            .await
-            .is_err()
-        {
-            // DNS provider error details and challenge record names stay out
-            // of broker diagnostics.
-            tracing::warn!("failed to clean up ACME DNS-01 TXT record");
-        }
-    }
 }
 
 /// Process-wide single-flight for ACME account registration. Let's Encrypt
@@ -1957,5 +2279,728 @@ mod tests {
             credentials_dir(std::path::Path::new("")),
             std::path::Path::new(".")
         );
+    }
+
+    // --- cap#412: ACME DNS-01 CNAME delegation ---
+
+    #[test]
+    fn delegation_pair_derivation() {
+        let (name, target) = expected_acme_cname_pair("app.example.com", "managed.test");
+        assert_eq!(name, "_acme-challenge.app.example.com");
+        assert_eq!(target, "app.example.com.acme.managed.test");
+        // Multi-label hostnames are delegated whole; every hostname maps to
+        // its own unique target.
+        let (other_name, other_target) =
+            expected_acme_cname_pair("a.b.example.com", "managed.test");
+        assert_eq!(other_name, "_acme-challenge.a.b.example.com");
+        assert_eq!(other_target, "a.b.example.com.acme.managed.test");
+        assert_ne!(target, other_target);
+    }
+
+    fn chain_lookup<'a>(
+        map: &'a [(&'a str, &'a str)],
+    ) -> impl FnMut(&str) -> std::future::Ready<Result<Option<String>, DnsLookupError>> + 'a {
+        move |query| {
+            std::future::ready(match map.iter().find(|(from, _)| *from == query) {
+                Some((_, to)) => Ok(Some(to.to_string())),
+                None => Ok(None),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_chain_accepts_direct_and_multi_hop_target_matches() {
+        let zone = "managed.test";
+        let ok = chain_lookup(&[(
+            "_acme-challenge.app.example.com",
+            "app.example.com.acme.managed.test",
+        )]);
+        assert!(delegation_chain_valid_with("app.example.com", zone, ok).await);
+
+        // Two and three correct hops (a tenant-side alias chain).
+        let two = chain_lookup(&[
+            ("_acme-challenge.app.example.com", "alias.customer.net"),
+            ("alias.customer.net", "app.example.com.acme.managed.test"),
+        ]);
+        assert!(delegation_chain_valid_with("app.example.com", zone, two).await);
+
+        let three = chain_lookup(&[
+            ("_acme-challenge.app.example.com", "one.customer.net"),
+            ("one.customer.net", "two.customer.net"),
+            ("two.customer.net", "APP.Example.COM.ACME.Managed.Test."),
+        ]);
+        assert!(delegation_chain_valid_with("app.example.com", zone, three).await);
+    }
+
+    #[tokio::test]
+    async fn delegation_chain_rejects_missing_wrong_and_overlong_chains() {
+        let zone = "managed.test";
+
+        // No CNAME at all.
+        let none = chain_lookup(&[]);
+        assert!(!delegation_chain_valid_with("app.example.com", zone, none).await);
+
+        // Wrong terminal target.
+        let wrong = chain_lookup(&[("_acme-challenge.app.example.com", "decoy.example.net")]);
+        assert!(!delegation_chain_valid_with("app.example.com", zone, wrong).await);
+
+        // Chain ends mid-way (no record at the last hop).
+        let truncated = chain_lookup(&[("_acme-challenge.app.example.com", "alias.customer.net")]);
+        assert!(!delegation_chain_valid_with("app.example.com", zone, truncated).await);
+
+        // A lookup error mid-chain (resolver failure, including NXDOMAIN at a
+        // hop that must be a CNAME) is a refusal.
+        let erroring = |_q: &str| {
+            std::future::ready::<Result<Option<String>, DnsLookupError>>(Err(DnsLookupError::from(
+                NetError::Timeout,
+            )))
+        };
+        assert!(!delegation_chain_valid_with("app.example.com", zone, erroring).await);
+
+        // A name whose record is a TXT (not a CNAME) answers as no-CNAME
+        // and is a refusal.
+        let txt_not_cname = chain_lookup(&[]);
+        assert!(!delegation_chain_valid_with("app.example.com", zone, txt_not_cname).await);
+
+        // More hops than the budget (the target only reachable past it) is
+        // covered by delegation_chain_allows_exactly_the_hop_budget.
+    }
+
+    #[tokio::test]
+    async fn delegation_chain_allows_exactly_the_hop_budget() {
+        let zone = "managed.test";
+        let target = "app.example.com.acme.managed.test";
+        // start -> h1 -> ... -> h7 -> target is exactly DELEGATION_MAX_HOPS
+        // (8) lookups and must pass; one more intermediate hop exceeds the
+        // budget and must fail.
+        fn refs(map: &[(String, String)]) -> Vec<(&str, &str)> {
+            map.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()
+        }
+        fn chain(last: usize, target: &str) -> Vec<(String, String)> {
+            let mut map = vec![(
+                "_acme-challenge.app.example.com".to_string(),
+                "h1.example.net".to_string(),
+            )];
+            for i in 1..last {
+                map.push((
+                    format!("h{i}.example.net"),
+                    format!("h{}.example.net", i + 1),
+                ));
+            }
+            map.push((format!("h{last}.example.net"), target.to_string()));
+            map
+        }
+        let exact_chain = chain(DELEGATION_MAX_HOPS - 1, target);
+        let exact = refs(&exact_chain);
+        assert!(delegation_chain_valid_with("app.example.com", zone, chain_lookup(&exact)).await);
+
+        let over_chain = chain(DELEGATION_MAX_HOPS, target);
+        let over = refs(&over_chain);
+        assert!(!delegation_chain_valid_with("app.example.com", zone, chain_lookup(&over)).await);
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum DelegationMode {
+        Ok,
+        Missing,
+        WrongTarget,
+    }
+
+    fn mock_cname_lookup(mode: DelegationMode, zone: &'static str) -> CnameLookupFn {
+        std::sync::Arc::new(move |name: &str| {
+            let answer = match mode {
+                DelegationMode::Missing => Ok(None),
+                DelegationMode::WrongTarget => Ok(Some("decoy.example.net".to_string())),
+                DelegationMode::Ok => {
+                    let host = name.strip_prefix("_acme-challenge.").unwrap_or(name);
+                    Ok(Some(format!("{host}.acme.{zone}")))
+                }
+            };
+            Box::pin(async move { answer })
+        })
+    }
+
+    /// What the fake ACME/Cloudflare doubles observed.
+    #[derive(Default)]
+    struct IssuanceCalls {
+        chal_posts: std::sync::atomic::AtomicUsize,
+        finalize_posts: std::sync::atomic::AtomicUsize,
+        order_lookups: std::sync::atomic::AtomicUsize,
+        new_order_posts: std::sync::atomic::AtomicUsize,
+        cf_zone_lookups: std::sync::atomic::AtomicUsize,
+        cf_creates: std::sync::Mutex<Vec<(String, String)>>,
+        cf_deletes: std::sync::atomic::AtomicUsize,
+    }
+
+    macro_rules! bump {
+        ($calls:expr, $field:ident) => {
+            $calls
+                .$field
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        };
+    }
+
+    macro_rules! tally {
+        ($calls:expr, $field:ident) => {
+            $calls.$field.load(std::sync::atomic::Ordering::SeqCst)
+        };
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum FailPoint {
+        None,
+        CreateSecond,
+        SetReady,
+        Finalize,
+        CertFetch,
+    }
+
+    /// Loopback ACME CA + fake Cloudflare for one issuance attempt.
+    ///
+    /// The order covers two hostnames: `name1.managed.test` (in-zone) and
+    /// `app.example.com` (out-of-zone, delegated). `fail` selects the leg
+    /// that returns 500 to prove the cleanup guard.
+    async fn spawn_issuance_doubles(
+        fail: FailPoint,
+    ) -> (
+        DnsConfig,
+        AcmeConfig,
+        reqwest::Client,
+        std::sync::Arc<IssuanceCalls>,
+    ) {
+        use axum::extract::{Path, Query};
+        use axum::routing::{delete, get, post};
+        use std::collections::HashMap;
+
+        let calls = std::sync::Arc::new(IssuanceCalls::default());
+
+        // --- fake Cloudflare ---
+        let cf_calls = calls.clone();
+        let fail_here = fail;
+        let zones = move |_q: Query<HashMap<String, String>>| {
+            let calls = cf_calls.clone();
+            async move {
+                bump!(calls, cf_zone_lookups);
+                axum::Json(serde_json::json!({
+                    "success": true,
+                    "result": [{"id": "zone-1"}],
+                    "errors": []
+                }))
+            }
+        };
+        let cf_calls = calls.clone();
+        let create = move |payload: axum::Json<serde_json::Value>| {
+            let calls = cf_calls.clone();
+            async move {
+                let name = payload
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let content = payload
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mut created = calls.cf_creates.lock().unwrap();
+                if fail_here == FailPoint::CreateSecond && created.len() == 1 {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({
+                            "success": false,
+                            "result": null,
+                            "errors": [{"code": 500, "message": "synthetic provider failure"}]
+                        })),
+                    );
+                }
+                created.push((name, content));
+                let id = format!("record-{}", created.len());
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "success": true,
+                        "result": {"id": id},
+                        "errors": []
+                    })),
+                )
+            }
+        };
+        let cf_calls = calls.clone();
+        let delete_record = move |_p: Path<(String, String)>| {
+            let calls = cf_calls.clone();
+            async move {
+                bump!(calls, cf_deletes);
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "success": true,
+                        "result": {},
+                        "errors": []
+                    })),
+                )
+            }
+        };
+        let cf_app = axum::Router::new()
+            .route("/zones", get(zones))
+            .route("/zones/{zone_id}/dns_records", post(create))
+            .route(
+                "/zones/{zone_id}/dns_records/{record_id}",
+                delete(delete_record),
+            );
+        let cf_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake cloudflare");
+        let cf_addr = cf_listener.local_addr().expect("fake cloudflare addr");
+        tokio::spawn(async move {
+            axum::serve(cf_listener, cf_app)
+                .await
+                .expect("serve fake cloudflare");
+        });
+
+        let dns_config = DnsConfig {
+            cloudflare_api_token: "token".to_string(),
+            cloudflare_api_base_url: format!("http://{cf_addr}"),
+            cloudflare_zone_id: None,
+            cloudflare_zone_name: "managed.test".to_string(),
+            target: "192.0.2.10".to_string(),
+            required: true,
+        };
+
+        // --- loopback ACME CA ---
+        let acme_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake acme");
+        let acme_addr = acme_listener.local_addr().expect("fake acme addr");
+        let base = format!("http://{acme_addr}");
+        let cert_pem = {
+            let key = rcgen::KeyPair::generate().expect("test key");
+            let params = rcgen::CertificateParams::new(vec!["name1.managed.test".to_string()])
+                .expect("test params");
+            params.self_signed(&key).expect("test cert").pem()
+        };
+        let calls_state = calls.clone();
+        let directory = base.clone();
+        tokio::spawn(serve_test_acme_server(acme_listener, {
+            let calls = calls_state.clone();
+            let directory = directory.clone();
+            move |path: &str| {
+                let calls = calls.clone();
+                let base = directory.clone();
+                let cert_pem = cert_pem.clone();
+                let chal_json = |n: u8| {
+                    format!(
+                        r#"{{"type":"dns-01","url":"{base}/chal/{n}","token":"token-{n}","status":"valid","error":null}}"#
+                    )
+                };
+                let authz_json = |host: &str, n: u8| {
+                    format!(
+                        r#"{{"identifier":{{"type":"dns","value":"{host}"}}, "status":"pending", "challenges":[{}], "wildcard":false}}"#,
+                        chal_json(n)
+                    )
+                };
+                let order_body = |status: &str, certificate: Option<String>| {
+                    format!(
+                        r#"{{"status":"{status}","authorizations":["{base}/authz/1","{base}/authz/2"],"finalize":"{base}/finalize","certificate":{},"error":null}}"#,
+                        certificate
+                            .map(|url| format!(r#""{url}""#))
+                            .unwrap_or_else(|| "null".to_string())
+                    )
+                };
+                let reply = |status: u16, headers: HeaderMap, body: String| (status, headers, body);
+                match path {
+                    "/dir" => reply(
+                        200,
+                        HeaderMap::new(),
+                        format!(
+                            r#"{{"newNonce":"{base}/nonce","newAccount":"{base}/new-acct","newOrder":"{base}/new-order"}}"#
+                        ),
+                    ),
+                    "/nonce" => reply(200, header_map(&[("Replay-Nonce", "nonce")]), String::new()),
+                    "/new-acct" => {
+                        let mut headers = HeaderMap::new();
+                        headers.insert(
+                            http::header::LOCATION,
+                            format!("{base}/accounts/1").parse().unwrap(),
+                        );
+                        reply(201, headers, String::new())
+                    }
+                    "/new-order" => {
+                        bump!(calls, new_order_posts);
+                        let mut headers = header_map(&[("Replay-Nonce", "nonce")]);
+                        headers.insert(
+                            http::header::LOCATION,
+                            format!("{base}/order/1").parse().unwrap(),
+                        );
+                        reply(201, headers, order_body("pending", None))
+                    }
+                    "/authz/1" => reply(200, HeaderMap::new(), authz_json("name1.managed.test", 1)),
+                    "/authz/2" => reply(200, HeaderMap::new(), authz_json("app.example.com", 2)),
+                    "/chal/1" | "/chal/2" => {
+                        bump!(calls, chal_posts);
+                        if fail == FailPoint::SetReady && tally!(calls, chal_posts) == 2 {
+                            return reply(
+                                    500,
+                                    HeaderMap::new(),
+                                    r#"{"type":"urn:ietf:params:acme:error:serverInternal","detail":"synthetic"}"#.to_string(),
+                                );
+                        }
+                        reply(200, HeaderMap::new(), chal_json(1))
+                    }
+                    "/order/1" => {
+                        bump!(calls, order_lookups);
+                        if tally!(calls, finalize_posts) > 0 {
+                            reply(
+                                200,
+                                HeaderMap::new(),
+                                order_body("valid", Some(format!("{base}/cert"))),
+                            )
+                        } else if tally!(calls, chal_posts) >= 2 {
+                            reply(200, HeaderMap::new(), order_body("ready", None))
+                        } else {
+                            reply(200, HeaderMap::new(), order_body("pending", None))
+                        }
+                    }
+                    "/finalize" => {
+                        bump!(calls, finalize_posts);
+                        if fail == FailPoint::Finalize {
+                            return reply(
+                                    500,
+                                    HeaderMap::new(),
+                                    r#"{"type":"urn:ietf:params:acme:error:serverInternal","detail":"synthetic"}"#.to_string(),
+                                );
+                        }
+                        reply(
+                            200,
+                            HeaderMap::new(),
+                            order_body("valid", Some(format!("{base}/cert"))),
+                        )
+                    }
+                    "/cert" => {
+                        if fail == FailPoint::CertFetch {
+                            return reply(500, HeaderMap::new(), String::new());
+                        }
+                        reply(200, HeaderMap::new(), cert_pem)
+                    }
+                    _ => reply(404, HeaderMap::new(), String::new()),
+                }
+            }
+        }));
+
+        let config = AcmeConfig {
+            directory_url: format!("http://{acme_addr}/dir"),
+            account_credentials_path: None,
+            dns_propagation_wait: Duration::ZERO,
+            dns_lookup_prefer_system: false,
+            dns_lookup_timeout: None,
+        };
+        let client = test_loopback_client();
+        (dns_config, config, client, calls)
+    }
+
+    fn issuance_hostnames() -> Vec<String> {
+        vec![
+            "name1.managed.test".to_string(),
+            "app.example.com".to_string(),
+        ]
+    }
+
+    async fn run_attempt(
+        dns_config: &DnsConfig,
+        config: &AcmeConfig,
+        client: &reqwest::Client,
+        hostnames: &[String],
+        delegation: DelegationMode,
+    ) -> Result<String, AcmeError> {
+        issue_dns01_certificate_attempt(
+            client,
+            Box::new(IssuanceHttpClient {
+                client: client.clone(),
+                failures: FailureHeaders::default(),
+            }),
+            dns_config,
+            config,
+            hostnames,
+            &[0u8; 16],
+            RequestTiming::new(),
+            mock_cname_lookup(delegation, "managed.test"),
+        )
+        .await
+    }
+
+    fn assert_cleanup(calls: &IssuanceCalls) {
+        let created = calls.cf_creates.lock().unwrap().clone();
+        assert_eq!(
+            tally!(calls, cf_deletes),
+            created.len(),
+            "every created TXT record must be cleaned up (created {created:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_issuance_writes_txt_at_target_and_cleans_up() {
+        let (dns_config, config, client, calls) = spawn_issuance_doubles(FailPoint::None).await;
+        let cert = run_attempt(
+            &dns_config,
+            &config,
+            &client,
+            &issuance_hostnames(),
+            DelegationMode::Ok,
+        )
+        .await
+        .expect("delegated issuance must succeed");
+        assert!(cert.starts_with("-----BEGIN CERTIFICATE-----"));
+
+        let created = calls.cf_creates.lock().unwrap().clone();
+        assert_eq!(created.len(), 2, "one TXT per hostname: {created:?}");
+        // The in-zone hostname writes its record directly...
+        assert!(
+            created
+                .iter()
+                .any(|(name, _)| name == "_acme-challenge.name1.managed.test")
+        );
+        // ...and the delegated hostname writes at the in-zone TARGET, not at
+        // _acme-challenge.<hostname>.
+        assert!(
+            created
+                .iter()
+                .any(|(name, _)| name == "app.example.com.acme.managed.test")
+        );
+        assert!(
+            !created
+                .iter()
+                .any(|(name, _)| name == "_acme-challenge.app.example.com")
+        );
+        for (_, value) in &created {
+            assert_eq!(value.len(), 43, "base64url key authorization: {value}");
+        }
+        assert_cleanup(&calls);
+    }
+
+    #[tokio::test]
+    async fn missing_delegation_fails_preflight_with_zero_provider_writes() {
+        let (dns_config, config, client, calls) = spawn_issuance_doubles(FailPoint::None).await;
+        let error = run_attempt(
+            &dns_config,
+            &config,
+            &client,
+            &issuance_hostnames(),
+            DelegationMode::Missing,
+        )
+        .await
+        .expect_err("missing delegation must refuse the whole request");
+        assert!(matches!(error, AcmeError::DelegationMissing));
+        assert_eq!(error.to_string(), "ACME DNS delegation missing");
+        assert_eq!(tally!(calls, new_order_posts), 0, "no ACME order");
+        assert!(calls.cf_creates.lock().unwrap().is_empty(), "no TXT writes");
+        assert_eq!(tally!(calls, cf_zone_lookups), 0, "not even a zone lookup");
+        assert_eq!(tally!(calls, cf_deletes), 0);
+
+        // The surfaced diagnostic for the refusal is the bounded code: no
+        // provider text, no retry deadline. (Asserted on diagnose() so this
+        // test never contacts a real resolver through the live lookup.)
+        let surfaced =
+            IssuanceFailure::diagnose(&AcmeError::DelegationMissing, &FailureHeaders::default());
+        assert_eq!(surfaced.code, IssuanceFailureCode::DelegationMissing);
+        assert_eq!(surfaced.code.as_str(), "acme_delegation_missing");
+        assert_eq!(surfaced.retry_after, None);
+    }
+
+    #[tokio::test]
+    async fn wrong_delegation_target_fails_preflight_with_zero_provider_writes() {
+        let (dns_config, config, client, calls) = spawn_issuance_doubles(FailPoint::None).await;
+        let error = run_attempt(
+            &dns_config,
+            &config,
+            &client,
+            &issuance_hostnames(),
+            DelegationMode::WrongTarget,
+        )
+        .await
+        .expect_err("wrong target must refuse");
+        assert!(matches!(error, AcmeError::DelegationMissing));
+        assert_eq!(tally!(calls, new_order_posts), 0);
+        assert!(calls.cf_creates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn second_create_failure_cleans_up_the_first_record() {
+        let (dns_config, config, client, calls) =
+            spawn_issuance_doubles(FailPoint::CreateSecond).await;
+        let error = run_attempt(
+            &dns_config,
+            &config,
+            &client,
+            &issuance_hostnames(),
+            DelegationMode::Ok,
+        )
+        .await
+        .expect_err("second create failure must fail issuance");
+        assert!(matches!(error, AcmeError::Dns(_)));
+        let created = calls.cf_creates.lock().unwrap().clone();
+        assert_eq!(created.len(), 1, "only the in-zone record was created");
+        assert_eq!(created[0].0, "_acme-challenge.name1.managed.test");
+        assert_eq!(
+            tally!(calls, cf_deletes),
+            1,
+            "the created record is deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_ready_failure_cleans_up_all_created_records() {
+        let (dns_config, config, client, calls) = spawn_issuance_doubles(FailPoint::SetReady).await;
+        let error = run_attempt(
+            &dns_config,
+            &config,
+            &client,
+            &issuance_hostnames(),
+            DelegationMode::Ok,
+        )
+        .await
+        .expect_err("set_ready failure must fail issuance");
+        assert!(matches!(error, AcmeError::Acme(_)));
+        assert_eq!(calls.cf_creates.lock().unwrap().len(), 2);
+        assert_cleanup(&calls);
+    }
+
+    #[tokio::test]
+    async fn finalize_failure_cleans_up_all_created_records() {
+        let (dns_config, config, client, calls) = spawn_issuance_doubles(FailPoint::Finalize).await;
+        let error = run_attempt(
+            &dns_config,
+            &config,
+            &client,
+            &issuance_hostnames(),
+            DelegationMode::Ok,
+        )
+        .await
+        .expect_err("finalize failure must fail issuance");
+        assert!(matches!(error, AcmeError::Acme(_)));
+        assert_eq!(calls.cf_creates.lock().unwrap().len(), 2);
+        assert_cleanup(&calls);
+    }
+
+    #[tokio::test]
+    async fn certificate_fetch_failure_cleans_up_all_created_records() {
+        let (dns_config, config, client, calls) =
+            spawn_issuance_doubles(FailPoint::CertFetch).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(120),
+            run_attempt(
+                &dns_config,
+                &config,
+                &client,
+                &issuance_hostnames(),
+                DelegationMode::Ok,
+            ),
+        )
+        .await
+        .expect("bounded despite retries")
+        .expect_err("certificate fetch failure must fail issuance");
+        assert!(matches!(error, AcmeError::Acme(_)));
+        assert_eq!(calls.cf_creates.lock().unwrap().len(), 2);
+        assert_cleanup(&calls);
+    }
+
+    #[tokio::test]
+    async fn cname_timeout_is_one_resolvers_answer_not_the_lookup_end() {
+        // A stalled preferred resolver yields a classified Timeout error
+        // from ONE attempt -- the value the fallback loop consumes --
+        // rather than ending the whole lookup.
+        let stalled = std::future::pending::<Result<Option<String>, DnsLookupError>>();
+        let timed_out = bounded_cname_attempt(stalled, Some(Duration::from_millis(10)))
+            .await
+            .unwrap_err();
+        assert!(matches!(timed_out.category, DnsErrorCategory::Timeout));
+        assert_eq!(timed_out.message, "DNS CNAME lookup timed out");
+
+        // The fallback's own budget is independent: a slow-but-successful
+        // answer within its window is returned, not punished for the
+        // preferred resolver's earlier stall.
+        let slow_ok = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok(Some("app.example.com.acme.managed.test".to_string()))
+        };
+        let answer = bounded_cname_attempt(slow_ok, Some(Duration::from_millis(200)))
+            .await
+            .unwrap();
+        assert_eq!(answer.as_deref(), Some("app.example.com.acme.managed.test"));
+
+        // No configured timeout preserves the native wait.
+        let native = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(None)
+        };
+        assert_eq!(bounded_cname_attempt(native, None).await.unwrap(), None);
+    }
+
+    fn cname_test_config(prefer_system: bool) -> Option<AcmeConfig> {
+        Some(AcmeConfig {
+            directory_url: "https://synthetic.invalid/dir".to_string(),
+            account_credentials_path: None,
+            dns_propagation_wait: Duration::from_secs(30),
+            dns_lookup_prefer_system: prefer_system,
+            dns_lookup_timeout: Some(Duration::from_millis(20)),
+        })
+    }
+
+    #[tokio::test]
+    async fn cname_timeout_on_preferred_falls_back_and_answers() {
+        // The regression b98ddf8d introduced and round 4 closes at the
+        // loop level: a timed-out PREFERRED resolver must not end the
+        // lookup; the other resolver answers within its own budget. The
+        // preferred slot is `system == prefer_system`, so the stall
+        // targets whichever resolver runs first for that configuration —
+        // answering on the preferred slot would pass trivially.
+        for prefer_system in [false, true] {
+            let config = cname_test_config(prefer_system);
+            let result = lookup_cname_with_resolvers(config.as_ref(), move |system| async move {
+                if system == prefer_system {
+                    std::future::pending().await
+                } else {
+                    Ok(Some("app.example.com.acme.managed.test".to_string()))
+                }
+            })
+            .await
+            .unwrap_or_else(|error| panic!("fallback must answer: {error:?}"));
+            assert_eq!(
+                result.as_deref(),
+                Some("app.example.com.acme.managed.test"),
+                "prefer_system={prefer_system}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cname_timeout_on_both_resolvers_is_a_classified_timeout() {
+        let config = cname_test_config(false);
+        let error = lookup_cname_with_resolvers(config.as_ref(), |_| {
+            std::future::pending::<Result<Option<String>, DnsLookupError>>()
+        })
+        .await
+        .expect_err("both resolvers stalled must fail");
+        assert!(matches!(error.category, DnsErrorCategory::Timeout));
+        assert_eq!(error.message, "DNS CNAME lookup timed out");
+    }
+
+    #[tokio::test]
+    async fn cname_resolver_order_honors_prefer_system() {
+        for prefer_system in [false, true] {
+            let config = cname_test_config(prefer_system);
+            let visits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let record = visits.clone();
+            lookup_cname_with_resolvers(config.as_ref(), move |system| {
+                let record = record.clone();
+                async move {
+                    record.lock().unwrap().push(system);
+                    // Answer on the preferred resolver so the fallback is
+                    // never tried: the visit order is the assertion.
+                    Ok(Some("app.example.com.acme.managed.test".to_string()))
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(*visits.lock().unwrap(), vec![prefer_system]);
+        }
     }
 }

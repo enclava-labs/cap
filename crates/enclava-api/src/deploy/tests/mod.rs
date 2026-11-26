@@ -523,6 +523,176 @@ fn tenant_image_pull_secret_without_scope_fails_closed() {
     ));
 }
 
+/// Issue #228: tag resolution may use the platform pull credentials only
+/// for a repository the operator explicitly allowed. Empty, absent, or
+/// invalid allowlists, incomplete credentials, other registries, and
+/// out-of-scope repositories all fail closed to anonymous resolution.
+#[test]
+fn tag_resolution_credentials_fail_closed_without_explicit_scope() {
+    let allow = Some("ghcr.io/team/app,ghcr.io/team/nested/*");
+    assert!(
+        resolution_pull_credentials_from("ghcr.io", "team/app", Some("cap-bot"), Some("tok"), None)
+            .is_none()
+    );
+    for raw in [
+        "",
+        "   ",
+        "bogus",
+        "ghcr.io/team/app,bogus",
+        "docker.io/team/app",
+    ] {
+        assert!(
+            resolution_pull_credentials_from(
+                "ghcr.io",
+                "team/app",
+                Some("cap-bot"),
+                Some("tok"),
+                Some(raw),
+            )
+            .is_none(),
+            "allowlist {raw:?} must not yield credentials"
+        );
+    }
+    assert!(
+        resolution_pull_credentials_from("ghcr.io", "team/app", None, Some("tok"), allow).is_none()
+    );
+    assert!(
+        resolution_pull_credentials_from("ghcr.io", "team/app", Some("cap-bot"), None, allow)
+            .is_none()
+    );
+    assert!(
+        resolution_pull_credentials_from("ghcr.io", "team/app", Some("  "), Some("tok"), allow)
+            .is_none()
+    );
+    assert!(
+        resolution_pull_credentials_from("ghcr.io", "team/app", Some("cap-bot"), Some("  "), allow)
+            .is_none()
+    );
+    // GHCR credentials must never be returned for a registry they cannot
+    // authenticate, even when the repository path matches an entry.
+    assert!(
+        resolution_pull_credentials_from(
+            "docker.io",
+            "team/app",
+            Some("cap-bot"),
+            Some("tok"),
+            allow
+        )
+        .is_none()
+    );
+    assert!(
+        resolution_pull_credentials_from(
+            "ghcr.io.attacker.example",
+            "team/app",
+            Some("cap-bot"),
+            Some("tok"),
+            allow,
+        )
+        .is_none()
+    );
+    assert!(
+        resolution_pull_credentials_from(
+            "ghcr.io",
+            "other/app",
+            Some("cap-bot"),
+            Some("tok"),
+            allow
+        )
+        .is_none()
+    );
+    // An exact entry does not widen to subrepositories.
+    assert!(
+        resolution_pull_credentials_from(
+            "ghcr.io",
+            "team/app/child",
+            Some("cap-bot"),
+            Some("tok"),
+            Some("ghcr.io/team/app"),
+        )
+        .is_none()
+    );
+    // A wildcard must not match a sibling prefix.
+    assert!(
+        resolution_pull_credentials_from(
+            "ghcr.io",
+            "team/nested-evil",
+            Some("cap-bot"),
+            Some("tok"),
+            Some("ghcr.io/team/nested/*"),
+        )
+        .is_none()
+    );
+    // Repository paths stay case-sensitive.
+    assert!(
+        resolution_pull_credentials_from(
+            "GHCR.IO",
+            "Org/app",
+            Some("cap-bot"),
+            Some("tok"),
+            Some("ghcr.io/org/app"),
+        )
+        .is_none()
+    );
+    // Dot segments satisfy a string prefix and then normalize to a different
+    // repository once reqwest builds the URL. They must not receive credentials.
+    for repository in [
+        "team/app/../other",
+        "team/app/../../victim/private",
+        "team/nested/../nested-evil",
+        "team/./app",
+        "team//app",
+    ] {
+        assert!(
+            resolution_pull_credentials_from(
+                "ghcr.io",
+                repository,
+                Some("cap-bot"),
+                Some("tok"),
+                Some("ghcr.io/team/app/*,ghcr.io/team/nested/*"),
+            )
+            .is_none(),
+            "{repository} must not yield credentials"
+        );
+    }
+}
+
+/// Issue #228: a matching ghcr.io repository returns the trimmed platform
+/// credentials and nothing else. Wildcard entries include subrepositories;
+/// registry spelling is case-insensitive.
+#[test]
+fn tag_resolution_credentials_attach_only_for_matching_ghcr_repository() {
+    let exact = resolution_pull_credentials_from(
+        "ghcr.io",
+        "team/app",
+        Some(" cap-bot "),
+        Some(" test-token "),
+        Some("ghcr.io/team/app"),
+    )
+    .unwrap();
+    assert_eq!(exact, ("cap-bot".to_string(), "test-token".to_string()));
+
+    let wildcard = resolution_pull_credentials_from(
+        "GHCR.IO",
+        "team/nested/child",
+        Some("cap-bot"),
+        Some("test-token"),
+        Some("ghcr.io/team/nested/*"),
+    )
+    .unwrap();
+    assert_eq!(wildcard.0, "cap-bot");
+    assert_eq!(wildcard.1, "test-token");
+
+    let second = resolution_pull_credentials_from(
+        "ghcr.io",
+        "other/app",
+        Some("cap-bot"),
+        Some("test-token"),
+        Some("ghcr.io/team/app, ghcr.io/other/app"),
+    )
+    .unwrap();
+    assert_eq!(second.1, "test-token");
+}
+
 /// Issue #225: a scope list with invalid entries must not silently
 /// degrade into a different (or missing) scope.
 #[test]
@@ -735,6 +905,7 @@ fn signed_deploy_with_local_artifacts_still_reconciles_global_kbs_policy() {
 
 fn customer_app_descriptor() -> DeploymentDescriptor {
     DeploymentDescriptor {
+        pod_supplemental_groups: None,
             schema_version: "v1".to_string(),
             org_id: uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
             org_slug: "8f346820".to_string(),
@@ -831,6 +1002,7 @@ fn signed_descriptor_runtime_fields_match_descriptor_expectations() {
 fn descriptor_runtime_overrides_stale_primary_container_fields() {
     let descriptor = customer_app_descriptor();
     let mut app = ConfidentialApp {
+        pod_supplemental_groups: None,
             app_id: descriptor.app_id,
             deployment_id: descriptor.deploy_id,
             name: descriptor.app_name.clone(),
@@ -916,6 +1088,7 @@ fn signed_descriptor_without_subpath_mounts_clears_stale_storage_paths() {
         .mounts
         .retain(|mount| mount.destination == "/state");
     let mut app = ConfidentialApp {
+        pod_supplemental_groups: None,
             app_id: descriptor.app_id,
             deployment_id: descriptor.deploy_id,
             name: descriptor.app_name.clone(),
@@ -1272,6 +1445,50 @@ async fn rollout_watch_password_timeout_stays_nonterminal_for_failed_app_redeplo
     assert!(!outcome.terminal);
 }
 
+#[test]
+fn extended_owner_wait_probe_slice_covers_a_single_poll() {
+    // `watch_rollout` polls at the start of a slice, so one completed poll
+    // reports a late unlock at the next probe cycle; a second poll inside
+    // the slice buys at most one poll interval of latency against the 60 s
+    // observation requeue cap. Staying below one poll interval keeps each
+    // probe to a single Kubernetes poll round trip, however many apps wait
+    // (#231, #387).
+    assert!(
+        EXTENDED_OWNER_WAIT_PROBE_SLICE
+            < enclava_engine::apply::types::ApplyConfig::default().poll_interval,
+        "the probe must cost one poll round trip, not a full poll interval"
+    );
+    assert!(EXTENDED_OWNER_WAIT_PROBE_SLICE < ROLLOUT_OBSERVATION_SLICE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn extended_owner_wait_releases_the_worker_after_the_probe_slice() {
+    // With the production 90 s slice configured, an abandoned locked app
+    // must end its observation after the short probe instead of holding its
+    // dispatch worker for the full slice, while the owner wait itself stays
+    // nonterminal (#231).
+    let budget = fresh_initialization_budget("32Mi", "32Mi");
+    let started = tokio::time::Instant::now();
+    let outcome = DeploymentRollout::observe_only(
+        queued_apply_app(),
+        rollout_test_engine(),
+        "probe-slice-manifest".to_string(),
+        expired_rollout_anchor(budget),
+        budget,
+    )
+    .expect("valid rollout budget")
+    .watch()
+    .await;
+    assert_eq!(outcome.deploy_status, "watching");
+    assert_eq!(outcome.app_status, "creating");
+    assert!(!outcome.terminal);
+    assert!(
+        started.elapsed() <= EXTENDED_OWNER_WAIT_PROBE_SLICE + std::time::Duration::from_secs(1),
+        "extended owner wait must release its worker after the probe slice, held {:?}",
+        started.elapsed()
+    );
+}
+
 fn settled_statefulset(
     generation: i64,
     observed: i64,
@@ -1554,6 +1771,21 @@ impl GateCluster {
     /// ordering satisfied), mounting both claims, with configurable
     /// readiness — a still-formatting initializer reports `ready=false`.
     fn with_pod(&mut self, namespace: &str, workload: &str, ready: bool) {
+        // Claims are created at 00:00:00Z; the default pod at 00:01:00Z —
+        // strictly later, the shape the whole-second waiver rule accepts.
+        self.with_pod_created_at(namespace, workload, ready, "2025-01-01T00:01:00Z");
+    }
+
+    /// Ordinal-0 pod at an explicit creation timestamp; pass the claims'
+    /// own second ("2025-01-01T00:00:00Z") to reproduce the normal
+    /// StatefulSet first-deploy flow (claim + pod within one second).
+    fn with_pod_created_at(
+        &mut self,
+        namespace: &str,
+        workload: &str,
+        ready: bool,
+        created_at: &str,
+    ) {
         let pod_name = format!("{workload}-0");
         let state_claim = format!("state-{workload}-0");
         let tls_claim = format!("tls-state-{workload}-0");
@@ -1564,7 +1796,7 @@ impl GateCluster {
                 "metadata": {
                     "name": pod_name,
                     "namespace": namespace,
-                    "creationTimestamp": "2025-01-01T00:01:00Z",
+                    "creationTimestamp": created_at,
                 },
                 "spec": {
                     "containers": [],
@@ -1581,6 +1813,45 @@ impl GateCluster {
                         "status": ready_status,
                     }],
                 },
+        });
+        self.put(
+            format!("/api/v1/namespaces/{namespace}/pods"),
+            200,
+            serde_json::json!({"apiVersion": "v1", "kind": "PodList", "items": [pod]}),
+        );
+    }
+
+    /// Ordinal-0 pod mounting a SUBSET of the claims, to prove the relaxed
+    /// admission requires both volumes.
+    fn with_pod_mounting(
+        &mut self,
+        namespace: &str,
+        workload: &str,
+        ready: bool,
+        claims: &[&str],
+        created_at: &str,
+    ) {
+        let pod_name = format!("{workload}-0");
+        let ready_status = if ready { "True" } else { "False" };
+        let volumes: Vec<serde_json::Value> = claims
+            .iter()
+            .map(|vct| {
+                serde_json::json!({
+                    "name": vct,
+                    "persistentVolumeClaim": {"claimName": format!("{vct}-{workload}-0")},
+                })
+            })
+            .collect();
+        let pod = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": pod_name,
+                    "namespace": namespace,
+                    "creationTimestamp": created_at,
+                },
+                "spec": {"containers": [], "volumes": volumes},
+                "status": {"conditions": [{"type": "Ready", "status": ready_status}]},
         });
         self.put(
             format!("/api/v1/namespaces/{namespace}/pods"),
@@ -1636,6 +1907,70 @@ fn gate_engine(cluster: GateCluster) -> ApplyEngine {
         cluster.client(),
         enclava_engine::apply::types::ApplyConfig::default(),
     )
+}
+
+#[tokio::test]
+async fn ingress_restart_unproven_when_pod_shares_claims_second() {
+    // The normal StatefulSet first-deploy flow: the controller creates the
+    // ordinal-0 PVCs and then the pod within one whole second (observed on
+    // dev for every fresh app). The strict verdict stays Unproven — the
+    // whole-second rule exists to defend the size-floor waiver against a
+    // pod predating a REPLACED claim — which is exactly the case the
+    // domains route's first-add admission relaxes with
+    // inspect_ready_pod_mounts_all_claims.
+    let mut cluster = GateCluster::deployed("cap-app", "app");
+    cluster.with_pod_created_at("cap-app", "app", true, "2025-01-01T00:00:00Z");
+    let engine = gate_engine(cluster);
+    let verdict = ingress_restart_verdict(&engine, "cap-app", "app")
+        .await
+        .expect("live cluster proof must resolve");
+    assert_eq!(verdict, IngressRestartVerdict::Unproven);
+    assert!(
+        enclava_engine::apply::orchestrator::inspect_ready_pod_mounts_all_claims(
+            &engine, "cap-app", "app"
+        )
+        .await
+        .expect("relaxed admission probe must resolve"),
+        "a same-second Ready pod mounting both claims proves first-boot completed: the first domain verify must be admitted"
+    );
+}
+
+#[tokio::test]
+async fn relaxed_restart_admission_requires_ready_pod_mounting_both_claims() {
+    // Not Ready (first-boot still running): no admission.
+    let mut cluster = GateCluster::deployed("cap-app", "app");
+    cluster.with_pod_created_at("cap-app", "app", false, "2025-01-01T00:00:00Z");
+    let engine = gate_engine(cluster);
+    assert!(
+        !enclava_engine::apply::orchestrator::inspect_ready_pod_mounts_all_claims(
+            &engine, "cap-app", "app"
+        )
+        .await
+        .expect("probe must resolve")
+    );
+
+    // No pod at all: no admission.
+    let engine = gate_engine(GateCluster::deployed("cap-app", "app"));
+    assert!(
+        !enclava_engine::apply::orchestrator::inspect_ready_pod_mounts_all_claims(
+            &engine, "cap-app", "app"
+        )
+        .await
+        .expect("probe must resolve")
+    );
+
+    // Pod mounting only one of the two claims: no admission (the restart
+    // re-opens both volumes).
+    let mut cluster = GateCluster::deployed("cap-app", "app");
+    cluster.with_pod_mounting("cap-app", "app", true, &["state"], "2025-01-01T00:00:00Z");
+    let engine = gate_engine(cluster);
+    assert!(
+        !enclava_engine::apply::orchestrator::inspect_ready_pod_mounts_all_claims(
+            &engine, "cap-app", "app"
+        )
+        .await
+        .expect("probe must resolve")
+    );
 }
 
 #[tokio::test]
@@ -9486,4 +9821,372 @@ async fn recovery_budget_bounds_stalled_compensation() {
         "a stalled compensation falls out as a deferred error"
     );
     assert!(started.elapsed() >= PULL_SECRET_CREATE_RECOVERY_BUDGET);
+}
+
+fn publication_row(
+    id: Uuid,
+    fence: &[i64],
+    published: bool,
+    provenance_incomplete: bool,
+) -> PublicationRecoveryDeployment {
+    PublicationRecoveryDeployment {
+        id,
+        manifest_hash: Some("hash-a".to_string()),
+        fence_generations: fence.to_vec(),
+        provenance_incomplete,
+        published,
+    }
+}
+
+#[test]
+fn publication_recovery_stamps_the_live_deployment_id_not_an_entered_apply() {
+    let written = Uuid::new_v4();
+    let entered_only = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: Some(written),
+        mutation_generation: Some(7),
+        manifest_hash: Some("hash-a".to_string()),
+    };
+    let rows = vec![
+        publication_row(entered_only, &[8], false, false),
+        publication_row(written, &[7], false, false),
+    ];
+    assert_eq!(
+        decide_workload_publication_recovery(&live, &rows),
+        PublicationRecoveryDecision::Stamp(written)
+    );
+}
+
+#[test]
+fn publication_recovery_does_not_treat_a_planned_hash_as_a_write() {
+    // The live object still names the previous generation. A later row that
+    // stored the same manifest hash before reaching the StatefulSet is not it.
+    let previous = Uuid::new_v4();
+    let planned = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: Some(previous),
+        mutation_generation: Some(4),
+        manifest_hash: Some("hash-a".to_string()),
+    };
+    let rows = vec![
+        publication_row(previous, &[4], true, false),
+        publication_row(planned, &[], false, false),
+    ];
+    assert_eq!(
+        decide_workload_publication_recovery(&live, &rows),
+        PublicationRecoveryDecision::AlreadyRecorded
+    );
+}
+
+#[test]
+fn publication_recovery_accepts_a_fenced_generation_when_the_label_was_stripped() {
+    let written = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: None,
+        mutation_generation: Some(9),
+        manifest_hash: Some("hash-a".to_string()),
+    };
+    assert_eq!(
+        decide_workload_publication_recovery(
+            &live,
+            &[publication_row(written, &[9], false, false)]
+        ),
+        PublicationRecoveryDecision::Stamp(written)
+    );
+}
+
+#[test]
+fn publication_recovery_refuses_a_stripped_label_when_the_manifest_hash_disagrees() {
+    let written = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: None,
+        mutation_generation: Some(9),
+        manifest_hash: Some("live-hash".to_string()),
+    };
+    let mut row = publication_row(written, &[9], false, false);
+    row.manifest_hash = Some("row-hash".to_string());
+    assert_eq!(
+        decide_workload_publication_recovery(&live, &[row]),
+        PublicationRecoveryDecision::Ambiguous
+    );
+}
+
+#[test]
+fn publication_recovery_covers_a_historical_label_without_fence_provenance() {
+    let historical = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: Some(historical),
+        mutation_generation: Some(3),
+        manifest_hash: None,
+    };
+    let mut row = publication_row(historical, &[], false, true);
+    row.manifest_hash = None;
+    assert_eq!(
+        decide_workload_publication_recovery(&live, &[row]),
+        PublicationRecoveryDecision::Stamp(historical)
+    );
+}
+
+#[test]
+fn publication_recovery_refuses_disagreeing_label_and_generation() {
+    let labeled = Uuid::new_v4();
+    let fenced = Uuid::new_v4();
+    let live = LiveWorkloadPublication {
+        deployment_id: Some(labeled),
+        mutation_generation: Some(5),
+        manifest_hash: Some("hash-a".to_string()),
+    };
+    let rows = vec![
+        publication_row(labeled, &[4], false, false),
+        publication_row(fenced, &[5], false, false),
+    ];
+    assert_eq!(
+        decide_workload_publication_recovery(&live, &rows),
+        PublicationRecoveryDecision::Ambiguous
+    );
+}
+
+#[test]
+fn live_workload_publication_reads_the_applied_spec_identity() {
+    let deployment_id = Uuid::new_v4();
+    let sts: k8s_openapi::api::apps::v1::StatefulSet = serde_json::from_value(serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": {
+            "name": "app",
+            "namespace": "cap-app",
+            "annotations": {
+                "enclava.dev/cap-provider-mutation-generation": "12",
+                "enclava.dev/manifest-hash": "abc"
+            }
+        },
+        "spec": {
+            "template": {
+                "metadata": {
+                    "labels": { (enclava_engine::manifest::DEPLOYMENT_ID_LABEL): deployment_id.to_string() }
+                }
+            }
+        }
+    }))
+    .expect("statefulset publication fixture");
+    assert_eq!(
+        live_workload_publication(&sts),
+        LiveWorkloadPublication {
+            deployment_id: Some(deployment_id),
+            mutation_generation: Some(12),
+            manifest_hash: Some("abc".to_string()),
+        }
+    );
+}
+
+pub(crate) fn publication_statefulset_client(deployment_id: Uuid, fail: bool) -> kube::Client {
+    use axum::http::{Request, Response};
+    use http_body_util::BodyExt;
+    use kube::client::Body;
+    use tower::service_fn;
+
+    kube::Client::new(
+        service_fn(move |request: Request<Body>| async move {
+            let _ = request.into_body().collect().await;
+            if fail {
+                let status = serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "reason": "ServerTimeout",
+                    "message": "timed out",
+                    "code": 500,
+                });
+                return Ok::<_, std::io::Error>(
+                    Response::builder()
+                        .status(500)
+                        .body(Body::from(serde_json::to_vec(&status).unwrap()))
+                        .unwrap(),
+                );
+            }
+            let sts = serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "metadata": {
+                    "name": "queued-app",
+                    "namespace": "cap-queued-app",
+                    "annotations": {
+                        "enclava.dev/cap-provider-mutation-generation": "4",
+                        "enclava.dev/manifest-hash": "written"
+                    }
+                },
+                "spec": {
+                    "replicas": 1,
+                    "template": {
+                        "metadata": {
+                            "labels": { (enclava_engine::manifest::DEPLOYMENT_ID_LABEL): deployment_id.to_string() }
+                        }
+                    }
+                }
+            });
+            Ok(Response::builder()
+                .status(200)
+                .body(Body::from(serde_json::to_vec(&sts).unwrap()))
+                .unwrap())
+        }),
+        "default",
+    )
+}
+
+#[tokio::test]
+async fn recover_unpublished_workload_spec_stamps_the_live_generation() {
+    let pool = crate::test_support::database_test_pool().await;
+    let (app, deployment_id, _, _) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'applying',
+                apply_committed_at = clock_timestamp(),
+                manifest_hash = 'written',
+                namespace_fence_generations = ARRAY[4]::bigint[],
+                workload_spec_published_at = NULL
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&pool)
+    .await
+    .expect("mark the crash window");
+
+    recover_unpublished_workload_spec(
+        &pool,
+        &publication_statefulset_client(deployment_id, false),
+        app.id,
+        &app.namespace,
+        &app.name,
+        PublicationRecoveryMode::BeforeSupersession,
+    )
+    .await
+    .expect("recover the written spec");
+    let stamped: bool = sqlx::query_scalar(
+        "SELECT workload_spec_published_at IS NOT NULL FROM deployments WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read recovered stamp");
+    assert!(
+        stamped,
+        "the live deployment id must recover the lost stamp"
+    );
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(app.org_id)
+        .execute(&pool)
+        .await
+        .expect("delete publication recovery fixture");
+}
+
+#[tokio::test]
+async fn deleting_publication_recovery_bumps_policy_generation_with_the_stamp() {
+    let pool = crate::test_support::database_test_pool().await;
+    let (app, deployment_id, _, _) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+    sqlx::query(
+        "UPDATE apps
+            SET status = 'deleting',
+                workload_teardown_required = true,
+                workload_teardown_completed_at = NULL
+          WHERE id = $1",
+    )
+    .bind(app.id)
+    .execute(&pool)
+    .await
+    .expect("mark deleting teardown");
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'failed',
+                apply_committed_at = clock_timestamp(),
+                manifest_hash = 'written',
+                namespace_fence_generations = ARRAY[4]::bigint[],
+                workload_spec_published_at = NULL
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&pool)
+    .await
+    .expect("open the crash window");
+    let before: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read policy generation");
+
+    let stamped = recover_deleting_workload_publications(
+        &pool,
+        &publication_statefulset_client(deployment_id, false),
+    )
+    .await
+    .expect("recover deleting publication");
+    assert!(stamped);
+    let (published, after): (bool, i64) = sqlx::query_as(
+        "SELECT deployment.workload_spec_published_at IS NOT NULL,
+                reconciliation.desired_generation
+           FROM deployments AS deployment
+           CROSS JOIN kbs_signed_policy_reconciliation AS reconciliation
+          WHERE deployment.id = $1
+            AND reconciliation.singleton",
+    )
+    .bind(deployment_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read stamp and generation");
+    assert!(published, "the live generation must be stamped");
+    assert_eq!(
+        after,
+        before + 1,
+        "the selector change needs a new policy generation"
+    );
+
+    let again = recover_deleting_workload_publications(
+        &pool,
+        &publication_statefulset_client(deployment_id, false),
+    )
+    .await
+    .expect("second recovery is a no-op");
+    assert!(!again, "an already stamped generation must not bump again");
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(app.org_id)
+        .execute(&pool)
+        .await
+        .expect("delete generation-bump fixture");
+}
+
+#[tokio::test]
+async fn recover_unpublished_workload_spec_refuses_an_unreadable_in_flight_write() {
+    let pool = crate::test_support::database_test_pool().await;
+    let (app, deployment_id, _, _) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'applying',
+                apply_committed_at = clock_timestamp(),
+                workload_spec_published_at = NULL
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&pool)
+    .await
+    .expect("mark an in-flight StatefulSet attempt");
+
+    let error = recover_unpublished_workload_spec(
+        &pool,
+        &publication_statefulset_client(deployment_id, true),
+        app.id,
+        &app.namespace,
+        &app.name,
+        PublicationRecoveryMode::BeforeSupersession,
+    )
+    .await
+    .expect_err("an unreadable in-flight write must not be superseded");
+    assert!(matches!(error, DeployError::PublicationUnclassified));
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(app.org_id)
+        .execute(&pool)
+        .await
+        .expect("delete unreadable publication fixture");
 }
