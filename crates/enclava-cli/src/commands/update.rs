@@ -4,7 +4,7 @@
 //! signature on the checksums when `cosign` is on PATH.
 
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use clap::Args;
@@ -62,13 +62,16 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         return Ok(());
     }
     let asset = asset?;
+    // Symlinks are resolved: the update replaces the binary a link points at,
+    // and the path is shown before anything is written.
+    let exe = std::env::current_exe()?.canonicalize()?;
     if option_env!("ENCLAVA_RELEASE_VERSION").is_none() {
         println!("This binary was built from source; updating replaces it with the release build.");
     }
     if !args.yes {
         interactive::require_prompt("pass --yes to install the update")?;
         let confirm = dialoguer::Confirm::new()
-            .with_prompt(format!("Install enclava {latest}?"))
+            .with_prompt(format!("Install enclava {latest} to {}?", exe.display()))
             .default(true)
             .interact()?;
         if !confirm {
@@ -97,14 +100,14 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     }
     verify_signature(&client, &base, &sums).await?;
 
-    let exe = replace_exe(&extract_binary(&archive)?)?;
+    replace_exe(&exe, &extract_binary(&archive)?)?;
     println!("Updated enclava {VERSION} -> {latest} ({})", exe.display());
     Ok(())
 }
 
 fn http_client(redirect: reqwest::redirect::Policy) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("enclava-cli/{VERSION}"))
         .https_only(true)
         .redirect(redirect)
         .connect_timeout(Duration::from_secs(30))
@@ -185,8 +188,8 @@ async fn verify_signature(client: &reqwest::Client, base: &str, sums: &[u8]) -> 
         .stderr(std::process::Stdio::null())
         .status();
     if probe.is_err() {
-        println!(
-            "note: cosign not found; verified checksum only. \
+        eprintln!(
+            "warning: cosign not found; verified checksum only. \
              Install cosign for signature verification."
         );
         return Ok(());
@@ -233,10 +236,9 @@ fn extract_binary(archive: &[u8]) -> Result<Vec<u8>> {
     Err(format!("release archive does not contain {BIN}").into())
 }
 
-/// Swap the running executable for `binary`: written next to it, then renamed
+/// Swap the executable at `exe` for `binary`: written next to it, then renamed
 /// over it, so an interrupted update never leaves a partial binary.
-fn replace_exe(binary: &[u8]) -> Result<PathBuf> {
-    let exe = std::env::current_exe()?.canonicalize()?;
+fn replace_exe(exe: &Path, binary: &[u8]) -> Result<()> {
     let dir = exe.parent().unwrap_or(Path::new("."));
     let mut staged = tempfile::Builder::new()
         .prefix(".enclava-update-")
@@ -260,15 +262,15 @@ fn replace_exe(binary: &[u8]) -> Result<PathBuf> {
     let parked = {
         let parked = exe.with_extension("exe.old");
         let _ = std::fs::remove_file(&parked);
-        std::fs::rename(&exe, &parked)?;
+        std::fs::rename(exe, &parked)?;
         parked
     };
-    if let Err(e) = staged.persist(&exe) {
+    if let Err(e) = staged.persist(exe) {
         #[cfg(windows)]
-        let _ = std::fs::rename(&parked, &exe);
+        let _ = std::fs::rename(&parked, exe);
         return Err(format!("could not replace {}: {}", exe.display(), e.error).into());
     }
-    Ok(exe)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -293,6 +295,49 @@ mod tests {
         );
         let refused = release_asset("freebsd", "x86_64").unwrap_err().to_string();
         assert!(refused.contains("cargo install"), "{refused}");
+    }
+
+    #[test]
+    fn archive_binary_replaces_the_installed_one() {
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (name, body) in [("README", &b"docs"[..]), (BIN, &b"new build"[..])] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, body).unwrap();
+        }
+        let archive = tar.into_inner().unwrap().finish().unwrap();
+        let binary = extract_binary(&archive).unwrap();
+        assert_eq!(binary, b"new build");
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join(BIN);
+        std::fs::write(&exe, b"old build").unwrap();
+        replace_exe(&exe, &binary).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new build");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&exe).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            std::fs::read(exe.with_extension("exe.old")).unwrap(),
+            b"old build"
+        );
+
+        let empty = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let empty = tar::Builder::new(empty)
+            .into_inner()
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert!(extract_binary(&empty).is_err());
     }
 
     #[test]

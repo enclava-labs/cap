@@ -71,7 +71,8 @@ release, `ENCLAVA_INSTALL_DIR` to change the destination. Other platforms:
 
 To upgrade an installed CLI, run `enclava update`: it checks for a newer release
 and, after confirmation, replaces the binary in place with the same checksum and
-cosign checks as the installer (`--check` only reports, `--yes` skips the prompt).
+cosign checks as the installer (`--check` only reports, `--yes` skips the prompt). To go
+back to an earlier release, rerun the installer with `ENCLAVA_VERSION=vX.Y.Z`.
 
 ## CLI Flow
 
