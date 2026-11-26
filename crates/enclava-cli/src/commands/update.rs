@@ -358,11 +358,12 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let still_running = child.try_wait().unwrap().is_none();
         let replaced = replace_exe(&exe, b"new build");
+        // Sampled after the swap: alive now means loaded throughout it.
+        let still_running = child.try_wait().unwrap().is_none();
         child.kill().unwrap();
         child.wait().unwrap();
-        assert!(still_running, "fixture process exited before the swap");
+        assert!(still_running, "fixture process exited during the swap");
         replaced.unwrap();
         assert_eq!(std::fs::read(&exe).unwrap(), b"new build");
     }
