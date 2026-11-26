@@ -2009,13 +2009,10 @@ mod tests {
         .await
         .expect("insert the domain challenge");
         let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
-        TXT_TEST_ANSWERS
-            .lock()
-            .expect("txt answers lock")
-            .push((
-                txt_name.clone(),
-                vec![format!("enclava-domain-verification={token}")],
-            ));
+        TXT_TEST_ANSWERS.lock().expect("txt answers lock").push((
+            txt_name.clone(),
+            vec![format!("enclava-domain-verification={token}")],
+        ));
         // A pre-existing dns_records row for the hostname, row-locked by a
         // held transaction: record_custom_domain's upsert blocks on it.
         let dns_row = Uuid::new_v4();
@@ -2084,13 +2081,11 @@ mod tests {
         // future is still blocked mid-DNS-write.
         {
             let mut renewal_blocker = pool.begin().await.expect("begin the renewal blocker");
-            sqlx::query(
-                "UPDATE app_mutation_leases SET updated_at = updated_at WHERE app_id = $1",
-            )
-            .bind(app.id)
-            .execute(&mut *renewal_blocker)
-            .await
-            .expect("lock the app mutation lease row");
+            sqlx::query("UPDATE app_mutation_leases SET updated_at = updated_at WHERE app_id = $1")
+                .bind(app.id)
+                .execute(&mut *renewal_blocker)
+                .await
+                .expect("lock the app mutation lease row");
             tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
             renewal_blocker
                 .rollback()
@@ -2106,13 +2101,12 @@ mod tests {
         assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
 
         // The lane rolled back: the staged verified_at write is gone.
-        let verified_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
-            "SELECT verified_at FROM custom_domain_challenges WHERE id = $1",
-        )
-        .bind(challenge_id)
-        .fetch_one(&pool)
-        .await
-        .expect("read the challenge row");
+        let verified_at: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT verified_at FROM custom_domain_challenges WHERE id = $1")
+                .bind(challenge_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the challenge row");
         assert!(
             verified_at.is_none(),
             "the staged verified_at write must roll back with the lane"
