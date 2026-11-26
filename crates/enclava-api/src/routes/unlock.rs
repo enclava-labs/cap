@@ -2313,6 +2313,180 @@ mod tests {
         (artifacts, signed)
     }
 
+    /// The transition route's identity loader must include the ROLLBACK's
+    /// source generation: while a replacement publication is unconfirmed,
+    /// the app's live TEE is still the OLDER workload, so
+    /// `load_admissible_launch_identities` must return that generation's
+    /// identity and not only the newest publication's (cap#380 review
+    /// round 1: the transition coverage gap).
+    #[tokio::test]
+    async fn transition_identity_loader_includes_the_older_live_generation() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap192_transition_loader").await;
+        let fixture = insert_unlock_test_app(&pool).await;
+        let app = &fixture.app;
+
+        // The older generation: the app's live, healthy workload. Its TEE is
+        // the one a rollback transitions FROM.
+        let older_deploy = Uuid::new_v4();
+        crate::kbs::tests::insert_test_deployment(
+            &pool,
+            app.org_id,
+            app.id,
+            older_deploy,
+            "healthy",
+            Utc::now(),
+        )
+        .await;
+        crate::kbs::tests::set_test_setup_state(&pool, older_deploy, "accepted").await;
+
+        // The newer generation: an unconfirmed publication (failed
+        // deployment, workload published) — required teardown authority
+        // until it is superseded, exactly like the pinned-intermediate
+        // kbs fixtures.
+        let newer_deploy = Uuid::new_v4();
+        crate::kbs::tests::insert_test_deployment(
+            &pool,
+            app.org_id,
+            app.id,
+            newer_deploy,
+            "failed",
+            Utc::now() + chrono::Duration::seconds(1),
+        )
+        .await;
+        crate::kbs::tests::set_test_setup_state(&pool, newer_deploy, "accepted").await;
+        crate::kbs::tests::mark_test_workload_published(&pool, newer_deploy).await;
+
+        let mut expected_identities = Vec::new();
+        for (deploy_id, cc_init_data) in
+            [(older_deploy, [0x06_u8; 32]), (newer_deploy, [0x16_u8; 32])]
+        {
+            let (mut artifacts, signed) =
+                test_signing_artifacts(app, deploy_id, "sha256:test-image", "");
+            artifacts.descriptor.expected_cc_init_data_hash = cc_init_data;
+            let descriptor_payload =
+                serde_json::to_value(&artifacts.descriptor).expect("descriptor payload serializes");
+            sqlx::query(
+                "INSERT INTO workload_artifacts (
+                     descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                     descriptor_signature, descriptor_signing_key_id,
+                     org_keyring_payload, org_keyring_signature,
+                     signed_policy_artifact
+                 ) VALUES ($1, $2, $3, $4, $5, 'test-key',
+                           '{}'::jsonb, $6, $7)",
+            )
+            .bind(artifacts.descriptor_core_hash.to_vec())
+            .bind(app.id)
+            .bind(deploy_id)
+            .bind(&descriptor_payload)
+            .bind(vec![1_u8; 64])
+            .bind(vec![2_u8; 64])
+            .bind(serde_json::to_value(&signed).expect("signed artifact serializes"))
+            .execute(&pool)
+            .await
+            .expect("insert transition loader workload artifact");
+
+            // The candidate eligibility mirrors the verifier's deploy
+            // authority: the artifact's signing key must be a member of the
+            // org's latest keyring. Both generations sign with the same
+            // deterministic test deployer key, so one version covers both.
+            if expected_identities.is_empty() {
+                crate::kbs::tests::insert_test_keyring_version(
+                    &pool,
+                    app.org_id,
+                    1,
+                    &[&hex::encode(artifacts.descriptor_signing_pubkey)],
+                )
+                .await;
+            }
+            crate::kbs::tests::insert_test_job(
+                &pool,
+                app.org_id,
+                app.id,
+                deploy_id,
+                deploy_id,
+                Some((deploy_id, &signed)),
+            )
+            .await;
+            expected_identities.push(artifacts.descriptor.launch_identity());
+        }
+
+        let identities = crate::tee_attestation::load_admissible_launch_identities(&pool, app)
+            .await
+            .expect("load the app's admissible launch identities");
+        assert_eq!(
+            identities,
+            vec![expected_identities[0].clone()],
+            "the running app's newest operation is the healthy live workload: the loader              must return exactly the identity the live TEE (and any mode-transition              rollback source) attests"
+        );
+
+        // A newer generation that failed AFTER publishing its workload spec:
+        // the app keeps RUNNING the older TEE while the newest operation is
+        // the failed publication. Pin the loader's answer — the prior
+        // healthy workload's identity stays admissible — so the semantics
+        // cannot drift silently: the transition route's quote binding
+        // follows the workload the Service can actually still hit.
+        let newer_deploy = Uuid::new_v4();
+        crate::kbs::tests::insert_test_deployment(
+            &pool,
+            app.org_id,
+            app.id,
+            newer_deploy,
+            "failed",
+            Utc::now() + chrono::Duration::seconds(1),
+        )
+        .await;
+        crate::kbs::tests::set_test_setup_state(&pool, newer_deploy, "accepted").await;
+        crate::kbs::tests::mark_test_workload_published(&pool, newer_deploy).await;
+        let (mut newer_artifacts, newer_signed) =
+            test_signing_artifacts(app, newer_deploy, "sha256:test-image-2", "");
+        newer_artifacts.descriptor.expected_cc_init_data_hash = [0x16_u8; 32];
+        let newer_payload = serde_json::to_value(&newer_artifacts.descriptor)
+            .expect("newer descriptor payload serializes");
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             ) VALUES ($1, $2, $3, $4, $5, 'test-key',
+                       '{}'::jsonb, $6, $7)",
+        )
+        .bind(newer_artifacts.descriptor_core_hash.to_vec())
+        .bind(app.id)
+        .bind(newer_deploy)
+        .bind(&newer_payload)
+        .bind(vec![1_u8; 64])
+        .bind(vec![2_u8; 64])
+        .bind(serde_json::to_value(&newer_signed).expect("signed artifact serializes"))
+        .execute(&pool)
+        .await
+        .expect("insert the failed publication's workload artifact");
+        crate::kbs::tests::insert_failed_apply_job(
+            &pool,
+            app.org_id,
+            app.id,
+            newer_deploy,
+            &newer_signed,
+            6,
+        )
+        .await;
+
+        let identities_after_failure =
+            crate::tee_attestation::load_admissible_launch_identities(&pool, app)
+                .await
+                .expect("reload the app's admissible launch identities");
+        assert_eq!(
+            identities_after_failure,
+            vec![expected_identities[0].clone()],
+            "the newest operation failed, but the app still runs the older workload: the \
+             loader keeps returning that live TEE's identity — the transition route (and a \
+             mode rollback) still binds its quote to the source generation"
+        );
+
+        delete_unlock_test_org(&pool, app.org_id).await;
+    }
+
     #[test]
     fn parses_public_unlock_mode_names() {
         assert_eq!(
