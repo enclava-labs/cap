@@ -1999,7 +1999,7 @@ mod tests {
         state.db = pool.clone();
         let (app, _deployment_id, _lease, _payload) =
             crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
-        let (kube, _kube_task) = hanging_ingress_kube(&app.name).await;
+        let (kube, _kube_task, writes_in_flight) = hanging_ingress_kube(&app.name).await;
         state.kube_client = kube;
 
         let old_domain = "tenant-ingress-old.example-test.com";
@@ -2094,6 +2094,17 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
+        // PROVE the tenant-ingress write is in flight before the renewal
+        // is lost (review 4703559887): wait for the fake's ConfigMap
+        // write counter, so the loss cannot fire during an earlier step.
+        let write_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while writes_in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < write_deadline,
+                "the tenant-ingress ConfigMap write never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         // Block the heartbeat's renewal on the app lease row past the 2s
         // test renew timeout while the ConfigMap apply is in flight.
         {
@@ -2209,7 +2220,7 @@ mod tests {
         state.db = pool.clone();
         let (app, _deployment_id, _lease, _payload) =
             crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
-        let (kube, _kube_task) = hanging_ingress_kube(&app.name).await;
+        let (kube, _kube_task, writes_in_flight) = hanging_ingress_kube(&app.name).await;
         state.kube_client = kube;
         let domain = "route-publish-loss.example-test.com";
         sqlx::query("UPDATE apps SET custom_domain = $1 WHERE id = $2")
@@ -2297,6 +2308,17 @@ mod tests {
             );
         }
 
+        // PROVE the edge write is in flight before the renewal is lost
+        // (review 4703559887): wait for the fake's ConfigMap write
+        // counter, so the loss cannot fire during an earlier step.
+        let write_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while writes_in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < write_deadline,
+                "the edge ConfigMap write never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         // Block the heartbeat's renewal past the 2s test renew timeout
         // while the edge ConfigMap write is in flight.
         {
@@ -2431,18 +2453,27 @@ mod tests {
     /// list answers empty, and the tenant-ingress ConfigMap apply is
     /// never answered -- the provider future hangs mid-write, exactly
     /// where a lost renewal must abort it.
-    async fn hanging_ingress_kube(workload: &str) -> (kube::Client, tokio::task::JoinHandle<()>) {
+    async fn hanging_ingress_kube(
+        workload: &str,
+    ) -> (
+        kube::Client,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the fake kube listener");
         let port = listener.local_addr().unwrap().port();
         let workload = workload.to_string();
+        let writes_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = writes_in_flight.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
                 let workload = workload.clone();
+                let counter = counter.clone();
                 tokio::spawn(async move {
                     let mut stream = stream;
                     loop {
@@ -2538,9 +2569,13 @@ mod tests {
                                 "{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404,\"message\":\"not found\"}",
                             ))
                         } else if path.contains("configmaps") {
-                            // The tenant-ingress ConfigMap SSA apply: never
-                            // answer. The provider future stays in flight
-                            // until the renewal loss aborts it.
+                            // The tenant-ingress ConfigMap SSA apply (or
+                            // the shared edge config write): never answer.
+                            // The provider future stays in flight until
+                            // the renewal loss aborts it. The counter lets
+                            // the test PROVE the write is in flight before
+                            // it kills the renewal (review 4703559887).
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             None
                         } else {
                             Some(respond("200 OK", "{}"))
@@ -2568,7 +2603,7 @@ mod tests {
             format!("http://127.0.0.1:{port}").parse().unwrap(),
         ))
         .expect("build the fake kube client");
-        (client, task)
+        (client, task, writes_in_flight)
     }
 
     /// cap#422 R2 (review T1 + T2): drives the REAL verify path
