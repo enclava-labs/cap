@@ -1198,6 +1198,16 @@ async fn deploy_app_candidate(
                 ),
             ));
         }
+        // #424 admission: a group-bearing signed descriptor is refused BEFORE
+        // the transaction opens (the first write is the app_resources upsert
+        // far below), so a rejection leaves the database byte-identical.
+        // The worker's execution-time check still fails closed for jobs
+        // queued before a configuration change.
+        crate::routes::platform::admit_pod_supplemental_groups(
+            artifacts.descriptor.pod_supplemental_groups.as_deref(),
+            crate::routes::platform::pod_supplemental_groups_supported(),
+        )
+        .map_err(|admission| admission.refusal())?;
     }
     let signed_required = customer_signed_deploy_required(
         state.attestation.as_ref(),
@@ -2360,6 +2370,240 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("load setup test app")
+    }
+
+    /// #424 T1/T3 fixture: raw signed blobs for `deploy_app_candidate` whose
+    /// descriptor carries `pod_supplemental_groups` (contract-v1 shape) and a
+    /// restricted security context (so the signed-profile compare passes and
+    /// the admission decision is the next thing the handler reaches).
+    fn group_bearing_signed_blobs(app: &App) -> (String, String) {
+        use ed25519_dalek::Signer as _;
+        let descriptor = serde_json::json!({
+            "pod_supplemental_groups": [0, 6],
+            "independent_verification": true,
+            "schema_version": "v1",
+            "org_id": app.org_id,
+            "org_slug": app.tenant_id,
+            "app_id": app.id,
+            "app_name": app.name,
+            "deploy_id": Uuid::new_v4(),
+            "created_at": chrono::Utc::now(),
+            "nonce": "01".repeat(32),
+            "app_domain": app.domain,
+            "tee_domain": app.tee_domain.as_deref().unwrap_or(&app.domain),
+            "custom_domains": [],
+            "namespace": app.namespace,
+            "service_account": app.service_account,
+            "identity_hash": app.tenant_instance_identity_hash,
+            "image_ref": format!("ghcr.io/enclava-labs/test@sha256:{}", "aa".repeat(32)),
+            "image_digest": format!("sha256:{}", "aa".repeat(32)),
+            "signer_identity": {
+                "subject": app.signer_identity_subject.as_deref().unwrap_or_default(),
+                "issuer": app.signer_identity_issuer.as_deref().unwrap_or_default(),
+            },
+            "oci_runtime_spec": {
+                "command": [enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH],
+                "args": ["/usr/local/bin/test"],
+                "env": [],
+                "ports": [{"container_port": 8080, "protocol": "TCP"}],
+                "mounts": [],
+                "capabilities": {"add": [], "drop": ["ALL"]},
+                "security_context": {
+                    "run_as_user": 10001,
+                    "run_as_group": 10001,
+                    "read_only_root_fs": true,
+                    "allow_privilege_escalation": false,
+                    "privileged": false,
+                },
+                "resources": {"requests": [], "limits": []},
+            },
+            "sidecars": {
+                "attestation_proxy_digest": format!("sha256:{}", "11".repeat(32)),
+                "caddy_digest": format!("sha256:{}", "22".repeat(32)),
+            },
+            "api_signing_pubkey": "test-api-signing-key",
+            "expected_firmware_measurement": "03".repeat(32),
+            "expected_runtime_class": "kata-qemu-snp",
+            "kbs_resource_path": format!(
+                "default/{}-{}-owner/seed-encrypted",
+                app.namespace, app.name
+            ),
+            "unlock_mode": "password",
+            "policy_template_id": "enclava-kbs-policy-v1",
+            "policy_template_sha256": "04".repeat(32),
+            "platform_release_version": "cap-test",
+            "expected_agent_policy_hash": "05".repeat(32),
+            "expected_cc_init_data_hash": "06".repeat(32),
+            "expected_kbs_policy_hash": "07".repeat(32),
+        });
+        // decode_optional_blobs verifies customer signatures, so the fixture
+        // signs both envelopes with real test keys (the unlock.rs fixture
+        // pattern).
+        let deployer_key = ed25519_dalek::SigningKey::from_bytes(&[0x09; 32]);
+        let owner_key = ed25519_dalek::SigningKey::from_bytes(&[0x0b; 32]);
+        let descriptor_typed: enclava_common::descriptor::DeploymentDescriptor =
+            serde_json::from_value(descriptor.clone()).expect("descriptor fixture");
+        let descriptor_blob = serde_json::json!({
+            "descriptor": descriptor,
+            "signature": hex::encode(
+                deployer_key
+                    .sign(&enclava_common::descriptor::descriptor_canonical_bytes(
+                        &descriptor_typed
+                    ))
+                    .to_bytes()
+            ),
+            "signing_key_id": "test-deployer-key",
+            "signing_pubkey": hex::encode(deployer_key.verifying_key().to_bytes()),
+        })
+        .to_string();
+        let keyring = crate::signing_service::TestOrgKeyring {
+            org_id: app.org_id,
+            version: 1,
+            members: vec![
+                crate::signing_service::TestKeyringMember {
+                    user_id: Uuid::new_v4(),
+                    pubkey: deployer_key.verifying_key().to_bytes(),
+                    role: crate::signing_service::TestKeyringRole::Deployer,
+                    added_at: chrono::Utc::now(),
+                },
+                crate::signing_service::TestKeyringMember {
+                    user_id: Uuid::new_v4(),
+                    pubkey: owner_key.verifying_key().to_bytes(),
+                    role: crate::signing_service::TestKeyringRole::Owner,
+                    added_at: chrono::Utc::now(),
+                },
+            ],
+            updated_at: chrono::Utc::now(),
+        };
+        let keyring_blob = serde_json::json!({
+            "keyring": serde_json::to_value(&keyring).expect("keyring fixture"),
+            "signature": hex::encode(
+                owner_key
+                    .sign(&crate::signing_service::canonical_keyring_bytes_test(&keyring))
+                    .to_bytes()
+            ),
+            "signing_pubkey": hex::encode(owner_key.verifying_key().to_bytes()),
+        })
+        .to_string();
+        (descriptor_blob, keyring_blob)
+    }
+
+    /// #424 T1: a stable per-app snapshot of every table a signed deploy
+    /// writes before commit, so a refused admission is provably
+    /// byte-identical.
+    async fn deploy_row_snapshot(pool: &sqlx::PgPool, app_id: Uuid) -> serde_json::Value {
+        let snapshot: sqlx::types::Json<serde_json::Value> = sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+                'app_containers', (SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.id), '[]'::jsonb)
+                                     FROM app_containers c WHERE c.app_id = $1),
+                'app_resources', (SELECT to_jsonb(r) FROM app_resources r WHERE r.app_id = $1),
+                'deployments', (SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.id), '[]'::jsonb)
+                                  FROM deployments d WHERE d.app_id = $1),
+                'jobs', (SELECT coalesce(jsonb_agg(to_jsonb(j) ORDER BY j.deployment_id, j.generation), '[]'::jsonb)
+                           FROM deployment_apply_jobs j WHERE j.app_id = $1)
+            )",
+        )
+        .bind(app_id)
+        .fetch_one(pool)
+        .await
+        .expect("snapshot deploy rows");
+        snapshot.0
+    }
+
+    #[tokio::test]
+    async fn group_bearing_signed_descriptor_is_refused_before_persistence() {
+        // T1 (#424): with the capability off (the default — the variable is
+        // unset in this process), a group-bearing signed descriptor is
+        // refused with the admission code BEFORE the transaction opens, so
+        // no app-setting row changes.
+        let _gate_lock = crate::test_support::POD_SUPPLEMENTAL_GROUPS_GATE_LOCK
+            .lock()
+            .await;
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.require_customer_signed_policy_artifact = false;
+        let (descriptor_blob, keyring_blob) = group_bearing_signed_blobs(&app);
+        let before = deploy_row_snapshot(&pool, app.id).await;
+        let auth = AuthContext {
+            user_id: Uuid::new_v4(),
+            org_id: app.org_id,
+            org_name: "cap424-admission-test".to_string(),
+            role: crate::models::Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let body = serde_json::from_value(serde_json::json!({
+            "image": format!("ghcr.io/enclava-labs/test@sha256:{}", "aa".repeat(32)),
+            "customer_descriptor_blob": descriptor_blob,
+            "org_keyring_blob": keyring_blob,
+        }))
+        .expect("decode deploy request");
+        let error = deploy_app_candidate(auth, state, app.clone(), body, AppMutation::None, false)
+            .await
+            .expect_err("group-bearing descriptor must be refused before the transaction");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0["code"], "pod_supplemental_groups_not_supported",
+            "the refusal body carries the admission code"
+        );
+        let after = deploy_row_snapshot(&pool, app.id).await;
+        assert_eq!(
+            before, after,
+            "a refused deploy must leave every row byte-identical"
+        );
+        delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn group_bearing_signed_descriptor_is_admitted_when_the_gate_is_on() {
+        // T3, deploy control (#424): the ONLY test allowed to set the
+        // variable, under the shared gate lock. With the capability on, the
+        // same request passes the admission and fails for some later
+        // non-admission reason (the fixture is not a complete deploy) —
+        // never with the admission code.
+        let _gate_lock = crate::test_support::POD_SUPPLEMENTAL_GROUPS_GATE_LOCK
+            .lock()
+            .await;
+        let _gate = crate::test_support::PodSupplementalGroupsGateGuard::enable();
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.require_customer_signed_policy_artifact = false;
+        let (descriptor_blob, keyring_blob) = group_bearing_signed_blobs(&app);
+        let auth = AuthContext {
+            user_id: Uuid::new_v4(),
+            org_id: app.org_id,
+            org_name: "cap424-gate-on-test".to_string(),
+            role: crate::models::Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let body = serde_json::from_value(serde_json::json!({
+            "image": format!("ghcr.io/enclava-labs/test@sha256:{}", "aa".repeat(32)),
+            "customer_descriptor_blob": descriptor_blob,
+            "org_keyring_blob": keyring_blob,
+        }))
+        .expect("decode deploy request");
+        match deploy_app_candidate(auth, state, app.clone(), body, AppMutation::None, false).await {
+            Ok(_) => {}
+            Err((status, Json(error_body))) => {
+                assert_ne!(
+                    error_body["code"], "pod_supplemental_groups_not_supported",
+                    "gate on: the admission must pass (status {status})"
+                );
+                assert!(
+                    error_body["error"]
+                        .as_str()
+                        .map(|error| !error.contains("ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED"))
+                        .unwrap_or(true),
+                    "gate on: the refusal text must not appear"
+                );
+            }
+        }
+        delete_setup_test_org(&pool, app.org_id).await;
     }
 
     #[tokio::test]

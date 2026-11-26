@@ -503,6 +503,16 @@ pub async fn rollback(
                 ),
             ));
         }
+        // #424 admission: a group-bearing signed target is refused before
+        // restore_target_apply_snapshot replaces the app's stored rows (the
+        // operator-rollback hazard: the app would be committed to a target
+        // the worker cannot apply). The transaction is already open: return
+        // the refusal and drop it — no commit, nothing written yet.
+        crate::routes::platform::admit_pod_supplemental_groups(
+            artifacts.descriptor.pod_supplemental_groups.as_deref(),
+            crate::routes::platform::pod_supplemental_groups_supported(),
+        )
+        .map_err(|admission| admission.refusal())?;
     }
     if !crate::deploy::lock_and_verify_existing_app_authority(&mut tx, app.id, &authority_snapshot)
         .await
@@ -939,6 +949,632 @@ mod exact_snapshot_tests {
         .expect("terminalize rollback generation job");
         tx.commit().await.expect("commit rollback generation");
         deployment_id
+    }
+
+    /// #424 T2 fixture authority: the owner key that signs the descriptor
+    /// and the org keyring, plus the DB rows that make it a stored signer.
+    struct GroupBearingAuthority {
+        owner_key: ed25519_dalek::SigningKey,
+        user_id: Uuid,
+        signing_key_id: Uuid,
+        member_added_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    fn signed_test_keyring(
+        org_id: Uuid,
+        authority: &GroupBearingAuthority,
+        version: u64,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> (serde_json::Value, serde_json::Value, Vec<u8>) {
+        use ed25519_dalek::Signer as _;
+        use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
+        let pubkey = authority.owner_key.verifying_key().to_bytes();
+        let added_at = authority.member_added_at.to_rfc3339();
+        let member_hash = ce_v1_hash(&[
+            ("user_id", authority.user_id.as_bytes().as_slice()),
+            ("pubkey", pubkey.as_slice()),
+            ("role", b"owner"),
+            ("added_at", added_at.as_bytes()),
+        ]);
+        let user_id_label = authority.user_id.to_string();
+        let members_hash = ce_v1_hash(&[(user_id_label.as_str(), member_hash.as_slice())]);
+        let version_bytes = version.to_be_bytes();
+        let updated_at_text = updated_at.to_rfc3339();
+        let canonical = ce_v1_bytes(&[
+            ("purpose", b"enclava-org-keyring-v1"),
+            ("org_id", org_id.as_bytes().as_slice()),
+            ("version", &version_bytes),
+            ("members", &members_hash),
+            ("updated_at", updated_at_text.as_bytes()),
+        ]);
+        let signature = authority.owner_key.sign(&canonical).to_bytes().to_vec();
+        let keyring = serde_json::json!({
+            "org_id": org_id,
+            "version": version,
+            "members": [{
+                "user_id": authority.user_id,
+                "pubkey": hex::encode(pubkey),
+                "role": "owner",
+                "added_at": authority.member_added_at,
+            }],
+            "updated_at": updated_at,
+        });
+        let envelope = serde_json::json!({
+            "keyring": keyring,
+            "signature": hex::encode(&signature),
+            "signing_pubkey": hex::encode(pubkey),
+        });
+        (keyring, envelope, signature)
+    }
+
+    async fn insert_test_keyring_version(
+        pool: &sqlx::PgPool,
+        org_id: Uuid,
+        authority: &GroupBearingAuthority,
+        version: u64,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
+        let (keyring, envelope, signature) =
+            signed_test_keyring(org_id, authority, version, updated_at);
+        sqlx::query(
+            "INSERT INTO org_keyrings (
+                 org_id, version, keyring_payload, signature, signing_key_id
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(version as i64)
+        .bind(serde_json::to_vec(&keyring).expect("serialize test keyring"))
+        .bind(signature)
+        .bind(authority.signing_key_id)
+        .execute(pool)
+        .await
+        .expect("insert test keyring version");
+        envelope
+    }
+
+    /// #424 T2: turn `insert_job_fixture`'s unsigned deployment into a
+    /// healthy target whose stored signed descriptor carries
+    /// `pod_supplemental_groups`, so `rollback` reaches the admission
+    /// decision with a group-bearing authority to refuse. The shape mirrors
+    /// deployment_jobs.rs's signed rollback fixture (the same production
+    /// adapters: decode_optional_blobs, cc_init_data, the policy artifact
+    /// contract), with the one field under test added.
+    async fn mark_group_bearing_signed_healthy_target(
+        pool: &sqlx::PgPool,
+        deployment_id: Uuid,
+        mut payload: crate::deployment_jobs::DeploymentApplyJobPayload,
+        state: &mut crate::state::AppState,
+    ) {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        use ed25519_dalek::Signer as _;
+        use enclava_common::descriptor::descriptor_core_hash;
+        use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
+        use sha2::{Digest, Sha256};
+
+        payload.app.signer_identity_subject = Some(
+            "https://github.com/acme/app/.github/workflows/deploy.yml@refs/heads/main".to_string(),
+        );
+        payload.app.signer_identity_issuer =
+            Some("https://token.actions.githubusercontent.com".to_string());
+        payload.app.signer_identity_set_at = Some(chrono::Utc::now());
+        sqlx::query(
+            "UPDATE apps
+                SET signer_identity_subject = $2,
+                    signer_identity_issuer = $3,
+                    signer_identity_set_at = $4
+              WHERE id = $1",
+        )
+        .bind(payload.app.id)
+        .bind(payload.app.signer_identity_subject.as_deref())
+        .bind(payload.app.signer_identity_issuer.as_deref())
+        .bind(payload.app.signer_identity_set_at)
+        .execute(pool)
+        .await
+        .expect("record cap424 fixture identity");
+        let owner_key = ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]);
+        let platform_key = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
+        let user_id = Uuid::new_v4();
+        let signing_key_id = Uuid::new_v4();
+        let member_added_at = chrono::Utc::now();
+        let authority = GroupBearingAuthority {
+            owner_key,
+            user_id,
+            signing_key_id,
+            member_added_at,
+        };
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'cap424 signer')")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("insert cap424 signer user");
+        sqlx::query(
+            "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $2, 'owner'::role_enum)",
+        )
+        .bind(user_id)
+        .bind(payload.app.org_id)
+        .execute(pool)
+        .await
+        .expect("insert cap424 signer membership");
+        sqlx::query(
+            "INSERT INTO user_signing_keys (id, user_id, pubkey)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(signing_key_id)
+        .bind(user_id)
+        .bind(authority.owner_key.verifying_key().to_bytes().to_vec())
+        .execute(pool)
+        .await
+        .expect("insert cap424 signer key");
+        let keyring_envelope =
+            insert_test_keyring_version(pool, payload.app.org_id, &authority, 1, member_added_at)
+                .await;
+
+        let platform_pubkey_hex = hex::encode(platform_key.verifying_key().to_bytes());
+        state
+            .attestation
+            .as_mut()
+            .expect("cap424 fixture attestation")
+            .signing_service_pubkey_hex = Some(platform_pubkey_hex.clone());
+        state.require_customer_signed_policy_artifact = true;
+        payload.attestation_config = state.attestation.clone();
+
+        let image_digest = payload.snapshot.containers[0]
+            .image_digest
+            .clone()
+            .expect("cap424 fixture image digest");
+        let agent_policy_text =
+            "package agent_policy\n\ndefault CreateContainerRequest := true\n".to_string();
+        let rego_text = "package policy\n\ndefault allow := false\n".to_string();
+        let agent_policy_hash: [u8; 32] = Sha256::digest(agent_policy_text.as_bytes()).into();
+        let rego_hash: [u8; 32] = Sha256::digest(rego_text.as_bytes()).into();
+        use enclava_common::descriptor::{
+            Capabilities, DeploymentDescriptor, OciRuntimeSpec, Resources, SecurityContext,
+            Sidecars, SignerIdentity,
+        };
+        let mut descriptor = DeploymentDescriptor {
+            pod_supplemental_groups: Some(vec![0, 6]),
+            schema_version: "v1".to_string(),
+            org_id: payload.app.org_id,
+            org_slug: payload.app.tenant_id.clone(),
+            app_id: payload.app.id,
+            app_name: payload.app.name.clone(),
+            deploy_id: deployment_id,
+            created_at: chrono::Utc::now(),
+            nonce: [0x13; 32],
+            app_domain: payload.app.domain.clone(),
+            tee_domain: payload
+                .app
+                .tee_domain
+                .clone()
+                .unwrap_or_else(|| payload.app.domain.clone()),
+            custom_domains: payload.app.custom_domain.clone().into_iter().collect(),
+            namespace: payload.app.namespace.clone(),
+            service_account: payload.app.service_account.clone(),
+            identity_hash: hex::decode(&payload.app.tenant_instance_identity_hash)
+                .expect("decode fixture identity hash")
+                .try_into()
+                .expect("fixture identity hash length"),
+            image_ref: format!("ghcr.io/acme/app@{image_digest}"),
+            image_digest: image_digest.clone(),
+            signer_identity: SignerIdentity {
+                subject: payload
+                    .app
+                    .signer_identity_subject
+                    .clone()
+                    .unwrap_or_default(),
+                issuer: payload
+                    .app
+                    .signer_identity_issuer
+                    .clone()
+                    .unwrap_or_default(),
+            },
+            oci_runtime_spec: OciRuntimeSpec {
+                command: vec![
+                    enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH.to_string(),
+                ],
+                args: vec!["/usr/local/bin/app".to_string()],
+                env: vec![],
+                ports: vec![],
+                mounts: vec![],
+                capabilities: Capabilities::default(),
+                security_context: SecurityContext::default(),
+                resources: Resources::default(),
+            },
+            sidecars: Sidecars {
+                attestation_proxy_digest: format!("sha256:{}", "11".repeat(32)),
+                caddy_digest: format!("sha256:{}", "22".repeat(32)),
+            },
+            api_signing_pubkey: payload.api_signing_pubkey.clone(),
+            independent_verification: true,
+            expected_firmware_measurement: [3; 32].into(),
+            expected_runtime_class: "kata-qemu-snp".to_string(),
+            kbs_resource_path: format!(
+                "default/{}-{}-owner/seed-encrypted",
+                payload.app.namespace, payload.app.name
+            ),
+            unlock_mode: "password".to_string(),
+            policy_template_id: "enclava-kbs-policy-v1".to_string(),
+            policy_template_sha256: [4; 32],
+            platform_release_version: "cap-test".to_string(),
+            expected_agent_policy_hash: agent_policy_hash,
+            expected_cc_init_data_hash: [0; 32],
+            expected_kbs_policy_hash: rego_hash,
+        };
+        let descriptor_hash = descriptor_core_hash(&descriptor);
+        let provisional_descriptor_blob = serde_json::json!({
+            "descriptor": descriptor,
+            "signature": hex::encode(
+                authority
+                    .owner_key
+                    .sign(&enclava_common::descriptor::descriptor_canonical_bytes(&descriptor))
+                    .to_bytes()
+            ),
+            "signing_key_id": "cap424-owner",
+            "signing_pubkey": hex::encode(authority.owner_key.verifying_key().to_bytes()),
+        })
+        .to_string();
+        let provisional = crate::signing_service::decode_optional_blobs(
+            Some(provisional_descriptor_blob),
+            Some(keyring_envelope.to_string()),
+        )
+        .expect("decode cap424 provisional signed fixture")
+        .expect("cap424 provisional signed fixture exists");
+        let binding = provisional.binding();
+        assert_eq!(binding.descriptor_core_hash, descriptor_hash);
+
+        let mut app_spec = crate::deploy::build_confidential_app_from_rows(
+            &payload.app,
+            deployment_id,
+            payload
+                .attestation_config
+                .as_ref()
+                .expect("cap424 fixture payload attestation"),
+            &payload.api_signing_pubkey,
+            &payload.api_url,
+            &payload.snapshot.containers,
+            &payload.snapshot.resources,
+        )
+        .expect("build cap424 signed fixture runtime");
+        app_spec.workload_artifact_binding = Some(WorkloadArtifactBinding {
+            descriptor_core_hash: binding.descriptor_core_hash,
+            descriptor_signing_pubkey: binding.descriptor_signing_pubkey,
+            org_keyring_fingerprint: binding.org_keyring_fingerprint,
+            omit_log_encryption_claim: false,
+            legacy_collapsed_trustee_key: false,
+            omit_luks2_header_seal_claim: false,
+            omit_log_spool_bind_claim: false,
+        });
+        crate::routes::deployments::select_local_signed_artifact_delivery(
+            &mut app_spec.attestation,
+        );
+        app_spec.generated_agent_policy = Some(GeneratedAgentPolicy {
+            policy_text: agent_policy_text.clone(),
+            policy_sha256: agent_policy_hash,
+            genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+        });
+        let (_, cc_init_data_hash) =
+            enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+        descriptor.expected_cc_init_data_hash = hex::decode(cc_init_data_hash)
+            .expect("decode cap424 fixture cc-init hash")
+            .try_into()
+            .expect("cap424 fixture cc-init hash length");
+
+        let descriptor_signature =
+            authority
+                .owner_key
+                .sign(&enclava_common::descriptor::descriptor_canonical_bytes(
+                    &descriptor,
+                ));
+        let descriptor_blob = serde_json::json!({
+            "descriptor": descriptor,
+            "signature": hex::encode(descriptor_signature.to_bytes()),
+            "signing_key_id": "cap424-owner",
+            "signing_pubkey": hex::encode(authority.owner_key.verifying_key().to_bytes()),
+        })
+        .to_string();
+        let artifacts = crate::signing_service::decode_optional_blobs(
+            Some(descriptor_blob),
+            Some(keyring_envelope.to_string()),
+        )
+        .expect("decode cap424 signed fixture")
+        .expect("cap424 signed fixture exists");
+        artifacts
+            .validate_customer_authority(pool)
+            .await
+            .expect("validate cap424 signed fixture authority");
+
+        let metadata = crate::signing_service::PolicyMetadata {
+            app_id: payload.app.id.to_string(),
+            deploy_id: deployment_id.to_string(),
+            descriptor_core_hash: hex::encode(artifacts.descriptor_core_hash),
+            descriptor_signing_pubkey: hex::encode(artifacts.descriptor_signing_pubkey),
+            platform_release_version: artifacts.descriptor.platform_release_version.clone(),
+            policy_template_id: artifacts.descriptor.policy_template_id.clone(),
+            policy_template_sha256: hex::encode(artifacts.descriptor.policy_template_sha256),
+            agent_policy_sha256: hex::encode(agent_policy_hash),
+            genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+            signed_at: "2026-07-17T00:00:00+00:00".to_string(),
+            key_id: "cap424-policy-key".to_string(),
+        };
+        let metadata_hash = enclava_common::canonical::ce_v1_hash(&[
+            ("app_id", payload.app.id.as_bytes().as_slice()),
+            ("deploy_id", deployment_id.as_bytes().as_slice()),
+            ("descriptor_core_hash", &artifacts.descriptor_core_hash),
+            (
+                "descriptor_signing_pubkey",
+                &artifacts.descriptor_signing_pubkey,
+            ),
+            (
+                "platform_release_version",
+                metadata.platform_release_version.as_bytes(),
+            ),
+            ("policy_template_id", metadata.policy_template_id.as_bytes()),
+            (
+                "policy_template_sha256",
+                &artifacts.descriptor.policy_template_sha256,
+            ),
+            ("agent_policy_sha256", &agent_policy_hash),
+            (
+                "genpolicy_version_pin",
+                metadata.genpolicy_version_pin.as_bytes(),
+            ),
+            ("signed_at", metadata.signed_at.as_bytes()),
+            ("key_id", metadata.key_id.as_bytes()),
+        ]);
+        let signing_input = enclava_common::canonical::ce_v1_bytes(&[
+            ("purpose", b"enclava-policy-artifact-v1"),
+            ("metadata", &metadata_hash),
+            ("rego_sha256", &rego_hash),
+        ]);
+        let mut signed_policy_artifact = crate::signing_service::SignedPolicyArtifact {
+            metadata,
+            rego_text,
+            rego_sha256: hex::encode(rego_hash),
+            agent_policy_text,
+            agent_policy_sha256: hex::encode(agent_policy_hash),
+            signature: hex::encode(platform_key.sign(&signing_input).to_bytes()),
+            verify_pubkey_b64: B64.encode(platform_key.verifying_key().to_bytes()),
+            org_keyring: None,
+        };
+        artifacts
+            .validate_signed_artifact(&signed_policy_artifact, &platform_pubkey_hex)
+            .expect("validate cap424 signed fixture policy");
+        artifacts
+            .attach_customer_authority(&mut signed_policy_artifact)
+            .expect("attach cap424 signed fixture authority");
+
+        payload.artifact_deployment_id = Some(deployment_id);
+        payload.artifact_descriptor_core_hash = Some(artifacts.descriptor_core_hash);
+        let mut tx = pool.begin().await.expect("begin cap424 signed target");
+        sqlx::query("DELETE FROM deployments WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&mut *tx)
+            .await
+            .expect("delete unsigned target before cap424 recreation");
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot, image_digest
+             ) VALUES (
+                 $1, $2, $3, 'api'::trigger_enum, 'pending'::deploy_status_enum, $4, $5
+             )",
+        )
+        .bind(deployment_id)
+        .bind(payload.app.org_id)
+        .bind(payload.app.id)
+        .bind(serde_json::json!({
+            "image": &payload.snapshot.containers[0].image_ref,
+            "image_digest": &image_digest,
+            "signed_descriptor_core_hash": hex::encode(artifacts.descriptor_core_hash),
+            "log_encryption": serde_json::Value::Null,
+            "setup_state": crate::deployment_jobs::DEPLOYMENT_SETUP_ACCEPTED,
+        }))
+        .bind(&image_digest)
+        .execute(&mut *tx)
+        .await
+        .expect("insert cap424 signed target deployment");
+        crate::signing_service::insert_workload_artifact_fixture(
+            &mut tx,
+            payload.app.id,
+            deployment_id,
+            &artifacts,
+            &signed_policy_artifact,
+        )
+        .await
+        .expect("persist cap424 signed fixture");
+        crate::deployment_jobs::insert_setup_job(
+            &mut tx,
+            deployment_id,
+            deployment_id,
+            &payload,
+            true,
+            None,
+        )
+        .await
+        .expect("insert cap424 signed durable job");
+        sqlx::query(
+            "UPDATE deployments SET status = 'healthy', completed_at = now() WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&mut *tx)
+        .await
+        .expect("mark cap424 target healthy");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs SET state = 'completed' WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&mut *tx)
+        .await
+        .expect("complete cap424 target job");
+        tx.commit().await.expect("commit cap424 signed target");
+    }
+
+    #[tokio::test]
+    async fn group_bearing_signed_rollback_target_is_refused_before_persistence() {
+        // T2 (#424): with the capability off (the default — the variable is
+        // unset in this process), a healthy rollback target whose stored
+        // signed descriptor declares pod supplemental groups is refused with
+        // the admission code BEFORE restore_target_apply_snapshot replaces
+        // the app's stored rows.
+        let _gate_lock = crate::test_support::POD_SUPPLEMENTAL_GROUPS_GATE_LOCK
+            .lock()
+            .await;
+        let (_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap424_rollback").await;
+        let (app, source_id, _lease, mut payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        payload.api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
+        payload.api_url = state.api_url.clone();
+        mark_group_bearing_signed_healthy_target(&pool, source_id, payload, &mut state).await;
+        sqlx::query("UPDATE apps SET status = 'running' WHERE id = $1")
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("mark cap424 app running");
+
+        let before: serde_json::Value = sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
+            "SELECT jsonb_build_object(
+                'apps', (SELECT jsonb_agg(to_jsonb(a) ORDER BY a.id) FROM apps a WHERE a.id = $1),
+                'app_containers', (SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.id), '[]'::jsonb)
+                                     FROM app_containers c WHERE c.app_id = $1),
+                'app_resources', (SELECT to_jsonb(r) FROM app_resources r WHERE r.app_id = $1),
+                'deployments', (SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.id), '[]'::jsonb)
+                                  FROM deployments d WHERE d.app_id = $1),
+                'jobs', (SELECT coalesce(jsonb_agg(to_jsonb(j) ORDER BY j.deployment_id, j.generation), '[]'::jsonb)
+                           FROM deployment_apply_jobs j WHERE j.app_id = $1),
+                'audit', (SELECT coalesce(jsonb_agg(to_jsonb(x) ORDER BY x.id), '[]'::jsonb)
+                            FROM audit_log x WHERE x.app_id = $1)
+            )",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot rows before rollback")
+        .0;
+
+        let auth_user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'cap424 caller')")
+            .bind(auth_user_id)
+            .execute(&pool)
+            .await
+            .expect("insert cap424 caller user");
+        sqlx::query(
+            "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $2, 'owner'::role_enum)",
+        )
+        .bind(auth_user_id)
+        .bind(app.org_id)
+        .execute(&pool)
+        .await
+        .expect("insert cap424 caller membership");
+        let result = super::rollback(
+            crate::auth::middleware::AuthContext {
+                user_id: auth_user_id,
+                org_id: app.org_id,
+                org_name: "cap424-rollback-test".to_string(),
+                role: crate::models::Role::Owner,
+                api_key: None,
+                management_origin: crate::auth::middleware::ManagementOrigin::Public,
+            },
+            axum::extract::State(state),
+            axum::extract::Path(app.name.clone()),
+            axum::Json(super::RollbackRequest {
+                deployment_id: Some(source_id),
+            }),
+        )
+        .await;
+        let (status, axum::Json(body)) =
+            result.expect_err("group-bearing target must refuse the rollback");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["code"], "pod_supplemental_groups_not_supported",
+            "the refusal body carries the admission code"
+        );
+
+        let after: serde_json::Value = sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
+            "SELECT jsonb_build_object(
+                'apps', (SELECT jsonb_agg(to_jsonb(a) ORDER BY a.id) FROM apps a WHERE a.id = $1),
+                'app_containers', (SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.id), '[]'::jsonb)
+                                     FROM app_containers c WHERE c.app_id = $1),
+                'app_resources', (SELECT to_jsonb(r) FROM app_resources r WHERE r.app_id = $1),
+                'deployments', (SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.id), '[]'::jsonb)
+                                  FROM deployments d WHERE d.app_id = $1),
+                'jobs', (SELECT coalesce(jsonb_agg(to_jsonb(j) ORDER BY j.deployment_id, j.generation), '[]'::jsonb)
+                           FROM deployment_apply_jobs j WHERE j.app_id = $1),
+                'audit', (SELECT coalesce(jsonb_agg(to_jsonb(x) ORDER BY x.id), '[]'::jsonb)
+                            FROM audit_log x WHERE x.app_id = $1)
+            )",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot rows after rollback")
+        .0;
+        assert_eq!(
+            before, after,
+            "a refused rollback must leave every row byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_bearing_signed_rollback_target_is_admitted_when_the_gate_is_on() {
+        // T3, rollback control (#424): with the capability on, the same
+        // healthy group-bearing target is admitted exactly as before the
+        // admission existed — the rollback is accepted (201) and proceeds.
+        let _gate_lock = crate::test_support::POD_SUPPLEMENTAL_GROUPS_GATE_LOCK
+            .lock()
+            .await;
+        let _gate = crate::test_support::PodSupplementalGroupsGateGuard::enable();
+        let (_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap424_rollback_on").await;
+        let (app, source_id, _lease, mut payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        payload.api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
+        payload.api_url = state.api_url.clone();
+        mark_group_bearing_signed_healthy_target(&pool, source_id, payload, &mut state).await;
+        sqlx::query("UPDATE apps SET status = 'running' WHERE id = $1")
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("mark cap424-on app running");
+        let auth_user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'cap424-on caller')")
+            .bind(auth_user_id)
+            .execute(&pool)
+            .await
+            .expect("insert cap424-on caller user");
+        sqlx::query(
+            "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $2, 'owner'::role_enum)",
+        )
+        .bind(auth_user_id)
+        .bind(app.org_id)
+        .execute(&pool)
+        .await
+        .expect("insert cap424-on caller membership");
+        let (status, axum::Json(accepted)) = super::rollback(
+            crate::auth::middleware::AuthContext {
+                user_id: auth_user_id,
+                org_id: app.org_id,
+                org_name: "cap424-rollback-on-test".to_string(),
+                role: crate::models::Role::Owner,
+                api_key: None,
+                management_origin: crate::auth::middleware::ManagementOrigin::Public,
+            },
+            axum::extract::State(state),
+            axum::extract::Path(app.name.clone()),
+            axum::Json(super::RollbackRequest {
+                deployment_id: Some(source_id),
+            }),
+        )
+        .await
+        .expect("gate on: the group-bearing rollback target is admitted");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        assert_eq!(accepted.rolled_back_to, source_id);
     }
 
     #[tokio::test]

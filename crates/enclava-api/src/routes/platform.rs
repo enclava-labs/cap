@@ -74,6 +74,67 @@ pub(crate) fn pod_supplemental_groups_supported_from(value: Option<&str>) -> boo
     }
 }
 
+/// Admission failure for a signed descriptor's pod supplemental groups
+/// (#424): the shape rules failed (`Invalid`), or the list is well-formed
+/// but this API deployment has not enabled the capability
+/// (`NotSupported`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PodSupplementalGroupsAdmission {
+    Invalid(String),
+    NotSupported,
+}
+
+/// The shared admission decision for every signed-artifact entry point
+/// (signed deploy, rollback, unlock-mode transition): the descriptor's
+/// `pod_supplemental_groups` must pass the contract-v1 shape rules
+/// (`enclava_common::descriptor::validate_pod_supplemental_groups`) and,
+/// when present, the deployment capability gate. The capability is a
+/// PARAMETER (call sites pass `pod_supplemental_groups_supported()`) so
+/// this truth table is unit-testable without environment mutation.
+///
+/// The worker keeps its own execution-time check (deployment_jobs.rs):
+/// jobs queued before a configuration change must still fail closed.
+pub(crate) fn admit_pod_supplemental_groups(
+    groups: Option<&[i64]>,
+    supported: bool,
+) -> Result<(), PodSupplementalGroupsAdmission> {
+    // Shape first — the generic preflight's order: an invalid list is
+    // invalid regardless of the capability.
+    let owned = groups.map(<[i64]>::to_vec);
+    if let Some(groups) = owned.as_ref() {
+        enclava_common::descriptor::validate_pod_supplemental_groups(Some(groups))
+            .map_err(PodSupplementalGroupsAdmission::Invalid)?;
+    }
+    if groups.is_some() && !supported {
+        return Err(PodSupplementalGroupsAdmission::NotSupported);
+    }
+    Ok(())
+}
+
+impl PodSupplementalGroupsAdmission {
+    /// The #424 refusal: 400 with the code `pod_supplemental_groups_not_supported`
+    /// and one actionable sentence; a shape error answers 400 with the
+    /// validation message, as the generic preflight does today. No
+    /// `missing_pod_supplemental_groups` key — the CLI's merge remediation
+    /// (api_client.rs) must not fire for this code: a signed descriptor
+    /// cannot be merged client-side without re-signing.
+    pub(crate) fn refusal(&self) -> (StatusCode, Json<serde_json::Value>) {
+        match self {
+            PodSupplementalGroupsAdmission::Invalid(message) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": message})),
+            ),
+            PodSupplementalGroupsAdmission::NotSupported => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "the signed descriptor declares pod supplemental groups, which this API deployment has not enabled (ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED); enable the capability or use a descriptor without them",
+                    "code": "pod_supplemental_groups_not_supported",
+                })),
+            ),
+        }
+    }
+}
+
 pub(crate) fn deployment_context_response(state: &AppState) -> DeploymentContextResponse {
     DeploymentContextResponse {
         api_signing_pubkey: crate::auth::jwt::public_key_base64(&state.signing_key),
@@ -194,4 +255,63 @@ mod tests {
         assert!(!envelope.signature.is_empty());
         assert!(!envelope.signing_pubkey.is_empty());
     }
+}
+
+#[test]
+fn admit_pod_supplemental_groups_truth_table() {
+    // D1's truth table, unit-level: the capability is a parameter, so no
+    // environment mutation is needed. Valid = the contract-v1 shape
+    // (baseline 0 and 6 present, 1..=32 entries, no reserved gids).
+    let valid = [0_i64, 6];
+    let invalid = [0_i64];
+    for supported in [false, true] {
+        // None (legacy) is always admitted, gate either way.
+        assert_eq!(
+            admit_pod_supplemental_groups(None, supported),
+            Ok(()),
+            "legacy descriptor must be admitted when supported={supported}"
+        );
+        // A valid list: admitted only when the capability is on.
+        assert_eq!(
+            admit_pod_supplemental_groups(Some(&valid), supported),
+            if supported {
+                Ok(())
+            } else {
+                Err(PodSupplementalGroupsAdmission::NotSupported)
+            }
+        );
+        // An invalid list is invalid regardless of the capability, with
+        // the shared validation message.
+        assert!(matches!(
+            admit_pod_supplemental_groups(Some(&invalid), supported),
+            Err(PodSupplementalGroupsAdmission::Invalid(message))
+                if message == "pod_supplemental_groups must contain the platform baseline 0 and 6"
+        ));
+    }
+}
+
+#[test]
+fn admission_refusal_body_is_the_d4_contract() {
+    // The gate refusal carries the actionable sentence and the code; a
+    // shape error answers with the validation message alone, exactly as
+    // the generic preflight does today. Neither carries a
+    // missing_pod_supplemental_groups key (the CLI's merge remediation
+    // must not fire).
+    let (status, Json(body)) = PodSupplementalGroupsAdmission::NotSupported.refusal();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "pod_supplemental_groups_not_supported");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED"),
+        "the refusal names the enabling variable"
+    );
+    assert!(body.get("missing_pod_supplemental_groups").is_none());
+    let (status, Json(body)) =
+        PodSupplementalGroupsAdmission::Invalid("shape message".into()).refusal();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "shape message");
+    assert!(body.get("code").is_none());
+    assert!(body.get("missing_pod_supplemental_groups").is_none());
 }

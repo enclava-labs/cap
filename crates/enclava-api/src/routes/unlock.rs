@@ -859,6 +859,15 @@ async fn commit_unlock_mode_transition(
                 request.descriptor_platform_binding,
             )
             .map_err(crate::routes::deployments::signing_error_response)?;
+        // #424 admission: a group-bearing signed descriptor is refused before
+        // the first write of this transaction (the `UPDATE apps` further
+        // below), so a rejection leaves the database byte-identical. The
+        // transaction is already open: return the refusal and drop it.
+        crate::routes::platform::admit_pod_supplemental_groups(
+            artifacts.descriptor.pod_supplemental_groups.as_deref(),
+            crate::routes::platform::pod_supplemental_groups_supported(),
+        )
+        .map_err(|admission| admission.refusal())?;
         artifacts
             .validate_customer_authority_in_tx(&mut tx)
             .await
@@ -2057,6 +2066,36 @@ mod tests {
         }
     }
 
+    /// #424 T5/T3: a stable per-app snapshot of every table an unlock-mode
+    /// transition writes, so a refused admission is provably
+    /// byte-identical (rows are aggregated deterministically by id).
+    async fn unlock_transition_row_snapshot(
+        pool: &sqlx::PgPool,
+        app_id: Uuid,
+    ) -> serde_json::Value {
+        let snapshot: sqlx::types::Json<serde_json::Value> = sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+                'unlock_mode', (SELECT unlock_mode::text FROM apps WHERE id = $1),
+                'app_containers', (SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.id), '[]'::jsonb)
+                                     FROM app_containers c WHERE c.app_id = $1),
+                'app_resources', (SELECT to_jsonb(r) FROM app_resources r WHERE r.app_id = $1),
+                'deployments', (SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.id), '[]'::jsonb)
+                                  FROM deployments d WHERE d.app_id = $1),
+                'receipts', (SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY t.id), '[]'::jsonb)
+                               FROM unlock_transition_receipts t WHERE t.app_id = $1),
+                'audit', (SELECT coalesce(jsonb_agg(to_jsonb(a) ORDER BY a.id), '[]'::jsonb)
+                            FROM audit_log a WHERE a.app_id = $1),
+                'jobs', (SELECT coalesce(jsonb_agg(to_jsonb(j) ORDER BY j.deployment_id, j.generation), '[]'::jsonb)
+                           FROM deployment_apply_jobs j WHERE j.app_id = $1)
+            )",
+        )
+        .bind(app_id)
+        .fetch_one(pool)
+        .await
+        .expect("snapshot unlock transition rows");
+        snapshot.0
+    }
+
     async fn delete_unlock_test_org(pool: &sqlx::PgPool, org_id: Uuid) {
         sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
             .bind(org_id)
@@ -2079,7 +2118,36 @@ mod tests {
         crate::signing_service::DeploymentSigningArtifacts,
         crate::signing_service::SignedPolicyArtifact,
     ) {
+        test_signing_artifacts_with_pod_groups(
+            app,
+            deploy_id,
+            image_digest,
+            api_signing_pubkey,
+            None,
+            "auto",
+        )
+    }
+
+    /// #424 fixture variant: the signed descriptor carries
+    /// `pod_supplemental_groups` (the contract-v1 shape), so the admission
+    /// decision has something to refuse when the capability is off. The
+    /// unlock mode is the REQUESTED one (validate_deployment_inputs compares
+    /// the descriptor against the post-transition app shape).
+    #[allow(clippy::type_complexity)]
+    fn test_signing_artifacts_with_pod_groups(
+        app: &App,
+        deploy_id: Uuid,
+        image_digest: &str,
+        api_signing_pubkey: &str,
+        pod_supplemental_groups: Option<Vec<i64>>,
+        unlock_mode: &str,
+    ) -> (
+        crate::signing_service::DeploymentSigningArtifacts,
+        crate::signing_service::SignedPolicyArtifact,
+    ) {
         let descriptor = serde_json::json!({
+            "pod_supplemental_groups": pod_supplemental_groups,
+            "independent_verification": true,
             "schema_version": "v1",
             "org_id": app.org_id,
             "org_slug": app.tenant_id,
@@ -2127,7 +2195,7 @@ mod tests {
                 "default/{}-{}-owner/seed-encrypted",
                 app.namespace, app.name
             ),
-            "unlock_mode": "auto",
+            "unlock_mode": unlock_mode,
             "policy_template_id": "enclava-kbs-policy-v1",
             "policy_template_sha256": "04".repeat(32),
             "platform_release_version": "cap-test",
@@ -3202,6 +3270,203 @@ mod tests {
             .execute(&pool)
             .await
             .expect("drop durable-job failure function");
+        delete_unlock_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn group_bearing_signed_descriptor_rejects_transition_before_persistence() {
+        // T5 (#424): with the capability off (the default — the variable is
+        // unset in this process), a group-bearing signed descriptor on the
+        // unlock-mode transition is refused with the admission code BEFORE
+        // this transaction's first write, leaving the database
+        // byte-identical.
+        let _gate_lock = crate::test_support::POD_SUPPLEMENTAL_GROUPS_GATE_LOCK
+            .lock()
+            .await;
+        let pool = database_test_pool().await;
+        let UnlockTestFixture {
+            app,
+            user_id,
+            source_deployment_id,
+            authority,
+        } = insert_unlock_test_app(&pool).await;
+        let signing_key = SigningKey::from_bytes(&[21; 32]);
+        let quote_hash = "bf".repeat(32);
+        let receipt = signed_transition_receipt_for_app(
+            app.id,
+            "2026-07-17T10:45:00Z",
+            "auto",
+            "password",
+            &quote_hash,
+            &signing_key,
+        );
+        let verified_receipt = verify_transition_receipt(
+            &receipt,
+            &app,
+            RequestedUnlockMode::Auto,
+            RequestedUnlockMode::Password,
+        )
+        .expect("verify group-bearing transition receipt");
+        let attestation = transition_attestation_for_domain(
+            app.tee_domain.as_deref().expect("test TEE domain"),
+            &signing_key,
+            &quote_hash,
+        );
+        let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+        let deploy_id = Uuid::new_v4();
+        let image_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let api_signing_pubkey = "test-api-signing-key";
+        let (artifacts, signed) = test_signing_artifacts_with_pod_groups(
+            &app,
+            deploy_id,
+            image_digest,
+            api_signing_pubkey,
+            Some(vec![0, 6]),
+            "password",
+        );
+
+        let before = unlock_transition_row_snapshot(&pool, app.id).await;
+        let result = commit_unlock_mode_transition(
+            &pool,
+            UnlockModeCommitRequest {
+                org_id: app.org_id,
+                user_id,
+                app_name: &app.name,
+                observed_authority: &authority,
+                source_deployment_id,
+                requested: RequestedUnlockMode::Password,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id,
+                image_digest: Some(image_digest),
+                signed_workload_command: None,
+                signed_container_port: None,
+                signed_storage_paths: None,
+                signing_artifacts: Some(&artifacts),
+                signed_policy_artifact: Some(&signed),
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
+                log_encryption: None,
+                api_signing_pubkey,
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+                kube_client: None,
+            },
+        )
+        .await;
+        let (status, Json(body)) =
+            result.expect_err("group-bearing descriptor must refuse the transition");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["code"], "pod_supplemental_groups_not_supported",
+            "the refusal body carries the admission code"
+        );
+        let after = unlock_transition_row_snapshot(&pool, app.id).await;
+        assert_eq!(
+            before, after,
+            "a refused transition must leave every row byte-identical"
+        );
+        delete_unlock_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn group_bearing_signed_descriptor_is_admitted_when_the_gate_is_on() {
+        // T3, unlock control (#424): with the capability on, the same
+        // transition passes the admission and fails for its own later
+        // reason (this fixture's artifact authority, as before the
+        // admission existed) — never with the admission code.
+        let _gate_lock = crate::test_support::POD_SUPPLEMENTAL_GROUPS_GATE_LOCK
+            .lock()
+            .await;
+        let _gate = crate::test_support::PodSupplementalGroupsGateGuard::enable();
+        let pool = database_test_pool().await;
+        let UnlockTestFixture {
+            app,
+            user_id,
+            source_deployment_id,
+            authority,
+        } = insert_unlock_test_app(&pool).await;
+        let signing_key = SigningKey::from_bytes(&[21; 32]);
+        let quote_hash = "c0".repeat(32);
+        let receipt = signed_transition_receipt_for_app(
+            app.id,
+            "2026-07-17T10:45:00Z",
+            "auto",
+            "password",
+            &quote_hash,
+            &signing_key,
+        );
+        let verified_receipt = verify_transition_receipt(
+            &receipt,
+            &app,
+            RequestedUnlockMode::Auto,
+            RequestedUnlockMode::Password,
+        )
+        .expect("verify cap424-on transition receipt");
+        let attestation = transition_attestation_for_domain(
+            app.tee_domain.as_deref().expect("test TEE domain"),
+            &signing_key,
+            &quote_hash,
+        );
+        let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+        let deploy_id = Uuid::new_v4();
+        let image_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let api_signing_pubkey = "test-api-signing-key";
+        let (artifacts, signed) = test_signing_artifacts_with_pod_groups(
+            &app,
+            deploy_id,
+            image_digest,
+            api_signing_pubkey,
+            Some(vec![0, 6]),
+            "password",
+        );
+        let result = commit_unlock_mode_transition(
+            &pool,
+            UnlockModeCommitRequest {
+                org_id: app.org_id,
+                user_id,
+                app_name: &app.name,
+                observed_authority: &authority,
+                source_deployment_id,
+                requested: RequestedUnlockMode::Password,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id,
+                image_digest: Some(image_digest),
+                signed_workload_command: None,
+                signed_container_port: None,
+                signed_storage_paths: None,
+                signing_artifacts: Some(&artifacts),
+                signed_policy_artifact: Some(&signed),
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
+                log_encryption: None,
+                api_signing_pubkey,
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+                fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+                kube_client: None,
+            },
+        )
+        .await;
+        match result {
+            Ok(_) => {}
+            Err((status, Json(body))) => {
+                assert_ne!(
+                    body["code"], "pod_supplemental_groups_not_supported",
+                    "gate on: the admission must pass (status {status})"
+                );
+            }
+        }
         delete_unlock_test_org(&pool, app.org_id).await;
     }
 
