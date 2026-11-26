@@ -4,8 +4,8 @@ use super::{
     delete_tenant_namespace_with_timeouts, derive_identity, egress_allowlist_host_audit_reasons,
     issue_signer_rotation_token_route, list_apps, post_workload_teardown,
     request_workload_teardown, requires_workload_teardown, rotate_signer,
-    validate_egress_allowlist, validate_egress_mode, workload_teardown_http_failure,
-    workload_teardown_instance_id,
+    teardown_live_pod_failure, validate_egress_allowlist, validate_egress_mode,
+    workload_teardown_http_failure, workload_teardown_instance_id,
 };
 use crate::auth::jwt::SignerRotationTokenInput;
 use crate::auth::middleware::{AuthContext, ManagementOrigin};
@@ -787,6 +787,34 @@ async fn locked_running_workload_teardown_http_status_fails_destroy() {
     assert!(!diagnostics.contains("secret-namespace-sentinel"));
     assert!(!diagnostics.contains("secret-teardown-host.invalid"));
     assert!(!diagnostics.contains(&url));
+}
+
+#[test]
+fn teardown_live_pod_unavailable_body_is_untouched_by_the_probe_cause() {
+    // tom-h's D2: the 403's status class rides the WARN line only. The wire
+    // answer stays byte-identical to the pre-change refusal — same 502, same
+    // {"error": "app_delete_teardown_live_pod_unavailable"} body — because
+    // the stop-signal code set is closed on its consumers.
+    let app_id = uuid::Uuid::new_v4();
+    let (logs, guard) = captured_warn_logs();
+    let (status, Json(body)) = teardown_live_pod_failure(
+        app_id,
+        crate::kbs::TeardownLivePodError::KubernetesUnavailable {
+            cause: crate::kbs::KubeProbeCause::Forbidden,
+        },
+    );
+    drop(guard);
+
+    assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        serde_json::to_string(&body).expect("delete error response serializes"),
+        r#"{"error":"app_delete_teardown_live_pod_unavailable"}"#
+    );
+    let diagnostics = captured_log_text(&logs);
+    assert!(
+        diagnostics.contains("kube_cause") && diagnostics.contains("forbidden"),
+        "the refusal WARN names the kube read's status class: {diagnostics}"
+    );
 }
 
 #[test]

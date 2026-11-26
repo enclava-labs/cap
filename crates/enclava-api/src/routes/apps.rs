@@ -247,7 +247,15 @@ fn teardown_live_pod_failure(
         crate::kbs::TeardownLivePodError::Db(_) | crate::kbs::TeardownLivePodError::Projection => {
             return internal_server_error();
         }
-        crate::kbs::TeardownLivePodError::KubernetesUnavailable => {
+        crate::kbs::TeardownLivePodError::KubernetesUnavailable { cause } => {
+            // The cause rides the log only: the 502 code and body stay
+            // byte-identical, and the stop-signal code set stays closed on
+            // its consumers (tom-h's D2).
+            tracing::warn!(
+                app_id = %app_id,
+                kube_cause = %cause,
+                "teardown live pod probe failed: the kube read's status class"
+            );
             AppDeleteFailure::TeardownLivePodUnavailable
         }
         crate::kbs::TeardownLivePodError::Unnamed => AppDeleteFailure::TeardownLivePodUnnamed,
