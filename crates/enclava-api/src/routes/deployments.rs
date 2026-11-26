@@ -2588,22 +2588,32 @@ mod tests {
         }))
         .expect("decode deploy request");
         // The control must PROVE admission passed, not merely that the
-        // refusal is absent: this fixture fails at a KNOWN post-admission
-        // stage (the database-stage 500 the gate-off RED run also reaches
-        // once its check is removed; the profile compare and the admission
-        // are the only earlier gates). Pin the expected post-admission
-        // failure exactly.
+        // refusal is absent. By source order the admission is the LAST gate
+        // of the signed-artifacts block; every later failure of this
+        // fixture is post-admission: the image stage (parse, registry
+        // policy, egress-guard DNS — a 400 whose error is one of the
+        // image/registry texts, environment-dependent: a no-public-DNS
+        // sandbox refuses at the egress guard while a DNS environment
+        // reaches the database 500 the gate-off RED run also hit). Pin
+        // exactly those classes; the admission refusal and the
+        // profile/decode classes are excluded by name.
         match deploy_app_candidate(auth, state, app.clone(), body, AppMutation::None, false).await {
             Ok(_) => panic!("the fixture's later stages must refuse this deploy"),
             Err((status, Json(error_body))) => {
-                assert_eq!(
-                    status,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "gate on: the request must reach the post-admission database stage"
-                );
+                let error = error_body["error"].as_str().unwrap_or_default();
                 assert_ne!(
                     error_body["code"], "pod_supplemental_groups_not_supported",
                     "gate on: the admission must pass"
+                );
+                assert!(
+                    status == StatusCode::INTERNAL_SERVER_ERROR
+                        || (status == StatusCode::BAD_REQUEST
+                            && (error.starts_with("invalid image reference")
+                                || error.starts_with("unsupported registry")
+                                || error.starts_with("invalid registry URL")
+                                || error == "registry_destination_not_allowed"
+                                || error.starts_with("failed to resolve image"))),
+                    "gate on: the failure must be a post-admission image/registry/database class, got {status} {error:?}"
                 );
             }
         }
