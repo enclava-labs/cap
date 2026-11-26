@@ -756,19 +756,109 @@ fn tenant_image_pull_secret_applies_to_containers(
 }
 
 fn image_matches_repository_scope(image: &ImageRef, scope: &ImagePullRepositoryScope) -> bool {
-    // Same host, different spelling (`GHCR.IO` vs the canonical `ghcr.io`
-    // stored on the scope). Repository paths stay case-sensitive.
-    if !image.registry().eq_ignore_ascii_case(&scope.registry) {
+    repository_in_pull_scope(image.registry(), image.repository(), scope)
+}
+
+/// Same host, different spelling (`GHCR.IO` vs the canonical `ghcr.io`
+/// stored on the scope). Repository paths stay case-sensitive. An exact
+/// scope matches only that repository; `/*` also matches subrepositories
+/// and never a sibling prefix (`team/app` does not match `team/app-other`).
+fn repository_in_pull_scope(
+    registry: &str,
+    repository: &str,
+    scope: &ImagePullRepositoryScope,
+) -> bool {
+    // A tenant-controlled image can contain `.` or `..` (ImageRef allows
+    // them; the allowlist parser does not). reqwest normalizes those
+    // segments out of the manifest URL, so a string prefix match would
+    // attach credentials for a different repository than the one fetched.
+    // Literal segments only — the same rule the allowlist parser uses.
+    if !enclava_common::registry::repository_path_is_literal(repository) {
         return false;
     }
-    if image.repository() == scope.repository {
+    if !registry.eq_ignore_ascii_case(&scope.registry) {
+        return false;
+    }
+    if repository == scope.repository {
         return true;
     }
     scope.include_subrepositories
-        && image
-            .repository()
+        && repository
             .strip_prefix(&scope.repository)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Platform pull credentials for OCI tag resolution (issue #228).
+///
+/// Fail-closed, and deliberately stricter than pull-secret attachment:
+/// both `GHCR_USERNAME` and `GHCR_TOKEN` must be nonempty, and the image
+/// must match a non-empty `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES` entry.
+/// An empty, absent, or invalid allowlist yields no credentials — anonymous
+/// resolution — never a universal attach. These credentials authenticate
+/// only `ghcr.io`; any other registry is refused even before the allowlist
+/// is consulted, so a scope typo cannot forward the platform PAT elsewhere.
+pub(crate) fn resolution_pull_credentials(
+    registry: &str,
+    repository: &str,
+) -> Option<(String, String)> {
+    resolution_pull_credentials_from(
+        registry,
+        repository,
+        env_nonempty("GHCR_USERNAME").as_deref(),
+        env_nonempty("GHCR_TOKEN").as_deref(),
+        env_nonempty(TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV).as_deref(),
+    )
+}
+
+pub(crate) fn resolution_pull_credentials_from(
+    registry: &str,
+    repository: &str,
+    username: Option<&str>,
+    token: Option<&str>,
+    allowed_repositories: Option<&str>,
+) -> Option<(String, String)> {
+    if !registry.eq_ignore_ascii_case("ghcr.io") {
+        return None;
+    }
+    let username = trimmed_nonempty(username)?;
+    let token = trimmed_nonempty(token)?;
+    let Some(raw) = trimmed_nonempty(allowed_repositories) else {
+        tracing::debug!(
+            registry,
+            "platform pull credentials not used for tag resolution: \
+             TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES is empty or unset"
+        );
+        return None;
+    };
+    let Ok(scopes) = parse_image_pull_scopes_strict(&raw) else {
+        tracing::debug!(
+            registry,
+            "platform pull credentials not used for tag resolution: \
+             TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES is unusable"
+        );
+        return None;
+    };
+    if scopes.is_empty()
+        || !scopes
+            .iter()
+            .any(|scope| repository_in_pull_scope(registry, repository, scope))
+    {
+        tracing::debug!(
+            registry,
+            repository,
+            "platform pull credentials not used for tag resolution: repository is outside \
+             TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES"
+        );
+        return None;
+    }
+    Some((username, token))
+}
+
+fn trimmed_nonempty(value: Option<&str>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
 }
 
 fn public_internet_egress_excluded_cidrs_from_env() -> Vec<String> {
