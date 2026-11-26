@@ -1274,6 +1274,22 @@ pub struct ApiErrorBody {
     /// values; anything else is ignored by the client.
     #[serde(default)]
     pub idempotency_disposition: Option<String>,
+    /// CAP's upstream-failure receipt (cap#422): the status and code-shaped
+    /// error of the 5xx that the idempotency layer converted into a
+    /// recovery-required 409. Absent on older servers and on errors that
+    /// were not masked.
+    #[serde(default)]
+    pub outcome_cause: Option<ApiOutcomeCause>,
+}
+
+/// The upstream cause carried by an `idempotency_recovery_required` body:
+/// the masked 5xx's status plus its code-shaped error. Provider text never
+/// travels here (the API degrades it to a fixed code).
+#[derive(Debug, Deserialize)]
+pub struct ApiOutcomeCause {
+    pub status: u16,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[cfg(test)]

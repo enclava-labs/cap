@@ -345,6 +345,23 @@ pub(crate) fn signing_error_response(
         }
     };
 
+    // On the idempotent routes a 5xx here is masked by the idempotency
+    // layer into 409 idempotency_recovery_required with nothing else on
+    // the wire — the plain-deploy 409 outage on dev (2026-11-25) spent
+    // hours on exactly that blind spot. (Non-idempotent callers, e.g.
+    // the hosted policy preflight, surface the 5xx directly.) Log the
+    // code plus the error's Display (for Upstream it carries the
+    // service's status and refusal body) so the real cause is reachable
+    // from the api log. The typed guest-pull 4xx above is NOT masked and
+    // stays unlogged.
+    if status.is_server_error() {
+        tracing::warn!(
+            code = code,
+            error = %error,
+            "signed-policy resolution failed with a server error; idempotent routes mask this as 409 idempotency_recovery_required"
+        );
+    }
+
     (status, Json(serde_json::json!({"error": code})))
 }
 
@@ -421,18 +438,29 @@ pub(crate) async fn resolve_signed_policy_artifact(
                         crate::signing_service::SigningServiceError::ArtifactWithoutBlobs,
                     )
                 })?;
-        if artifacts
-            .validate_signed_artifact(&artifact, policy_authority_pubkey_hex)
-            .is_ok()
-        {
-            artifacts
-                .validate_canonical_agent_policy(&artifact, &generated)
-                .map_err(signing_error_response)?;
-            artifacts
-                .attach_customer_authority(&mut artifact)
-                .map_err(signing_error_response)?;
-            validate_proof_bundle_budget(artifacts, &artifact).map_err(signing_error_response)?;
-            return Ok(artifact);
+        match artifacts.validate_signed_artifact(&artifact, policy_authority_pubkey_hex) {
+            Ok(()) => {
+                artifacts
+                    .validate_canonical_agent_policy(&artifact, &generated)
+                    .map_err(signing_error_response)?;
+                artifacts
+                    .attach_customer_authority(&mut artifact)
+                    .map_err(signing_error_response)?;
+                validate_proof_bundle_budget(artifacts, &artifact)
+                    .map_err(signing_error_response)?;
+                return Ok(artifact);
+            }
+            // The artifact did not verify (customer-key-signed CLI
+            // artifacts never verify against the platform key); the
+            // platform /sign call below re-runs. This used to be silent
+            // — the plain-deploy 409 outage on dev (2026-11-25) needed
+            // this fork visible to diagnose.
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "provided signed_policy_artifact did not verify; falling back to the platform signing service"
+                );
+            }
         }
     }
 
@@ -480,6 +508,10 @@ fn classify_signer_identity(subject: &str, issuer: &str) -> crate::cosign::Verif
 #[cfg(test)]
 #[path = "deployments/tests/classifier.rs"]
 mod classifier_tests;
+
+#[cfg(test)]
+#[path = "deployments/tests/signing_errors.rs"]
+mod signing_error_logging_tests;
 
 fn validate_workload_security_profile(
     value: Option<&str>,

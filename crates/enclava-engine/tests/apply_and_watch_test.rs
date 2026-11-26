@@ -716,6 +716,78 @@ mod fresh_claim_evidence {
         assert!(claims.tls_data, "the newer tls claim is fresh");
     }
 
+    /// A missing ordinal-zero claim is a new volume: the admission signal
+    /// (review name `expects_fresh_volume`) is set. An unchecked claim stays
+    /// clear.
+    #[tokio::test]
+    async fn absent_claim_expects_fresh_volume() {
+        let claims = inspect(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            FreshVolumeClaims {
+                app_data: true,
+                tls_data: false,
+            },
+        )
+        .await
+        .expect("lookup succeeds");
+        assert!(claims.app_data, "a new claim is fresh");
+        assert!(!claims.tls_data, "an unchecked claim stays clear");
+    }
+
+    /// A present claim with a creation timestamp but no Ready ordinal-zero
+    /// pod is unproven. PVC existence is not initialization evidence. Phase
+    /// is not part of the evidence, so the fixture does not set it.
+    #[tokio::test]
+    async fn unproven_claim_without_ready_pod_expects_fresh_volume() {
+        let claims = inspect(
+            [created_pvc_entry("state-test-app-0", CREATED_JAN1)]
+                .into_iter()
+                .collect(),
+            std::collections::HashMap::new(),
+            FreshVolumeClaims {
+                app_data: true,
+                tls_data: false,
+            },
+        )
+        .await
+        .expect("lookup succeeds");
+        assert!(
+            claims.app_data,
+            "a present claim without a Ready pod is fresh"
+        );
+    }
+
+    /// A terminating claim is fresh even when a later Ready pod mounts it.
+    /// Both timestamps are set so this fails if the deletion-timestamp
+    /// short-circuit is removed: the pod would otherwise be positive proof.
+    #[tokio::test]
+    async fn recreated_terminating_claim_expects_fresh_volume() {
+        let (name, mut pvc) = created_pvc_entry("state-test-app-0", CREATED_JAN1);
+        pvc["metadata"]["deletionTimestamp"] = serde_json::json!("2026-10-14T00:00:00Z");
+        let claims = inspect(
+            [(name, pvc)].into_iter().collect(),
+            [pod_entry(
+                &["state-test-app-0"],
+                true,
+                "2026-01-02T00:00:00Z",
+                None,
+            )]
+            .into_iter()
+            .collect(),
+            FreshVolumeClaims {
+                app_data: true,
+                tls_data: false,
+            },
+        )
+        .await
+        .expect("lookup succeeds");
+        assert!(
+            claims.app_data,
+            "a terminating claim stays fresh despite a later Ready pod"
+        );
+    }
+
     /// `NONE` performs no Kubernetes I/O — the API floor admission for
     /// normal sizes must stay read-free.
     #[tokio::test]

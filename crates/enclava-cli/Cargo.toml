@@ -48,6 +48,10 @@ x509-cert = { workspace = true }
 sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl", "serde"] }
 fd-lock = "4.0.4"
 tempfile = "3"
+# `enclava update`: release tag comparison and archive extraction.
+semver = "1"
+flate2 = { workspace = true }
+tar = { version = "0.4", default-features = false }
 
 # Vendor OpenSSL everywhere (sev's AMD chain verification needs it): static
 # musl builds, Windows/macOS CI runners, and cross-checks all lack a usable
