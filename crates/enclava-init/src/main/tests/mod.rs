@@ -129,6 +129,7 @@ fn failure_surfaces_render_safe_json_and_stage_markers_stay_in_stage_file() {
         "error": "acme_rate_limited",
         "terminal": true,
         "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "failed_step": serde_json::Value::Null,
         "failed_stage": "provisioning static tls certificate",
     });
     let error_body = std::fs::read_to_string(&env.error).unwrap();
@@ -178,6 +179,7 @@ fn generic_bootstrap_failures_render_generic_safe_code() {
             "error": "enclava_init_failed",
             "terminal": true,
             "retry_after": null,
+            "failed_step": serde_json::Value::Null,
             "failed_stage": "opening luks volumes",
         }),
         "unknown failures must degrade to the generic safe code: {error_body}"
@@ -269,6 +271,7 @@ fn re_latched_failure_re_pairs_stage_and_error_files() {
             "error": "enclava_init_failed",
             "terminal": true,
             "retry_after": null,
+            "failed_step": serde_json::Value::Null,
             "failed_stage": "verifying trustee policy",
         }),
         "the error payload must name the stage this failure occurred at: {error_body}"
@@ -306,6 +309,7 @@ fn stage_less_latch_drops_the_marker_instead_of_naming_a_stage_it_never_reached(
             "error": "enclava_init_failed",
             "terminal": true,
             "retry_after": null,
+            "failed_step": serde_json::Value::Null,
             "failed_stage": null,
         }),
         "an unrecorded stage renders as null: {error_body}"
@@ -2255,4 +2259,112 @@ fn tls_unusable_marker_write_and_clear_roundtrip() {
     assert!(!marker.exists());
     // Clearing a missing marker is fine (boot-time stale-state cleanup).
     clear_tls_unusable(&marker);
+}
+
+// --- cap#428: the failing step rides the failed_step sibling field ---
+
+#[test]
+fn publish_public_tls_certificate_write_failure_reports_handoff_step() {
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    if nix::unistd::Uid::effective().is_root() {
+        return;
+    }
+    enclava_init::safe_diagnostics::set_last_stage(None);
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("tls.crt");
+    std::fs::write(&source, b"certificate bytes").unwrap();
+    let destination_dir = dir.path().join("handoff");
+    std::fs::create_dir_all(&destination_dir).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&destination_dir).unwrap().permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(&destination_dir, perms).unwrap();
+    let error = publish_public_tls_certificate(&source, &destination_dir.join("tls.crt"))
+        .expect_err("a read-only handoff directory must fail the publish");
+    let diagnostic = SafeBootstrapDiagnostic::diagnose(&error);
+    assert_eq!(diagnostic.code, SafeDiagnosticCode::EnclavaInitFailed);
+    assert_eq!(diagnostic.step(), Some(InitFailedStep::TlsHandoffFailed));
+    assert_eq!(
+        diagnostic.render_json(),
+        "{\"error\":\"enclava_init_failed\",\"failed_stage\":null,\"failed_step\":\"tls_handoff_failed\",\"retry_after\":null,\"terminal\":true}"
+    );
+}
+
+#[test]
+fn publish_public_tls_certificate_read_back_failure_reports_handoff_step() {
+    if nix::unistd::Uid::effective().is_root() {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    // The source is a file with no read permission: the read-back inside
+    // the publish fails before any write.
+    let source = dir.path().join("tls.crt");
+    std::fs::write(&source, b"certificate bytes").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&source).unwrap().permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&source, perms).unwrap();
+    let error = publish_public_tls_certificate(&source, &dir.path().join("out.crt"))
+        .expect_err("an unreadable source must fail the read-back");
+    let diagnostic = SafeBootstrapDiagnostic::diagnose(&error);
+    assert_eq!(diagnostic.step(), Some(InitFailedStep::TlsHandoffFailed));
+}
+
+#[test]
+fn chown_failure_reports_write_step() {
+    if nix::unistd::Uid::effective().is_root() {
+        // Root may chown to any identity, so the failure cannot be forced.
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.tls_state.mount_path = dir.path().to_string_lossy().to_string();
+    let persistent = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
+    std::fs::create_dir_all(&persistent).unwrap();
+    writes::atomic_write(
+        &tls_certificate::cert_path(&persistent),
+        b"certificate bytes",
+        0o644,
+    )
+    .unwrap();
+    // Chowning to the caddy identity needs privileges a test process does
+    // not hold: the ownership handoff loop fails, carrying the write step.
+    let error = provision_static_tls_certificate_with(&cfg, |_| Ok(())).unwrap_err();
+    let diagnostic = SafeBootstrapDiagnostic::diagnose(&error);
+    assert_eq!(diagnostic.code, SafeDiagnosticCode::EnclavaInitFailed);
+    assert_eq!(diagnostic.step(), Some(InitFailedStep::TlsWriteFailed));
+}
+
+#[test]
+fn report_failure_carries_the_step_on_every_surface() {
+    let _env_lock = FAILURE_ENV_LOCK.lock().unwrap();
+    let env = FailureEnvGuard::install();
+    record_stage("binding workload mount namespaces").unwrap();
+    // The incident's own shape: a target-create failure whose chain
+    // carries paths and errno text, wrapped in the contextual layers the
+    // bind path adds. Only the typed step may surface.
+    let error = anyhow!("mkdir /data: Read-only file system (os error 30)")
+        .context(InitStepError(InitFailedStep::BindTargetCreateFailed))
+        .context("creating target /data");
+    report_failure(&error);
+    let expected = json!({
+        "error": "enclava_init_failed",
+        "terminal": true,
+        "retry_after": null,
+        "failed_stage": "binding workload mount namespaces",
+        "failed_step": "bind_target_create_failed",
+    });
+    let error_body = std::fs::read_to_string(&env.error).unwrap();
+    let termination_body = std::fs::read_to_string(&env.termination).unwrap();
+    assert_eq!(error_body, termination_body);
+    for body in [&error_body, &termination_body] {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body.trim()).unwrap(),
+            expected,
+            "failure surfaces must carry the step: {body}"
+        );
+        assert!(!body.contains("/data"));
+        assert!(!body.contains("Read-only"));
+        assert!(!body.contains("os error"));
+    }
 }

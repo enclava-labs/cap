@@ -125,6 +125,21 @@ recompute it from later pod or volume state — and release worker slots after
 each 90-second observation slice. Password owner wait remains separately
 nonterminal.
 
+### The init-error file contract
+
+A failed bootstrap writes one bounded single-line JSON object to the
+init-error file (and the termination log): `error` is one of
+`acme_rate_limited`, `acme_certificate_issuance_failed`, or
+`enclava_init_failed` — never any other value, so downstream allowlists keep
+matching; `failed_stage` names the last stage reached; and `failed_step`
+(cap#428) names the instrumented failing step — one of
+`tls_decode_failed`, `tls_validate_failed`, `tls_write_failed`,
+`tls_handoff_failed`, `bind_sentinel_failed`, `bind_source_failed`,
+`bind_target_create_failed`, `bind_mount_failed` — or `null` when the failing
+site is not instrumented. The step is a sibling of the code, never a
+replacement for it: old readers that ignore unknown keys are unaffected, and
+no paths, errno text, or provider text ever appear.
+
 ### Numeric volume profiling
 
 `/run/enclava/init-stats.json` retains its version-1 boot fields and adds
