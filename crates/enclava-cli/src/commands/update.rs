@@ -46,18 +46,24 @@ pub struct UpdateArgs {
 
 pub async fn run(args: UpdateArgs) -> Result<()> {
     let latest = latest_tag().await?;
-    let asset = release_asset(std::env::consts::OS, std::env::consts::ARCH)?;
     if !is_newer(VERSION, &latest) {
         println!("enclava {VERSION} is up to date.");
         return Ok(());
     }
     println!("A new version of enclava is available: {latest} (installed: {VERSION}).");
+    // Resolved here but only required for the install: `--check` on a
+    // platform without release builds still reports the new version.
+    let asset = release_asset(std::env::consts::OS, std::env::consts::ARCH);
+    if args.check {
+        match asset {
+            Ok(_) => println!("Run `enclava update` to install it."),
+            Err(e) => println!("{e}"),
+        }
+        return Ok(());
+    }
+    let asset = asset?;
     if option_env!("ENCLAVA_RELEASE_VERSION").is_none() {
         println!("This binary was built from source; updating replaces it with the release build.");
-    }
-    if args.check {
-        println!("Run `enclava update` to install it.");
-        return Ok(());
     }
     if !args.yes {
         interactive::require_prompt("pass --yes to install the update")?;
