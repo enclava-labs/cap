@@ -4953,3 +4953,92 @@ fn deploy_config_load_reports_invalid_file_instead_of_missing() {
     let err = load_deploy_app_config(missing).unwrap_err().to_string();
     assert!(err.contains("no enclava.toml found"), "{err}");
 }
+
+#[test]
+fn terminal_failure_message_with_bind_stage_adds_the_storage_hint() {
+    // The plain-path contract's failure mode: the init died at the
+    // workload-mount bind stage. The first line stays the stable
+    // PaaS-matchable form; the hint names the most common cause (the binder
+    // has other failure modes and RootfulSudo runs a writable rootfs, so
+    // the hint must not claim a diagnosis).
+    let diagnostic = enclava_cli::tee_client::parse_terminal_bootstrap_error(&serde_json::json!({
+        "bootstrap_error": {
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+            "last_init_stage": "binding workload mount namespaces",
+        }
+    }))
+    .unwrap();
+    let message = terminal_bootstrap_failure_message("demo", &diagnostic);
+    assert_eq!(
+        message,
+        "terminal bootstrap failure for app demo: enclava_init_failed \
+             (init stage: binding workload mount namespaces); \
+             run `enclava status --app demo` for the latest state\n\
+             hint: a common cause of a failure at this stage is a [storage] paths entry \
+             the image does not contain -- the restricted profile runs a read-only root \
+             filesystem, so the bind stage cannot create it"
+    );
+}
+
+#[test]
+fn terminal_failure_message_with_other_stage_has_no_hint() {
+    // Any other init stage (or none) keeps the single-line message: the
+    // hint is specific to the storage-path bind failure mode.
+    for stage in [
+        Some("provisioning static tls certificate"),
+        Some("waiting for owner seed"),
+        None,
+    ] {
+        let mut bootstrap_error = serde_json::json!({
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+        });
+        if let Some(stage) = stage {
+            bootstrap_error["last_init_stage"] = serde_json::json!(stage);
+        }
+        let diagnostic = enclava_cli::tee_client::parse_terminal_bootstrap_error(
+            &serde_json::json!({ "bootstrap_error": bootstrap_error }),
+        )
+        .unwrap();
+        let message = terminal_bootstrap_failure_message("demo", &diagnostic);
+        assert!(
+            !message.contains("hint:"),
+            "stage {stage:?} must not carry the storage hint"
+        );
+        assert!(
+            message.starts_with("terminal bootstrap failure for app demo: enclava_init_failed")
+        );
+        assert!(!message.contains('\n'));
+    }
+}
+
+#[test]
+fn default_storage_path_warning_fires_only_for_the_default() {
+    // D3: the warning is value-based -- the serde default and an explicit
+    // "/data" are the same contract; any other paths (including a
+    // template image's /state/app-data) do not warn.
+    let default_config =
+        enclava_cli::app_config::AppConfig::parse("[app]\nname = \"demo\"\nport = 3000\n").unwrap();
+    assert!(default_storage_path_in_play(&default_config));
+
+    let explicit_default = enclava_cli::app_config::AppConfig::parse(
+        "[app]\nname = \"demo\"\nport = 3000\n\n[storage]\npaths = [\"/data\"]\n",
+    )
+    .unwrap();
+    assert!(default_storage_path_in_play(&explicit_default));
+
+    let template_paths = enclava_cli::app_config::AppConfig::parse(
+        "[app]\nname = \"demo\"\nport = 3000\n\n[storage]\npaths = [\"/state/app-data\"]\n",
+    )
+    .unwrap();
+    assert!(!default_storage_path_in_play(&template_paths));
+
+    let empty_paths = enclava_cli::app_config::AppConfig::parse(
+        "[app]\nname = \"demo\"\nport = 3000\n\n[storage]\npaths = []\n",
+    )
+    .unwrap();
+    assert!(!default_storage_path_in_play(&empty_paths));
+}

@@ -62,6 +62,10 @@ port = {port}
 command = ["/usr/local/bin/app"]
 
 [storage]
+# Every entry in paths must be a directory this image already contains:
+# the restricted profile runs a read-only root filesystem, so the init's
+# bind stage cannot create it. Template images ship /state/app-data --
+# deploy those with `enclava template deploy` instead of listing them here.
 paths = ["/data"]
 size = "5Gi"
 tls_size = "2Gi"
@@ -371,5 +375,20 @@ mod tests {
         assert!(workflow.contains("sbom-action"));
         assert!(workflow.contains("enclava deploy --image"));
         assert!(!workflow.contains("ENCLAVA_API_KEY"));
+    }
+
+    #[test]
+    fn generated_toml_states_the_storage_path_contract() {
+        // D2: the plain-path contract is said where the user writes it -- the
+        // comment carries the read-only-root-filesystem rule and points
+        // template images (which ship /state/app-data) at the real template
+        // command.
+        let toml_str = generate_enclava_toml("test-app", 8080);
+        assert!(
+            toml_str
+                .contains("Every entry in paths must be a directory this image already contains")
+        );
+        assert!(toml_str.contains("read-only root filesystem"));
+        assert!(toml_str.contains("enclava template deploy"));
     }
 }

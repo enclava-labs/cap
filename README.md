@@ -89,6 +89,12 @@ enclava status
 enclava key backup --out enclava-recovery.json
 ```
 
+Every entry in `[storage]` `paths` (default `/data`) must be a directory the
+image already contains: the restricted profile runs a read-only root
+filesystem, so the init's bind stage cannot create it. Template images ship
+`/state/app-data`; deploy those with `enclava template deploy` instead of
+listing them in `paths`.
+
 New apps and deployments are password-only. Auto-unlock creation, enable requests
 and `enclava auto-unlock enable` fail with `auto_unlock_disabled`; the guest never
 fetches its owner seed automatically. After guest replacement, use

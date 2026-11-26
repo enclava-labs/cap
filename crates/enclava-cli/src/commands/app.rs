@@ -29,7 +29,8 @@ use enclava_cli::keyring::{
 use enclava_cli::keys;
 use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, verify_envelope};
 use enclava_cli::tee_client::{
-    TeeBootstrapStatus, TeeClient, TeeError, TerminalBootstrapError, parse_terminal_bootstrap_error,
+    BIND_MOUNT_NAMESPACES_STAGE, TeeBootstrapStatus, TeeClient, TeeError, TerminalBootstrapError,
+    parse_terminal_bootstrap_error,
 };
 use enclava_common::log_encryption::{
     EncryptedLogFrame, LOG_ENCRYPTION_ALGORITHM, decrypt_log_frame, generate_log_keypair,
@@ -454,10 +455,31 @@ pub struct DeployArgs {
     pub no_store_mnemonic: bool,
 }
 
+/// D3: whether the app's storage paths are the default in play -- the serde
+/// default and an explicit "/data" are the same contract.
+pub(crate) fn default_storage_path_in_play(app_config: &AppConfig) -> bool {
+    app_config.storage.paths == enclava_cli::app_config::default_storage_paths()
+}
+
+/// D3: the plain-path storage contract, said at the moment it matters: the
+/// default `/data` is only usable when the image ships the directory, because
+/// the restricted profile runs a read-only root filesystem. One warning
+/// line, value-based, purely informational -- no behaviour change, no new
+/// flag.
+pub(crate) fn warn_when_default_storage_path_in_play(app_config: &AppConfig) {
+    if default_storage_path_in_play(app_config) {
+        eprintln!(
+            "warning: default storage path /data -- the image must contain it \
+             (the restricted profile runs a read-only root filesystem)"
+        );
+    }
+}
+
 pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> {
     let deploy_started = Instant::now();
     let app_config = load_deploy_app_config(AppConfig::find_and_load())?;
     let app_name = app_config.app.name.clone();
+    warn_when_default_storage_path_in_play(&app_config);
 
     let config_pairs = parse_config_inputs(&args.config_vars, &args.config_file_vars)?;
     let (api, paths, cli_config) = build_api_client()?;
@@ -787,15 +809,29 @@ fn should_retry_deploy_config(error: &TeeError) -> bool {
 
 /// Stable, provider-detail-free message for an authenticated terminal
 /// bootstrap failure: the recognized error code plus the optional validated
-/// retry deadline, in a form a PaaS verifier can safely match later.
+/// retry deadline, in a form a PaaS verifier can safely match later (the
+/// code stays immediately after the colon; the stage and the advice suffix
+/// follow it, so a prefix match on `terminal bootstrap failure for app X:
+/// <code>` is unchanged). A terminal failure whose init stage is the
+/// workload-mount bind stage gets one extra hint line naming the most
+/// common cause of that stage's failure -- NOT a diagnosis: the binder can
+/// fail with existing directories too, and the `RootfulSudo` profile runs
+/// a writable root filesystem.
 pub(crate) fn terminal_bootstrap_failure_message(
     app_name: &str,
     diagnostic: &TerminalBootstrapError,
 ) -> String {
-    format!(
+    let mut message = format!(
         "terminal bootstrap failure for app {app_name}: {}; run `enclava status --app {app_name}` for the latest state",
         diagnostic.stable_summary()
-    )
+    );
+    if diagnostic.last_init_stage() == Some(BIND_MOUNT_NAMESPACES_STAGE) {
+        message.push_str(
+            "\nhint: a common cause of a failure at this stage is a [storage] paths entry the image does not contain \
+             -- the restricted profile runs a read-only root filesystem, so the bind stage cannot create it",
+        );
+    }
+    message
 }
 
 /// Minimum spacing between terminal-diagnostic TEE probes inside long
