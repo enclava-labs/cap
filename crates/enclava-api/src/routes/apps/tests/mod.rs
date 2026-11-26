@@ -790,7 +790,6 @@ async fn locked_running_workload_teardown_http_status_fails_destroy() {
 }
 
 #[test]
-#[test]
 fn teardown_live_pod_unavailable_body_is_untouched_by_the_probe_cause() {
     // tom-h's D2: the 403's status class rides the WARN line only. The wire
     // answer stays byte-identical to the pre-change refusal — same 502, same
@@ -818,6 +817,7 @@ fn teardown_live_pod_unavailable_body_is_untouched_by_the_probe_cause() {
     );
 }
 
+#[test]
 fn app_delete_failure_discards_secret_source_diagnostics() {
     const SECRET: &str = "upstream-secret-error-sentinel";
 
