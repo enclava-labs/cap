@@ -120,10 +120,15 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
 /// Look up the latest release while `command` runs, for `print_notice` to
 /// report afterwards. Only release builds in a terminal check: a source build
 /// is not replaced by a release as a matter of course, and scripts get no
-/// extra request or output. `ENCLAVA_NO_UPDATE_CHECK` turns the check off.
+/// extra request or output. `verify` and `describe` can run on saved bundles
+/// with no network at all, so they never start one. `ENCLAVA_NO_UPDATE_CHECK`
+/// turns the check off.
 pub(crate) fn spawn_notice_check(command: &super::Command) -> NoticeCheck {
-    if matches!(command, super::Command::Update(_))
-        || option_env!("ENCLAVA_RELEASE_VERSION").is_none()
+    use super::Command;
+    if matches!(
+        command,
+        Command::Update(_) | Command::Verify(_) | Command::Describe(_)
+    ) || option_env!("ENCLAVA_RELEASE_VERSION").is_none()
         || !std::io::stderr().is_terminal()
         || std::env::var_os("ENCLAVA_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty())
     {
@@ -151,18 +156,19 @@ pub(crate) async fn print_notice(check: NoticeCheck) {
 }
 
 /// Latest release tag: the saved answer while it is recent, GitHub otherwise.
-/// `cache` holds the tag; its modification time is when it was last checked.
+/// `cache` holds `<REPO> <tag>`; its modification time is when it was last
+/// checked. An answer saved by a build that updates from another repository
+/// is ignored.
 async fn latest_for_notice(cache: PathBuf) -> Option<String> {
     let cached = std::fs::read_to_string(&cache)
         .ok()
-        .map(|tag| tag.trim().to_string())
-        .filter(|tag| !tag.is_empty());
+        .and_then(|saved| cached_tag(&saved));
     let checked_recently = std::fs::metadata(&cache)
         .and_then(|meta| meta.modified())
         .ok()
         .and_then(|checked| checked.elapsed().ok())
         .is_some_and(|age| age < NOTICE_CHECK_INTERVAL);
-    if checked_recently {
+    if checked_recently && cached.is_some() {
         return cached;
     }
     let latest = tokio::time::timeout(NOTICE_CHECK_TIMEOUT, latest_tag())
@@ -172,9 +178,19 @@ async fn latest_for_notice(cache: PathBuf) -> Option<String> {
         .or(cached);
     // A failed check is saved as well, so an offline machine asks once per
     // interval, not on every command. The state directory may not exist yet
-    // (before the first login); the check then simply runs again next time.
-    let _ = std::fs::write(&cache, latest.as_deref().unwrap_or(VERSION));
+    // (before the first login); `CliPaths::ensure_dirs` restricts it to the
+    // owner as soon as anything private is stored there.
+    if let Some(dir) = cache.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tag = latest.as_deref().unwrap_or(VERSION);
+    let _ = std::fs::write(&cache, format!("{REPO} {tag}"));
     latest
+}
+
+fn cached_tag(saved: &str) -> Option<String> {
+    let (repo, tag) = saved.trim().split_once(' ')?;
+    (repo == REPO && !tag.is_empty()).then(|| tag.to_string())
 }
 
 fn http_client(redirect: reqwest::redirect::Policy) -> Result<reqwest::Client> {

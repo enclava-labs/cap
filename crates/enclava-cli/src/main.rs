@@ -48,9 +48,9 @@ async fn main() {
         eprintln!("error: {e}");
     }
     commands::update::print_notice(update_check).await;
-    if result.is_err() {
-        std::process::exit(1);
-    }
+    // Exit here instead of returning: dropping the runtime would wait for a
+    // DNS lookup the abandoned update check may still have running.
+    std::process::exit(if result.is_err() { 1 } else { 0 });
 }
 
 #[cfg(test)]
