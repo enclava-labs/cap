@@ -395,17 +395,21 @@ mod tests {
 
     #[tokio::test]
     async fn tag_resolution_rejects_path_rewriting_tags_before_network() {
-        // These tags parse, and url 2.5.8 would rewrite the manifest path to
-        // /v2/enclava-labs/private/manifests/latest. The resolver must refuse
-        // before any request, so a prefix allowlist cannot authorize that GET.
+        // url 2.5.8 would rewrite the manifest path for these tags to
+        // /v2/enclava-labs/private/manifests/latest. ImageRef::parse rejects
+        // them as non-OCI tags, and the resolver must still refuse them before
+        // any request, so a prefix allowlist cannot authorize that GET.
         for tag in [
             "../../../enclava-labs/private/manifests/latest",
             "%2e%2e/%2e%2e/%2e%2e/enclava-labs/private/manifests/latest",
             r"..\..\..\enclava-labs\private\manifests\latest",
         ] {
             let raw = format!("ghcr.io/team/app:{tag}");
-            let image = enclava_common::image::ImageRef::parse(&raw).unwrap();
-            let err = resolve_image_digest(&registry_client(), &image)
+            assert!(
+                enclava_common::image::ImageRef::parse(&raw).is_err(),
+                "{raw} must not parse as an image reference"
+            );
+            let err = resolve_tag_to_digest(&registry_client(), "ghcr.io", "team/app", tag)
                 .await
                 .unwrap_err();
             assert!(
