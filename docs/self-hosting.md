@@ -59,7 +59,7 @@ fork changes each of them.
 | `deploy/api/` | Hostname, platform domain, DNS zone, release profile, image, and secrets. See [deploy/api/README.md](../deploy/api/README.md). |
 | `crates/enclava-cli/src/config.rs` | The CLI's default API URL (`https://api.enclava.dev`). Users can override it in `~/.enclava/config.toml`, but a fork should default to its own API. |
 | `crates/enclava-engine/src/manifest/ingress.rs` | The ACME account contact email rendered into every tenant's Caddy configuration. |
-| `scripts/install.sh`, `scripts/install.ps1` | The repository the installers download releases from, and the cosign identity they verify. |
+| `scripts/install.sh`, `scripts/install.ps1`, `crates/enclava-cli/src/commands/update.rs` (`REPO`) | The repository the installers and `enclava update` download releases from, and the cosign identity they verify. |
 | `PLATFORM_DOMAIN`, `CLOUDFLARE_ZONE_NAME` | Both default to `enclava.dev` in the API and the API image. Always set them explicitly. |
 
 Annotation and label keys such as `enclava.dev/tenant` and
