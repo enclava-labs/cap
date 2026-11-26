@@ -118,9 +118,31 @@ async fn release_mutation_and_rollback_lane(
 /// bound. Used only on the guard's renewal-loss arms; provider failures
 /// that RETURNED (settled) release normally.
 async fn quarantine_mutation_and_rollback_lane(
+    state: &AppState,
+    mutation: &crate::mutation_leases::AppMutationLease,
     app_lane: sqlx::Transaction<'static, sqlx::Postgres>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     app_lane.rollback().await.map_err(|_| internal_error())?;
+    // cap#422 R2 (review T1): the global `edge_config` fence is cross-app
+    // -- deployment apply for UNRELATED apps needs it, so a renewal loss
+    // on THIS app's verify must not hold it through the reclaim
+    // quarantine. On the DNS-tracking arm no edge request was issued at
+    // all (the fence was pre-claimed for a later publish); on the
+    // route-publish arm the uncertain edge write is covered by the
+    // app-scoped `edge(domain)` fence keeping THIS domain off the edge
+    // until reclaim. The app's own fences stay quarantined.
+    if let Err(error) = mutation
+        .release_fences_quarantined(&[crate::mutation_leases::ResourceFence::edge_config()])
+        .await
+    {
+        // Fail toward the old behavior: the fence stays quarantined
+        // (bounded by reclaim_after) rather than blocking this path's
+        // error return on a second failure.
+        tracing::warn!(
+            error = %error,
+            "cross-app fence release after renewal loss failed; the edge_config fence stays quarantined until reclaim"
+        );
+    }
     Ok(())
 }
 
@@ -830,7 +852,7 @@ pub async fn verify_challenge(
         Err(_) => {
             // Renewal lost mid-DNS-write: the request may still land
             // server-side, so the fences stay quarantined (cap#422).
-            quarantine_mutation_and_rollback_lane(app_lane).await?;
+            quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
             return Err(internal_error());
         }
     };
@@ -888,7 +910,7 @@ pub async fn verify_challenge(
                     // Durable renewal was lost mid-publish: the HAProxy
                     // write may still land, so the fences stay quarantined
                     // (cap#422).
-                    quarantine_mutation_and_rollback_lane(app_lane).await?;
+                    quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
                     return Err(internal_error());
                 }
             };
@@ -966,7 +988,7 @@ pub async fn verify_challenge(
             // ConfigMap write may still land server-side (a missing-object
             // create has no version to fence it), so the namespace fence
             // stays quarantined until reclaim instead of being released.
-            quarantine_mutation_and_rollback_lane(app_lane).await?;
+            quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
             return Err(internal_error());
         }
     };
@@ -1044,7 +1066,7 @@ pub async fn verify_challenge(
             Err(_) => {
                 // Renewal lost mid-publish: the write may still land, so
                 // the fences stay quarantined (cap#422).
-                quarantine_mutation_and_rollback_lane(app_lane).await?;
+                quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
                 return Err(internal_error());
             }
         }
@@ -1102,7 +1124,7 @@ pub async fn verify_challenge(
             Err(_) => {
                 // Renewal lost mid-delete: the deletion may still land,
                 // so the fences stay quarantined (cap#422).
-                quarantine_mutation_and_rollback_lane(app_lane).await?;
+                quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
                 return Err(internal_error());
             }
         };
@@ -1124,7 +1146,7 @@ pub async fn verify_challenge(
             Err(_) => {
                 // Renewal lost mid-removal: the route removal may still
                 // land, so the fences stay quarantined (cap#422).
-                quarantine_mutation_and_rollback_lane(app_lane).await?;
+                quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
                 return Err(internal_error());
             }
         };
@@ -1345,6 +1367,16 @@ pub async fn get_domain(
 }
 
 async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
+    // Test seam: hermetic tests pin the TXT answer for a name instead of
+    // resolving live (the production path below is untouched). Keyed by
+    // name so only the registering test's own lookups are affected.
+    #[cfg(test)]
+    {
+        let map = TXT_TEST_ANSWERS.lock().expect("txt test answers lock");
+        if let Some(values) = map.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()) {
+            return Ok(values);
+        }
+    }
     // Use the system resolver if configured; otherwise fall back to public
     // resolvers (Cloudflare 1.1.1.1, Google 8.8.8.8). Either way the live
     // record is fetched fresh -- not from any operator-side cache.
@@ -1379,6 +1411,13 @@ async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
     }
     Ok(out)
 }
+
+/// Hermetic TXT answers for `lookup_txt` (tests only). Registered by
+/// name so concurrent tests do not interfere; every entry must be
+/// removed by the registering test before it returns.
+#[cfg(test)]
+static TXT_TEST_ANSWERS: std::sync::Mutex<Vec<(String, Vec<String>)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// NXDOMAIN and NODATA mean "no TXT record here" and become an empty answer;
 /// every other resolver error (SERVFAIL, timeout, transport) stays a failure.
@@ -1910,6 +1949,231 @@ mod tests {
     /// reclaim (RECLAIM_QUARANTINE_SECONDS) instead of being released
     /// while a Kubernetes/DNS request can still land server-side. The
     /// staged business writes are still rolled back.
+    /// cap#422 R2 (review T1 + T2): drives the REAL verify path
+    /// (verify_challenge) with a renewal loss injected INSIDE the
+    /// DNS-tracking step (record_custom_domain). The dns_records row is
+    /// row-locked so the guard's provider future blocks mid-write; the
+    /// app mutation lease row is then held under a no-op write lock past
+    /// the heartbeat's renew timeout (the test build runs a 1s heartbeat
+    /// with a 2s renew timeout), which is the production renewal-loss
+    /// condition reached on the real path. RED on the pre-R2 head
+    /// (48bc819): the global edge_config fence stayed quarantined until
+    /// reclaim, so the unrelated deployment-apply claim below returned
+    /// Busy and the fence-owner assertion failed.
+    #[sqlx::test]
+    async fn renewal_loss_mid_verification_releases_the_cross_app_fence(pool: sqlx::PgPool) {
+        use crate::auth::middleware::ManagementOrigin;
+        use crate::models::Role;
+
+        let mut state = crate::test_support::lazy_state();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        state.db = pool.clone();
+        let (app, _deployment_id, _lease, _payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        let domain = "renewal-loss.example-test.com";
+        // Same-domain re-verification: the restart-admission engine is
+        // None on this path, so the black-hole test kube client is never
+        // touched before the DNS-tracking step.
+        sqlx::query("UPDATE apps SET custom_domain = $1 WHERE id = $2")
+            .bind(domain)
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("pin the app to the same domain");
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'renewal-loss tester')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert the verifying user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("insert the owner membership");
+        // The challenge is unexpired and unverified: needs_persist stages
+        // the verified_at write in the lane the arm must roll back.
+        let token = "renewal-loss-challenge-token";
+        let challenge_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO custom_domain_challenges
+                 (id, app_id, domain, challenge_token, expires_at)
+             VALUES ($1, $2, $3, $4, now() + interval '1 hour')",
+        )
+        .bind(challenge_id)
+        .bind(app.id)
+        .bind(domain)
+        .bind(token)
+        .execute(&pool)
+        .await
+        .expect("insert the domain challenge");
+        let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
+        TXT_TEST_ANSWERS
+            .lock()
+            .expect("txt answers lock")
+            .push((
+                txt_name.clone(),
+                vec![format!("enclava-domain-verification={token}")],
+            ));
+        // A pre-existing dns_records row for the hostname, row-locked by a
+        // held transaction: record_custom_domain's upsert blocks on it.
+        let dns_row = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO dns_records
+                 (id, app_id, hostname, record_type, target, is_custom, provider)
+             VALUES ($1, $2, $3, 'CUSTOM', '', true, 'user')",
+        )
+        .bind(dns_row)
+        .bind(app.id)
+        .bind(domain)
+        .execute(&pool)
+        .await
+        .expect("seed the tracked dns record");
+        let mut blocker = pool.begin().await.expect("begin the dns blocker");
+        sqlx::query("SELECT id FROM dns_records WHERE id = $1 FOR UPDATE")
+            .bind(dns_row)
+            .execute(&mut *blocker)
+            .await
+            .expect("lock the tracked dns record");
+
+        let auth = AuthContext {
+            user_id,
+            org_id: app.org_id,
+            org_name: format!("durable-{}", app.org_id),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: ManagementOrigin::Public,
+        };
+        let app_name = app.name.clone();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            crate::routes::domains::verify_challenge(
+                auth,
+                State(task_state),
+                Path((app_name, domain.to_string())),
+            )
+            .await
+        });
+
+        // Wait for the handler to claim the mutation (it then blocks in
+        // record_custom_domain on the locked dns_records row).
+        let claim_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let claimed: bool = sqlx::query_scalar(
+                "SELECT owner_token IS NOT NULL FROM app_mutation_leases WHERE app_id = $1",
+            )
+            .bind(app.id)
+            .fetch_optional(&pool)
+            .await
+            .expect("poll the app mutation lease")
+            .unwrap_or(false);
+            if claimed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < claim_deadline,
+                "the verify never claimed the mutation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Block the heartbeat's renewal on the app lease row: a no-op
+        // UPDATE holds the row write lock past the 2s test renew timeout,
+        // so the heartbeat declares the lease lost while the provider
+        // future is still blocked mid-DNS-write.
+        {
+            let mut renewal_blocker = pool.begin().await.expect("begin the renewal blocker");
+            sqlx::query(
+                "UPDATE app_mutation_leases SET updated_at = updated_at WHERE app_id = $1",
+            )
+            .bind(app.id)
+            .execute(&mut *renewal_blocker)
+            .await
+            .expect("lock the app mutation lease row");
+            tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+            renewal_blocker
+                .rollback()
+                .await
+                .expect("release the renewal blocker");
+        }
+
+        // The guard aborted (renewal lost mid-DNS-write) and the arm ran.
+        let response = task
+            .await
+            .expect("the verify task must join")
+            .expect_err("the renewal loss must fail the verify");
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // The lane rolled back: the staged verified_at write is gone.
+        let verified_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT verified_at FROM custom_domain_challenges WHERE id = $1",
+        )
+        .bind(challenge_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the challenge row");
+        assert!(
+            verified_at.is_none(),
+            "the staged verified_at write must roll back with the lane"
+        );
+
+        // The APP-SCOPED fences stay quarantined until reclaim_after.
+        for (scope, key) in [
+            ("dns_hostname", domain.to_string()),
+            ("edge_route", domain.to_string()),
+            ("kubernetes_namespace", app.namespace.clone()),
+        ] {
+            let owner: Option<Uuid> = sqlx::query_scalar(
+                "SELECT owner_token FROM external_resource_mutation_leases
+                  WHERE resource_scope = $1 AND resource_key = $2",
+            )
+            .bind(scope)
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|_| panic!("read the {scope}/{key} fence row"));
+            assert!(
+                owner.is_some(),
+                "{scope}/{key} must stay quarantined until reclaim_after"
+            );
+        }
+
+        // THE R2 PROPERTY (review T1): the cross-app edge_config fence is
+        // RELEASED on this arm — an unrelated app's deployment apply can
+        // claim it immediately instead of waiting out the quarantine.
+        let edge_owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT owner_token FROM external_resource_mutation_leases
+              WHERE resource_scope = 'edge_config' AND resource_key = 'global'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read the edge_config fence row");
+        assert!(
+            edge_owner.is_none(),
+            "the cross-app edge_config fence must be released after the renewal loss"
+        );
+        match crate::mutation_leases::claim_resources(
+            &state,
+            "deployment-apply-test",
+            Uuid::new_v4(),
+            vec![crate::mutation_leases::ResourceFence::edge_config()],
+        )
+        .await
+        {
+            Ok(_lease) => {}
+            Err(error) => panic!(
+                "an unrelated app's deployment apply must be able to claim edge_config now: {error}"
+            ),
+        }
+
+        blocker.rollback().await.expect("release the dns blocker");
+        TXT_TEST_ANSWERS
+            .lock()
+            .expect("txt answers lock")
+            .retain(|(name, _)| name != &txt_name);
+    }
+
     #[sqlx::test]
     async fn quarantine_on_renewal_loss_keeps_the_fences_and_rolls_back(pool: sqlx::PgPool) {
         let mut state = crate::test_support::lazy_state();
@@ -1951,7 +2215,7 @@ mod tests {
             .execute(&mut *lane)
             .await
             .expect("stage the domain assignment");
-        quarantine_mutation_and_rollback_lane(lane)
+        quarantine_mutation_and_rollback_lane(&state, &mutation, lane)
             .await
             .expect("roll the lane back on renewal loss");
         drop(mutation);
@@ -1962,8 +2226,10 @@ mod tests {
                 .await
                 .expect("read the app row");
         assert_eq!(staged, None, "no staged business write survives");
-        // The fences stay owned: a newer mutation cannot claim the
-        // namespace while the unresolved write may still land.
+        // The APP-SCOPED fences stay owned: a newer mutation cannot claim
+        // the namespace while the unresolved write may still land. The
+        // global edge_config fence is RELEASED (cap#422 R2, review T1):
+        // it is cross-app, and unrelated apps' deployment apply needs it.
         let still_owned: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM external_resource_mutation_leases
               WHERE operation_id = $1",
@@ -1973,8 +2239,19 @@ mod tests {
         .await
         .expect("count owned rows after quarantine");
         assert!(
-            still_owned >= 4,
-            "the fences stay quarantined, not released"
+            still_owned >= 3,
+            "the app-scoped fences stay quarantined, not released"
+        );
+        let edge_config_released: Option<Uuid> = sqlx::query_scalar(
+            "SELECT owner_token FROM external_resource_mutation_leases
+              WHERE resource_scope = 'edge_config' AND resource_key = 'global'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read the edge_config fence row");
+        assert!(
+            edge_config_released.is_none(),
+            "the cross-app edge_config fence must be released on a renewal-loss quarantine"
         );
         let app_lease_held: bool = sqlx::query_scalar(
             "SELECT owner_token IS NOT NULL FROM app_mutation_leases WHERE app_id = $1",
