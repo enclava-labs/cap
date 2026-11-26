@@ -32,8 +32,18 @@ const RECLAIM_QUARANTINE_SECONDS: i64 = 360;
 /// retaining case — so a live, non-deleting namespace then proves no
 /// deletion of ours is pending.
 const RETAINED_FENCE_SETTLE_SECONDS: i64 = 300;
+#[cfg(not(test))]
 const HEARTBEAT_SECONDS: u64 = 30;
+/// Tests drive renewal-loss arms deterministically: a fast heartbeat
+/// interval and a short renew timeout let a test block the renewal long
+/// enough to lose the lease in seconds instead of 30+10. Production
+/// keeps 30s/10s.
+#[cfg(test)]
+const HEARTBEAT_SECONDS: u64 = 1;
+#[cfg(not(test))]
 const RENEW_TIMEOUT_SECONDS: u64 = 10;
+#[cfg(test)]
+const RENEW_TIMEOUT_SECONDS: u64 = 2;
 
 /// Bound for each individual namespace-absence probe in
 /// `release_retained_deployment_namespace_fences`. Without it, one stalled
@@ -326,6 +336,55 @@ impl AppMutationLease {
             poison_resource_scope(&mut tx, self.token, &self.resources, resource_scope).await?;
         if retained == 0 {
             return Err(MutationLeaseError::Lost);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// cap#422 R2 (review T1): on a renewal-loss arm the claimed rows stay
+    /// quarantined until `reclaim_after` by design -- but a CROSS-APP
+    /// fence (the global `edge_config`) blocks unrelated apps' deployment
+    /// apply for the whole quarantine bound, and on those arms no write of
+    /// THAT fence's own is in flight. Clear exactly the given fences' rows
+    /// by token and generation: `release_resource_in_tx`'s heartbeat-alive
+    /// guard does not apply (the loss is the reason we are here), and a
+    /// zero-row result means the reclaimer already took the fence -- which
+    /// is equally released. Everything not named keeps its reclaim
+    /// quarantine.
+    pub async fn release_fences_quarantined(
+        &self,
+        fences: &[ResourceFence],
+    ) -> Result<(), MutationLeaseError> {
+        let mut releases = Vec::new();
+        for fence in fences {
+            if let Some(resource) = self.resources.iter().find(|r| &r.fence == fence) {
+                releases.push(resource.clone());
+            }
+        }
+        if releases.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for resource in &releases {
+            sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                    SET owner_token = NULL,
+                        operation_kind = NULL,
+                        operation_id = NULL,
+                        locked_until = NULL,
+                        reclaim_after = NULL,
+                        updated_at = clock_timestamp()
+                  WHERE resource_scope = $1
+                    AND resource_key = $2
+                    AND owner_token = $3
+                    AND generation = $4",
+            )
+            .bind(&resource.fence.scope)
+            .bind(&resource.fence.key)
+            .bind(self.token)
+            .bind(resource.generation)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(())

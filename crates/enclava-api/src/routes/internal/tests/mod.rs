@@ -1340,6 +1340,7 @@ async fn stale_owner_and_pre_upgrade_completion_are_fenced_after_reclaim() {
     );
 
     let stale_lease = IdempotencyLease {
+        path: "/internal/test".to_string(),
         pool: pool.clone(),
         key: key.clone(),
         token: stale_token,
@@ -9563,4 +9564,157 @@ async fn idempotency_reaper_terminalizes_only_long_abandoned_reservations() {
         "a recent deferred reservation must stay reclaimable"
     );
     drop(live_lease);
+}
+
+// --- cap#422: a 5xx masked as idempotency_recovery_required logs and
+// carries the upstream cause ---
+
+struct CapturedErrorLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedErrorLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("captured log mutex").extend(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn captured_error_logs() -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer({
+            let logs = std::sync::Arc::clone(&logs);
+            move || CapturedErrorLogWriter(std::sync::Arc::clone(&logs))
+        })
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (logs, guard)
+}
+
+fn captured_error_log_text(logs: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+    String::from_utf8(logs.lock().expect("captured log mutex").clone())
+        .expect("captured logs are UTF-8")
+}
+
+#[test]
+fn outcome_unknown_cause_code_is_bounded_and_code_shaped() {
+    assert_eq!(
+        outcome_unknown_cause_code(&serde_json::json!({
+            "error": "edge_route_backend_unavailable"
+        })),
+        "edge_route_backend_unavailable"
+    );
+    // Over-long code-shaped tokens are cut at 128, not passed through
+    // wholesale.
+    let long = "x".repeat(300);
+    let bounded = outcome_unknown_cause_code(&serde_json::json!({ "error": long }));
+    assert_eq!(bounded.chars().count(), 128);
+    // Provider text — free-form strings, kube object names — is never
+    // carried into the stored receipt; it degrades to `unavailable`.
+    for text in [
+        "internal error",
+        "sni route: InvalidBackendTag",
+        "haproxy update: configmaps \"cap-edge\" not found",
+        "resolve backend: service not found in namespace",
+    ] {
+        assert_eq!(
+            outcome_unknown_cause_code(&serde_json::json!({ "error": text })),
+            "unavailable",
+            "provider text must not reach the receipt: {text}"
+        );
+    }
+    // No error key, or a non-string one, degrades to a fixed code.
+    assert_eq!(
+        outcome_unknown_cause_code(&serde_json::json!({})),
+        "unavailable"
+    );
+    assert_eq!(
+        outcome_unknown_cause_code(&serde_json::json!({ "error": 5 })),
+        "unavailable"
+    );
+}
+
+#[tokio::test]
+async fn outcome_unknown_5xx_is_logged_and_carries_the_cause() {
+    let pool = database_test_pool().await;
+    let state = idempotency_test_state(pool.clone());
+    let suffix = Uuid::new_v4().simple().to_string();
+    let key = format!("outcome-unknown-cause-{suffix}");
+    let path = format!("/internal/test/outcome-unknown-cause/{suffix}");
+    let hash = Sha256::digest(b"outcome-unknown-cause").to_vec();
+    let lease = expect_idempotency_execution(
+        begin_idempotent_request(&state, &key, "POST", &path, &hash)
+            .await
+            .expect("reserve the idempotent lease"),
+    );
+    let operation_id = lease.operation_id;
+
+    let (logs, _guard) = captured_error_logs();
+    let masked = complete_idempotent_result(
+        lease,
+        Err((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": "edge_route_backend_unavailable"})),
+        )),
+    )
+    .await
+    .expect_err("the 5xx converts into the fail-closed 409 receipt");
+    assert_eq!(masked.0, StatusCode::CONFLICT);
+    assert_eq!(masked.1.0["error"], "idempotency_recovery_required");
+    // The outcome cause is strictly additive: the upstream status + a
+    // code-shaped error, nothing else. It is `outcome_cause`, not `cause`:
+    // the PaaS relay reads the existing `cause` field as a plain string.
+    assert_eq!(masked.1.0["outcome_cause"]["status"], 502);
+    assert_eq!(
+        masked.1.0["outcome_cause"]["error"],
+        "edge_route_backend_unavailable"
+    );
+    assert!(
+        masked.1.0.get("cause").is_none(),
+        "the string-typed cause field is untouched"
+    );
+    let expected_base = idempotency_recovery_required_body();
+    let masked_object = masked.1.0.as_object().expect("the receipt is an object");
+    for (field, value) in expected_base
+        .as_object()
+        .expect("the base receipt is an object")
+    {
+        assert_eq!(masked_object.get(field), Some(value), "{field} unchanged");
+    }
+    assert_eq!(
+        masked_object.len(),
+        expected_base.as_object().expect("object").len() + 1
+    );
+
+    // The ERROR record names the operation id, the path, the upstream
+    // status and the code-shaped error — no provider text, no secrets.
+    let text = captured_error_log_text(&logs);
+    assert!(
+        text.contains(&operation_id.to_string()),
+        "names the operation id"
+    );
+    assert!(text.contains(&path), "names the request path");
+    assert!(text.contains("502"), "names the upstream status");
+    assert!(
+        text.contains("edge_route_backend_unavailable"),
+        "names the code-shaped error"
+    );
+
+    // Terminal: a same-key retry replays the receipt, never in-progress.
+    let replay = expect_idempotency_replay(
+        begin_idempotent_request(&state, &key, "POST", &path, &hash)
+            .await
+            .expect("replay the terminal receipt"),
+    );
+    assert_eq!(replay.0, StatusCode::CONFLICT);
+    assert_eq!(replay.1, masked.1.0);
 }

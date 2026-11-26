@@ -103,6 +103,9 @@ struct IdempotencyLease {
     key: String,
     token: Uuid,
     operation_id: Uuid,
+    /// The request path the operation was claimed under (cap#422: logged
+    /// when a 5xx is converted into a fail-closed receipt).
+    path: String,
     reclaimed: bool,
     regenerate: bool,
     committed_keyring_checkpoint: bool,
@@ -179,6 +182,7 @@ impl IdempotencyLease {
         token: Uuid,
         claim: IdempotencyLeaseClaim,
         recovery: IdempotencyRecovery,
+        path: &str,
     ) -> Self {
         let lease_seconds = recovery.lease_seconds();
         let heartbeat_pool = pool.clone();
@@ -217,6 +221,7 @@ impl IdempotencyLease {
             key,
             token,
             operation_id: claim.operation_id,
+            path: path.to_string(),
             reclaimed: claim.reclaimed,
             regenerate: claim.regenerate,
             committed_keyring_checkpoint: claim.committed_keyring_checkpoint,
@@ -1044,6 +1049,46 @@ fn idempotency_recovery_required_body() -> serde_json::Value {
     })
 }
 
+/// cap#422: the code-shaped error carried by the receipt — a single
+/// snake-case token, bounded at 128 chars. Provider text (free-form error
+/// strings, kube object names) is never carried: it degrades to
+/// `unavailable`, so the stored and replayed receipt cannot expose
+/// internal details.
+fn outcome_unknown_cause_code(body: &serde_json::Value) -> String {
+    fn is_code_shaped(code: &str) -> bool {
+        let mut chars = code.chars();
+        matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(|code| code.chars().take(128).collect::<String>())
+        .filter(|code| is_code_shaped(code))
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+/// cap#422: the recovery-required 409 body with an additive
+/// `outcome_cause` field (upstream status + error code) so the CLI user
+/// and support can act. The existing keys are unchanged; the field is
+/// named `outcome_cause`, not `cause`, because the PaaS relay reads the
+/// existing `cause` field as a plain string (cap_proxy deferral causes).
+fn idempotency_recovery_required_body_with_cause(
+    status: StatusCode,
+    code: &str,
+) -> serde_json::Value {
+    let mut body = idempotency_recovery_required_body();
+    if let Some(map) = body.as_object_mut() {
+        map.insert(
+            "outcome_cause".to_string(),
+            serde_json::json!({
+                "status": status.as_u16(),
+                "error": code,
+            }),
+        );
+    }
+    body
+}
+
 async fn complete_unrecoverable_idempotency_request(
     pool: &sqlx::PgPool,
     key: &str,
@@ -1410,6 +1455,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                 config_token_receipt,
             },
             recovery,
+            path,
         )));
     }
 
@@ -1538,6 +1584,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                     config_token_receipt: Some(receipt),
                 },
                 recovery,
+                path,
             )));
         }
         if !reclaimable {
@@ -1725,6 +1772,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                 }),
         },
         recovery,
+        path,
     )))
 }
 
@@ -2015,22 +2063,21 @@ async fn complete_idempotent_result(
                     return Err(idempotency_in_progress_error());
                 }
                 IdempotencyErrorDisposition::OutcomeUnknown => {
-                    // cd 2026-11-25 (plain-deploy 409): a 5xx masked as a
-                    // recovery receipt used to be invisible — the real
-                    // status and code reached neither the log nor the 409
-                    // body. Log at ERROR (operation id, upstream status,
-                    // code-shaped error; no provider text, no secrets).
-                    let cause_code = body
-                        .get("error")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unavailable");
+                    // cap#422: a 5xx masked as recovery_required used to be
+                    // invisible — the real status and code reached neither
+                    // the log nor the 409 body. Log at ERROR (operation id,
+                    // path, upstream status, code-shaped error; no provider
+                    // text, no secrets) and carry the cause additively.
+                    let cause_code = outcome_unknown_cause_code(&body);
                     tracing::error!(
                         operation_id = %lease.operation_id,
+                        path = %lease.path,
                         upstream_status = status.as_u16(),
                         upstream_error = %cause_code,
                         "idempotent request failed with a server error; fail-closed receipt recorded"
                     );
-                    let terminal = idempotency_recovery_required_body();
+                    let terminal =
+                        idempotency_recovery_required_body_with_cause(status, &cause_code);
                     finish_idempotent_request(lease, StatusCode::CONFLICT, &terminal).await?;
                     return Err((StatusCode::CONFLICT, Json(terminal)));
                 }
@@ -4056,6 +4103,7 @@ async fn begin_app_delete_request(
                             config_token_receipt: None,
                         },
                         IdempotencyRecovery::RetrySafe,
+                        path,
                     )));
                 }
             }

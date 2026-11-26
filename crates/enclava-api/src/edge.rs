@@ -802,6 +802,19 @@ impl BackendTag {
     }
 }
 
+/// True when the edge error is Kubernetes NotFound for the looked-up
+/// object — e.g. the app's Service on an app that was never deployed
+/// (cap#422: the same-domain re-verification path distinguishes
+/// "not deployed" from real backend failures this way, mirroring the
+/// first-verification rule). `resolve_backend_target`'s other callers are
+/// unaffected.
+pub fn is_kube_not_found(error: &EdgeRouteError) -> bool {
+    matches!(
+        error,
+        EdgeRouteError::Kube(kube::Error::Api(api)) if api.code == 404
+    )
+}
+
 /// Build the backend target string for a Service in the given namespace and
 /// port. Inputs are validated DNS labels; the namespace and app come from
 /// trusted DB rows but we still validate as defense in depth.
