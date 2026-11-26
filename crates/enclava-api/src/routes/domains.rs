@@ -118,7 +118,6 @@ async fn release_mutation_and_rollback_lane(
 /// bound. Used only on the guard's renewal-loss arms; provider failures
 /// that RETURNED (settled) release normally.
 async fn quarantine_mutation_and_rollback_lane(
-    state: &AppState,
     mutation: &crate::mutation_leases::AppMutationLease,
     app_lane: sqlx::Transaction<'static, sqlx::Postgres>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -852,7 +851,7 @@ pub async fn verify_challenge(
         Err(_) => {
             // Renewal lost mid-DNS-write: the request may still land
             // server-side, so the fences stay quarantined (cap#422).
-            quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
+            quarantine_mutation_and_rollback_lane(&mutation, app_lane).await?;
             return Err(internal_error());
         }
     };
@@ -910,7 +909,7 @@ pub async fn verify_challenge(
                     // Durable renewal was lost mid-publish: the HAProxy
                     // write may still land, so the fences stay quarantined
                     // (cap#422).
-                    quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
+                    quarantine_mutation_and_rollback_lane(&mutation, app_lane).await?;
                     return Err(internal_error());
                 }
             };
@@ -988,7 +987,7 @@ pub async fn verify_challenge(
             // ConfigMap write may still land server-side (a missing-object
             // create has no version to fence it), so the namespace fence
             // stays quarantined until reclaim instead of being released.
-            quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
+            quarantine_mutation_and_rollback_lane(&mutation, app_lane).await?;
             return Err(internal_error());
         }
     };
@@ -1066,7 +1065,7 @@ pub async fn verify_challenge(
             Err(_) => {
                 // Renewal lost mid-publish: the write may still land, so
                 // the fences stay quarantined (cap#422).
-                quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
+                quarantine_mutation_and_rollback_lane(&mutation, app_lane).await?;
                 return Err(internal_error());
             }
         }
@@ -1124,7 +1123,7 @@ pub async fn verify_challenge(
             Err(_) => {
                 // Renewal lost mid-delete: the deletion may still land,
                 // so the fences stay quarantined (cap#422).
-                quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
+                quarantine_mutation_and_rollback_lane(&mutation, app_lane).await?;
                 return Err(internal_error());
             }
         };
@@ -1146,7 +1145,7 @@ pub async fn verify_challenge(
             Err(_) => {
                 // Renewal lost mid-removal: the route removal may still
                 // land, so the fences stay quarantined (cap#422).
-                quarantine_mutation_and_rollback_lane(&state, &mutation, app_lane).await?;
+                quarantine_mutation_and_rollback_lane(&mutation, app_lane).await?;
                 return Err(internal_error());
             }
         };
@@ -2209,7 +2208,7 @@ mod tests {
             .execute(&mut *lane)
             .await
             .expect("stage the domain assignment");
-        quarantine_mutation_and_rollback_lane(&state, &mutation, lane)
+        quarantine_mutation_and_rollback_lane(&mutation, lane)
             .await
             .expect("roll the lane back on renewal loss");
         drop(mutation);
