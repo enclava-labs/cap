@@ -2595,8 +2595,10 @@ mod tests {
         // image/registry texts, environment-dependent: a no-public-DNS
         // sandbox refuses at the egress guard while a DNS environment
         // reaches the database 500 the gate-off RED run also hit). Pin
-        // exactly those classes; the admission refusal and the
-        // profile/decode classes are excluded by name.
+        // exactly those classes; the admission refusal, the profile/decode
+        // classes and the image PARSE error (a malformed fixture, not a
+        // post-admission environment refusal) are excluded by name — and
+        // the fixture's digest-pinned image never reaches tag resolution.
         match deploy_app_candidate(auth, state, app.clone(), body, AppMutation::None, false).await {
             Ok(_) => panic!("the fixture's later stages must refuse this deploy"),
             Err((status, Json(error_body))) => {
@@ -2608,11 +2610,9 @@ mod tests {
                 assert!(
                     status == StatusCode::INTERNAL_SERVER_ERROR
                         || (status == StatusCode::BAD_REQUEST
-                            && (error.starts_with("invalid image reference")
-                                || error.starts_with("unsupported registry")
+                            && (error.starts_with("unsupported registry")
                                 || error.starts_with("invalid registry URL")
-                                || error == "registry_destination_not_allowed"
-                                || error.starts_with("failed to resolve image"))),
+                                || error == "registry_destination_not_allowed")),
                     "gate on: the failure must be a post-admission image/registry/database class, got {status} {error:?}"
                 );
             }
