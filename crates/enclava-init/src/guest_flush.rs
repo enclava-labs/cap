@@ -115,6 +115,25 @@ pub fn signal_safe_sync() {
     unsafe { nix::libc::sync() };
 }
 
+/// Async-signal-safe monotonic clock reading, nanoseconds since boot. The
+/// SIGTERM handler records this BEFORE its immediate writeback so the
+/// teardown budget starts at the signal, not after the handler's own sync:
+/// Kubernetes starts the termination grace period when it delivers the
+/// signal, and the writeback inside the handler is already grace-period
+/// time (cap#378 review round 1).
+pub fn signal_safe_monotonic_nanos() -> u64 {
+    let mut timespec = nix::libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime(2) with a valid output pointer is
+    // async-signal-safe.
+    unsafe {
+        nix::libc::clock_gettime(nix::libc::CLOCK_MONOTONIC, &mut timespec);
+    }
+    (timespec.tv_sec.max(0) as u64) * 1_000_000_000 + timespec.tv_nsec.max(0) as u64
+}
+
 pub fn syncfs_path(path: &Path) -> io::Result<()> {
     let file = File::open(path)?;
     syncfs_fd(file.as_raw_fd())
@@ -314,6 +333,12 @@ pub struct TeardownFlushOutcome {
 /// re-flushing every [`RELUSH_INTERVAL`] until `deadline` (measured from
 /// entry, i.e. from SIGTERM), then flush a final time.
 ///
+/// `elapsed` is the monotonic time since entry. The deadline is checked
+/// against ELAPSED time, not accumulated sleep, so time spent inside the
+/// flushes themselves (the guest writeback) and inside `pending` counts
+/// against the grace boundary: the final flush must not be pushed past
+/// Kubernetes' kill deadline by slow writeback (cap#378 review round 1).
+///
 /// The first flush is what saves the writes that were already dirty when
 /// pod delete arrived — the reported failure. The second flush covers
 /// writes the workload made in its own SIGTERM handler before it exited.
@@ -322,50 +347,60 @@ pub struct TeardownFlushOutcome {
 /// the grace period (cap#193 round-2 review, warning 3). No flush may be
 /// dropped: a sibling that ignores SIGTERM must not turn the wait into a
 /// skip.
-pub fn run_teardown_flush<F, P, S>(
+pub fn run_teardown_flush<F, P, S, N>(
     siblings: &[SiblingProcess],
     initial_wait: Duration,
     deadline: Duration,
     mut flush: F,
     mut pending: P,
     mut sleep: S,
+    mut elapsed: N,
 ) -> TeardownFlushOutcome
 where
     F: FnMut(FlushReason),
     P: FnMut(&[SiblingProcess]) -> Vec<u32>,
     S: FnMut(Duration),
+    N: FnMut() -> Duration,
 {
     flush(FlushReason::OnSignal);
-    let mut waited = Duration::ZERO;
     let mut remaining = pending(siblings);
-    while !remaining.is_empty() && waited < initial_wait {
-        let slice = WAIT_SLICE.min(initial_wait.saturating_sub(waited));
+    while !remaining.is_empty() {
+        let waited = elapsed();
+        if waited >= initial_wait {
+            break;
+        }
+        let slice = WAIT_SLICE.min(initial_wait - waited);
         if slice.is_zero() {
             break;
         }
         sleep(slice);
-        waited = waited.saturating_add(slice);
         remaining = pending(siblings);
     }
     flush(FlushReason::AfterSiblings);
     let mut after_sibling_flushes = 1u32;
     // Linger: siblings that ignore SIGTERM keep the guest alive until the
     // grace boundary; keep their ongoing writes flushed while we wait.
-    let mut next_flush = waited.saturating_add(RELUSH_INTERVAL);
+    // next_flush is re-derived from the clock after every flush so the
+    // writeback time inside the flush itself is part of the schedule.
+    let mut next_flush = elapsed().saturating_add(RELUSH_INTERVAL);
     let mut lingered = false;
-    while !remaining.is_empty() && waited < deadline {
+    while !remaining.is_empty() {
+        let waited = elapsed();
+        if waited >= deadline {
+            break;
+        }
         lingered = true;
-        let slice = WAIT_SLICE.min(deadline.saturating_sub(waited));
+        let slice = WAIT_SLICE.min(deadline - waited);
         if slice.is_zero() {
             break;
         }
         sleep(slice);
-        waited = waited.saturating_add(slice);
         remaining = pending(siblings);
+        let waited = elapsed();
         if waited >= next_flush {
             flush(FlushReason::AfterSiblings);
             after_sibling_flushes += 1;
-            next_flush = waited.saturating_add(RELUSH_INTERVAL);
+            next_flush = elapsed().saturating_add(RELUSH_INTERVAL);
         }
     }
     if lingered {
@@ -375,7 +410,7 @@ where
         after_sibling_flushes += 1;
     }
     TeardownFlushOutcome {
-        waited,
+        waited: elapsed(),
         siblings_remaining: remaining,
         after_sibling_flushes,
     }
@@ -389,16 +424,18 @@ pub struct TeardownRequest<'a> {
 }
 
 /// Production teardown: every flush pass goes through [`flush_mounts_with`].
-pub fn execute_teardown_with<G, P, S>(
+pub fn execute_teardown_with<G, P, S, N>(
     request: &TeardownRequest<'_>,
     ops: &mut G,
     mut pending: P,
     sleep: S,
+    elapsed: N,
 ) -> (Vec<FlushReport>, TeardownFlushOutcome)
 where
     G: GuestSync,
     P: FnMut(&[SiblingProcess]) -> Vec<u32>,
     S: FnMut(Duration),
+    N: FnMut() -> Duration,
 {
     let mut reports = Vec::new();
     let outcome = run_teardown_flush(
@@ -410,6 +447,7 @@ where
         },
         &mut pending,
         sleep,
+        elapsed,
     );
     (reports, outcome)
 }
@@ -423,7 +461,29 @@ where
     P: FnMut(&[SiblingProcess]) -> Vec<u32>,
     S: FnMut(Duration),
 {
-    execute_teardown_with(request, &mut LibcGuestSync, pending, sleep)
+    let start = std::time::Instant::now();
+    execute_teardown_with(request, &mut LibcGuestSync, pending, sleep, || {
+        start.elapsed()
+    })
+}
+
+/// The production entry point: the grace budget is measured from the epoch
+/// the SIGTERM handler recorded at signal delivery (before its own
+/// writeback), so handler sync time, flush time, and poll time all count
+/// against Kubernetes' kill deadline.
+pub fn execute_teardown_since_epoch<P, S>(
+    request: &TeardownRequest<'_>,
+    pending: P,
+    sleep: S,
+    teardown_epoch_nanos: u64,
+) -> (Vec<FlushReport>, TeardownFlushOutcome)
+where
+    P: FnMut(&[SiblingProcess]) -> Vec<u32>,
+    S: FnMut(Duration),
+{
+    execute_teardown_with(request, &mut LibcGuestSync, pending, sleep, || {
+        Duration::from_nanos(signal_safe_monotonic_nanos().saturating_sub(teardown_epoch_nanos))
+    })
 }
 
 #[cfg(test)]
@@ -475,14 +535,93 @@ mod tests {
         assert!(report.global_sync);
     }
 
+    /// A controllable monotonic clock for the deadline accounting: sleep
+    /// advances it, and tests can advance it inside a flush closure to
+    /// model writeback time (the case the review round flagged).
+    struct FakeClock(std::cell::RefCell<Duration>);
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self(std::cell::RefCell::new(Duration::ZERO))
+        }
+
+        fn advance(&self, duration: Duration) {
+            *self.0.borrow_mut() += duration;
+        }
+
+        fn elapsed(&self) -> Duration {
+            *self.0.borrow()
+        }
+
+        fn sleeping(&self) -> impl FnMut(Duration) + '_ {
+            move |delay| self.advance(delay)
+        }
+
+        fn now(&self) -> impl FnMut() -> Duration + '_ {
+            move || self.elapsed()
+        }
+    }
+
+    #[test]
+    fn teardown_counts_writeback_time_against_the_deadline() {
+        // The review round's bug: the linger loop used accumulated sleep,
+        // so time spent inside the flushes (the guest writeback) was free
+        // and the final flush could be pushed past Kubernetes' kill
+        // deadline. Here every flush burns 3 s of writeback while the
+        // sleep slices advance the clock 200 ms each: the schedule must be
+        // decided by the clock (sleep + writeback), never by sleep alone.
+        let clock = FakeClock::new();
+        let mut flushes = 0;
+        let outcome = run_teardown_flush(
+            &[SiblingProcess {
+                pid: 9,
+                start_time_ticks: Some(1),
+            }],
+            Duration::from_millis(100),
+            Duration::from_millis(11_100),
+            |_| {
+                flushes += 1;
+                // Model slow writeback: the flush itself burns 3 s.
+                clock.advance(Duration::from_secs(3));
+            },
+            |_| vec![9],
+            clock.sleeping(),
+            clock.now(),
+        );
+        // The 100 ms initial budget: the signal flush burns 3 s, so the
+        // after-sibling flush happens with no sleep at all. Linger: slices
+        // advance 200 ms; the re-flush fires at ~11 s of clock and burns
+        // 3 s more, so the loop sees elapsed past the 11.1 s deadline and
+        // ends — one re-flush, then the final flush. The final schedule
+        // lands at 14 s, not at a sleep-only 11.2 s while more grace is
+        // silently burned.
+        assert!(
+            outcome.waited >= Duration::from_millis(11_100),
+            "the clock must reach the deadline: {:?}",
+            outcome.waited
+        );
+        assert!(
+            outcome.waited <= Duration::from_millis(11_100) + Duration::from_secs(6),
+            "after the clock crosses the deadline only the boundary re-flush (started before it)              and the final flush may run — never another sleep cycle: {:?}",
+            outcome.waited
+        );
+        assert_eq!(
+            flushes, 4,
+            "signal, after-siblings, ONE linger re-flush, final — not a sleep-only cadence"
+        );
+        assert_eq!(outcome.siblings_remaining, vec![9]);
+    }
+
     #[test]
     fn teardown_flushes_before_the_wait_and_again_after_the_sibling_exits() {
         let sibling = SiblingProcess {
             pid: 42,
             start_time_ticks: Some(7),
         };
-        let events = std::cell::RefCell::new(Vec::new());
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let clock = FakeClock::new();
         let mut checks = 0;
+        let recorded_events = events.clone();
         let outcome = run_teardown_flush(
             &[sibling],
             SIBLING_EXIT_WAIT,
@@ -497,13 +636,15 @@ mod tests {
                 if checks == 1 { vec![42] } else { vec![] }
             },
             |delay| {
-                events
+                recorded_events
                     .borrow_mut()
-                    .push(format!("sleep:{}ms", delay.as_millis()))
+                    .push(format!("sleep:{}ms", delay.as_millis()));
+                clock.advance(delay);
             },
+            clock.now(),
         );
         assert_eq!(
-            events.into_inner(),
+            events.borrow().clone(),
             vec![
                 "flush:signal".to_string(),
                 format!("sleep:{}ms", WAIT_SLICE.as_millis()),
@@ -522,6 +663,7 @@ mod tests {
     #[test]
     fn teardown_still_flushes_when_the_sibling_ignores_sigterm() {
         let mut events = Vec::new();
+        let clock = FakeClock::new();
         let outcome = run_teardown_flush(
             &[SiblingProcess {
                 pid: 9,
@@ -531,7 +673,8 @@ mod tests {
             Duration::from_millis(800),
             |reason| events.push(reason),
             |_| vec![9],
-            |_| {},
+            clock.sleeping(),
+            clock.now(),
         );
         assert_eq!(
             events,
@@ -554,6 +697,7 @@ mod tests {
         // so the workload's ongoing writes keep landing (round-2 review
         // warning 3).
         let mut events = Vec::new();
+        let clock = FakeClock::new();
         let outcome = run_teardown_flush(
             &[SiblingProcess {
                 pid: 9,
@@ -563,7 +707,8 @@ mod tests {
             Duration::from_millis(11_100),
             |reason| events.push(reason),
             |_| vec![9],
-            |_| {},
+            clock.sleeping(),
+            clock.now(),
         );
         let signal_flushes = events
             .iter()
@@ -595,6 +740,7 @@ mod tests {
             start_time_ticks: Some(7),
         }];
         let mut checks = 0;
+        let clock = FakeClock::new();
         let (reports, outcome) = execute_teardown_with(
             &TeardownRequest {
                 mounts: &mounts,
@@ -607,7 +753,8 @@ mod tests {
                 checks += 1;
                 if checks == 1 { vec![42] } else { vec![] }
             },
-            |_| {},
+            clock.sleeping(),
+            clock.now(),
         );
         assert_eq!(reports.len(), 2);
         assert!(reports.iter().all(|report| report.global_sync));

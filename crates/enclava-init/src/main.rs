@@ -61,6 +61,13 @@ const MANAGED_CONFIG_DIR_MODE: u32 = 0o750;
 /// second flush after workload processes exit.
 static TEARDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// The monotonic instant SIGTERM arrived, recorded by the handler BEFORE
+/// its own writeback: Kubernetes' termination grace period starts at
+/// signal delivery, so the teardown budget must include the handler's
+/// sync and every later flush, not only the monitor's sleeps
+/// (cap#378 review round 1). Zero means no signal was delivered.
+static TEARDOWN_EPOCH_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().map(String::as_str) == Some("--bind-mount-into-ns") {
@@ -826,6 +833,13 @@ fn teardown_requested() -> bool {
 }
 
 extern "C" fn handle_teardown_signal(_signal: i32) {
+    // The grace clock starts at the signal, not when the monitor wakes:
+    // record the epoch before the writeback below so its time is counted
+    // against the kill deadline too.
+    TEARDOWN_EPOCH_NANOS.store(
+        guest_flush::signal_safe_monotonic_nanos(),
+        Ordering::Release,
+    );
     // Immediate flush. kubelet SIGKILLs this process at the end of the
     // grace period whether or not the monitor thread has noticed the flag.
     guest_flush::signal_safe_sync();
@@ -907,7 +921,8 @@ fn complete_teardown_flush(mounts: &[PathBuf]) -> ! {
         mounts = ?mounts,
         "pod teardown: flushing guest filesystems"
     );
-    let (reports, outcome) = guest_flush::execute_teardown(
+    let teardown_epoch_nanos = TEARDOWN_EPOCH_NANOS.load(Ordering::Acquire);
+    let (reports, outcome) = guest_flush::execute_teardown_since_epoch(
         &guest_flush::TeardownRequest {
             mounts,
             siblings: &siblings,
@@ -916,6 +931,7 @@ fn complete_teardown_flush(mounts: &[PathBuf]) -> ! {
         },
         |siblings| guest_flush::pending_siblings(Path::new("/proc"), siblings),
         std::thread::sleep,
+        teardown_epoch_nanos,
     );
     for (index, report) in reports.iter().enumerate() {
         let reason = if index == 0 {
