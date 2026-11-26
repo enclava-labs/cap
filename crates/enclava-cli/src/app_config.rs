@@ -105,7 +105,7 @@ pub struct StorageSection {
     pub tls_size: String,
 }
 
-fn default_storage_paths() -> Vec<String> {
+pub fn default_storage_paths() -> Vec<String> {
     vec!["/data".to_string()]
 }
 
