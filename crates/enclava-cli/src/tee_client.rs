@@ -172,6 +172,23 @@ pub const TERMINAL_BOOTSTRAP_ERROR_CODES: [&str; 3] = [
     "enclava_init_failed",
 ];
 
+/// The exact fixed-vocabulary failing steps the init may report on the
+/// `bootstrap_error.failed_step` sibling (cap#428). The step is a SIBLING
+/// of the code, never a replacement for it: recognition stays keyed on the
+/// `error` code alone, so an unknown step can never turn a recognized
+/// diagnostic into `None`. Duplicated from the producer and the proxy by
+/// the same deliberate trust-boundary rule as the other vocabularies.
+pub const TERMINAL_BOOTSTRAP_FAILED_STEPS: [&str; 8] = [
+    "tls_decode_failed",
+    "tls_validate_failed",
+    "tls_write_failed",
+    "tls_handoff_failed",
+    "bind_sentinel_failed",
+    "bind_source_failed",
+    "bind_target_create_failed",
+    "bind_mount_failed",
+];
+
 /// The exact fixed-vocabulary init phases the attestation proxy may report
 /// inside `bootstrap_error.last_init_stage` (enclava-init `record_stage`, in
 /// boot order). Duplicated from cap-api's `routes::status::LAST_INIT_STAGES`
@@ -227,6 +244,7 @@ pub struct TerminalBootstrapError {
     code: &'static str,
     retry_after: Option<DateTime<Utc>>,
     stage: Option<&'static str>,
+    step: Option<&'static str>,
 }
 
 impl TerminalBootstrapError {
@@ -245,6 +263,14 @@ impl TerminalBootstrapError {
         self.stage
     }
 
+    /// The instrumented failing step the proxy reported on the
+    /// `failed_step` sibling, when it is an exact
+    /// [`TERMINAL_BOOTSTRAP_FAILED_STEPS`] match; unknown or malformed
+    /// steps never reach here and never affect recognition.
+    pub fn failed_step(&self) -> Option<&'static str> {
+        self.step
+    }
+
     /// Stable, safe-to-print summary: the recognized code plus the validated
     /// deadline and init stage, re-serialized as UTC RFC3339 seconds (`Z`)
     /// rather than echoed from the response body.
@@ -258,6 +284,9 @@ impl TerminalBootstrapError {
         }
         if let Some(stage) = self.stage {
             summary.push_str(&format!(" (init stage: {stage})"));
+        }
+        if let Some(step) = self.step {
+            summary.push_str(&format!(" (failed step: {step})"));
         }
         summary
     }
@@ -279,7 +308,9 @@ pub struct TeeBootstrapStatus {
 /// Recognizes a diagnostic only when the `error` code is exactly one of
 /// [`TERMINAL_BOOTSTRAP_ERROR_CODES`], `terminal` is exactly `true`, and
 /// `retry_after` is absent, `null`, or a strictly valid UTC RFC3339 deadline
-/// within the broker's 365-day bound. The optional `last_init_stage` the
+/// within the broker's 365-day bound. The optional `failed_step` sibling is
+/// carried only on an exact [`TERMINAL_BOOTSTRAP_FAILED_STEPS`] match and
+/// never influences recognition. The optional `last_init_stage` the
 /// proxy merges into the same object (attestation-proxy
 /// `bootstrap_diagnostics_for_status`) is carried only on an exact
 /// [`LAST_INIT_STAGES`] match. Absent, unknown, or malformed fields yield
@@ -320,10 +351,23 @@ pub fn parse_terminal_bootstrap_error(body: &serde_json::Value) -> Option<Termin
                 .find(|known| **known == stage)
                 .copied()
         });
+    // The failing step (cap#428): a sibling read AFTER recognition, so an
+    // unknown, malformed, or missing step can never turn a recognized
+    // diagnostic into None — the fast terminal path is preserved.
+    let step = field
+        .get("failed_step")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|step| {
+            TERMINAL_BOOTSTRAP_FAILED_STEPS
+                .iter()
+                .find(|known| **known == step)
+                .copied()
+        });
     Some(TerminalBootstrapError {
         code,
         retry_after,
         stage,
+        step,
     })
 }
 
