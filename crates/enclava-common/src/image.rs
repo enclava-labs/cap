@@ -102,17 +102,9 @@ fn split_tag(name: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// OCI distribution-spec tag grammar: `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`.
+/// Rejects anything but one literal OCI tag (`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`).
 fn validate_tag(tag: &str) -> Result<(), ImageRefError> {
-    let valid = tag.len() <= 128
-        && tag
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-        && tag
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
-    if valid {
+    if crate::registry::tag_is_literal_oci(tag) {
         Ok(())
     } else {
         Err(ImageRefError::Invalid(format!(

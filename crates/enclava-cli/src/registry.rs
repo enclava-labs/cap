@@ -274,19 +274,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn tag_resolution_rejects_path_rewriting_tags_before_network() {
+    #[test]
+    fn tag_resolution_rejects_path_rewriting_tags_before_network() {
         for tag in [
             "../../../enclava-labs/private/manifests/latest",
             "%2e%2e/%2e%2e/%2e%2e/enclava-labs/private/manifests/latest",
             r"..\..\..\enclava-labs\private\manifests\latest",
         ] {
             let raw = format!("ghcr.io/team/app:{tag}");
-            let image = ImageRef::parse(&raw).unwrap();
-            let err = resolve_image_digest(&image).await.unwrap_err();
             assert!(
-                err.contains("literal repository and OCI tag"),
-                "{raw} must be refused before a retargeted manifest GET: {err}"
+                ImageRef::parse(&raw).is_err(),
+                "{raw} must be refused before a retargeted manifest GET"
             );
         }
     }
