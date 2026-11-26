@@ -228,6 +228,23 @@ pub async fn generate_agent_policy(
 
     let log_encryption = validate_log_encryption_config(body.log_encryption.clone())?;
     let descriptor = body.descriptor;
+    enclava_common::descriptor::validate_pod_supplemental_groups(
+        descriptor.pod_supplemental_groups.as_ref(),
+    )
+    .map_err(|message| json_error(StatusCode::BAD_REQUEST, message))?;
+    // Init-first rollout guard (policy-templates#23): a group-bearing
+    // descriptor only reaches a field-tolerant init image when the
+    // deployment capability is enabled; otherwise admission fails closed
+    // here instead of the guest failing verification on every start.
+    if descriptor.pod_supplemental_groups.is_some()
+        && !crate::routes::platform::pod_supplemental_groups_supported()
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "pod_supplemental_groups requires an init image that tolerates the field, \
+             which this API deployment has not enabled",
+        ));
+    }
     let expected_identity_hash = hex::decode(&app.tenant_instance_identity_hash).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -257,6 +274,12 @@ pub async fn generate_agent_policy(
         .agent_policy(&crate::signing_service::AgentPolicyRequest {
             descriptor,
             log_encryption: log_encryption.clone(),
+            // Defense in depth for the init-first rollout: never ask the
+            // signing service for discovery unless THIS API deployment
+            // enabled pod supplemental groups (a group-bearing descriptor
+            // would fail verification under a pre-change init image).
+            supports_pod_supplemental_groups: body.supports_pod_supplemental_groups
+                && crate::routes::platform::pod_supplemental_groups_supported(),
         })
         .await
         .map_err(signing_error_response)?;
@@ -266,6 +289,7 @@ pub async fn generate_agent_policy(
         agent_policy_sha256: response.agent_policy_sha256,
         genpolicy_version_pin: response.genpolicy_version_pin,
         log_encryption,
+        pod_supplemental_groups: response.pod_supplemental_groups,
     }))
 }
 

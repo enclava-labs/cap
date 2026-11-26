@@ -5877,6 +5877,10 @@ pub struct ApplyDeploymentManifestsRequest {
     pub sigstore_material: Vec<u8>,
     pub provenance_oci_material: Vec<u8>,
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): the signed descriptor's declared
+    /// pod-level supplemental groups, rendered into the real StatefulSet.
+    /// None for unsigned/legacy renders (platform baseline [0, 6]).
+    pub pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 /// Immutable database-row inputs captured for one queued deployment apply.
@@ -6298,6 +6302,7 @@ pub(crate) fn build_confidential_app_from_rows(
         },
         attestation: attestation_config.clone(),
         egress_mode,
+        pod_supplemental_groups: None,
         public_internet_egress_excluded_cidrs: public_internet_egress_excluded_cidrs_from_env(),
         allow_internal_egress: crate::routes::apps::internal_egress_allowlist_enabled()
             && app.egress_allowlist.0.iter().any(|rule| {
@@ -7934,6 +7939,7 @@ pub async fn apply_deployment_manifests(
         sigstore_material,
         provenance_oci_material,
         log_encryption,
+        pod_supplemental_groups,
     } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
 
@@ -7948,6 +7954,7 @@ pub async fn apply_deployment_manifests(
     )?;
     app_spec.workload_artifact_binding = workload_artifact_binding;
     app_spec.log_encryption = log_encryption;
+    app_spec.pod_supplemental_groups = pod_supplemental_groups;
     if let (Some(workload_artifacts), Some(trustee_policy)) = (
         local_workload_artifacts_json.as_ref(),
         local_trustee_policy_json.as_ref(),
