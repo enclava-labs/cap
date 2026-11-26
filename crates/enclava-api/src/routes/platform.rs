@@ -168,6 +168,13 @@ mod tests {
 
     #[tokio::test]
     async fn deployment_context_returns_runtime_signing_key_and_broker_url() {
+        // The response embeds a live `pod_supplemental_groups_supported()`
+        // read; the #424 gate controls mutate that variable, so this test
+        // shares their lock (a parallel local run would otherwise race an
+        // unlocked read — serialized CI only hides it).
+        let _gate_lock = crate::test_support::POD_SUPPLEMENTAL_GROUPS_GATE_LOCK
+            .lock()
+            .await;
         let signing_key = SigningKey::from_bytes(&[9; 32]);
         let expected_pubkey = public_key_base64(&signing_key);
         let mut state = lazy_state();

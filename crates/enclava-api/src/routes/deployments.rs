@@ -2587,19 +2587,23 @@ mod tests {
             "org_keyring_blob": keyring_blob,
         }))
         .expect("decode deploy request");
+        // The control must PROVE admission passed, not merely that the
+        // refusal is absent: this fixture fails at a KNOWN post-admission
+        // stage (the database-stage 500 the gate-off RED run also reaches
+        // once its check is removed; the profile compare and the admission
+        // are the only earlier gates). Pin the expected post-admission
+        // failure exactly.
         match deploy_app_candidate(auth, state, app.clone(), body, AppMutation::None, false).await {
-            Ok(_) => {}
+            Ok(_) => panic!("the fixture's later stages must refuse this deploy"),
             Err((status, Json(error_body))) => {
+                assert_eq!(
+                    status,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "gate on: the request must reach the post-admission database stage"
+                );
                 assert_ne!(
                     error_body["code"], "pod_supplemental_groups_not_supported",
-                    "gate on: the admission must pass (status {status})"
-                );
-                assert!(
-                    error_body["error"]
-                        .as_str()
-                        .map(|error| !error.contains("ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED"))
-                        .unwrap_or(true),
-                    "gate on: the refusal text must not appear"
+                    "gate on: the admission must pass"
                 );
             }
         }

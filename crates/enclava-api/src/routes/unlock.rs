@@ -3458,12 +3458,31 @@ mod tests {
             },
         )
         .await;
+        // The control must PROVE admission passed: with the gate on, this
+        // fixture fails at the KNOWN post-admission stage — the signed
+        // artifact authority (the same signing-error class the
+        // invalid_artifact_authority test pins: this fixture's keyring
+        // members have no DB rows) or the missing platform signing-service
+        // pubkey (503) — both strictly after the admission point. Pin the
+        // accepted post-admission failure classes exactly; anything else
+        // (including a 4xx admission refusal) fails the control.
         match result {
-            Ok(_) => {}
+            Ok(_) => panic!("the fixture's post-admission stages must refuse this transition"),
             Err((status, Json(body))) => {
+                assert!(
+                    matches!(
+                        status,
+                        StatusCode::BAD_REQUEST | StatusCode::SERVICE_UNAVAILABLE
+                    ),
+                    "gate on: the known post-admission failure class, got {status}"
+                );
                 assert_ne!(
                     body["code"], "pod_supplemental_groups_not_supported",
-                    "gate on: the admission must pass (status {status})"
+                    "gate on: the admission must pass"
+                );
+                assert!(
+                    body["error"].as_str().is_none_or(|error| error != "the signed descriptor declares pod supplemental groups, which this API deployment has not enabled (ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED); enable the capability or use a descriptor without them"),
+                    "gate on: the admission refusal text must not appear"
                 );
             }
         }
