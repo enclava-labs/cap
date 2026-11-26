@@ -4875,9 +4875,11 @@ fn deploy_config_load_reports_invalid_file_instead_of_missing() {
 
 #[test]
 fn terminal_failure_message_with_bind_stage_adds_the_storage_hint() {
-    // The exact failure mode of the plain-path contract: the init died at
-    // the workload-mount bind stage. The first line stays the stable
-    // PaaS-matchable form; the hint is one extra line naming the contract.
+    // The plain-path contract's failure mode: the init died at the
+    // workload-mount bind stage. The first line stays the stable
+    // PaaS-matchable form; the hint names the most common cause (the binder
+    // has other failure modes and RootfulSudo runs a writable rootfs, so
+    // the hint must not claim a diagnosis).
     let diagnostic = enclava_cli::tee_client::parse_terminal_bootstrap_error(&serde_json::json!({
         "bootstrap_error": {
             "error": "enclava_init_failed",
@@ -4893,9 +4895,9 @@ fn terminal_failure_message_with_bind_stage_adds_the_storage_hint() {
         "terminal bootstrap failure for app demo: enclava_init_failed \
              (init stage: binding workload mount namespaces); \
              run `enclava status --app demo` for the latest state\n\
-             hint: every [storage] paths entry must be a directory the image already contains \
-             -- the restricted profile runs a read-only root filesystem, \
-             so the bind stage cannot create it"
+             hint: a common cause of a failure at this stage is a [storage] paths entry \
+             the image does not contain -- the restricted profile runs a read-only root \
+             filesystem, so the bind stage cannot create it"
     );
 }
 

@@ -806,12 +806,14 @@ fn should_retry_deploy_config(error: &TeeError) -> bool {
 
 /// Stable, provider-detail-free message for an authenticated terminal
 /// bootstrap failure: the recognized error code plus the optional validated
-/// retry deadline, in a form a PaaS verifier can safely match later. A
-/// terminal failure whose init stage is the workload-mount bind stage gets
-/// one extra hint line carrying the plain-path storage contract -- that
-/// stage fails exactly when a `[storage]` `paths` entry is a directory the
-/// image does not contain, and the restricted profile's read-only root
-/// filesystem leaves the init unable to create it.
+/// retry deadline, in a form a PaaS verifier can safely match later (the
+/// code stays immediately after the colon; the stage and the advice suffix
+/// follow it, so a prefix match on `terminal bootstrap failure for app X:
+/// <code>` is unchanged). A terminal failure whose init stage is the
+/// workload-mount bind stage gets one extra hint line naming the most
+/// common cause of that stage's failure -- NOT a diagnosis: the binder can
+/// fail with existing directories too, and the `RootfulSudo` profile runs
+/// a writable root filesystem.
 pub(crate) fn terminal_bootstrap_failure_message(
     app_name: &str,
     diagnostic: &TerminalBootstrapError,
@@ -822,9 +824,8 @@ pub(crate) fn terminal_bootstrap_failure_message(
     );
     if diagnostic.last_init_stage() == Some(BIND_MOUNT_NAMESPACES_STAGE) {
         message.push_str(
-            "\nhint: every [storage] paths entry must be a directory the image already contains \
-             -- the restricted profile runs a read-only root filesystem, so the bind stage \
-             cannot create it",
+            "\nhint: a common cause of a failure at this stage is a [storage] paths entry the image does not contain \
+             -- the restricted profile runs a read-only root filesystem, so the bind stage cannot create it",
         );
     }
     message
