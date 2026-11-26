@@ -234,11 +234,14 @@ pub fn enforce_floor_on_claims(
     Ok(())
 }
 
-/// Per-claim fresh-volume verdicts. `true` means the claim lacks positive
-/// initialization evidence — it is missing, terminating, or never proven
-/// initialized — so this render provisions it FRESH: the 32 MiB floor and
-/// the first-boot rollout allowance apply to it. `false` means the claim
-/// was not inspected or proven initialized.
+/// Per-claim fresh-volume verdicts. A `true` bit is the admission signal the
+/// security review called `expects_fresh_volume`: the claim lacks positive
+/// initialization evidence — it is missing (new), terminating or otherwise
+/// recreated, or present but unproven — so this render provisions it FRESH:
+/// the 32 MiB floor and the first-boot rollout allowance apply to it.
+/// `false` means the claim was not inspected or proven initialized by live
+/// Ready ordinal-zero pod evidence. State (`app_data`) and TLS (`tls_data`)
+/// are independent, so a mixed render may set only one bit.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FreshVolumeClaims {
     /// state volume (`storage`/`app_data_size` → VCT `state`)
