@@ -10,19 +10,24 @@
 //! step, so the subprocess runs unprivileged in CI.
 
 use std::process::Command;
+use tempfile::TempDir;
+
+/// A guard-owned source path that is guaranteed NOT to exist: a fresh
+/// tempdir nobody else can create files in, plus an absent child path. The
+/// child therefore always takes the missing-source branch (open fails),
+/// never whatever a previous process left at a fixed shared path.
+fn missing_source() -> (TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("missing-source");
+    assert!(!path.exists());
+    (dir, path.to_string_lossy().to_string())
+}
 
 fn run_child(pid: &str, source: &str, target: &str) -> std::process::ExitStatus {
-    let missing = std::env::temp_dir().join("missing-source-for-cap428");
-    let _ = std::fs::remove_file(&missing);
-    let source = if source.is_empty() {
-        missing.to_string_lossy().to_string()
-    } else {
-        source.to_string()
-    };
     Command::new(env!("CARGO_BIN_EXE_enclava-init"))
         .arg("--bind-mount-into-ns")
         .arg(pid)
-        .arg(&source)
+        .arg(source)
         .arg(target)
         .output()
         .expect("spawn the real binder child")
@@ -33,7 +38,8 @@ fn run_child(pid: &str, source: &str, target: &str) -> std::process::ExitStatus 
 fn child_exits_with_the_typed_source_step_code() {
     // A missing source fails at the child's open: the typed step is
     // bind_source_failed, so the child exits 3 (the fixed table).
-    let status = run_child("1", "", "/data");
+    let (_guard, source) = missing_source();
+    let status = run_child("1", &source, "/data");
     assert_eq!(
         status.code(),
         Some(3),

@@ -3916,7 +3916,9 @@ hkdf-info = "tls-state-luks-key"
                 full_chain_pem(&[&unanchored_pem, &other_root.cert.pem()]),
         })
         .to_string();
-        let (base, _server) = spawn_local_broker("200 OK", "200 OK", body);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), body)], events.clone());
         let cfg = broker_config_with_endpoints(
             dir.path(),
             TEST_HOSTNAMES,
@@ -3924,6 +3926,11 @@ hkdf-info = "tls-state-luks-key"
             &format!("{base}/kbs-token"),
         );
         let error = provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap_err();
+        // The broker POST was observed, so the failure came from the
+        // RESPONSE's anchored validation — not from the retained chain,
+        // whose own (expired) validation arm would produce the same step
+        // without ever contacting the broker.
+        assert_eq!(*events.lock().unwrap(), vec!["post"]);
         assert_step(&error, InitFailedStep::TlsValidateFailed);
     }
 
