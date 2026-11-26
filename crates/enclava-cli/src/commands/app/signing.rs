@@ -6,7 +6,7 @@ use super::*;
 fn parse_app_id(id: &str) -> Result<Uuid, Box<dyn std::error::Error>> {
     Uuid::parse_str(id).map_err(|err| {
         format!(
-            "app id returned by the platform is not a UUID (got {id:?}; {err}) -- the app              row may be incomplete; retry the deploy once any app quota or in-flight              operation clears, or contact the operator if it persists"
+            "app id returned by the platform is not a UUID (got {id:?}; {err}) -- the app row may be incomplete; retry the deploy once any app quota or in-flight operation clears, or contact the operator if it persists"
         )
         .into()
     })
@@ -297,6 +297,9 @@ fn render_trustee_policy(
 
 pub(crate) struct ConfidentialAppForCcHash<'a> {
     pub(crate) image: enclava_common::image::ImageRef,
+    /// The (post-discovery-merge) descriptor's declared pod supplemental
+    /// groups (contract v1, policy-templates#23).
+    pub(crate) pod_supplemental_groups: Option<Vec<i64>>,
     pub(crate) deployment_id: Uuid,
     pub(crate) release: &'a PlatformRelease,
     pub(crate) workload_artifact_binding: WorkloadArtifactBinding,
@@ -317,6 +320,7 @@ pub(crate) fn confidential_app_for_cc_hash(
 ) -> Result<ConfidentialApp, Box<dyn std::error::Error>> {
     let ConfidentialAppForCcHash {
         image,
+        pod_supplemental_groups,
         deployment_id,
         release,
         workload_artifact_binding,
@@ -414,6 +418,7 @@ pub(crate) fn confidential_app_for_cc_hash(
             verification_material: None,
         },
         egress_mode: enclava_engine::types::EgressMode::Restricted,
+        pod_supplemental_groups,
         public_internet_egress_excluded_cidrs: Vec::new(),
         allow_internal_egress: false,
         egress_allowlist: Vec::new(),
@@ -448,12 +453,14 @@ async fn fetch_generated_agent_policy(
     api: &ApiClient,
     release: &PlatformRelease,
     descriptor: &enclava_cli::descriptor::DeploymentDescriptor,
-) -> Result<(GeneratedAgentPolicy, Option<LogEncryptionConfig>), Box<dyn std::error::Error>> {
+    supports_pod_supplemental_groups: bool,
+) -> Result<GeneratedAgentPolicyFetch, Box<dyn std::error::Error>> {
     let response = api
         .generate_agent_policy(
             &descriptor.app_name,
             &AgentPolicyRequest {
                 descriptor: descriptor.clone(),
+                supports_pod_supplemental_groups,
             },
         )
         .await?;
@@ -473,14 +480,86 @@ async fn fetch_generated_agent_policy(
     if actual != policy_sha256 {
         return Err("policy signing service returned agent_policy_sha256 that does not match agent_policy_text".into());
     }
-    Ok((
-        GeneratedAgentPolicy {
+    Ok(GeneratedAgentPolicyFetch {
+        policy: GeneratedAgentPolicy {
             policy_text: response.agent_policy_text,
             policy_sha256,
             genpolicy_version_pin: response.genpolicy_version_pin,
         },
-        response.log_encryption,
-    ))
+        log_encryption: response.log_encryption,
+        pod_supplemental_groups: response.pod_supplemental_groups,
+    })
+}
+
+/// One /agent-policy call's verified outcome.
+struct GeneratedAgentPolicyFetch {
+    policy: GeneratedAgentPolicy,
+    log_encryption: Option<LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): Some ONLY when the signing
+    /// service ran the guest-pull group discovery for this call.
+    pod_supplemental_groups: Option<Vec<i64>>,
+}
+
+/// Contract v1 (policy-templates#23): fetch the generated agent policy,
+/// and when the signing service reports discovered guest-pull groups,
+/// canonicalize + validate them, set them on the descriptor, and RE-CALL.
+/// Only the re-call's policy is returned (its agent_policy_sha256 is
+/// verified inside `fetch_generated_agent_policy`); the caller computes
+/// every hash AFTER this function so the signed artifacts bind the final
+/// descriptor. `supports_pod_supplemental_groups = false` keeps the legacy
+/// single-call flow and never sends the field.
+pub(crate) async fn fetch_policy_with_group_discovery(
+    api: &ApiClient,
+    release: &PlatformRelease,
+    descriptor: &mut enclava_cli::descriptor::DeploymentDescriptor,
+    supports_pod_supplemental_groups: bool,
+) -> Result<(GeneratedAgentPolicy, Option<LogEncryptionConfig>), Box<dyn std::error::Error>> {
+    let first =
+        fetch_generated_agent_policy(api, release, descriptor, supports_pod_supplemental_groups)
+            .await?;
+    // Legacy capability: a single call, and any stray groups field on the
+    // response is ignored — the descriptor bytes (and their core hash)
+    // stay exactly legacy.
+    let Some(discovered) = first
+        .pod_supplemental_groups
+        .filter(|_| supports_pod_supplemental_groups)
+    else {
+        return Ok((first.policy, first.log_encryption));
+    };
+    if descriptor.pod_supplemental_groups.is_some() {
+        return Err(
+            "signing service reported pod_supplemental_groups for a descriptor that already declares them"
+                .into(),
+        );
+    }
+    apply_discovered_pod_groups(descriptor, discovered)?;
+    // The re-call DECLARES the groups, so the service must generate without
+    // further discovery; anything else fails closed.
+    let second =
+        fetch_generated_agent_policy(api, release, descriptor, supports_pod_supplemental_groups)
+            .await?;
+    if second.pod_supplemental_groups.is_some() {
+        return Err(
+            "signing service still reports pod_supplemental_groups after the descriptor declares them"
+                .into(),
+        );
+    }
+    Ok((second.policy, second.log_encryption))
+}
+
+/// Canonicalize (sorted unique) + admission-validate the discovered list,
+/// then set it on the descriptor. Invalid lists fail closed.
+pub(crate) fn apply_discovered_pod_groups(
+    descriptor: &mut enclava_cli::descriptor::DeploymentDescriptor,
+    discovered: Vec<i64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut canonical = discovered;
+    canonical.sort_unstable();
+    canonical.dedup();
+    enclava_common::descriptor::validate_pod_supplemental_groups(Some(&canonical))
+        .map_err(|message| format!("discovered pod_supplemental_groups: {message}"))?;
+    descriptor.pod_supplemental_groups = Some(canonical);
+    Ok(())
 }
 
 fn bootstrap_identity_hash(
@@ -719,6 +798,10 @@ pub(crate) async fn build_signed_deploy_blobs(
         org_slug: org_name.clone(),
         app_id,
         app_name: app.name.clone(),
+        // Per-deployment identity, not per-retry. A template-deploy retry must
+        // replay the already-signed request (cap#292) rather than call this
+        // again: a fresh id and timestamp here change the idempotency key and
+        // start a second deployment beside the one still in flight.
         deploy_id: Uuid::new_v4(),
         created_at: Utc::now(),
         app_domain: app.domain.clone(),
@@ -766,6 +849,19 @@ pub(crate) async fn build_signed_deploy_blobs(
         expected_kbs_policy_hash: [0; 32],
     });
 
+    // Contract v1 (policy-templates#23): fetch the generated policy BEFORE
+    // hashing the descriptor, merging any discovered guest-pull groups and
+    // re-calling, so the core hash, cc-init-data and signatures bind the
+    // FINAL descriptor (groups included). Only the re-call's policy is
+    // used. Capability false = legacy single call, byte-for-byte.
+    let pod_supplemental_groups_supported = deployment_context.pod_supplemental_groups_supported;
+    let (generated_agent_policy, log_encryption) = fetch_policy_with_group_discovery(
+        api,
+        &release,
+        &mut descriptor,
+        pod_supplemental_groups_supported,
+    )
+    .await?;
     let descriptor_core_hash = enclava_cli::descriptor::descriptor_core_hash(&descriptor);
     // cap#244 review (version-skew): when the VERIFIED release predates the
     // `luks2_header_seal` field (empty), the still-pre-change API this CLI
@@ -788,14 +884,13 @@ pub(crate) async fn build_signed_deploy_blobs(
         omit_luks2_header_seal_claim: !release_carries_seal_claim,
         omit_log_spool_bind_claim: !log_spool_state_bind_supported,
     };
-    let (generated_agent_policy, log_encryption) =
-        fetch_generated_agent_policy(api, &release, &descriptor).await?;
     descriptor.expected_agent_policy_hash = generated_agent_policy.policy_sha256;
     let cc_app = confidential_app_for_cc_hash(
         app,
         app_config,
         ConfidentialAppForCcHash {
             image: image_ref.clone(),
+            pod_supplemental_groups: descriptor.pod_supplemental_groups.clone(),
             deployment_id: descriptor.deploy_id,
             release: &release,
             workload_artifact_binding,

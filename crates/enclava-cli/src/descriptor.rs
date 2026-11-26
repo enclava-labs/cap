@@ -65,7 +65,6 @@ pub const CAP_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 pub const CAP_APP_SEED_PATH: &str = "/state/app/seed";
 pub const CAP_APP_UID: u32 = 10001;
 pub const CAP_APP_GID: u32 = 10001;
-pub const CAP_APP_CPU_REQUEST: &str = "250m";
 pub const CAP_APP_MEMORY_REQUEST: &str = "512Mi";
 const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
     &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
@@ -179,7 +178,10 @@ pub fn cap_app_oci_runtime_spec(input: CapAppOciRuntimeSpecInput) -> OciRuntimeS
         security_context,
         resources: Resources {
             requests: vec![
-                named_value("cpu", CAP_APP_CPU_REQUEST),
+                named_value(
+                    "cpu",
+                    &enclava_engine::manifest::shape::app_cpu_request(&input.cpu_limit),
+                ),
                 named_value(
                     "memory",
                     &enclava_engine::manifest::shape::app_memory_request(&input.memory_limit),
@@ -281,6 +283,27 @@ pub fn trusted_deployment_expectation_from_descriptor(
     }
 }
 
+/// Recover the trusted deployment identity from a persisted descriptor blob
+/// so a resumed template deploy can still bind a terminal bootstrap diagnostic
+/// to the deployment it is waiting on.
+pub fn trusted_deployment_expectation_from_descriptor_blob(
+    blob: &str,
+) -> Result<TrustedDeploymentExpectation, DescriptorError> {
+    Ok(trusted_deployment_expectation_from_descriptor(
+        &descriptor_from_blob(blob)?.descriptor,
+    ))
+}
+
+/// Unlock mode baked into the signed descriptor. A resumed template deploy
+/// must follow this, not a catalog row fetched on the retry.
+pub fn unlock_mode_from_descriptor_blob(blob: &str) -> Result<String, DescriptorError> {
+    Ok(descriptor_from_blob(blob)?.descriptor.unlock_mode)
+}
+
+fn descriptor_from_blob(blob: &str) -> Result<DeploymentDescriptorEnvelope, DescriptorError> {
+    Ok(serde_json::from_str(blob)?)
+}
+
 pub fn sign(
     deployer: &UserSigningKey,
     descriptor: DeploymentDescriptor,
@@ -300,6 +323,7 @@ pub fn build_descriptor(input: DeploymentDescriptorBuildInput) -> DeploymentDesc
     let mut nonce = [0u8; 32];
     OsRng.fill_bytes(&mut nonce);
     DeploymentDescriptor {
+        pod_supplemental_groups: None,
         schema_version: "v1".to_string(),
         org_id: input.org_id,
         org_slug: input.org_slug,
@@ -358,6 +382,7 @@ mod tests {
 
     fn fixed_descriptor() -> DeploymentDescriptor {
         DeploymentDescriptor {
+            pod_supplemental_groups: None,
             schema_version: "v1".to_string(),
             org_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
             org_slug: "abcd1234".to_string(),

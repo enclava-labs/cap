@@ -157,6 +157,41 @@ pub fn manifest_repository(registry: &str, repository: &str) -> String {
     }
 }
 
+/// True when `repository` is a slash-separated path of literal segments.
+/// `.`, `..`, and empty segments are rejected so a prefix allowlist cannot
+/// be escaped by a path an HTTP client will normalize before sending
+/// (issue #228).
+pub fn repository_path_is_literal(repository: &str) -> bool {
+    !repository.is_empty()
+        && repository
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+/// OCI tag grammar: one literal tag, not a path. `..`, `%2e%2e`, and `\` in
+/// a tag are rejected so a URL parser cannot retarget the manifest request
+/// after the repository allowlist has matched (issue #228).
+pub fn tag_is_literal_oci(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    let Some((first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || *first == b'_') || rest.len() > 127 {
+        return false;
+    }
+    rest.iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Manifest path a literal repository and tag must round-trip to. `None`
+/// when either side is not literal, so callers refuse before building a URL.
+pub fn literal_manifest_path(repository: &str, tag: &str) -> Option<String> {
+    if !repository_path_is_literal(repository) || !tag_is_literal_oci(tag) {
+        return None;
+    }
+    Some(format!("/v2/{repository}/manifests/{tag}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +316,41 @@ mod tests {
         assert!(realm_host_allowed("registry.gitlab.com", "gitlab.com"));
         assert!(!realm_host_allowed("ghcr.io", "auth.docker.io"));
         assert!(!realm_host_allowed("quay.io", "gitlab.com"));
+    }
+
+    #[test]
+    fn repository_path_rejects_dot_segments() {
+        assert!(repository_path_is_literal("team/app"));
+        assert!(repository_path_is_literal("library/nginx"));
+        assert!(!repository_path_is_literal("team/app/../other"));
+        assert!(!repository_path_is_literal("team/app/../../victim/private"));
+        assert!(!repository_path_is_literal("team/./app"));
+        assert!(!repository_path_is_literal("team//app"));
+        assert!(!repository_path_is_literal(""));
+        assert!(!repository_path_is_literal("/team/app"));
+    }
+
+    #[test]
+    fn tag_rejects_path_rewriting_forms() {
+        assert!(tag_is_literal_oci("latest"));
+        assert!(tag_is_literal_oci("v1.2.3-rc.1"));
+        assert!(tag_is_literal_oci("_build"));
+        assert!(!tag_is_literal_oci(""));
+        assert!(!tag_is_literal_oci(".hidden"));
+        assert!(!tag_is_literal_oci(
+            "../../../enclava-labs/private/manifests/latest"
+        ));
+        assert!(!tag_is_literal_oci(
+            "%2e%2e/%2e%2e/%2e%2e/enclava-labs/private/manifests/latest"
+        ));
+        assert!(!tag_is_literal_oci(
+            r"..\..\..\enclava-labs\private\manifests\latest"
+        ));
+        assert!(literal_manifest_path("team/app", "latest").is_some());
+        assert!(
+            literal_manifest_path("team/app", "../../../enclava-labs/private/manifests/latest")
+                .is_none()
+        );
     }
 
     #[test]

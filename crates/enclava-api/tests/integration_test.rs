@@ -4,11 +4,12 @@ use axum::{
     Extension, Json as AxumJson, Router,
     extract::State as AxumState,
     http::{Method, Request, Response, StatusCode, header},
+    response::IntoResponse,
     routing::post,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{Duration, Utc};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use enclava_api::{
     auth::jwt::issue_session_token,
     deploy::DeploymentApplySnapshot,
@@ -48,10 +49,49 @@ const TEST_GENPOLICY_PIN: &str = "kata-containers/genpolicy@3.28.0+test";
 #[derive(Clone)]
 struct TestPolicyService {
     signing_key: Arc<SigningKey>,
+    /// How many /sign requests the deployed-behavior fake refused —
+    /// lets the reproduction test prove the refusal path was reached.
+    sign_refusals: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Contract v1 (policy-templates#23) fixture: records the upstream request
+/// and answers with the given discovered groups, so the CLI-facing broker's
+/// pass-through can be asserted in both directions.
+async fn recording_agent_policy(
+    AxumState(recorder): AxumState<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+    body: String,
+) -> (StatusCode, String) {
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let supports = payload["supports_pod_supplemental_groups"]
+        .as_bool()
+        .unwrap_or(false);
+    recorder.lock().unwrap().push(payload);
+    if supports {
+        let text = "package agent_policy\n\ndefault CreateContainerRequest := true\n";
+        (
+            StatusCode::OK,
+            serde_json::json!({
+                "agent_policy_text": text,
+                "agent_policy_sha256": hex::encode(Sha256::digest(text.as_bytes())),
+                "genpolicy_version_pin": TEST_GENPOLICY_PIN,
+                "pod_supplemental_groups": [27, 6, 0, 27],
+            })
+            .to_string(),
+        )
+    } else {
+        // The typed legacy error shape the signing service emits for a
+        // guest-pull group failure without the capability.
+        (
+            StatusCode::BAD_REQUEST,
+            "genpolicy_guest_pull_groups_required: missing pod supplemental groups [27]"
+                .to_string(),
+        )
+    }
 }
 
 async fn test_agent_policy() -> AxumJson<AgentPolicyResponse> {
     AxumJson(AgentPolicyResponse {
+        pod_supplemental_groups: None,
         agent_policy_text: TEST_AGENT_POLICY.to_string(),
         agent_policy_sha256: hex::encode(Sha256::digest(TEST_AGENT_POLICY.as_bytes())),
         genpolicy_version_pin: TEST_GENPOLICY_PIN.to_string(),
@@ -107,6 +147,73 @@ async fn test_sign_policy(
         verify_pubkey_b64: B64.encode(service.signing_key.verifying_key().to_bytes()),
         org_keyring: None,
     })
+}
+
+/// The /sign behavior of the DEPLOYED policy-templates build 2c83d1ea:
+/// `verify_signing_inputs` checks the deployer's descriptor signature over
+/// the SERVICE's canonical bytes, and those bytes still predate the
+/// `pod_supplemental_groups` record that enclava-common (cap#421) added to
+/// its own canonicalization. A descriptor that DECLARES groups therefore
+/// fails the check and /sign refuses before generation — the shape of the
+/// 2026-11-25 plain-deploy 409 outage on dev.
+async fn deployed_service_sign_policy(
+    AxumState(service): AxumState<TestPolicyService>,
+    AxumJson(request): AxumJson<Value>,
+) -> axum::response::Response {
+    let envelope: Value = serde_json::from_str(
+        request["customer_descriptor_blob"]
+            .as_str()
+            .expect("customer descriptor blob"),
+    )
+    .expect("descriptor envelope JSON");
+    let descriptor: DeploymentDescriptor =
+        serde_json::from_value(envelope["descriptor"].clone()).expect("deployment descriptor");
+    if descriptor.pod_supplemental_groups.is_some() {
+        // 2c83d1ea's descriptor_canonical_bytes carries no pod record:
+        // verify over the stripped form — the exact bytes it hashes.
+        let mut stripped = descriptor.clone();
+        stripped.pod_supplemental_groups = None;
+        let bytes = descriptor_canonical_bytes(&stripped);
+        let pubkey: [u8; 32] = hex::decode(
+            envelope["signing_pubkey"]
+                .as_str()
+                .expect("descriptor signing pubkey"),
+        )
+        .expect("pubkey hex")
+        .try_into()
+        .expect("pubkey length");
+        let signature: [u8; 64] = hex::decode(
+            envelope["signature"]
+                .as_str()
+                .expect("descriptor signature"),
+        )
+        .expect("signature hex")
+        .try_into()
+        .expect("signature length");
+        let verifying = VerifyingKey::from_bytes(&pubkey).expect("verifying key from envelope");
+        match verifying.verify(&bytes, &Signature::from_bytes(&signature)) {
+            // The CLI signs over the WITH-groups bytes, so this arm is
+            // unreachable for the production fixture: kept so the
+            // emulation stays honest (a signature that really verified
+            // over the stripped bytes would sign normally).
+            Ok(()) => {}
+            Err(_) => {
+                service
+                    .sign_refusals
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // 2c83d1ea maps any AppError to (400, message): the real
+                // refusal is a 400, not a 422.
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "descriptor signature verification failed: ed25519 signature",
+                )
+                    .into_response();
+            }
+        }
+    }
+    test_sign_policy(AxumState(service), AxumJson(request))
+        .await
+        .into_response()
 }
 
 fn test_policy_metadata_hash(metadata: &PolicyMetadata) -> [u8; 32] {
@@ -443,6 +550,7 @@ fn signed_deployment_descriptor(
     api_signing_pubkey: &str,
 ) -> DeploymentDescriptor {
     DeploymentDescriptor {
+        pod_supplemental_groups: None,
         schema_version: "v1".to_string(),
         org_id: app.org_id,
         org_slug: app.tenant_id.clone(),
@@ -2991,6 +3099,7 @@ async fn rejected_signed_deployments_leave_existing_and_candidate_container_rows
         .route("/sign", post(test_sign_policy))
         .with_state(TestPolicyService {
             signing_key: policy_signing_key.clone(),
+            sign_refusals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
     let policy_server = axum_test::TestServer::builder()
         .http_transport()
@@ -3197,6 +3306,7 @@ async fn paas_internal_agent_policy_route_reaches_cap_policy_broker() {
         .try_into()
         .expect("identity hash length");
     let descriptor = DeploymentDescriptor {
+        pod_supplemental_groups: None,
         schema_version: "v1".to_string(),
         org_id: cap_org_id,
         org_slug,
@@ -3601,9 +3711,10 @@ async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
 async fn custom_domain_verified_challenge_rechecks_txt_within_window() {
     // Regression guard against re-introducing a verified-skip: a challenge that
     // already holds `verified_at` but is still within its window MUST re-run the
-    // live TXT lookup -- it may not skip straight to applying the domain. This
-    // env has no DNS, so the lookup surfaces as a 502 lookup error (not a 200
-    // skip-to-apply), and no domain is attached.
+    // live TXT lookup -- it may not skip straight to applying the domain. The
+    // test domain has no TXT record, so the lookup either finds nothing (412)
+    // or, with no working resolver, fails (502) -- never a 200 skip-to-apply --
+    // and no domain is attached.
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);
@@ -3653,9 +3764,14 @@ async fn custom_domain_verified_challenge_rechecks_txt_within_window() {
         .add_header("x-forwarded-for", "127.0.0.1")
         .authorization_bearer(&session_token)
         .await;
-    // The live TXT lookup ran and failed (no DNS in this env) -- proof that a
-    // captured `verified_at` did not bypass it.
-    verify.assert_status(StatusCode::BAD_GATEWAY);
+    // The live TXT lookup ran and did not find the token -- proof that a
+    // captured `verified_at` did not bypass it. A resolver that answers
+    // NXDOMAIN gives 412; an environment with no resolver gives 502.
+    let status = verify.status_code();
+    assert!(
+        status == StatusCode::PRECONDITION_FAILED || status == StatusCode::BAD_GATEWAY,
+        "expected 412 or 502 from the live TXT recheck, got {status}"
+    );
 
     // No apply, no re-persist: the domain is not attached and the proof stands
     // unchanged.
@@ -4669,4 +4785,462 @@ async fn deployment_diagnostics_reports_foreign_lease_blocker() {
     );
     assert_eq!(body["blocking_operation"], "app_delete");
     assert!(body["blocked_until"].is_string());
+}
+
+#[tokio::test]
+async fn agent_policy_broker_relays_the_capability_and_discovered_groups_both_ways() {
+    // Contract v1 (policy-templates#23): the CLI-facing /agent-policy
+    // broker relays supports_pod_supplemental_groups to the signing service
+    // and pod_supplemental_groups back to the caller; without the capability
+    // the flag is NOT sent (legacy bytes) and the service's typed
+    // guest-pull error maps to a structured 4xx carrying the missing
+    // groups — never a 502.
+    let (mut state, pool) = setup_paas_managed_test_state().await;
+    let recorder: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let policy_service = Router::new()
+        .route("/agent-policy", post(recording_agent_policy))
+        .with_state(recorder.clone());
+    let policy_server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(policy_service);
+    state.signing_service = Some(
+        enclava_api::signing_service::SigningServiceClient::new(
+            policy_server
+                .server_url("/")
+                .expect("policy service URL")
+                .to_string(),
+            None,
+        )
+        .expect("policy signing service client"),
+    );
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("groups-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("groups-app-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "signer_identity_subject": github_signer_subject(),
+        "signer_identity_issuer": github_signer_issuer(),
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let (cap_org_id, org_slug, cap_app_id, domain, tee_domain, namespace, service_account, identity_hash_hex): (
+        Uuid, String, Uuid, String, Option<String>, String, String, String,
+    ) = sqlx::query_as(
+        "SELECT o.id, o.cust_slug, a.id, a.domain, a.tee_domain, a.namespace, a.service_account, a.tenant_instance_identity_hash
+           FROM apps a JOIN organizations o ON o.id = a.org_id WHERE a.name = $1",
+    )
+    .bind(&app_name)
+    .fetch_one(&pool)
+    .await
+    .expect("app descriptor inputs");
+
+    let descriptor = serde_json::json!({
+        "schema_version": "v1",
+        "org_id": cap_org_id,
+        "org_slug": org_slug,
+        "app_id": cap_app_id,
+        "app_name": app_name,
+        "deploy_id": Uuid::new_v4(),
+        "created_at": Utc::now().to_rfc3339(),
+        "nonce": "07".repeat(32),
+        "app_domain": domain,
+        "tee_domain": tee_domain,
+        "custom_domains": [],
+        "namespace": namespace,
+        "service_account": service_account,
+        "identity_hash": identity_hash_hex,
+        "image_ref": "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "signer_identity": {"subject": github_signer_subject(), "issuer": github_signer_issuer()},
+        "oci_runtime_spec": {
+            "command": [], "args": [], "env": [], "ports": [], "mounts": [],
+            "capabilities": {"add": [], "drop": []},
+            "security_context": {"run_as_user": 10001, "run_as_group": 10001, "read_only_root_fs": true, "allow_privilege_escalation": false, "privileged": false},
+            "resources": {}
+        },
+        "sidecars": {
+            "attestation_proxy_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "caddy_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "api_signing_pubkey": "test-api-signing-pubkey",
+        "independent_verification": true,
+        "expected_firmware_measurement": "03".repeat(32),
+        "expected_runtime_class": "kata-qemu-snp",
+        "kbs_resource_path": format!("default/{namespace}-{app_name}-owner/seed-encrypted"),
+        "unlock_mode": "password",
+        "policy_template_id": "enclava-kbs-policy-v1",
+        "policy_template_sha256": "04".repeat(32),
+        "platform_release_version": "cap-test",
+        "expected_agent_policy_hash": "05".repeat(32),
+        "expected_cc_init_data_hash": "06".repeat(32),
+        "expected_kbs_policy_hash": "07".repeat(32),
+    });
+
+    // Gate OFF (the env is unset): the relay never asks the service for
+    // discovery even when the caller declares the capability — the typed
+    // legacy error surfaces instead, mapped to the structured 4xx.
+    let response = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/agent-policy"
+        )),
+        &format!("groups-agent-policy-gate-off-{suffix}"),
+        &paas_user_id,
+    )
+    .json(
+        &serde_json::json!({ "descriptor": descriptor, "supports_pod_supplemental_groups": true }),
+    )
+    .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = response.json();
+    assert_eq!(body["error"], "genpolicy_guest_pull_groups_required");
+    assert_eq!(
+        body["missing_pod_supplemental_groups"],
+        serde_json::json!([27])
+    );
+
+    // Gate ON: ops enabled the deployment capability atomically with the
+    // field-tolerant init image pin.
+    unsafe {
+        std::env::set_var("ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED", "1");
+    }
+
+    // Capability direction: the request flag reaches the signing service.
+    let response = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/agent-policy"
+        )),
+        &format!("groups-agent-policy-capable-{suffix}"),
+        &paas_user_id,
+    )
+    .json(
+        &serde_json::json!({ "descriptor": descriptor, "supports_pod_supplemental_groups": true }),
+    )
+    .await;
+    response.assert_status(StatusCode::OK);
+    let body: Value = response.json();
+    assert_eq!(
+        body["pod_supplemental_groups"],
+        serde_json::json!([27, 6, 0, 27])
+    );
+
+    // Legacy direction: no flag on the wire at all, and the typed error
+    // maps to a structured 4xx with the missing groups.
+    let response = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/agent-policy"
+        )),
+        &format!("groups-agent-policy-legacy-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&serde_json::json!({ "descriptor": descriptor }))
+    .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = response.json();
+    assert_eq!(body["error"], "genpolicy_guest_pull_groups_required");
+    assert_eq!(
+        body["missing_pod_supplemental_groups"],
+        serde_json::json!([27])
+    );
+
+    let requests = recorder.lock().unwrap();
+    // gate-off request, capable request, legacy request.
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[0]
+            .get("supports_pod_supplemental_groups")
+            .is_none(),
+        "gate off: the relay forces the capability off: {}",
+        requests[0]
+    );
+    assert_eq!(
+        requests[1]["supports_pod_supplemental_groups"],
+        serde_json::json!(true)
+    );
+    assert!(
+        requests[2]
+            .get("supports_pod_supplemental_groups")
+            .is_none(),
+        "false is OMITTED on the relay wire (legacy bytes): {}",
+        requests[2]
+    );
+    // The descriptor itself round-trips through the relay unchanged.
+    assert_eq!(
+        requests[1]["descriptor"]["policy_template_id"],
+        serde_json::json!("enclava-kbs-policy-v1")
+    );
+}
+
+/// cap#425-adjacent (cd plain-deploy 409, 2026-11-25): a plain hosted CLI
+/// deploy of a guest-pull image that DECLARES pod_supplemental_groups was
+/// refused with 409 idempotency_recovery_required on dev, deterministically,
+/// with no WARN/ERROR anywhere. Root cause (reproduced here end to end):
+/// the CLI signs its descriptor envelope over enclava-common's canonical
+/// bytes (which include the pod record since cap#421), while the deployed
+/// policy-templates 2c83d1ea service verifies over its own canonical bytes
+/// (which still exclude the record) — so /sign refuses the signature before
+/// generation, CAP masks the refusal as 502 signing_service_unavailable,
+/// and the idempotency layer turns that 5xx into the fail-closed 409. The
+/// WARN added to signing_error_response (and the ERROR at the
+/// OutcomeUnknown arm) is what makes the service's refusal body reachable.
+#[tokio::test]
+async fn hosted_plain_deploy_with_declared_pod_groups_reproduces_the_masked_409() {
+    let (mut state, pool) = setup_paas_managed_test_state().await;
+    // The policy service behaves exactly like the deployed 2c83d1ea build.
+    let policy_signing_key = Arc::new(SigningKey::from_bytes(&[0x33; 32]));
+    let sign_refusals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let policy_service = Router::new()
+        .route("/agent-policy", post(test_agent_policy))
+        .route("/sign", post(deployed_service_sign_policy))
+        .with_state(TestPolicyService {
+            signing_key: policy_signing_key.clone(),
+            sign_refusals: sign_refusals.clone(),
+        });
+    let policy_server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(policy_service);
+    state.signing_service = Some(
+        enclava_api::signing_service::SigningServiceClient::new(
+            policy_server
+                .server_url("/")
+                .expect("policy service URL")
+                .to_string(),
+            None,
+        )
+        .expect("policy signing service client"),
+    );
+    state
+        .attestation
+        .as_mut()
+        .expect("test attestation config")
+        .signing_service_pubkey_hex =
+        Some(hex::encode(policy_signing_key.verifying_key().to_bytes()));
+
+    let api_signing_pubkey = enclava_api::auth::jwt::public_key_base64(&state.signing_key);
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("masked409-{}", &suffix[..12]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("masked409-app-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "signer_identity_subject": github_signer_subject(),
+        "signer_identity_issuer": github_signer_issuer(),
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let (cap_org_id, _org_slug, cap_app_id, domain, tee_domain, namespace, service_account, identity_hash_hex): (
+        Uuid, String, Uuid, String, Option<String>, String, String, String,
+    ) = sqlx::query_as(
+        "SELECT o.id, o.cust_slug, a.id, a.domain, a.tee_domain, a.namespace, a.service_account, a.tenant_instance_identity_hash
+           FROM apps a JOIN organizations o ON o.id = a.org_id
+          WHERE a.name = $1",
+    )
+    .bind(&app_name)
+    .fetch_one(&pool)
+    .await
+    .expect("app descriptor inputs");
+
+    // Register the customer authority the way the CLI's org keyring does.
+    let customer_key = SigningKey::from_bytes(&[0x44; 32]);
+    let org_keyring_envelope =
+        register_test_customer_authority(&pool, cap_org_id, &customer_key).await;
+
+    // The descriptor the NEW CLI sends: the discovered pod supplemental
+    // groups are DECLARED (the guest-pull group discovery merged them), and
+    // the envelope is signed over enclava-common's canonical bytes, which
+    // include the pod record.
+    let identity_hash: [u8; 32] = hex::decode(identity_hash_hex)
+        .expect("decode identity hash")
+        .try_into()
+        .expect("identity hash length");
+    let descriptor = DeploymentDescriptor {
+        pod_supplemental_groups: Some(vec![0, 6, 27]),
+        schema_version: "v1".to_string(),
+        org_id: cap_org_id,
+        org_slug: format!("masked-{suffix}"),
+        app_id: cap_app_id,
+        app_name: app_name.clone(),
+        deploy_id: Uuid::new_v4(),
+        created_at: Utc::now(),
+        nonce: [7; 32],
+        app_domain: domain,
+        tee_domain: tee_domain.expect("tee domain"),
+        custom_domains: vec![],
+        namespace: namespace.clone(),
+        service_account,
+        identity_hash,
+        image_ref: "ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8912cca5727e45dd8a397de37a338282ec37a785ad4d7e6aef52edaff".to_string(),
+        image_digest: "sha256:c5e0f9f8912cca5727e45dd8a397de37a338282ec37a785ad4d7e6aef52edaff".to_string(),
+        signer_identity: SignerIdentity {
+            subject: github_signer_subject().to_string(),
+            issuer: github_signer_issuer().to_string(),
+        },
+        oci_runtime_spec: OciRuntimeSpec {
+            command: vec![enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH.to_string()],
+            args: vec!["/usr/local/bin/app".to_string()],
+            env: vec![],
+            ports: vec![Port {
+                container_port: 8000,
+                protocol: "TCP".to_string(),
+            }],
+            mounts: vec![],
+            capabilities: Capabilities::default(),
+            security_context: SecurityContext::default(),
+            resources: Resources::default(),
+        },
+        sidecars: Sidecars {
+            attestation_proxy_digest:
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            caddy_digest:
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+        },
+        api_signing_pubkey: api_signing_pubkey.clone(),
+        independent_verification: true,
+        expected_firmware_measurement: [3; 32].into(),
+        expected_runtime_class: "kata-qemu-snp".to_string(),
+        kbs_resource_path: format!("default/{namespace}-{app_name}-owner/seed-encrypted"),
+        unlock_mode: "password".to_string(),
+        policy_template_id: "enclava-kbs-policy-v1".to_string(),
+        policy_template_sha256: [4; 32],
+        platform_release_version: "cap-test".to_string(),
+        expected_agent_policy_hash: Sha256::digest(TEST_AGENT_POLICY.as_bytes()).into(),
+        expected_cc_init_data_hash: [6; 32],
+        expected_kbs_policy_hash: Sha256::digest(TEST_KBS_POLICY.as_bytes()).into(),
+    };
+    // The CLI re-signs the envelope after merging the groups.
+    let (customer_descriptor_blob, org_keyring_blob) =
+        signed_test_artifact_blobs(descriptor.clone(), &customer_key, &org_keyring_envelope);
+
+    // The CLI-built signed_policy_artifact: customer-key-signed over the
+    // same signing input the platform service uses (it never verifies
+    // against the platform key — CAP is expected to fall back to /sign).
+    let rego_hash: [u8; 32] = Sha256::digest(TEST_KBS_POLICY.as_bytes()).into();
+    let agent_policy_hash: [u8; 32] = Sha256::digest(TEST_AGENT_POLICY.as_bytes()).into();
+    let metadata = PolicyMetadata {
+        app_id: descriptor.app_id.to_string(),
+        deploy_id: descriptor.deploy_id.to_string(),
+        descriptor_core_hash: hex::encode(descriptor_core_hash(&descriptor)),
+        descriptor_signing_pubkey: hex::encode(customer_key.verifying_key().to_bytes()),
+        platform_release_version: descriptor.platform_release_version.clone(),
+        policy_template_id: descriptor.policy_template_id.clone(),
+        policy_template_sha256: hex::encode(descriptor.policy_template_sha256),
+        agent_policy_sha256: hex::encode(agent_policy_hash),
+        genpolicy_version_pin: TEST_GENPOLICY_PIN.to_string(),
+        signed_at: "2026-11-25T19:24:39+00:00".to_string(),
+        key_id: "cli-deployer-key".to_string(),
+    };
+    let signing_input = ce_v1_bytes(&[
+        ("purpose", b"enclava-policy-artifact-v1"),
+        ("metadata", &test_policy_metadata_hash(&metadata)),
+        ("rego_sha256", &rego_hash),
+    ]);
+    let cli_artifact = SignedPolicyArtifact {
+        metadata,
+        rego_text: TEST_KBS_POLICY.to_string(),
+        rego_sha256: hex::encode(rego_hash),
+        agent_policy_text: TEST_AGENT_POLICY.to_string(),
+        agent_policy_sha256: hex::encode(agent_policy_hash),
+        signature: hex::encode(customer_key.sign(&signing_input).to_bytes()),
+        verify_pubkey_b64: B64.encode(customer_key.verifying_key().to_bytes()),
+        org_keyring: None,
+    };
+
+    let response = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/deploy"
+        )),
+        &format!("masked409-deploy-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&serde_json::json!({
+        "image": descriptor.image_ref,
+        "customer_descriptor_blob": customer_descriptor_blob,
+        "org_keyring_blob": org_keyring_blob,
+        "signed_policy_artifact": serde_json::to_string(&cli_artifact).expect("artifact JSON"),
+    }))
+    .await;
+
+    // The production symptom, reproduced: the underlying /sign refusal is
+    // masked by the idempotency layer into the fail-closed receipt.
+    response.assert_status(StatusCode::CONFLICT);
+    let body: Value = response.json();
+    assert_eq!(
+        body["error"], "idempotency_recovery_required",
+        "unexpected receipt: {body}"
+    );
+    assert_eq!(body["retryable"], false);
+
+    // Nothing was applied: no deployment rows, the app never left creating
+    // (the observed dev state).
+    let deployments: i64 = sqlx::query_scalar("SELECT count(*) FROM deployments WHERE app_id = $1")
+        .bind(cap_app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count deployments");
+    assert_eq!(deployments, 0, "no deployment rows may exist");
+    let status: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+        .bind(cap_app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("app status");
+    assert_eq!(status, "creating");
+
+    // The receipt is terminal: a same-key retry replays it instead of
+    // re-running the (9.7 s on dev) generation.
+    let replay = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/deploy"
+        )),
+        &format!("masked409-deploy-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&serde_json::json!({
+        "image": descriptor.image_ref,
+        "customer_descriptor_blob": customer_descriptor_blob,
+        "org_keyring_blob": org_keyring_blob,
+        "signed_policy_artifact": serde_json::to_string(&cli_artifact).expect("artifact JSON"),
+    }))
+    .await;
+    replay.assert_status(StatusCode::CONFLICT);
+    let replay_body: Value = replay.json();
+    assert_eq!(replay_body["error"], "idempotency_recovery_required");
+
+    // The refusal was reached exactly once and the replay did NOT re-run
+    // /sign: the first request was refused by the deployed-behavior fake
+    // (a transport error on /agent-policy would leave the counter at zero),
+    // and the terminal receipt replays without a second refusal.
+    assert_eq!(
+        sign_refusals.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one /sign refusal: the first request, never the replay"
+    );
 }

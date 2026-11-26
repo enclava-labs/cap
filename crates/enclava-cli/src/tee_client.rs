@@ -172,6 +172,35 @@ pub const TERMINAL_BOOTSTRAP_ERROR_CODES: [&str; 3] = [
     "enclava_init_failed",
 ];
 
+/// The exact fixed-vocabulary init phases the attestation proxy may report
+/// inside `bootstrap_error.last_init_stage` (enclava-init `record_stage`, in
+/// boot order). Duplicated from cap-api's `routes::status::LAST_INIT_STAGES`
+/// and enclava-paas's `hosted_snapshot::LAST_INIT_STAGES` by the same
+/// deliberate rule as [`TERMINAL_BOOTSTRAP_ERROR_CODES`]: each trust boundary
+/// revalidates the literal vocabulary locally, so an unknown, malformed, or
+/// overlong remote stage is dropped here and can never reach operator
+/// plaintext as part of a terminal diagnostic.
+pub const LAST_INIT_STAGES: [&str; 12] = [
+    "loading config",
+    "validating signed config",
+    "verifying trustee policy",
+    "waiting for owner seed",
+    "opening luks volumes",
+    "preparing mount ownership",
+    "provisioning static tls certificate",
+    "writing component seeds",
+    "waiting for workload containers",
+    "binding workload mount namespaces",
+    "seeding caddy runtime handoff",
+    "marking ready",
+];
+
+/// The init stage whose terminal failure is the plain-path storage-contract
+/// failure mode: enclava-init cannot create a `[storage]` `paths` entry that
+/// the image does not already contain, because the restricted profile runs a
+/// read-only root filesystem at that bind stage.
+pub const BIND_MOUNT_NAMESPACES_STAGE: &str = "binding workload mount namespaces";
+
 /// Upper bound on `/status` bodies accepted by the safe bootstrap-status read.
 const MAX_BOOTSTRAP_STATUS_BODY_BYTES: usize = 64 * 1024;
 
@@ -188,14 +217,16 @@ const TERMINAL_BOOTSTRAP_RETRY_AFTER_MAX_FUTURE_SECONDS: i64 = 365 * 24 * 60 * 6
 /// A terminal bootstrap failure diagnostic recognized in the TEE's `/status`
 /// response.
 ///
-/// Carries only the stable error code and an optional validated retry
-/// deadline -- never arbitrary provider detail. A `retry_after` that has
-/// already elapsed is preserved: it means a retry may now be attempted
-/// separately, not that the terminal failure is erased.
+/// Carries only the stable error code, an optional validated retry
+/// deadline, and the optional fixed-vocabulary init stage -- never arbitrary
+/// provider detail. A `retry_after` that has already elapsed is preserved: it
+/// means a retry may now be attempted separately, not that the terminal
+/// failure is erased.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalBootstrapError {
     code: &'static str,
     retry_after: Option<DateTime<Utc>>,
+    stage: Option<&'static str>,
 }
 
 impl TerminalBootstrapError {
@@ -207,18 +238,28 @@ impl TerminalBootstrapError {
         self.retry_after
     }
 
+    /// The init stage the proxy reported inside `bootstrap_error`, when it
+    /// is an exact [`LAST_INIT_STAGES`] match; unknown or malformed stages
+    /// never reach here.
+    pub fn last_init_stage(&self) -> Option<&'static str> {
+        self.stage
+    }
+
     /// Stable, safe-to-print summary: the recognized code plus the validated
-    /// deadline, re-serialized as UTC RFC3339 seconds (`Z`) rather than echoed
-    /// from the response body.
+    /// deadline and init stage, re-serialized as UTC RFC3339 seconds (`Z`)
+    /// rather than echoed from the response body.
     pub fn stable_summary(&self) -> String {
-        match self.retry_after {
-            Some(deadline) => format!(
-                "{} (retry_after {})",
-                self.code,
+        let mut summary = self.code.to_string();
+        if let Some(deadline) = self.retry_after {
+            summary.push_str(&format!(
+                " (retry_after {})",
                 deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-            ),
-            None => self.code.to_string(),
+            ));
         }
+        if let Some(stage) = self.stage {
+            summary.push_str(&format!(" (init stage: {stage})"));
+        }
+        summary
     }
 }
 
@@ -238,9 +279,12 @@ pub struct TeeBootstrapStatus {
 /// Recognizes a diagnostic only when the `error` code is exactly one of
 /// [`TERMINAL_BOOTSTRAP_ERROR_CODES`], `terminal` is exactly `true`, and
 /// `retry_after` is absent, `null`, or a strictly valid UTC RFC3339 deadline
-/// within the broker's 365-day bound. Absent, unknown, or malformed fields
-/// yield no diagnostic, so pre-existing retry deadlines keep governing and no
-/// raw response text ever reaches the console.
+/// within the broker's 365-day bound. The optional `last_init_stage` the
+/// proxy merges into the same object (attestation-proxy
+/// `bootstrap_diagnostics_for_status`) is carried only on an exact
+/// [`LAST_INIT_STAGES`] match. Absent, unknown, or malformed fields yield
+/// no diagnostic or no stage respectively, so pre-existing retry deadlines
+/// keep governing and no raw response text ever reaches the console.
 pub fn parse_terminal_bootstrap_error(body: &serde_json::Value) -> Option<TerminalBootstrapError> {
     let field = body.get("bootstrap_error")?;
     if !field.is_object() {
@@ -267,7 +311,20 @@ pub fn parse_terminal_bootstrap_error(body: &serde_json::Value) -> Option<Termin
         }
         _ => return None,
     };
-    Some(TerminalBootstrapError { code, retry_after })
+    let stage = field
+        .get("last_init_stage")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|stage| {
+            LAST_INIT_STAGES
+                .iter()
+                .find(|known| **known == stage)
+                .copied()
+        });
+    Some(TerminalBootstrapError {
+        code,
+        retry_after,
+        stage,
+    })
 }
 
 /// Launch identity verified during attestation: the SNP HOST_DATA (launch

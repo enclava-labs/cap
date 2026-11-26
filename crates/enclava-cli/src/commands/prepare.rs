@@ -77,22 +77,17 @@ where
         .join(".github")
         .join("workflows")
         .join("enclava-deploy.yml");
-    let existing_paths: Vec<PathBuf> = [&toml_path, &workflow_path]
-        .into_iter()
-        .filter(|path| path.exists())
-        .cloned()
-        .collect();
-    let update_existing = if existing_paths.is_empty() {
-        false
-    } else {
-        confirm_update_existing(&existing_paths)?
-    };
+    // An existing enclava.toml is the user's configuration (storage paths,
+    // resources, command), not scaffolding: it is never regenerated. Only the
+    // generated workflow can be refreshed, and only after confirmation.
+    let update_workflow =
+        workflow_path.exists() && confirm_update_existing(std::slice::from_ref(&workflow_path))?;
 
     let inferred_name = default_app_name(cwd);
     let detected_port = detect_dockerfile_port(&cwd.join("Dockerfile")).unwrap_or(3000);
     let toml_content = generate_enclava_toml(&inferred_name, detected_port);
 
-    let workflow_app_name = if toml_path.exists() && !update_existing {
+    let workflow_app_name = if toml_path.exists() {
         existing_app_name(&toml_path, &inferred_name)
     } else {
         inferred_name.clone()
@@ -100,12 +95,12 @@ where
     let workflow_content = generate_github_workflow(&workflow_app_name);
 
     let mut report = PrepareReport::default();
-    write_target(cwd, &toml_path, &toml_content, update_existing, &mut report)?;
+    write_target(cwd, &toml_path, &toml_content, false, &mut report)?;
     write_target(
         cwd,
         &workflow_path,
         &workflow_content,
-        update_existing,
+        update_workflow,
         &mut report,
     )?;
 
@@ -152,7 +147,8 @@ fn print_report(report: &PrepareReport) {
 
 #[derive(clap::Args)]
 pub struct PrepareArgs {
-    /// Update existing Enclava files without the interactive confirmation
+    /// Regenerate an existing deploy workflow without the interactive
+    /// confirmation. An existing enclava.toml is always kept as is.
     #[arg(long)]
     pub yes: bool,
 }
@@ -168,10 +164,10 @@ pub async fn prepare(args: PrepareArgs) -> Result<(), Box<dyn std::error::Error>
             return Ok(true);
         }
         super::interactive::require_prompt(
-            "pass --yes to update the existing files without confirmation",
+            "pass --yes to regenerate the existing workflow without confirmation",
         )?;
         Confirm::new()
-            .with_prompt("Update existing Enclava files?")
+            .with_prompt("Regenerate the existing deploy workflow?")
             .default(false)
             .interact()
             .map_err(Into::into)
@@ -241,7 +237,7 @@ mod tests {
         std::fs::write(workflow_dir.join("enclava-deploy.yml"), "existing workflow").unwrap();
 
         let report = prepare_project_with_confirmation(tmp.path(), |paths| {
-            assert_eq!(paths.len(), 2);
+            assert_eq!(paths, [workflow_dir.join("enclava-deploy.yml")]);
             Ok(false)
         })
         .unwrap();
@@ -266,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_overwrites_existing_files_when_confirmed() {
+    fn prepare_keeps_existing_config_and_updates_workflow_when_confirmed() {
         let tmp = tempfile::tempdir().unwrap();
         let workflow_dir = tmp.path().join(".github").join("workflows");
         std::fs::create_dir_all(&workflow_dir).unwrap();
@@ -275,11 +271,23 @@ mod tests {
             "FROM alpine\nEXPOSE 9090/tcp\n",
         )
         .unwrap();
-        std::fs::write(tmp.path().join("enclava.toml"), "existing config").unwrap();
+        // A stateless config: regenerating it would inject paths = ["/data"].
+        let existing = generate_enclava_toml("stateless-app", 8080)
+            .replace("paths = [\"/data\"]", "paths = []")
+            .replace("cpu = \"1\"", "cpu = \"0.5\"")
+            .replace("memory = \"1Gi\"", "memory = \"512Mi\"");
+        assert!(
+            AppConfig::parse(&existing)
+                .unwrap()
+                .storage
+                .paths
+                .is_empty()
+        );
+        std::fs::write(tmp.path().join("enclava.toml"), &existing).unwrap();
         std::fs::write(workflow_dir.join("enclava-deploy.yml"), "existing workflow").unwrap();
 
         let report = prepare_project_with_confirmation(tmp.path(), |paths| {
-            assert_eq!(paths.len(), 2);
+            assert_eq!(paths, [workflow_dir.join("enclava-deploy.yml")]);
             Ok(true)
         })
         .unwrap();
@@ -287,19 +295,38 @@ mod tests {
         assert!(report.created.is_empty());
         assert_eq!(
             report.updated,
-            vec![
-                "enclava.toml".to_string(),
-                ".github/workflows/enclava-deploy.yml".to_string()
-            ]
+            vec![".github/workflows/enclava-deploy.yml".to_string()]
         );
-        assert!(report.kept_existing.is_empty());
+        assert_eq!(report.kept_existing, vec!["enclava.toml".to_string()]);
 
-        let toml = std::fs::read_to_string(tmp.path().join("enclava.toml")).unwrap();
-        let config = AppConfig::parse(&toml).unwrap();
-        assert_eq!(config.app.port, 9090);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("enclava.toml")).unwrap(),
+            existing
+        );
 
         let workflow = std::fs::read_to_string(workflow_dir.join("enclava-deploy.yml")).unwrap();
-        assert!(workflow.contains("name: Build signed image"));
+        assert!(workflow.contains("name: Build signed image for stateless-app"));
         assert!(workflow.contains("id-token: write"));
+    }
+
+    #[test]
+    fn prepare_keeps_existing_config_without_prompt_when_workflow_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("enclava.toml"), "existing config").unwrap();
+
+        let report = prepare_project_with_confirmation(tmp.path(), |_| {
+            panic!("nothing would be overwritten, so nothing to confirm")
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.created,
+            vec![".github/workflows/enclava-deploy.yml".to_string()]
+        );
+        assert_eq!(report.kept_existing, vec!["enclava.toml".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("enclava.toml")).unwrap(),
+            "existing config"
+        );
     }
 }

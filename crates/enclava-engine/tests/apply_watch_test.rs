@@ -1,7 +1,7 @@
 use enclava_engine::apply::types::DeployPhase;
 use enclava_engine::apply::watch::{
     PodSnapshot, classify_pod_phase, pod_label_selector, pod_matches_statefulset_update_revision,
-    pod_runtime_failure_message, pod_terminal_failure_code,
+    pod_runtime_failure_message, pod_terminal_failure_code, rollout_runtime_failure,
     stale_terminating_pod_needs_force_delete,
 };
 use k8s_openapi::api::core::v1::{
@@ -373,4 +373,130 @@ async fn watch_rollout_times_out_on_missing_statefulset() {
         result,
         Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(_))
     ));
+}
+
+fn crashed_container(
+    name: &str,
+    restart_count: i32,
+    waiting_reason: Option<&str>,
+    terminated: (&str, i32),
+) -> ContainerStatus {
+    let terminated = ContainerState {
+        terminated: Some(ContainerStateTerminated {
+            reason: Some(terminated.0.to_string()),
+            exit_code: terminated.1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (state, last_state) = match waiting_reason {
+        Some(reason) => (
+            ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some(reason.to_string()),
+                    message: None,
+                }),
+                ..Default::default()
+            },
+            Some(terminated),
+        ),
+        None => (terminated, None),
+    };
+    ContainerStatus {
+        name: name.to_string(),
+        restart_count,
+        state: Some(state),
+        last_state,
+        ..Default::default()
+    }
+}
+
+fn pod_with(container: ContainerStatus) -> Pod {
+    Pod {
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            container_statuses: Some(vec![container]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn rollout_tolerates_first_enclava_init_restarts_then_fails() {
+    // A Trustee restart makes enclava-init's policy fetch fail once: exit 1,
+    // then CrashLoopBackOff until the kubelet restarts it.
+    for restart_count in 0..2 {
+        let exited = pod_with(crashed_container(
+            "enclava-init",
+            restart_count,
+            None,
+            ("Error", 1),
+        ));
+        assert!(rollout_runtime_failure(&exited).is_none());
+        // The status surface still reports what the container is doing.
+        assert!(pod_runtime_failure_message(&exited).is_some());
+        let backing_off = pod_with(crashed_container(
+            "enclava-init",
+            restart_count,
+            Some("CrashLoopBackOff"),
+            ("Error", 1),
+        ));
+        assert!(rollout_runtime_failure(&backing_off).is_none());
+    }
+    // A failure that persists past the budget is terminal.
+    let persistent = pod_with(crashed_container(
+        "enclava-init",
+        2,
+        Some("CrashLoopBackOff"),
+        ("Error", 1),
+    ));
+    assert_eq!(
+        rollout_runtime_failure(&persistent)
+            .expect("persistent init failure is terminal")
+            .public_message(),
+        "container_runtime_failure status=waiting code=crash_loop_back_off; \
+         previous_container_runtime_failure status=terminated code=error exit_code=1"
+    );
+}
+
+#[test]
+fn rollout_still_fails_fast_on_definitive_failures() {
+    let definitive = [
+        // Any other container crashing is the workload's own failure.
+        crashed_container("web", 0, None, ("Error", 1)),
+        crashed_container("web", 0, Some("CrashLoopBackOff"), ("Error", 1)),
+        // enclava-init failures that are not its generic exit 1.
+        crashed_container("enclava-init", 0, None, ("OOMKilled", 137)),
+        crashed_container("enclava-init", 0, None, ("StartError", 128)),
+        crashed_container("enclava-init", 0, None, ("Error", 101)),
+        crashed_container(
+            "enclava-init",
+            0,
+            Some("CrashLoopBackOff"),
+            ("StartError", 128),
+        ),
+        crashed_container("enclava-init", 0, Some("ImagePullBackOff"), ("Error", 1)),
+    ];
+    for container in definitive {
+        let label = format!("{container:?}");
+        assert!(
+            rollout_runtime_failure(&pod_with(container)).is_some(),
+            "must stay terminal on first sight: {label}"
+        );
+    }
+
+    // A tolerated init restart never masks another container's failure.
+    let mut pod = pod_with(crashed_container("enclava-init", 0, None, ("Error", 1)));
+    pod.status
+        .as_mut()
+        .unwrap()
+        .container_statuses
+        .as_mut()
+        .unwrap()
+        .push(crashed_container("web", 0, None, ("Error", 2)));
+    assert_eq!(
+        rollout_runtime_failure(&pod).unwrap().public_message(),
+        "container_runtime_failure status=terminated code=error exit_code=2"
+    );
 }

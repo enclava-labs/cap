@@ -32,8 +32,18 @@ const RECLAIM_QUARANTINE_SECONDS: i64 = 360;
 /// retaining case — so a live, non-deleting namespace then proves no
 /// deletion of ours is pending.
 const RETAINED_FENCE_SETTLE_SECONDS: i64 = 300;
+#[cfg(not(test))]
 const HEARTBEAT_SECONDS: u64 = 30;
+/// Tests drive renewal-loss arms deterministically: a fast heartbeat
+/// interval and a short renew timeout let a test block the renewal long
+/// enough to lose the lease in seconds instead of 30+10. Production
+/// keeps 30s/10s.
+#[cfg(test)]
+const HEARTBEAT_SECONDS: u64 = 1;
+#[cfg(not(test))]
 const RENEW_TIMEOUT_SECONDS: u64 = 10;
+#[cfg(test)]
+const RENEW_TIMEOUT_SECONDS: u64 = 2;
 
 /// Bound for each individual namespace-absence probe in
 /// `release_retained_deployment_namespace_fences`. Without it, one stalled
@@ -326,6 +336,55 @@ impl AppMutationLease {
             poison_resource_scope(&mut tx, self.token, &self.resources, resource_scope).await?;
         if retained == 0 {
             return Err(MutationLeaseError::Lost);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// cap#422 R2 (review T1): on a renewal-loss arm the claimed rows stay
+    /// quarantined until `reclaim_after` by design -- but a CROSS-APP
+    /// fence (the global `edge_config`) blocks unrelated apps' deployment
+    /// apply for the whole quarantine bound, and on those arms no write of
+    /// THAT fence's own is in flight. Clear exactly the given fences' rows
+    /// by token and generation: `release_resource_in_tx`'s heartbeat-alive
+    /// guard does not apply (the loss is the reason we are here), and a
+    /// zero-row result means the reclaimer already took the fence -- which
+    /// is equally released. Everything not named keeps its reclaim
+    /// quarantine.
+    pub async fn release_fences_quarantined(
+        &self,
+        fences: &[ResourceFence],
+    ) -> Result<(), MutationLeaseError> {
+        let mut releases = Vec::new();
+        for fence in fences {
+            if let Some(resource) = self.resources.iter().find(|r| &r.fence == fence) {
+                releases.push(resource.clone());
+            }
+        }
+        if releases.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for resource in &releases {
+            sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                    SET owner_token = NULL,
+                        operation_kind = NULL,
+                        operation_id = NULL,
+                        locked_until = NULL,
+                        reclaim_after = NULL,
+                        updated_at = clock_timestamp()
+                  WHERE resource_scope = $1
+                    AND resource_key = $2
+                    AND owner_token = $3
+                    AND generation = $4",
+            )
+            .bind(&resource.fence.scope)
+            .bind(&resource.fence.key)
+            .bind(self.token)
+            .bind(resource.generation)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -742,6 +801,117 @@ pub async fn claim_resources(
         heartbeat_lost,
         _admission: admission,
     })
+}
+
+/// Minimum spacing between busy-claim WARN lines, process-wide. Waiters
+/// requeue every few seconds; one line per window is enough to name a holder.
+const BUSY_CLAIM_LOG_INTERVAL: Duration = Duration::from_secs(30);
+static BUSY_CLAIM_LOGGED_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// One live or quarantined owner blocking a claim.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct BusyFenceHolder {
+    pub(crate) fence_scope: String,
+    pub(crate) fence_key: String,
+    pub(crate) operation_kind: Option<String>,
+    pub(crate) operation_id: Option<Uuid>,
+    pub(crate) generation: i64,
+    /// False once renewal stopped: the owner is gone (or lost its lease) and
+    /// only the reclaim quarantine still holds the row.
+    pub(crate) heartbeat_live: bool,
+    pub(crate) seconds_since_renewal: f64,
+    /// `None` for a fence retained until explicit reconciliation.
+    pub(crate) reclaimable_in_seconds: Option<f64>,
+}
+
+pub(crate) async fn busy_fence_holders(
+    pool: &PgPool,
+    app_id: Option<Uuid>,
+    resources: &[ResourceFence],
+) -> Result<Vec<BusyFenceHolder>, sqlx::Error> {
+    let scopes: Vec<&str> = resources.iter().map(|fence| fence.scope.as_str()).collect();
+    let keys: Vec<&str> = resources.iter().map(|fence| fence.key.as_str()).collect();
+    sqlx::query_as(
+        "SELECT resource_scope AS fence_scope,
+                resource_key AS fence_key,
+                operation_kind, operation_id, generation,
+                COALESCE(locked_until > clock_timestamp(), false) AS heartbeat_live,
+                EXTRACT(EPOCH FROM clock_timestamp() - updated_at)::float8
+                    AS seconds_since_renewal,
+                CASE WHEN reclaim_after = 'infinity'::timestamptz THEN NULL
+                     ELSE EXTRACT(EPOCH FROM reclaim_after - clock_timestamp())::float8
+                END AS reclaimable_in_seconds
+           FROM external_resource_mutation_leases
+          WHERE owner_token IS NOT NULL
+            AND reclaim_after > clock_timestamp()
+            AND (resource_scope, resource_key) IN (
+                SELECT * FROM UNNEST($1::text[], $2::text[])
+            )
+         UNION ALL
+         SELECT 'app' AS fence_scope,
+                app_id::text AS fence_key,
+                operation_kind, operation_id, generation,
+                COALESCE(locked_until > clock_timestamp(), false) AS heartbeat_live,
+                EXTRACT(EPOCH FROM clock_timestamp() - updated_at)::float8
+                    AS seconds_since_renewal,
+                CASE WHEN reclaim_after = 'infinity'::timestamptz THEN NULL
+                     ELSE EXTRACT(EPOCH FROM reclaim_after - clock_timestamp())::float8
+                END AS reclaimable_in_seconds
+           FROM app_mutation_leases
+          WHERE app_id = $3
+            AND owner_token IS NOT NULL
+            AND reclaim_after > clock_timestamp()",
+    )
+    .bind(scopes)
+    .bind(keys)
+    .bind(app_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Name the owners a `Busy` claim ran into, at WARN, at most once per
+/// [`BUSY_CLAIM_LOG_INTERVAL`]. Diagnostic only: a failed lookup is ignored
+/// and nothing here changes what the caller does with the `Busy` result.
+pub(crate) async fn warn_claim_busy(
+    pool: &PgPool,
+    waiter: &'static str,
+    waiting_operation_id: Uuid,
+    app_id: Option<Uuid>,
+    resources: &[ResourceFence],
+) {
+    let due = |logged_at: &Option<std::time::Instant>| {
+        logged_at.is_none_or(|at| at.elapsed() >= BUSY_CLAIM_LOG_INTERVAL)
+    };
+    if !BUSY_CLAIM_LOGGED_AT.lock().is_ok_and(|at| due(&at)) {
+        return;
+    }
+    let Ok(holders) = busy_fence_holders(pool, app_id, resources).await else {
+        return;
+    };
+    if holders.is_empty() {
+        return;
+    }
+    match BUSY_CLAIM_LOGGED_AT.lock() {
+        Ok(mut logged_at) if due(&logged_at) => *logged_at = Some(std::time::Instant::now()),
+        _ => return,
+    }
+    for holder in holders {
+        tracing::warn!(
+            waiter,
+            %waiting_operation_id,
+            fence_scope = %holder.fence_scope,
+            fence_key = %holder.fence_key,
+            holder_operation_kind = holder.operation_kind.as_deref().unwrap_or("unknown"),
+            holder_operation_id = ?holder.operation_id,
+            holder_generation = holder.generation,
+            holder_heartbeat_live = holder.heartbeat_live,
+            holder_seconds_since_renewal = holder.seconds_since_renewal,
+            reclaimable_in_seconds = ?holder.reclaimable_in_seconds,
+            error_code = "mutation_fence_busy",
+            "mutation claim is waiting on an owned fence; the waiter requeues until it is released or reclaimable"
+        );
+    }
 }
 
 /// Sweep snapshot of every `kubernetes_namespace` lease.
@@ -1192,6 +1362,63 @@ pub async fn reconcile_orphaned_deployment_apply_leases(
             AND resource.reclaim_after = 'infinity'::timestamptz",
     )
     .bind(RECLAIM_QUARANTINE_SECONDS)
+    .execute(pool)
+    .await?;
+    Ok(resources.rows_affected())
+}
+
+/// The operation kind the custom-domain verify path claims; shared by the
+/// route, the reconciler, and tests so the literal cannot drift.
+pub(crate) const CUSTOM_DOMAIN_SET_OPERATION: &str = "custom_domain_set";
+
+/// Bound custom-domain namespace fences whose own renewal clock has
+/// lapsed. Selection is by the FENCE row's expired `locked_until`, not a
+/// join against the app lease: a later operation (deployment setup) can
+/// replace an expired app lease without claiming the namespace fence, and
+/// a join would then lose the orphan forever (Devin review on this PR).
+/// A fence whose owner lease is still live is excluded explicitly; the
+/// quarantine window runs from repair time (`GREATEST`), so a freshly
+/// orphaned fence gets the full ordinary quarantine rather than an
+/// already-past deadline.
+///
+/// A `custom_domain_set` verify that armed the infinite
+/// `kubernetes_namespace` fence (the pre-F-C code) and then lost its
+/// request — cancelled at the hosted proxy while the restarted pod sat
+/// locked in password mode — left the fence orphaned with no reclaim
+/// window: every later deploy, verify, or delete on that app answered
+/// `mutation_fence_busy` forever, because the deployment-apply repair loop
+/// joins on `operation_kind = 'deployment_apply'` and so never touched
+/// these rows. The domain-only reapply writes only generation-CAS'd,
+/// idempotent Kubernetes objects and never deletes the namespace, so
+/// elapsed lease expiry IS authority to re-bound the fence to the ordinary
+/// reclaim quarantine — the same reasoning the deployment loop applies to
+/// a crashed worker's pre-arm rows (the deliberately retained
+/// namespace-delete markers are labeled differently and stay infinite).
+///
+/// This is also the repair for apps wedged by the old behavior: once this
+/// ships, their expired fences are bounded on the next reconciler tick
+/// without manual database action.
+pub async fn reconcile_orphaned_custom_domain_fences(
+    pool: &PgPool,
+) -> Result<u64, MutationLeaseError> {
+    let resources = sqlx::query(
+        "UPDATE external_resource_mutation_leases AS resource
+            SET reclaim_after = GREATEST(resource.locked_until, clock_timestamp())
+                    + ($1::bigint * interval '1 second'),
+                updated_at = clock_timestamp()
+          WHERE resource.resource_scope = 'kubernetes_namespace'
+            AND resource.operation_kind = $2
+            AND resource.reclaim_after = 'infinity'::timestamptz
+            AND resource.locked_until <= clock_timestamp()
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM app_mutation_leases AS app
+                 WHERE app.owner_token = resource.owner_token
+                   AND app.locked_until > clock_timestamp()
+            )",
+    )
+    .bind(RECLAIM_QUARANTINE_SECONDS)
+    .bind(CUSTOM_DOMAIN_SET_OPERATION)
     .execute(pool)
     .await?;
     Ok(resources.rows_affected())
@@ -4539,5 +4766,301 @@ pub(crate) mod tests {
                 .await
                 .expect("remove provenance-fixture organization");
         }
+    }
+
+    #[tokio::test]
+    async fn custom_domain_fence_reconciler_bounds_orphaned_infinite_fences() {
+        // The F-C wedge, reproduced at the data layer: a custom_domain_set
+        // verify armed the infinite namespace fence, then lost its request;
+        // the lease heartbeat died and locked_until lapsed. The reconciler
+        // must bound the fence to the ordinary reclaim quarantine so the
+        // next mutation can proceed — this is also the repair for apps
+        // wedged by the pre-fix behavior.
+        let pool = database_test_pool(2).await;
+        let (_org_id, app_id) = insert_app(&pool, "fence-reconcile.example.test").await;
+        let state = std::sync::Arc::new(state_with_pool(pool.clone()));
+        let operation_id = Uuid::new_v4();
+        let resources = vec![ResourceFence::new(
+            "kubernetes_namespace",
+            format!("cap-testing-fence-{}", uuid::Uuid::new_v4().simple()),
+        )];
+        let lease = claim(
+            &state,
+            app_id,
+            CUSTOM_DOMAIN_SET_OPERATION,
+            operation_id,
+            false,
+            resources.clone(),
+        )
+        .await
+        .expect("claim custom_domain_set lease");
+        lease
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("arm the infinite fence (the pre-F-C behavior)");
+        let (owner_token, _generation) = (lease.token, 0i64);
+        // Simulate the lost holder: `renew` keeps the app lease and every
+        // fence in ONE transaction, so heartbeat death (process loss,
+        // request cancellation) lapses BOTH clocks together — that is the
+        // real orphan shape this reconciler repairs. Nothing ever bounds
+        // an armed fence on its own: `renew`'s CASE preserves
+        // reclaim_after = 'infinity', so once the holder is gone the
+        // fence-row clock is the only selector that can pick it up.
+        for table in ["app_mutation_leases", "external_resource_mutation_leases"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET locked_until = clock_timestamp() - interval '1 second' WHERE owner_token = $1"
+            ))
+            .bind(owner_token)
+            .execute(&pool)
+            .await
+            .expect("expire the holder's rows");
+        }
+        let still_infinite: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM external_resource_mutation_leases WHERE reclaim_after = 'infinity'::timestamptz AND owner_token = $1",
+        )
+        .bind(owner_token)
+        .fetch_one(&pool)
+        .await
+        .expect("count infinite fences");
+        assert_eq!(still_infinite, 1, "precondition: the fence is infinite");
+
+        let repaired = reconcile_orphaned_custom_domain_fences(&pool)
+            .await
+            .expect("reconciler run");
+        assert_eq!(
+            repaired, 1,
+            "the orphaned custom_domain_set fence is bounded"
+        );
+        let bounded: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT reclaim_after FROM external_resource_mutation_leases WHERE owner_token = $1 AND resource_scope = 'kubernetes_namespace'",
+        )
+        .bind(owner_token)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch the bounded fence");
+        let bounded = bounded.expect("reclaim_after is finite now");
+        assert!(
+            bounded > chrono::Utc::now(),
+            "the reclaim window is in the future (quarantine), not immediate"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_domain_fence_reconciler_leaves_live_leases_and_other_kinds_alone() {
+        let pool = database_test_pool(2).await;
+        let (_org_id, app_id) = insert_app(&pool, "fence-live.example.test").await;
+        let state = std::sync::Arc::new(state_with_pool(pool.clone()));
+        let operation_id = Uuid::new_v4();
+        let lease = claim(
+            &state,
+            app_id,
+            CUSTOM_DOMAIN_SET_OPERATION,
+            operation_id,
+            false,
+            vec![ResourceFence::new(
+                "kubernetes_namespace",
+                format!("cap-testing-fence-{}", uuid::Uuid::new_v4().simple()),
+            )],
+        )
+        .await
+        .expect("claim");
+        lease
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("arm");
+        // Lease still LIVE (locked_until in the future): the reconciler
+        // must not touch THIS lease's fence (the global repair count is
+        // not asserted — a sibling test's genuinely orphaned row may
+        // legitimately be bounded by the same run).
+        let _ = reconcile_orphaned_custom_domain_fences(&pool)
+            .await
+            .expect("reconciler run");
+        let still_infinite: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM external_resource_mutation_leases WHERE reclaim_after = 'infinity'::timestamptz AND owner_token = $1",
+        )
+        .bind(lease.token)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(still_infinite, 1, "the live lease's fence stays armed");
+
+        // An expired DEPLOYMENT-apply infinite fence (the deliberately
+        // retained marker kind) is not this reconciler's business either.
+        let (_org_two, app_two) = insert_app(&pool, "fence-other.example.test").await;
+        let state_two = std::sync::Arc::new(state_with_pool(pool.clone()));
+        let op_two = Uuid::new_v4();
+        let other = claim(
+            &state_two,
+            app_two,
+            RETAINED_DEPLOYMENT_NAMESPACE_OPERATION,
+            op_two,
+            false,
+            vec![ResourceFence::new(
+                "kubernetes_namespace",
+                format!("cap-testing-fence-{}", uuid::Uuid::new_v4().simple()),
+            )],
+        )
+        .await
+        .expect("claim");
+        other
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("arm");
+        sqlx::query("UPDATE app_mutation_leases SET locked_until = clock_timestamp() - interval '1 second' WHERE owner_token = $1")
+            .bind(other.token)
+            .execute(&pool)
+            .await
+            .expect("expire");
+        reconcile_orphaned_custom_domain_fences(&pool)
+            .await
+            .expect("reconciler run");
+        // The retained deployment marker kind is not this reconciler's
+        // business: its fence stays infinite even with the lease expired.
+        let other_still_infinite: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM external_resource_mutation_leases WHERE reclaim_after = 'infinity'::timestamptz AND owner_token = $1",
+        )
+        .bind(other.token)
+        .fetch_one(&pool)
+        .await
+        .expect("count other");
+        assert_eq!(
+            other_still_infinite, 1,
+            "the retained deployment marker kind is untouched by the custom-domain reconciler"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_domain_fence_reconciler_repairs_after_app_lease_replacement() {
+        // Devin review on this PR: a later operation (deployment setup)
+        // can replace an expired app lease WITHOUT claiming the namespace
+        // fence, so an owner-token JOIN would lose the orphan forever.
+        // Selection is by the fence row's own expired clock; a live owner
+        // is excluded explicitly.
+        let pool = database_test_pool(2).await;
+        let (_org_id, app_id) = insert_app(&pool, "fence-replaced.example.test").await;
+        let state = std::sync::Arc::new(state_with_pool(pool.clone()));
+        let fence_key = format!("cap-testing-fence-{}", uuid::Uuid::new_v4().simple());
+        let mut lease = claim(
+            &state,
+            app_id,
+            CUSTOM_DOMAIN_SET_OPERATION,
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::new("kubernetes_namespace", &fence_key)],
+        )
+        .await
+        .expect("claim");
+        lease
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("arm");
+        // Holder death: stop the heartbeat (no more renewal), keep the
+        // durable rows, then lap BOTH clocks. Dropping the lease object
+        // also releases the side-effect admission the replacement claim
+        // needs; the fenced rows persist exactly as a crashed holder's do.
+        let orphan_token = lease.token;
+        lease.stop_heartbeat();
+        drop(lease);
+        // Both clocks lapse AND the app lease's reclaim quarantine elapses
+        // (a real replacement claim cannot happen before it).
+        // Both timestamps past, preserving the reclaim_after > locked_until
+        // shape constraint the schema enforces on owned rows.
+        sqlx::query(
+            "UPDATE app_mutation_leases SET locked_until = clock_timestamp() - interval '2 seconds', reclaim_after = clock_timestamp() - interval '1 second' WHERE owner_token = $1",
+        )
+        .bind(orphan_token)
+        .execute(&pool)
+        .await
+        .expect("expire the app lease");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases SET locked_until = clock_timestamp() - interval '1 second' WHERE owner_token = $1",
+        )
+        .bind(orphan_token)
+        .execute(&pool)
+        .await
+        .expect("expire the fence row");
+        // A later operation replaces the app lease (deployment setup does
+        // not request the namespace fence) — the orphan's owner row is gone.
+        let replacement = claim(
+            &state,
+            app_id,
+            "deployment_setup",
+            Uuid::new_v4(),
+            false,
+            vec![],
+        )
+        .await
+        .expect("replacement claim without the namespace fence");
+
+        let repaired = reconcile_orphaned_custom_domain_fences(&pool)
+            .await
+            .expect("reconciler run");
+        assert!(
+            repaired >= 1,
+            "the fence is bounded even though its app lease was replaced"
+        );
+        let bounded = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "SELECT reclaim_after FROM external_resource_mutation_leases WHERE owner_token = $1 AND resource_scope = 'kubernetes_namespace'",
+        )
+        .bind(orphan_token)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch the bounded reclaim deadline");
+        assert!(bounded > chrono::Utc::now());
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn custom_domain_fence_reconciler_never_bounds_a_fence_with_live_owner() {
+        // The crash-between-renews shape: `renew` (app lease) and
+        // `renew_resources` (fence rows) are SEPARATE transactions, so a
+        // holder can crash between them leaving fence-EXPIRED +
+        // owner-LIVE. The NOT-EXISTS live-owner exclusion is what keeps
+        // the reconciler from bounding a live operation's fence (which
+        // would admit a concurrent same-scope mutation mid-operation).
+        // Mixed clocks — ONLY the fence row's clock is expired.
+        let pool = database_test_pool(2).await;
+        let (_org_id, app_id) = insert_app(&pool, "fence-mixed-clock.example.test").await;
+        let state = std::sync::Arc::new(state_with_pool(pool.clone()));
+        let fence_key = format!("cap-testing-fence-{}", uuid::Uuid::new_v4().simple());
+        let lease = claim(
+            &state,
+            app_id,
+            "custom_domain_set",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::new("kubernetes_namespace", &fence_key)],
+        )
+        .await
+        .expect("claim");
+        lease
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("arm");
+        // ONLY the fence row's clock lapses; the app lease stays live
+        // (heartbeat still running).
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases SET locked_until = clock_timestamp() - interval '1 second' WHERE owner_token = $1 AND resource_scope = 'kubernetes_namespace'",
+        )
+        .bind(lease.token)
+        .execute(&pool)
+        .await
+        .expect("lapse only the fence clock");
+
+        let repaired = reconcile_orphaned_custom_domain_fences(&pool)
+            .await
+            .expect("reconciler run");
+        assert_eq!(
+            repaired, 0,
+            "a fence whose owner lease is still live is never bounded"
+        );
+        let still_infinite: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM external_resource_mutation_leases WHERE reclaim_after = 'infinity'::timestamptz AND owner_token = $1 AND resource_scope = 'kubernetes_namespace'",
+        )
+        .bind(lease.token)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(still_infinite, 1, "the live owner's fence stays armed");
     }
 }

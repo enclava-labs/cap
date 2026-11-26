@@ -42,13 +42,22 @@ the workload-attested broker and validates retained state on the encrypted
   calls.
 - Invalid retained state aborts init without ordering a replacement
   certificate and without replacing the retained private key. This covers
-  malformed, untrusted, hostname-mismatched, and key-mismatched state, and
-  certificates that are expired but were *not* otherwise valid within their
-  own window (see renewal below). Recovery is explicit operator removal of
-  the stale `tls.crt`.
-- Only an actually missing certificate (`ENOENT`) starts issuance. A
-  certificate-less retained key is kept and reused for the new CSR, so an
-  interrupted first issuance retries with the same key.
+  malformed, untrusted, and key-mismatched state, and certificates that are
+  expired but were *not* otherwise valid within their own window (see
+  renewal below). Recovery is explicit operator removal of the stale
+  `tls.crt`.
+- One coverage exception: a retained chain that is otherwise trustworthy
+  (regular files, key binding, anchored path — re-checked with the
+  hostname test removed) but does not cover the configured hostname set is
+  re-ordered with the retained key instead of aborting: the configured set
+  can legitimately grow after the first deploy (a custom domain verified
+  on an already-deployed app). An un-parseable *configured* hostname is
+  NOT a coverage miss and still aborts.
+- Only an actually missing certificate (`ENOENT`) starts FIRST issuance
+  — distinct from the re-ordering paths above (coverage miss, renewal),
+  which run with `tls.crt` present. A certificate-less retained key is
+  kept and reused for the new CSR, so an interrupted first issuance
+  retries with the same key.
 - Fresh broker responses are validated with the same anchored checks before
   `tls.crt` is written.
 

@@ -1448,3 +1448,96 @@ fn transition_evidence_hash_binds_raw_snp_report_not_envelope() {
     short.report_b64 = base64::engine::general_purpose::STANDARD.encode([0x5a; 16]);
     assert!(super::transition_attestation_evidence_sha256(Some(&short), envelope).is_err());
 }
+
+#[test]
+fn last_init_stages_are_the_fixed_vocabulary() {
+    // Same literal vocabulary as cap-api `routes::status::LAST_INIT_STAGES`
+    // and enclava-paas `hosted_snapshot::LAST_INIT_STAGES`, revalidated at
+    // this trust boundary; the bind stage must be part of it.
+    assert_eq!(
+        super::LAST_INIT_STAGES,
+        [
+            "loading config",
+            "validating signed config",
+            "verifying trustee policy",
+            "waiting for owner seed",
+            "opening luks volumes",
+            "preparing mount ownership",
+            "provisioning static tls certificate",
+            "writing component seeds",
+            "waiting for workload containers",
+            "binding workload mount namespaces",
+            "seeding caddy runtime handoff",
+            "marking ready",
+        ]
+    );
+    assert!(super::LAST_INIT_STAGES.contains(&super::BIND_MOUNT_NAMESPACES_STAGE));
+}
+
+#[test]
+fn parses_the_reported_init_stage_into_the_summary() {
+    // The proxy merges the recorded stage into the bootstrap_error object
+    // (attestation-proxy bootstrap_diagnostics_for_status); an exact
+    // vocabulary match is carried and rendered, never echoed raw.
+    let body = serde_json::json!({
+        "bootstrap_error": {
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+            "last_init_stage": "binding workload mount namespaces",
+            "detail": SYNTHETIC_SECRET_MARKER,
+        }
+    });
+    let diagnostic = super::parse_terminal_bootstrap_error(&body).unwrap();
+    assert_eq!(diagnostic.code(), "enclava_init_failed");
+    assert_eq!(
+        diagnostic.last_init_stage(),
+        Some("binding workload mount namespaces")
+    );
+    assert_eq!(
+        diagnostic.stable_summary(),
+        "enclava_init_failed (init stage: binding workload mount namespaces)"
+    );
+    let with_deadline = serde_json::json!({
+        "bootstrap_error": {
+            "error": "acme_rate_limited",
+            "terminal": true,
+            "retry_after": "2027-01-01T12:00:00+00:00",
+            "last_init_stage": "provisioning static tls certificate",
+        }
+    });
+    let diagnostic = super::parse_terminal_bootstrap_error(&with_deadline).unwrap();
+    assert_eq!(
+        diagnostic.stable_summary(),
+        "acme_rate_limited (retry_after 2027-01-01T12:00:00Z) (init stage: provisioning static tls certificate)"
+    );
+}
+
+#[test]
+fn unknown_or_malformed_init_stage_is_dropped_not_the_diagnostic() {
+    // An unknown, malformed, or overlong stage is dropped (None); the
+    // recognized terminal diagnostic itself survives so the stop decision
+    // is unchanged.
+    for stage in [
+        serde_json::json!("marking super ready"),
+        serde_json::json!("BINDING WORKLOAD MOUNT NAMESPACES"),
+        serde_json::json!(""),
+        serde_json::Value::Null,
+        serde_json::json!(7),
+        serde_json::json!({ "stage": "loading config" }),
+        serde_json::json!(format!("binding {SYNTHETIC_SECRET_MARKER}")),
+    ] {
+        let body = serde_json::json!({
+            "bootstrap_error": {
+                "error": "enclava_init_failed",
+                "terminal": true,
+                "retry_after": null,
+                "last_init_stage": stage,
+            }
+        });
+        let diagnostic = super::parse_terminal_bootstrap_error(&body)
+            .unwrap_or_else(|| panic!("diagnostic must survive stage {stage:?}"));
+        assert_eq!(diagnostic.last_init_stage(), None, "stage {stage:?}");
+        assert_eq!(diagnostic.stable_summary(), "enclava_init_failed");
+    }
+}
