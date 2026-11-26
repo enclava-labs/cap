@@ -1604,6 +1604,90 @@ fn parses_the_reported_failed_step_into_the_summary() {
 }
 
 #[test]
+fn failed_steps_match_the_paired_contracts() {
+    // An INDEPENDENT literal, not the constant under test: the three
+    // hand-maintained copies of this vocabulary (this one, the producer's
+    // InitFailedStep::as_str, the proxy's INIT_FAILED_STEPS) drift
+    // discoverably — a typo or dropped entry here fails this pin instead
+    // of passing vacuously through inputs built from the constant.
+    assert_eq!(
+        super::TERMINAL_BOOTSTRAP_FAILED_STEPS,
+        [
+            "tls_decode_failed",
+            "tls_validate_failed",
+            "tls_write_failed",
+            "tls_handoff_failed",
+            "bind_sentinel_failed",
+            "bind_source_failed",
+            "bind_target_create_failed",
+            "bind_mount_failed",
+        ]
+    );
+}
+
+#[test]
+fn parses_the_proxy_status_shape_from_the_companion_pr() {
+    // The EXACT wire shape the proxy emits (attestation-proxy#21's
+    // status_json + the stage merge): parsed here as one fixture so a
+    // field-name or value mismatch between the two repos cannot slip
+    // through hand-built test JSON. Copied byte-for-byte from the proxy's
+    // own status test expectations.
+    let body = serde_json::json!({
+        "bootstrap_error": {
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+            "failed_step": "bind_target_create_failed",
+        }
+    });
+    let diagnostic = super::parse_terminal_bootstrap_error(&body).unwrap();
+    assert_eq!(diagnostic.code(), "enclava_init_failed");
+    assert_eq!(diagnostic.failed_step(), Some("bind_target_create_failed"));
+    assert_eq!(diagnostic.last_init_stage(), None);
+    // The merged-object shape the /status body carries once the stage file
+    // is read too (proxy bootstrap_diagnostics_for_status merges
+    // last_init_stage into the same object).
+    let body = serde_json::json!({
+        "bootstrap_error": {
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+            "last_init_stage": "binding workload mount namespaces",
+            "failed_step": "bind_target_create_failed",
+        }
+    });
+    let diagnostic = super::parse_terminal_bootstrap_error(&body).unwrap();
+    assert_eq!(
+        diagnostic.stable_summary(),
+        "enclava_init_failed (init stage: binding workload mount namespaces) (failed step: bind_target_create_failed)"
+    );
+}
+
+#[test]
+fn the_failed_step_sibling_renders_for_every_recognized_code() {
+    // The sibling is not init-failed-specific on the CLI side: every
+    // recognized code renders a step it carries (the PRODUCER only ever
+    // emits a step beside enclava_init_failed, and the proxy drops it
+    // otherwise, so this pins the parser's independence from the code).
+    for code in super::TERMINAL_BOOTSTRAP_ERROR_CODES {
+        let body = serde_json::json!({
+            "bootstrap_error": {
+                "error": code,
+                "terminal": true,
+                "retry_after": null,
+                "failed_step": "tls_handoff_failed",
+            }
+        });
+        let diagnostic = super::parse_terminal_bootstrap_error(&body).unwrap();
+        assert_eq!(diagnostic.failed_step(), Some("tls_handoff_failed"));
+        assert_eq!(
+            diagnostic.stable_summary(),
+            format!("{code} (failed step: tls_handoff_failed)")
+        );
+    }
+}
+
+#[test]
 fn unknown_or_malformed_failed_step_is_dropped_not_the_diagnostic() {
     // An unknown, malformed, or missing step is dropped (None); the
     // recognized terminal diagnostic itself survives so the fast terminal

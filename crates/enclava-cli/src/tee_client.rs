@@ -176,8 +176,12 @@ pub const TERMINAL_BOOTSTRAP_ERROR_CODES: [&str; 3] = [
 /// `bootstrap_error.failed_step` sibling (cap#428). The step is a SIBLING
 /// of the code, never a replacement for it: recognition stays keyed on the
 /// `error` code alone, so an unknown step can never turn a recognized
-/// diagnostic into `None`. Duplicated from the producer and the proxy by
-/// the same deliberate trust-boundary rule as the other vocabularies.
+/// diagnostic into `None`. PAIRED COPIES of this contract: the producer's
+/// `InitFailedStep::as_str` (enclava-labs/cap#433,
+/// crates/enclava-init/src/safe_diagnostics.rs) and the proxy's
+/// `INIT_FAILED_STEPS` (enclava-labs/attestation-proxy#21, src/handlers.rs)
+/// — the same deliberate trust-boundary rule as the other vocabularies,
+/// pinned across the three copies by the contract tests in each repo.
 pub const TERMINAL_BOOTSTRAP_FAILED_STEPS: [&str; 8] = [
     "tls_decode_failed",
     "tls_validate_failed",
