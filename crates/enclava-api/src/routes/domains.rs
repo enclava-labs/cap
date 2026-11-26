@@ -1003,11 +1003,19 @@ pub async fn verify_challenge(
     {
         Ok(outcome) => outcome,
         Err(_) => {
-            // cap#422: durable renewal was lost mid-reapply. The ingress
-            // ConfigMap write may still land server-side (a missing-object
-            // create has no version to fence it), so the namespace fence
-            // stays quarantined until reclaim instead of being released.
-            quarantine_mutation_and_rollback_lane(&mutation, app_lane).await?;
+            // cap#422 R2 round 4 (review 4703156939): durable renewal was
+            // lost mid-reapply. The tenant-ingress write is APP-SCOPED
+            // state -- reapply_tenant_ingress SSA-applies the app's own
+            // ConfigMap in its namespace (deploy.rs:6961-6962) and patches
+            // its StatefulSet restart annotation; the shared route
+            // publish starts only after this step returns, so no edge
+            // request is in flight and the cross-app edge_config fence is
+            // released. The app's own fences (its namespace, dns/edge for
+            // its domains) stay quarantined: the uncertain ConfigMap
+            // write may still land server-side and a missing-object
+            // create has no version to fence it.
+            quarantine_mutation_and_rollback_lane_releasing_edge_config(&mutation, app_lane)
+                .await?;
             return Err(internal_error());
         }
     };
@@ -1972,6 +1980,395 @@ mod tests {
     /// reclaim (RECLAIM_QUARANTINE_SECONDS) instead of being released
     /// while a Kubernetes/DNS request can still land server-side. The
     /// staged business writes are still rolled back.
+    /// cap#422 R2 round 4 (review 4703156939): renewal lost mid
+    /// tenant-ingress reapply, on the REAL verify path. The tenant-ingress
+    /// write is the APP's OWN ConfigMap (deploy.rs:6961-6962: SSA-applied
+    /// in the app's namespace) plus its StatefulSet restart annotation --
+    /// not edge state; the shared route publish starts only after that
+    /// step returns (domains.rs:1064-1079). So this arm releases the
+    /// cross-app edge_config fence while the app-scoped ones (its
+    /// namespace, dns/edge for BOTH the old and the new domain) stay
+    /// quarantined until reclaim_after.
+    #[sqlx::test]
+    async fn tenant_ingress_renewal_loss_releases_the_cross_app_fence(pool: sqlx::PgPool) {
+        use crate::auth::middleware::ManagementOrigin;
+        use crate::models::Role;
+
+        let mut state = crate::test_support::lazy_state();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        state.db = pool.clone();
+        let (app, _deployment_id, _lease, _payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        let (kube, _kube_task) = hanging_ingress_kube(&app.name).await;
+        state.kube_client = kube;
+
+        let old_domain = "tenant-ingress-old.example-test.com";
+        let domain = "tenant-ingress-new.example-test.com";
+        // A CHANGED domain: the restart-admission engine is Some (its
+        // kube gate passes against the fake), and the re-verify reaches
+        // the tenant-ingress reapply.
+        sqlx::query("UPDATE apps SET custom_domain = $1 WHERE id = $2")
+            .bind(old_domain)
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("pin the app to the old domain");
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'ingress-loss tester')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert the verifying user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("insert the owner membership");
+        let token = "tenant-ingress-loss-token";
+        let challenge_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO custom_domain_challenges
+                 (id, app_id, domain, challenge_token, expires_at)
+             VALUES ($1, $2, $3, $4, now() + interval '1 hour')",
+        )
+        .bind(challenge_id)
+        .bind(app.id)
+        .bind(domain)
+        .bind(token)
+        .execute(&pool)
+        .await
+        .expect("insert the domain challenge");
+        let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
+        TXT_TEST_ANSWERS.lock().expect("txt answers lock").push((
+            txt_name.clone(),
+            vec![format!("enclava-domain-verification={token}")],
+        ));
+
+        let auth = AuthContext {
+            user_id,
+            org_id: app.org_id,
+            org_name: format!("durable-{}", app.org_id),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: ManagementOrigin::Public,
+        };
+        let app_name = app.name.clone();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            crate::routes::domains::verify_challenge(
+                auth,
+                State(task_state),
+                Path((app_name, domain.to_string())),
+            )
+            .await
+        });
+
+        // Wait for the handler to claim the mutation (it then runs the
+        // DNS-tracking write, passes admission against the fake kube, and
+        // hangs in the tenant-ingress ConfigMap apply).
+        let claim_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut task = task;
+        loop {
+            tokio::select! {
+                settled = &mut task => {
+                    panic!("the verify settled before the renewal loss: {settled:?}");
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+            }
+            let claimed: bool = sqlx::query_scalar(
+                "SELECT owner_token IS NOT NULL FROM app_mutation_leases WHERE app_id = $1",
+            )
+            .bind(app.id)
+            .fetch_optional(&pool)
+            .await
+            .expect("poll the app mutation lease")
+            .unwrap_or(false);
+            if claimed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < claim_deadline,
+                "the verify never claimed the mutation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Block the heartbeat's renewal on the app lease row past the 2s
+        // test renew timeout while the ConfigMap apply is in flight.
+        {
+            let mut renewal_blocker = pool.begin().await.expect("begin the renewal blocker");
+            sqlx::query("UPDATE app_mutation_leases SET updated_at = updated_at WHERE app_id = $1")
+                .bind(app.id)
+                .execute(&mut *renewal_blocker)
+                .await
+                .expect("lock the app mutation lease row");
+            tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+            renewal_blocker
+                .rollback()
+                .await
+                .expect("release the renewal blocker");
+        }
+
+        // The guard aborted (renewal lost mid-tenant-ingress) and the arm
+        // ran. The join is deadline-bounded.
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("the verify must settle within the test deadline")
+            .expect("the verify task must join")
+            .expect_err("the renewal loss must fail the verify");
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // The lane rolled back: the staged verified_at write is gone.
+        let verified_at: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT verified_at FROM custom_domain_challenges WHERE id = $1")
+                .bind(challenge_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the challenge row");
+        assert!(
+            verified_at.is_none(),
+            "the staged verified_at write must roll back with the lane"
+        );
+
+        // The APP-SCOPED fences stay quarantined until reclaim_after: the
+        // app's own namespace and dns/edge for BOTH the old and the new
+        // domain (the uncertain ConfigMap write and the old domain's
+        // cleanup are exactly what they guard).
+        for (scope, key) in [
+            ("kubernetes_namespace", app.namespace.clone()),
+            ("dns_hostname", old_domain.to_string()),
+            ("edge_route", old_domain.to_string()),
+            ("dns_hostname", domain.to_string()),
+            ("edge_route", domain.to_string()),
+        ] {
+            let owner: Option<Uuid> = sqlx::query_scalar(
+                "SELECT owner_token FROM external_resource_mutation_leases
+                  WHERE resource_scope = $1 AND resource_key = $2",
+            )
+            .bind(scope)
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|_| panic!("read the {scope}/{key} fence row"));
+            assert!(
+                owner.is_some(),
+                "{scope}/{key} must stay quarantined until reclaim_after"
+            );
+        }
+
+        // THE ROUND-4 PROPERTY: the tenant-ingress write is app-scoped
+        // state, so the cross-app edge_config fence is RELEASED here too.
+        let edge_owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT owner_token FROM external_resource_mutation_leases
+              WHERE resource_scope = 'edge_config' AND resource_key = 'global'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read the edge_config fence row");
+        assert!(
+            edge_owner.is_none(),
+            "the cross-app edge_config fence must be released after the tenant-ingress renewal loss"
+        );
+        match crate::mutation_leases::claim_resources(
+            &state,
+            "deployment-apply-test",
+            Uuid::new_v4(),
+            vec![crate::mutation_leases::ResourceFence::edge_config()],
+        )
+        .await
+        {
+            Ok(_lease) => {}
+            Err(error) => panic!(
+                "an unrelated app's deployment apply must be able to claim edge_config now: {error}"
+            ),
+        }
+
+        TXT_TEST_ANSWERS
+            .lock()
+            .expect("txt answers lock")
+            .retain(|(name, _)| name != &txt_name);
+    }
+
+    /// cap#422 R2 round 4 (review 4703157106): the EDGE-WRITE arm —
+    /// renewal lost mid HAProxy route PUBLISH, on the REAL verify path.
+    /// The route publish writes the SHARED edge config (the edge
+    /// namespace's HAProxy ConfigMap); the request is in flight when the
+    /// renewal dies, and a freed edge_config fence would let an unrelated
+    /// deployment's reconcile claim the next generation and adopt the
+    /// post-write config as its base — so THIS arm keeps the full
+    /// quarantine, edge_config included, and an unrelated deployment
+    /// apply requeues instead of proceeding.
+    #[sqlx::test]
+    async fn route_publish_renewal_loss_keeps_the_shared_edge_fence(pool: sqlx::PgPool) {
+        use crate::auth::middleware::ManagementOrigin;
+        use crate::models::Role;
+
+        let mut state = crate::test_support::lazy_state();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        state.db = pool.clone();
+        let (app, _deployment_id, _lease, _payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        let (kube, _kube_task) = hanging_ingress_kube(&app.name).await;
+        state.kube_client = kube;
+        let domain = "route-publish-loss.example-test.com";
+        sqlx::query("UPDATE apps SET custom_domain = $1 WHERE id = $2")
+            .bind(domain)
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("pin the app to the same domain");
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'publish-loss tester')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert the verifying user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("insert the owner membership");
+        let token = "route-publish-loss-token";
+        let challenge_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO custom_domain_challenges
+                 (id, app_id, domain, challenge_token, expires_at)
+             VALUES ($1, $2, $3, $4, now() + interval '1 hour')",
+        )
+        .bind(challenge_id)
+        .bind(app.id)
+        .bind(domain)
+        .bind(token)
+        .execute(&pool)
+        .await
+        .expect("insert the domain challenge");
+        let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
+        TXT_TEST_ANSWERS.lock().expect("txt answers lock").push((
+            txt_name.clone(),
+            vec![format!("enclava-domain-verification={token}")],
+        ));
+
+        let auth = AuthContext {
+            user_id,
+            org_id: app.org_id,
+            org_name: format!("durable-{}", app.org_id),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: ManagementOrigin::Public,
+        };
+        let app_name = app.name.clone();
+        let task_state = state.clone();
+        let mut task = tokio::spawn(async move {
+            crate::routes::domains::verify_challenge(
+                auth,
+                State(task_state),
+                Path((app_name, domain.to_string())),
+            )
+            .await
+        });
+
+        // Wait for the claim; the handler then runs the DNS-tracking
+        // write, resolves the app Service against the fake (Deployed) and
+        // hangs inside the route publish's edge ConfigMap write.
+        let claim_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            tokio::select! {
+                settled = &mut task => {
+                    panic!("the verify settled before the renewal loss: {settled:?}");
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+            }
+            let claimed: bool = sqlx::query_scalar(
+                "SELECT owner_token IS NOT NULL FROM app_mutation_leases WHERE app_id = $1",
+            )
+            .bind(app.id)
+            .fetch_optional(&pool)
+            .await
+            .expect("poll the app mutation lease")
+            .unwrap_or(false);
+            if claimed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < claim_deadline,
+                "the verify never claimed the mutation"
+            );
+        }
+
+        // Block the heartbeat's renewal past the 2s test renew timeout
+        // while the edge ConfigMap write is in flight.
+        {
+            let mut renewal_blocker = pool.begin().await.expect("begin the renewal blocker");
+            sqlx::query("UPDATE app_mutation_leases SET updated_at = updated_at WHERE app_id = $1")
+                .bind(app.id)
+                .execute(&mut *renewal_blocker)
+                .await
+                .expect("lock the app mutation lease row");
+            tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+            renewal_blocker
+                .rollback()
+                .await
+                .expect("release the renewal blocker");
+        }
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("the verify must settle within the test deadline")
+            .expect("the verify task must join")
+            .expect_err("the renewal loss must fail the verify");
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // The lane rolled back: the staged verified_at write is gone.
+        let verified_at: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT verified_at FROM custom_domain_challenges WHERE id = $1")
+                .bind(challenge_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the challenge row");
+        assert!(
+            verified_at.is_none(),
+            "the staged verified_at write must roll back with the lane"
+        );
+
+        // THE ROUND-4 KEEP PROPERTY: the edge write is in flight, so the
+        // cross-app edge_config fence STAYS quarantined until
+        // reclaim_after — an unrelated deployment apply must NOT be able
+        // to claim it (it requeues, exactly as deployment apply does
+        // against a held fence).
+        let edge_owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT owner_token FROM external_resource_mutation_leases
+              WHERE resource_scope = 'edge_config' AND resource_key = 'global'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read the edge_config fence row");
+        assert!(
+            edge_owner.is_some(),
+            "the edge_config fence must stay quarantined while the route publish is unresolved"
+        );
+        match crate::mutation_leases::claim_resources(
+            &state,
+            "deployment-apply-test",
+            Uuid::new_v4(),
+            vec![crate::mutation_leases::ResourceFence::edge_config()],
+        )
+        .await
+        {
+            Ok(_lease) => panic!(
+                "an unrelated deployment apply must NOT claim edge_config while the route publish is unresolved"
+            ),
+            Err(crate::mutation_leases::MutationLeaseError::Busy) => {}
+            Err(error) => panic!("the unrelated claim should be Busy, got {error}"),
+        }
+
+        TXT_TEST_ANSWERS
+            .lock()
+            .expect("txt answers lock")
+            .retain(|(name, _)| name != &txt_name);
+    }
+
     /// cap#422 R2 round 3: the EDGE-WRITE arms keep the full quarantine —
     /// an in-flight ConfigMap write can still land, and a freed
     /// edge_config fence would let an unrelated deployment's reconcile
@@ -2026,6 +2423,152 @@ mod tests {
             still_owned, 4,
             "every fence stays quarantined on an edge-write arm, edge_config included"
         );
+    }
+
+    /// A minimal kube API stand-in for driving the REAL verify path past
+    /// the restart-admission gate and INTO a provider call (round 4): the
+    /// StatefulSet GET answers 200 (admission verdict: Ready), the PVC
+    /// list answers empty, and the tenant-ingress ConfigMap apply is
+    /// never answered -- the provider future hangs mid-write, exactly
+    /// where a lost renewal must abort it.
+    async fn hanging_ingress_kube(workload: &str) -> (kube::Client, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the fake kube listener");
+        let port = listener.local_addr().unwrap().port();
+        let workload = workload.to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let workload = workload.clone();
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    loop {
+                        // Read one request head (and its body) so routing
+                        // can look at the method and path.
+                        let mut head = Vec::new();
+                        let mut byte = [0u8; 1];
+                        loop {
+                            match stream.readable().await {
+                                Ok(()) => {}
+                                Err(_) => return,
+                            }
+                            match stream.try_read(&mut byte) {
+                                Ok(0) => return,
+                                Ok(1) => {
+                                    head.push(byte[0]);
+                                    if head.ends_with(b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    continue;
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                        let head_text = String::from_utf8_lossy(&head).to_string();
+                        let mut lines = head_text.lines();
+                        let request_line = lines.next().unwrap_or_default().to_string();
+                        let mut content_length = 0usize;
+                        for line in lines {
+                            if let Some(value) =
+                                line.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0u8; content_length];
+                        if content_length > 0 {
+                            use tokio::io::AsyncReadExt;
+                            let _ = stream.read_exact(&mut body).await;
+                        }
+                        let parts: Vec<&str> = request_line.split_whitespace().collect();
+                        let method = parts.first().copied().unwrap_or("");
+                        let path = parts.get(1).copied().unwrap_or("");
+                        fn respond(status: &str, body: &str) -> String {
+                            format!(
+                                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: keep-alive\r\ncontent-length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                        }
+                        let response = if path.contains("statefulsets") && method == "GET" {
+                            Some(respond(
+                                "200 OK",
+                                "{\"apiVersion\":\"apps/v1\",\"kind\":\"StatefulSet\",\"metadata\":{\"name\":\"app\"},\"spec\":{},\"status\":{}}",
+                            ))
+                        } else if path.contains("persistentvolumeclaims") && method == "GET" {
+                            // A provisioned claim older than the pod below,
+                            // so the pod proves it initialized (admission
+                            // verdict: Ready).
+                            Some(respond(
+                                "200 OK",
+                                "{\"apiVersion\":\"v1\",\"kind\":\"PersistentVolumeClaim\",\"metadata\":{\"name\":\"claim\",\"creationTimestamp\":\"2020-01-01T00:00:00Z\"}}",
+                            ))
+                        } else if path.contains("pods") {
+                            let claim = enclava_engine::manifest::volumes::provisioned_claim_name(
+                                "state", &workload,
+                            );
+                            let tls_claim =
+                                enclava_engine::manifest::volumes::provisioned_claim_name(
+                                    "tls-state",
+                                    &workload,
+                                );
+                            let pod = format!(
+                                "{{\"apiVersion\":\"v1\",\"kind\":\"PodList\",\"metadata\":{{}},\"items\":[{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"name\":\"pod\",\"creationTimestamp\":\"2021-01-01T00:00:00Z\"}},\"spec\":{{\"volumes\":[{{\"name\":\"v0\",\"persistentVolumeClaim\":{{\"claimName\":\"{claim}\"}}}},{{\"name\":\"v1\",\"persistentVolumeClaim\":{{\"claimName\":\"{tls_claim}\"}}}}]}},\"status\":{{\"conditions\":[{{\"type\":\"Ready\",\"status\":\"True\"}}]}}}}]}}"
+                            );
+                            Some(respond("200 OK", &pod))
+                        } else if path.contains("configmaps")
+                            && method == "GET"
+                            && path.contains("tenant-envoy")
+                        {
+                            // The SHARED edge config exists and parses as
+                            // an empty HAProxy config; the route publish's
+                            // write to it is what hangs below.
+                            Some(respond(
+                                "200 OK",
+                                "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"haproxy-tenant\",\"namespace\":\"tenant-envoy\"},\"data\":{\"haproxy.cfg\":\"global\\n\"}}",
+                            ))
+                        } else if path.contains("configmaps") && method == "GET" {
+                            Some(respond(
+                                "404 Not Found",
+                                "{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404,\"message\":\"not found\"}",
+                            ))
+                        } else if path.contains("configmaps") {
+                            // The tenant-ingress ConfigMap SSA apply: never
+                            // answer. The provider future stays in flight
+                            // until the renewal loss aborts it.
+                            None
+                        } else {
+                            Some(respond("200 OK", "{}"))
+                        };
+                        match response {
+                            Some(response) => {
+                                use tokio::io::AsyncWriteExt;
+                                if stream.write_all(response.as_bytes()).await.is_err() {
+                                    return;
+                                }
+                            }
+                            None => {
+                                // Hold the connection open without
+                                // responding until the client goes away.
+                                loop {
+                                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let client = kube::Client::try_from(kube::Config::new(
+            format!("http://127.0.0.1:{port}").parse().unwrap(),
+        ))
+        .expect("build the fake kube client");
+        (client, task)
     }
 
     /// cap#422 R2 (review T1 + T2): drives the REAL verify path
