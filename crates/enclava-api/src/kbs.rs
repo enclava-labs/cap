@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
-use kube::api::{Api, PostParams};
+use kube::api::{Api, ListParams, PostParams};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1697,13 +1697,58 @@ pub(crate) enum TeardownLivePodError {
     #[error("database error")]
     Db(#[from] sqlx::Error),
     #[error("kubernetes unavailable")]
-    KubernetesUnavailable,
+    KubernetesUnavailable {
+        /// Why the kube read failed, for the refusal log only. NEVER
+        /// surfaced on the wire: the 502 code and body stay byte-identical
+        /// and the stop-signal code set stays closed on its consumers.
+        cause: KubeProbeCause,
+    },
     #[error("owned ordinal pod has no provable deployment identity")]
     Unnamed,
     #[error("named live pod is not in the teardown unit")]
     Uncovered,
     #[error("teardown unit could not be projected")]
     Projection,
+}
+
+/// Why the pod probe's kube read failed. Carried to the refusal WARN line
+/// only (tom-h's D2): the incident spent half an hour misdiagnosed as a
+/// network outage because a 403 collapsed into "kubernetes unavailable".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KubeProbeCause {
+    /// The apiserver answered a refusal (HTTP 403).
+    Forbidden,
+    /// TEARDOWN_POD_PROBE_TIMEOUT elapsed before an answer.
+    Timeout,
+    /// Anything else: transport failure, other API error, or an apiserver
+    /// answer that cannot be a point query's result.
+    Other,
+}
+
+impl KubeProbeCause {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Forbidden => "forbidden",
+            Self::Timeout => "timeout",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for KubeProbeCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Classify a kube error for the refusal log. Only a 403 is "forbidden";
+/// the code never branches on it (fail closed stands), it only names the
+/// class at the refusal.
+const fn kube_probe_cause(error: &kube::Error) -> KubeProbeCause {
+    match error {
+        kube::Error::Api(api_error) if api_error.code == 403 => KubeProbeCause::Forbidden,
+        _ => KubeProbeCause::Other,
+    }
 }
 
 /// Published generation strictly between the newest completed job and the
@@ -1886,20 +1931,42 @@ pub(crate) async fn observe_owned_ordinal_pod(
     let sets: Api<k8s_openapi::api::apps::v1::StatefulSet> =
         Api::namespaced(client.clone(), namespace);
     let pod_name = enclava_engine::manifest::volumes::provisioned_pod_name(app_name);
+    // A namespaced LIST with a metadata.name field selector is a
+    // server-side point query the role already authorizes with `list`. The
+    // role deliberately grants no `get` on pods: in this cluster that also
+    // authorizes `get pods/log` (tenant pod logs). Same observable
+    // semantics as the named GET it replaces: an empty list is the 404->None
+    // equivalence, and any error fails closed.
+    let list_params = ListParams::default().fields(&format!("metadata.name={pod_name}"));
     let observed = tokio::time::timeout(TEARDOWN_POD_PROBE_TIMEOUT, async {
-        tokio::try_join!(pods.get_opt(&pod_name), sets.get_opt(app_name))
+        tokio::try_join!(pods.list(&list_params), sets.get_opt(app_name))
     })
     .await;
     match observed {
-        Ok(Ok((None, _))) => Ok(OwnedPodIdentity::Absent),
-        Ok(Ok((Some(_), None))) => Ok(OwnedPodIdentity::Unnamed),
-        Ok(Ok((Some(pod), Some(statefulset)))) => {
-            let Some(uid) = statefulset.metadata.uid.as_deref() else {
-                return Ok(OwnedPodIdentity::Unnamed);
-            };
-            Ok(owned_ordinal_pod_deployment_id(&pod, app_name, uid))
+        Ok(Ok((pod_list, statefulset))) => {
+            let mut pods = pod_list.items.into_iter();
+            match (pods.next(), pods.next(), statefulset) {
+                (None, _, _) => Ok(OwnedPodIdentity::Absent),
+                // A metadata.name-selected list cannot contain two items;
+                // if the apiserver ever answers otherwise, never guess.
+                (Some(_), Some(_), _) => Err(TeardownLivePodError::KubernetesUnavailable {
+                    cause: KubeProbeCause::Other,
+                }),
+                (Some(_), None, None) => Ok(OwnedPodIdentity::Unnamed),
+                (Some(pod), None, Some(statefulset)) => {
+                    let Some(uid) = statefulset.metadata.uid.as_deref() else {
+                        return Ok(OwnedPodIdentity::Unnamed);
+                    };
+                    Ok(owned_ordinal_pod_deployment_id(&pod, app_name, uid))
+                }
+            }
         }
-        Ok(Err(_)) | Err(_) => Err(TeardownLivePodError::KubernetesUnavailable),
+        Ok(Err(error)) => Err(TeardownLivePodError::KubernetesUnavailable {
+            cause: kube_probe_cause(&error),
+        }),
+        Err(_) => Err(TeardownLivePodError::KubernetesUnavailable {
+            cause: KubeProbeCause::Timeout,
+        }),
     }
 }
 
@@ -10302,6 +10369,237 @@ resource_bindings := {
             }),
             ..k8s_openapi::api::core::v1::Pod::default()
         }
+    }
+
+    /// What the probe fake answers for the pods LIST. A Hang never resolves,
+    /// so only the probe's own 5 s bound can end it.
+    #[derive(Clone)]
+    enum ProbePods {
+        Items(Vec<k8s_openapi::api::core::v1::Pod>),
+        Forbidden,
+        Hang,
+    }
+
+    /// A minimal in-memory apiserver for `observe_owned_ordinal_pod`: serves
+    /// the namespaced pods LIST (the field-selected point query this change
+    /// sends instead of the named GET the role deliberately does not grant)
+    /// and the named statefulsets GET, recording every request's method,
+    /// path, and query so the tests can pin the wire shape.
+    struct ProbeFake {
+        pods: ProbePods,
+        statefulset: Option<k8s_openapi::api::apps::v1::StatefulSet>,
+        queries: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ProbeFake {
+        fn client(&self) -> kube::Client {
+            let pods = self.pods.clone();
+            let statefulset = self.statefulset.clone();
+            let queries = self.queries.clone();
+            kube::Client::new(
+                tower::service_fn(move |request: axum::http::Request<kube::client::Body>| {
+                    let pods = pods.clone();
+                    let statefulset = statefulset.clone();
+                    let queries = queries.clone();
+                    async move {
+                        let (method, path, query) = (
+                            request.method().clone(),
+                            request.uri().path().to_string(),
+                            request.uri().query().unwrap_or_default().to_string(),
+                        );
+                        queries
+                            .lock()
+                            .await
+                            .push(format!("{method} {path}?{query}"));
+                        let status_json = |code: u16, reason: &str| {
+                            serde_json::to_vec(&serde_json::json!({
+                                "kind": "Status",
+                                "apiVersion": "v1",
+                                "status": "Failure",
+                                "message": "fake probe rejection",
+                                "reason": reason,
+                                "code": code,
+                            }))
+                            .unwrap()
+                        };
+                        let response = |code: u16, body: Vec<u8>| {
+                            Ok::<_, std::io::Error>(
+                                axum::http::Response::builder()
+                                    .status(code)
+                                    .body(kube::client::Body::from(body))
+                                    .unwrap(),
+                            )
+                        };
+                        if path.ends_with("/pods") {
+                            match pods {
+                                ProbePods::Items(items) => {
+                                    let list = kube::core::ObjectList {
+                                        items,
+                                        types: kube::core::TypeMeta {
+                                            kind: "PodList".to_string(),
+                                            api_version: "v1".to_string(),
+                                        },
+                                        metadata: Default::default(),
+                                    };
+                                    response(
+                                        200,
+                                        serde_json::to_vec(&list).map_err(std::io::Error::other)?,
+                                    )
+                                }
+                                ProbePods::Forbidden => {
+                                    response(403, status_json(403, "Forbidden"))
+                                }
+                                ProbePods::Hang => std::future::pending().await,
+                            }
+                        } else if path.contains("/statefulsets/") {
+                            match statefulset {
+                                Some(set) => response(
+                                    200,
+                                    serde_json::to_vec(&set).map_err(std::io::Error::other)?,
+                                ),
+                                None => response(404, status_json(404, "NotFound")),
+                            }
+                        } else {
+                            unreachable!("unexpected probe request {path}")
+                        }
+                    }
+                }),
+                "default",
+            )
+        }
+    }
+
+    fn probe_statefulset(app_name: &str) -> k8s_openapi::api::apps::v1::StatefulSet {
+        k8s_openapi::api::apps::v1::StatefulSet {
+            metadata: kube::core::ObjectMeta {
+                name: Some(app_name.to_string()),
+                uid: Some("sts-uid".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    async fn probe_decision(fake: &ProbeFake) -> Result<OwnedPodIdentity, TeardownLivePodError> {
+        observe_owned_ordinal_pod(&fake.client(), "tenant-ns", "app-live").await
+    }
+
+    #[tokio::test]
+    async fn probe_reads_the_named_pod_through_the_field_selected_list() {
+        // The transport now rides `list` + fieldSelector metadata.name=<pod>
+        // because the role grants pods list/watch/delete but deliberately no
+        // `get` (in this cluster get pods also authorizes get pods/log).
+        let deployment_id = Uuid::new_v4();
+        let pod = teardown_ordinal_pod("app-live", Some(&deployment_id.to_string()), true, false);
+        let fake = ProbeFake {
+            pods: ProbePods::Items(vec![pod]),
+            statefulset: Some(probe_statefulset("app-live")),
+            queries: Default::default(),
+        };
+        assert!(matches!(
+            probe_decision(&fake).await,
+            Ok(OwnedPodIdentity::Named(named)) if named == deployment_id
+        ));
+        let requests = fake.queries.lock().await;
+        assert!(
+            requests.iter().any(|request| request
+                .starts_with("GET /api/v1/namespaces/tenant-ns/pods?")
+                && request.ends_with("fieldSelector=metadata.name%3Dapp-live-0")),
+            "the probe must pin the field-selected LIST: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_empty_list_is_the_absent_equivalence() {
+        // The get_opt-404 -> None case: an empty list means the pod is gone.
+        let fake = ProbeFake {
+            pods: ProbePods::Items(Vec::new()),
+            statefulset: Some(probe_statefulset("app-live")),
+            queries: Default::default(),
+        };
+        assert!(matches!(
+            probe_decision(&fake).await,
+            Ok(OwnedPodIdentity::Absent)
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_missing_statefulset_is_unnamed() {
+        // A pod without its StatefulSet cannot be proven an owned ordinal.
+        let deployment_id = Uuid::new_v4();
+        let pod = teardown_ordinal_pod("app-live", Some(&deployment_id.to_string()), true, false);
+        let fake = ProbeFake {
+            pods: ProbePods::Items(vec![pod]),
+            statefulset: None,
+            queries: Default::default(),
+        };
+        assert!(matches!(
+            probe_decision(&fake).await,
+            Ok(OwnedPodIdentity::Unnamed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_forbidden_list_fails_closed_and_names_its_cause() {
+        // The 403 that broke dev: the delete is refused (fail closed), and
+        // the cause class reaches the refusal log — the code set and the
+        // 502 body stay exactly as they were.
+        let fake = ProbeFake {
+            pods: ProbePods::Forbidden,
+            statefulset: Some(probe_statefulset("app-live")),
+            queries: Default::default(),
+        };
+        assert!(
+            matches!(
+                probe_decision(&fake).await,
+                Err(TeardownLivePodError::KubernetesUnavailable {
+                    cause: KubeProbeCause::Forbidden
+                })
+            ),
+            "the 403 fails closed with the forbidden cause class"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_timeout_fails_closed_with_the_timeout_cause() {
+        // A hanging apiserver is ended only by TEARDOWN_POD_PROBE_TIMEOUT;
+        // paused tokio time fires it without a real 5 s sleep.
+        let fake = ProbeFake {
+            pods: ProbePods::Hang,
+            statefulset: Some(probe_statefulset("app-live")),
+            queries: Default::default(),
+        };
+        assert!(
+            matches!(
+                probe_decision(&fake).await,
+                Err(TeardownLivePodError::KubernetesUnavailable {
+                    cause: KubeProbeCause::Timeout
+                })
+            ),
+            "the 5 s bound ends a hanging apiserver with the timeout cause"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_duplicate_named_items_never_guess() {
+        // A metadata.name-selected list cannot hold two items; if an
+        // apiserver ever answers otherwise, fail closed rather than pick.
+        let deployment_id = Uuid::new_v4();
+        let pod = teardown_ordinal_pod("app-live", Some(&deployment_id.to_string()), true, false);
+        let fake = ProbeFake {
+            pods: ProbePods::Items(vec![pod.clone(), pod]),
+            statefulset: Some(probe_statefulset("app-live")),
+            queries: Default::default(),
+        };
+        assert!(
+            matches!(
+                probe_decision(&fake).await,
+                Err(TeardownLivePodError::KubernetesUnavailable {
+                    cause: KubeProbeCause::Other
+                })
+            ),
+            "two items for one name is not a point query; never guess"
+        );
     }
 
     #[test]
