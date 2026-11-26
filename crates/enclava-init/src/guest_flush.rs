@@ -576,22 +576,61 @@ mod tests {
         // epoch being dropped).
         let epoch =
             signal_safe_monotonic_nanos().saturating_sub(Duration::from_secs(5).as_nanos() as u64);
-        let (_reports, outcome) = execute_teardown_since_epoch(
+        // Instant GuestSync ops (Recorder) so no real writeback can mask a
+        // clock regression: with no siblings and a zero initial wait the
+        // loop never sleeps, and the reported wait is exactly the distance
+        // from the epoch.
+        let mut ops = Recorder {
+            calls: Vec::new(),
+            fail_suffix: "never",
+        };
+        let (_reports, outcome) = execute_teardown_with(
             &TeardownRequest {
                 mounts: &[],
                 siblings: &[],
                 initial_wait: Duration::ZERO,
                 deadline: TEARDOWN_DEADLINE,
             },
+            &mut ops,
             |_| Vec::new(),
             |_| {},
-            epoch,
+            || Duration::from_nanos(signal_safe_monotonic_nanos().saturating_sub(epoch)),
         );
         assert!(
-            outcome.waited >= Duration::from_secs(5),
-            "the epoch must be the clock's origin: {:?}",
+            outcome.waited >= Duration::from_secs(5) && outcome.waited < Duration::from_secs(7),
+            "the epoch must be the clock's origin, with nothing else adding time: {:?}",
             outcome.waited
         );
+    }
+
+    #[test]
+    fn teardown_skips_the_periodic_flush_due_exactly_at_the_deadline() {
+        // Round 3: a periodic flush coming due exactly AS the clock reaches
+        // the deadline must be skipped — the final boundary flush covers
+        // it, and running both would spend two writebacks inside the time
+        // the grace period reserves for the last one. With instant
+        // flushes, 100 ms initial wait, and RELUSH_INTERVAL = 5 s, the
+        // re-flush at 5.1 s schedules the next for exactly the 10.1 s
+        // deadline: nothing may run there except the final flush.
+        let clock = FakeClock::new();
+        let mut flushes = 0;
+        let outcome = run_teardown_flush(
+            &[SiblingProcess {
+                pid: 9,
+                start_time_ticks: Some(1),
+            }],
+            Duration::from_millis(100),
+            Duration::from_millis(10_100),
+            |_| flushes += 1,
+            |_| vec![9],
+            clock.sleeping(),
+            clock.now(),
+        );
+        assert_eq!(
+            flushes, 4,
+            "signal, after-siblings, ONE re-flush at 5.1 s, final — the pass due              exactly at the deadline is skipped"
+        );
+        assert_eq!(outcome.after_sibling_flushes, 3);
     }
 
     #[test]
