@@ -694,6 +694,31 @@ mod tests {
     /// variables and the process-global stage tracker.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Captures an environment variable and restores it on drop, so a
+    /// panicking (or early-returning) test can never leak its override into
+    /// the rest of the test-binary process.
+    struct EnvRestoreGuard {
+        var: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestoreGuard {
+        fn set(var: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(var);
+            unsafe { std::env::set_var(var, value) };
+            Self { var, previous }
+        }
+    }
+
+    impl Drop for EnvRestoreGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.var, value) },
+                None => unsafe { std::env::remove_var(self.var) },
+            }
+        }
+    }
+
     fn test_config() -> Config {
         Config {
             mode: Mode::Autounlock,
@@ -741,34 +766,17 @@ mod tests {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         // A container that never appears: the wait exhausts its (short)
-        // timeout and the failure carries the sentinel step.
-        let previous_containers = std::env::var_os("ENCLAVA_INIT_WAIT_FOR_CONTAINERS");
-        let previous_dir = std::env::var_os("ENCLAVA_INIT_STARTED_DIR");
-        let previous_timeout = std::env::var_os("ENCLAVA_INIT_WAIT_FOR_CONTAINERS_TIMEOUT_SECONDS");
-        unsafe {
-            std::env::set_var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", "never-starts");
-            std::env::set_var("ENCLAVA_INIT_STARTED_DIR", dir.path().join("started"));
-            std::env::set_var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS_TIMEOUT_SECONDS", "1");
-        }
+        // timeout and the failure carries the sentinel step. The guards
+        // restore every override on drop, so nothing leaks.
+        let _containers = EnvRestoreGuard::set("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", "never-starts");
+        let _started_dir = EnvRestoreGuard::set(
+            "ENCLAVA_INIT_STARTED_DIR",
+            &dir.path().join("started").to_string_lossy(),
+        );
+        let _timeout =
+            EnvRestoreGuard::set("ENCLAVA_INIT_WAIT_FOR_CONTAINERS_TIMEOUT_SECONDS", "1");
         let cfg = test_config();
         let error = wait_for_container_start_sentinels(&cfg).unwrap_err();
-        let _ = previous_containers;
-        match std::env::var_os("ENCLAVA_INIT_WAIT_FOR_CONTAINERS") {
-            Some(value) => unsafe { std::env::set_var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", value) },
-            None => unsafe { std::env::remove_var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS") },
-        }
-        match previous_dir {
-            Some(value) => unsafe { std::env::set_var("ENCLAVA_INIT_STARTED_DIR", value) },
-            None => unsafe { std::env::remove_var("ENCLAVA_INIT_STARTED_DIR") },
-        }
-        match previous_timeout {
-            Some(value) => unsafe {
-                std::env::set_var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS_TIMEOUT_SECONDS", value)
-            },
-            None => unsafe {
-                std::env::remove_var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS_TIMEOUT_SECONDS")
-            },
-        }
         let diagnostic = enclava_init::safe_diagnostics::SafeBootstrapDiagnostic::diagnose(&error);
         assert_eq!(
             diagnostic.step(),
@@ -861,6 +869,12 @@ mod tests {
             "{\"error\":\"enclava_init_failed\",\"failed_stage\":null,\"failed_step\":\"bind_target_create_failed\",\"retry_after\":null,\"terminal\":true}"
         );
     }
+
+    // The REAL child subprocess (current_exe --bind-mount-into-ns) cannot
+    // be driven from this unit-test binary: the harness owns its own argv.
+    // The child's exit-code half of the contract is driven end-to-end by
+    // tests/binder_exit_code.rs against the real binary; this suite pins
+    // the parent's mapping table and the typed-error construction.
 
     #[test]
     fn parent_maps_child_exit_codes_and_unmapped_stay_untyped() {

@@ -3886,14 +3886,34 @@ hkdf-info = "tls-state-luks-key"
 
     #[test]
     fn broker_response_validation_failure_reports_validate_step() {
+        // The response chain is key-matched (issued for the RETAINED key an
+        // expired certificate's renewal carries) but signed under an issuer
+        // the config does not trust: validation fails at the ANCHOR check,
+        // not a key mismatch. The expired retained certificate no longer
+        // serves, so the failed renewal propagates as the provisioning
+        // error instead of staying warn-only.
         let dir = tempdir().unwrap();
-        let (root, _chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
-        // A well-formed chain issued under a DIFFERENT root: the broker
-        // response decodes, but the anchored validation fails.
-        let (_other_root, other_chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        });
+        let (other_root, _other_chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let retained_key = KeyPair::from_pem(&chain.leaf_key_pem).unwrap();
+        let unanchored_pem = mint_leaf_for_key(
+            &other_root.params,
+            &other_root.key,
+            &retained_key,
+            TEST_HOSTNAMES,
+        );
         let body = json!({
             "certificate_chain_pem":
-                full_chain_pem(&[&other_chain.chain_pem, &_other_root.cert.pem()]),
+                full_chain_pem(&[&unanchored_pem, &other_root.cert.pem()]),
         })
         .to_string();
         let (base, _server) = spawn_local_broker("200 OK", "200 OK", body);
@@ -3903,8 +3923,6 @@ hkdf-info = "tls-state-luks-key"
             &format!("{base}/broker"),
             &format!("{base}/kbs-token"),
         );
-        let persistent = dir.path().join("persistent");
-        let anchors = [root.anchor()];
         let error = provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap_err();
         assert_step(&error, InitFailedStep::TlsValidateFailed);
     }

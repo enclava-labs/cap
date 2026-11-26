@@ -140,6 +140,13 @@ site is not instrumented. The step is a sibling of the code, never a
 replacement for it: old readers that ignore unknown keys are unaffected, and
 no paths, errno text, or provider text ever appear.
 
+The bind child (`--bind-mount-into-ns`) runs in a separate process, so its
+typed step crosses the boundary through a fixed exit-code table instead:
+`3` = `bind_source_failed`, `4` = `bind_target_create_failed`,
+`5` = `bind_mount_failed`, and exit `1` for every untyped failure (a signal
+death has no code). The parent maps the child's exit code back into the same
+typed step; the child's stdout/stderr stays inside the parent's error chain.
+
 ### Numeric volume profiling
 
 `/run/enclava/init-stats.json` retains its version-1 boot fields and adds
