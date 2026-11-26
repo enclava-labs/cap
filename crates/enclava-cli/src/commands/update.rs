@@ -25,13 +25,6 @@ pub(crate) const VERSION: &str = match option_env!("ENCLAVA_RELEASE_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
-const OS: &str = if cfg!(target_os = "macos") {
-    "macos"
-} else if cfg!(windows) {
-    "windows"
-} else {
-    "linux"
-};
 const BIN: &str = if cfg!(windows) {
     "enclava.exe"
 } else {
@@ -53,6 +46,7 @@ pub struct UpdateArgs {
 
 pub async fn run(args: UpdateArgs) -> Result<()> {
     let latest = latest_tag().await?;
+    let asset = release_asset(std::env::consts::OS, std::env::consts::ARCH)?;
     if !is_newer(VERSION, &latest) {
         println!("enclava {VERSION} is up to date.");
         return Ok(());
@@ -77,7 +71,6 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         }
     }
 
-    let asset = format!("enclava-{OS}-{}.tar.gz", std::env::consts::ARCH);
     let base = format!("https://github.com/{REPO}/releases/download/{latest}");
     let client = http_client(reqwest::redirect::Policy::default())?;
 
@@ -111,6 +104,19 @@ fn http_client(redirect: reqwest::redirect::Policy) -> Result<reqwest::Client> {
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(600))
         .build()?)
+}
+
+/// Release archive for this platform. Releases cover Linux, macOS and
+/// Windows only; any other OS must not be handed one of those binaries.
+fn release_asset(os: &str, arch: &str) -> Result<String> {
+    match os {
+        "linux" | "macos" | "windows" => Ok(format!("enclava-{os}-{arch}.tar.gz")),
+        _ => Err(format!(
+            "no release builds are published for {os}; update with \
+             `cargo install --locked --git https://github.com/{REPO} enclava-cli`"
+        )
+        .into()),
+    }
 }
 
 /// `releases/latest` redirects to `releases/tag/<tag>`; reading the redirect
@@ -271,6 +277,16 @@ mod tests {
         assert!(!is_newer("v0.1.22", "v0.1.22"));
         assert!(!is_newer("v0.2.0", "v0.1.22"));
         assert!(is_newer("v0.1.22", "nightly"));
+    }
+
+    #[test]
+    fn only_published_platforms_get_a_release_asset() {
+        assert_eq!(
+            release_asset("linux", "x86_64").unwrap(),
+            "enclava-linux-x86_64.tar.gz"
+        );
+        let refused = release_asset("freebsd", "x86_64").unwrap_err().to_string();
+        assert!(refused.contains("cargo install"), "{refused}");
     }
 
     #[test]
