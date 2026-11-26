@@ -397,7 +397,11 @@ where
         sleep(slice);
         remaining = pending(siblings);
         let waited = elapsed();
-        if waited >= next_flush {
+        // A periodic flush that comes due exactly as the deadline arrives
+        // is skipped: the final boundary flush below covers that pass, and
+        // running both would spend two writebacks inside the time the
+        // grace period reserves for the last one (round-2 review).
+        if waited >= next_flush && waited < deadline {
             flush(FlushReason::AfterSiblings);
             after_sibling_flushes += 1;
             next_flush = elapsed().saturating_add(RELUSH_INTERVAL);
@@ -560,6 +564,34 @@ mod tests {
         fn now(&self) -> impl FnMut() -> Duration + '_ {
             move || self.elapsed()
         }
+    }
+
+    #[test]
+    fn execute_teardown_since_epoch_measures_from_the_handler_epoch() {
+        // The grace clock's ORIGIN is the epoch the SIGTERM handler
+        // recorded (before its own writeback), not monitor entry: prove it
+        // by handing execute_teardown_since_epoch an epoch five seconds in
+        // the past and asserting the returned wait already includes those
+        // five seconds (round-2 review: the unit pins could not catch the
+        // epoch being dropped).
+        let epoch =
+            signal_safe_monotonic_nanos().saturating_sub(Duration::from_secs(5).as_nanos() as u64);
+        let (_reports, outcome) = execute_teardown_since_epoch(
+            &TeardownRequest {
+                mounts: &[],
+                siblings: &[],
+                initial_wait: Duration::ZERO,
+                deadline: TEARDOWN_DEADLINE,
+            },
+            |_| Vec::new(),
+            |_| {},
+            epoch,
+        );
+        assert!(
+            outcome.waited >= Duration::from_secs(5),
+            "the epoch must be the clock's origin: {:?}",
+            outcome.waited
+        );
     }
 
     #[test]
