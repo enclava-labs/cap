@@ -2420,12 +2420,12 @@ mod tests {
             "the running app's newest operation is the healthy live workload: the loader              must return exactly the identity the live TEE (and any mode-transition              rollback source) attests"
         );
 
-        // A newer generation that failed AFTER publishing its workload spec:
-        // the app keeps RUNNING the older TEE while the newest operation is
-        // the failed publication. Pin the loader's answer — the prior
-        // healthy workload's identity stays admissible — so the semantics
-        // cannot drift silently: the transition route's quote binding
-        // follows the workload the Service can actually still hit.
+        // A newer generation, first as an ACTIVE handoff ('applying': the
+        // replacement is published but unconfirmed — both generations can
+        // still be serving), then as a failed publication. Pin the loader's
+        // answer in BOTH states so the semantics cannot drift silently: the
+        // transition route's quote binding follows the workload(s) the
+        // Service can actually still hit.
         let newer_deploy = Uuid::new_v4();
         crate::kbs::tests::insert_test_deployment(
             &pool,
@@ -2471,6 +2471,65 @@ mod tests {
             6,
         )
         .await;
+        // Active handoff: the newer generation is nonterminal with a LIVE
+        // apply job (the nonterminal-status guard requires a job in
+        // setup_pending/setting_up/pending/running). The rank-1 operation
+        // is the replacement itself. Pin what the loader returns while
+        // BOTH generations can still be serving.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs \
+                 SET state = 'running', lock_token = gen_random_uuid(), \
+                     locked_until = clock_timestamp() + interval '1 minute', \
+                     last_error_code = NULL \
+               WHERE deployment_id = $1",
+        )
+        .bind(newer_deploy)
+        .execute(&pool)
+        .await
+        .expect("make the newer job live");
+        sqlx::query("UPDATE deployments SET status = 'applying'::deploy_status_enum WHERE id = $1")
+            .bind(newer_deploy)
+            .execute(&pool)
+            .await
+            .expect("activate the newer deployment");
+        let newer_identity = newer_artifacts.descriptor.launch_identity();
+        let identities_during_handoff =
+            crate::tee_attestation::load_admissible_launch_identities(&pool, app)
+                .await
+                .expect("load identities during the active handoff");
+        assert_eq!(
+            identities_during_handoff.len(),
+            2,
+            "during an active handoff both generations can still be serving, so BOTH \
+             identities must be admissible: {identities_during_handoff:?}"
+        );
+        assert!(
+            identities_during_handoff.contains(&expected_identities[0]),
+            "the older live workload's identity stays admissible during the handoff"
+        );
+        assert!(
+            identities_during_handoff.contains(&newer_identity),
+            "the applying replacement's identity is admissible during the handoff"
+        );
+
+        // The handoff resolves as a failed publication: flip the newer
+        // deployment to failed (and its job out of the live states) and
+        // re-load.
+        sqlx::query("UPDATE deployments SET status = 'failed'::deploy_status_enum WHERE id = $1")
+            .bind(newer_deploy)
+            .execute(&pool)
+            .await
+            .expect("fail the newer deployment");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs \
+                 SET state = 'failed', lock_token = NULL, locked_until = NULL, \
+                     last_error_code = 'deployment_apply_failed' \
+               WHERE deployment_id = $1",
+        )
+        .bind(newer_deploy)
+        .execute(&pool)
+        .await
+        .expect("settle the newer job");
 
         let identities_after_failure =
             crate::tee_attestation::load_admissible_launch_identities(&pool, app)
