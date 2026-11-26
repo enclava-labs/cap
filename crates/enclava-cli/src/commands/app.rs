@@ -29,7 +29,8 @@ use enclava_cli::keyring::{
 use enclava_cli::keys;
 use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, verify_envelope};
 use enclava_cli::tee_client::{
-    TeeBootstrapStatus, TeeClient, TeeError, TerminalBootstrapError, parse_terminal_bootstrap_error,
+    BIND_MOUNT_NAMESPACES_STAGE, TeeBootstrapStatus, TeeClient, TeeError, TerminalBootstrapError,
+    parse_terminal_bootstrap_error,
 };
 use enclava_common::log_encryption::{
     EncryptedLogFrame, LOG_ENCRYPTION_ALGORITHM, decrypt_log_frame, generate_log_keypair,
@@ -44,7 +45,10 @@ use enclava_engine::types::{
 use std::collections::{HashMap, VecDeque};
 use uuid::Uuid;
 
-use crate::commands::template::{normalize_ngrok_tcp_url, should_retry_api_transport_error};
+use crate::commands::template::{
+    is_supported_stable_ssh_template, normalize_stable_ssh_endpoint,
+    should_retry_api_transport_error,
+};
 
 const DEPLOY_HEALTH_TIMEOUT_SECONDS: u64 = 900;
 
@@ -87,6 +91,23 @@ fn optional_app_name_from_config_result(
     }
 }
 
+/// Only a missing `enclava.toml` gets the "run `enclava init`" hint; a file
+/// that exists but fails to parse or validate reports its own error, so the
+/// user learns which key to fix.
+fn load_deploy_app_config(
+    result: Result<AppConfig, AppConfigError>,
+) -> Result<AppConfig, Box<dyn std::error::Error>> {
+    match result {
+        Ok(config) => Ok(config),
+        Err(AppConfigError::ReadFile { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Err("no enclava.toml found -- run `enclava init` or specify --app".into())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Build an authenticated API client from stored config/credentials.
 fn build_api_client() -> Result<(ApiClient, CliPaths, config::CliConfig), Box<dyn std::error::Error>>
 {
@@ -109,7 +130,7 @@ fn parse_config_vars(vars: &[String]) -> Result<Vec<(String, String)>, Box<dyn s
         .collect()
 }
 
-fn parse_config_inputs(
+pub(crate) fn parse_config_inputs(
     vars: &[String],
     file_vars: &[String],
 ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
@@ -279,7 +300,10 @@ pub(crate) fn deploy_preflight_needs_claim(
 mod signing;
 pub(crate) use enclava_cli::descriptor::TrustedDeploymentExpectation;
 #[cfg(test)]
-pub(crate) use signing::{ConfidentialAppForCcHash, confidential_app_for_cc_hash};
+pub(crate) use signing::{
+    ConfidentialAppForCcHash, apply_discovered_pod_groups, confidential_app_for_cc_hash,
+    fetch_policy_with_group_discovery,
+};
 pub(crate) use signing::{
     SignedDeployBlobParams, build_signed_deploy_blobs, ensure_manual_deploy_keyring,
     fetch_verified_platform_release, load_or_derive_bootstrap_private_key,
@@ -374,8 +398,8 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
         health_timeout: app_config.health.as_ref().map(|h| h.timeout),
         signer_identity_subject,
         signer_identity_issuer,
-        egress_allowlist: vec![],
-        egress_mode: None,
+        egress_allowlist: app_config.egress.allowlist_for_request(),
+        egress_mode: app_config.egress.mode_for_request(),
     };
 
     let spinner = ProgressBar::new_spinner();
@@ -431,15 +455,31 @@ pub struct DeployArgs {
     pub no_store_mnemonic: bool,
 }
 
+/// D3: whether the app's storage paths are the default in play -- the serde
+/// default and an explicit "/data" are the same contract.
+pub(crate) fn default_storage_path_in_play(app_config: &AppConfig) -> bool {
+    app_config.storage.paths == enclava_cli::app_config::default_storage_paths()
+}
+
+/// D3: the plain-path storage contract, said at the moment it matters: the
+/// default `/data` is only usable when the image ships the directory, because
+/// the restricted profile runs a read-only root filesystem. One warning
+/// line, value-based, purely informational -- no behaviour change, no new
+/// flag.
+pub(crate) fn warn_when_default_storage_path_in_play(app_config: &AppConfig) {
+    if default_storage_path_in_play(app_config) {
+        eprintln!(
+            "warning: default storage path /data -- the image must contain it \
+             (the restricted profile runs a read-only root filesystem)"
+        );
+    }
+}
+
 pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> {
     let deploy_started = Instant::now();
-    let app_config = match AppConfig::find_and_load() {
-        Ok(config) => config,
-        Err(_) => {
-            return Err("no enclava.toml found -- run `enclava init` or specify --app".into());
-        }
-    };
+    let app_config = load_deploy_app_config(AppConfig::find_and_load())?;
     let app_name = app_config.app.name.clone();
+    warn_when_default_storage_path_in_play(&app_config);
 
     let config_pairs = parse_config_inputs(&args.config_vars, &args.config_file_vars)?;
     let (api, paths, cli_config) = build_api_client()?;
@@ -769,15 +809,29 @@ fn should_retry_deploy_config(error: &TeeError) -> bool {
 
 /// Stable, provider-detail-free message for an authenticated terminal
 /// bootstrap failure: the recognized error code plus the optional validated
-/// retry deadline, in a form a PaaS verifier can safely match later.
+/// retry deadline, in a form a PaaS verifier can safely match later (the
+/// code stays immediately after the colon; the stage and the advice suffix
+/// follow it, so a prefix match on `terminal bootstrap failure for app X:
+/// <code>` is unchanged). A terminal failure whose init stage is the
+/// workload-mount bind stage gets one extra hint line naming the most
+/// common cause of that stage's failure -- NOT a diagnosis: the binder can
+/// fail with existing directories too, and the `RootfulSudo` profile runs
+/// a writable root filesystem.
 pub(crate) fn terminal_bootstrap_failure_message(
     app_name: &str,
     diagnostic: &TerminalBootstrapError,
 ) -> String {
-    format!(
+    let mut message = format!(
         "terminal bootstrap failure for app {app_name}: {}; run `enclava status --app {app_name}` for the latest state",
         diagnostic.stable_summary()
-    )
+    );
+    if diagnostic.last_init_stage() == Some(BIND_MOUNT_NAMESPACES_STAGE) {
+        message.push_str(
+            "\nhint: a common cause of a failure at this stage is a [storage] paths entry the image does not contain \
+             -- the restricted profile runs a read-only root filesystem, so the bind stage cannot create it",
+        );
+    }
+    message
 }
 
 /// Minimum spacing between terminal-diagnostic TEE probes inside long
@@ -2037,6 +2091,48 @@ pub(crate) async fn reconcile_success_with_deployment_history(
     wait_deadline: Instant,
     history: &mut DeploymentHistoryProbe,
 ) -> Result<SuccessGate, Box<dyn std::error::Error>> {
+    reconcile_with_deployment_history(api, app_name, deployment_id, wait_deadline, history, false)
+        .await
+}
+
+/// A deployment CAP has accepted but whose workload roll has not finished:
+/// the previous pod may still be the one answering for the app.
+///
+/// `healthy`, `failed` and `rolled_back` are settled. `rolled_back`
+/// intentionally confirms, as in the non-rollout gate: CAP has finished
+/// with this deployment and the workload it restored is the one serving, so
+/// it will not roll (or relock) behind the user after the wait exits.
+pub(crate) fn deployment_rollout_in_flight(status: &str) -> bool {
+    matches!(status, "pending" | "applying" | "watching")
+}
+
+/// [`reconcile_success_with_deployment_history`] for readiness signals the
+/// *previous* workload can also produce (the stable SSH endpoint): the fresh
+/// observation must additionally show the deployment's roll settled.
+/// Without that, a redeploy reads the old pod's readiness as its own while
+/// CAP has not applied the new StatefulSet yet, exits 0, and the app then
+/// rolls (and, in password mode, relocks) behind the user's back. An
+/// in-flight status is [`SuccessGate::Inconclusive`]: the wait keeps running
+/// and observes the roll, its relock stop, or its deadline.
+pub(crate) async fn reconcile_rollout_with_deployment_history(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+    wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
+) -> Result<SuccessGate, Box<dyn std::error::Error>> {
+    reconcile_with_deployment_history(api, app_name, deployment_id, wait_deadline, history, true)
+        .await
+}
+
+async fn reconcile_with_deployment_history(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+    wait_deadline: Instant,
+    history: &mut DeploymentHistoryProbe,
+    require_settled_rollout: bool,
+) -> Result<SuccessGate, Box<dyn std::error::Error>> {
     if deployment_id == "pending" {
         return Ok(SuccessGate::Confirmed);
     }
@@ -2055,10 +2151,12 @@ pub(crate) async fn reconcile_success_with_deployment_history(
                         );
                         false
                     }
-                    Some(_) => {
+                    Some(deployment) => {
                         // Only the fresh request's non-failure is authority;
                         // a stale one may predate the failure.
-                        fresh_confirmed |= current;
+                        fresh_confirmed |= current
+                            && !(require_settled_rollout
+                                && deployment_rollout_in_flight(&deployment.status));
                         true
                     }
                     // A missing row is never authority (cap#220 review
@@ -3033,7 +3131,13 @@ fn missing_required_config_keys(
 }
 
 fn stable_ssh_endpoint_state_from_app(app: &AppResponse) -> StableSshEndpointState {
-    if app.template_slug.as_deref() != Some("debian-ssh-ngrok") {
+    // Same slug allowlist and host shapes as `enclava template ssh-command`.
+    // A ngrok-only check reports a reserved FRP endpoint as not_stable_template.
+    if app
+        .template_slug
+        .as_deref()
+        .is_none_or(|slug| !is_supported_stable_ssh_template(slug))
+    {
         return StableSshEndpointState::NotStableTemplate;
     }
     let Some(endpoint) = app.template_expected.stable_ssh_endpoint.as_deref() else {
@@ -3042,7 +3146,7 @@ fn stable_ssh_endpoint_state_from_app(app: &AppResponse) -> StableSshEndpointSta
     if endpoint.trim().is_empty() {
         return StableSshEndpointState::Missing;
     }
-    match normalize_ngrok_tcp_url(endpoint) {
+    match normalize_stable_ssh_endpoint(endpoint) {
         Ok(normalized) if endpoint == normalized => StableSshEndpointState::Ready(normalized),
         _ => StableSshEndpointState::Invalid,
     }
@@ -3079,6 +3183,7 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
             status: 403,
             code: Some(code),
             message,
+            ..
         }) if code == "missing_scope" && message.contains("apps:logs") => {
             return Err(format!(
                 "{message}\nRun `enclava login --approve-logs` and approve the new session to read workload logs."
@@ -3865,8 +3970,19 @@ pub struct DestroyArgs {
 }
 
 pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let app_name = resolve_app_name(&args.app)?;
-    let (api, _paths, _cli_config) = build_api_client()?;
+    let requested = resolve_app_name(&args.app)?;
+    // Template deploy lowercases before it locks and saves. PaaS does the
+    // same in `validate_slug` before DELETE, so `Shell` deletes `shell` and
+    // returns success. An exact-match API 404s on `Shell` and leaves `shell`.
+    // Either way the resume file and the lock are under the slug. Send that
+    // slug, and confirm it, so a 404 or a success is about the same app whose
+    // file we clear. A name that is not a slug is sent unchanged and only its
+    // own key is touched.
+    let app_name = template_resume_instance_name(&requested);
+    let paths = CliPaths::resolve()?;
+    let cli_config = config::load_config(&paths)?;
+    let creds = config::load_credentials(&paths)?;
+    let api = ApiClient::from_config(&cli_config, &creds);
 
     if !args.force {
         super::interactive::require_prompt("pass --force to destroy without confirmation")?;
@@ -3893,6 +4009,14 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
         }
     }
 
+    let scope =
+        crate::commands::template::template_deploy_resume_scope(&api, &creds, &cli_config).await?;
+    // Same per-app lock as `template deploy`, held across deletion and resume
+    // cleanup. `app_name` is already the slug that deploy locks, and it is the
+    // name this delete sends.
+    let _deploy_lock =
+        enclava_cli::template_deploy_retry::lock_template_deploy(&paths, &scope, &app_name).await?;
+
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.red} {msg}")?);
     spinner.set_message(format!("Destroying {app_name}..."));
@@ -3907,7 +4031,59 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
         spinner.finish_with_message(format!("Destroy of '{app_name}' did not complete."));
         eprintln!("Hint: {hint}");
     }
-    result?;
+    // A destroy can outlast a connection: when the response is lost in
+    // transit the server still finishes the teardown. Ask the server what
+    // happened instead of reporting a failure for an app that is gone.
+    let result = match result {
+        Err(ApiError::Http(error)) => {
+            spinner.set_message(format!(
+                "Lost the connection while destroying {app_name}; checking whether it finished..."
+            ));
+            let outcome = outcome_after_lost_destroy_response(
+                || async { api.get_app(&app_name).await.map(|_| ()) },
+                DESTROY_LOST_RESPONSE_WINDOW,
+                DESTROY_LOST_RESPONSE_INTERVAL,
+                DESTROY_LOST_RESPONSE_CHECK_TIMEOUT,
+            )
+            .await;
+            if outcome == LostDestroyOutcome::Gone {
+                Ok(())
+            } else {
+                spinner.finish_with_message(format!(
+                    "Destroy of '{app_name}' was sent, but its outcome is unknown."
+                ));
+                eprintln!("Hint: {}", lost_destroy_hint(&outcome, &app_name));
+                Err(ApiError::Http(error))
+            }
+        }
+        other => other,
+    };
+    let already_gone = matches!(&result, Err(ApiError::Api { status: 404, .. }));
+    if let Err(error) = result {
+        if !already_gone {
+            return Err(error.into());
+        }
+        // The app is already absent. The unreadable-resume refusal tells the
+        // user to destroy and deploy again; a dashboard destroy leaves the
+        // local file, so a 404 must still remove it.
+        return Err(forget_destroyed_app_template_deploy(&paths, &scope, &app_name)
+        .map(|()| {
+            format!(
+                "{error}. The stored template deploy request for `{app_name}` was removed, so deploying this name again will not replay or refuse on it."
+            )
+        })
+        .unwrap_or_else(|clear_error| {
+            format!("{error}; also failed to remove the stored template deploy request: {clear_error}")
+        })
+        .into());
+    }
+
+    forget_destroyed_app_template_deploy(&paths, &scope, &app_name)
+        .map_err(|err| {
+            format!(
+                "app '{app_name}' was destroyed, but the stored template deploy request could not be removed: {err}. Remove that file before deploying this name again."
+            )
+        })?;
 
     spinner.finish_with_message(format!("App '{app_name}' destroyed."));
 
@@ -3923,6 +4099,104 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 #[cfg(test)]
 #[path = "app/tests/mod.rs"]
 pub(crate) mod tests;
+
+/// Slug template deploy locks and PaaS deletes.
+///
+/// Both fold the instance name to lowercase before they store or delete.
+/// Destroy must send, lock, and clear that same slug. Clearing it after a
+/// delete of the raw name is wrong: PaaS has already deleted the slug, and
+/// an exact-match API has not. A name that is not a slug was never a
+/// template-deploy key, so it is left unchanged.
+fn template_resume_instance_name(app_name: &str) -> String {
+    crate::commands::template::normalize_slug(app_name).unwrap_or_else(|_| app_name.to_string())
+}
+
+/// Drop the local template-deploy resume file after the named app is gone.
+///
+/// The file is keyed by the exact app name sent to the API and by the
+/// normalized API base. Leaving it makes the next deploy of that name replay
+/// a descriptor signed for the destroyed app, or refuse forever when the file
+/// cannot be read. `app destroy` is the recovery those refusals document, so
+/// it has to remove the file for the name it actually deleted. The caller
+/// holds the template-deploy lock for this name; clearing without that lock
+/// races a deploy that is about to save or stamp the file.
+fn forget_destroyed_app_template_deploy(
+    paths: &CliPaths,
+    scope: &str,
+    app_name: &str,
+) -> Result<(), String> {
+    enclava_cli::template_deploy_retry::clear_template_deploy_attempt(
+        paths,
+        scope,
+        &template_resume_instance_name(app_name),
+    )
+}
+
+/// What to tell the user when a lost destroy response could not be resolved.
+fn lost_destroy_hint(outcome: &LostDestroyOutcome, app_name: &str) -> String {
+    match outcome {
+        LostDestroyOutcome::StillPresent => format!(
+            "the connection dropped before the server answered, and '{app_name}' still existed after 5 minutes of checking. The teardown may still be running: check `enclava status --app {app_name}`, and run `enclava destroy --app {app_name}` again if the app is still there."
+        ),
+        _ => format!(
+            "the connection dropped before the server answered, and the CLI could not confirm whether '{app_name}' still exists. Check `enclava status --app {app_name}`; if the app is still there, run `enclava destroy --app {app_name}` again."
+        ),
+    }
+}
+
+/// How long destroy keeps asking whether the app is gone after the delete
+/// response was lost: a check every 5 seconds for 5 minutes in total, the time
+/// the hosted route allows a delete to run. Each check is cut off after 15
+/// seconds, and the 5 minutes include the time the checks themselves take.
+const DESTROY_LOST_RESPONSE_WINDOW: Duration = Duration::from_secs(300);
+const DESTROY_LOST_RESPONSE_INTERVAL: Duration = Duration::from_secs(5);
+const DESTROY_LOST_RESPONSE_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What the server says about an app whose destroy response never arrived.
+#[derive(Debug, PartialEq, Eq)]
+enum LostDestroyOutcome {
+    /// The server answered "no such app" (404).
+    Gone,
+    /// The final check got an answer, and it still showed the app.
+    StillPresent,
+    /// The final check produced no answer, or the credential cannot read the app.
+    Unverified,
+}
+
+/// After a destroy whose response never arrived, ask the server whether the
+/// app is gone. Only a 404 counts as gone. A lookup the credential is not
+/// allowed to make (a delete-only key, an expired session) ends the checks at
+/// once, since repeating it cannot answer the question.
+async fn outcome_after_lost_destroy_response<F, Fut>(
+    mut lookup: F,
+    window: Duration,
+    interval: Duration,
+    check_timeout: Duration,
+) -> LostDestroyOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ApiError>>,
+{
+    let deadline = tokio::time::Instant::now() + window;
+    let mut outcome;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(check_timeout.min(remaining), lookup()).await {
+            Ok(Ok(())) => outcome = LostDestroyOutcome::StillPresent,
+            Ok(Err(ApiError::Api { status: 404, .. })) => return LostDestroyOutcome::Gone,
+            Ok(Err(ApiError::NotAuthenticated))
+            | Ok(Err(ApiError::Api {
+                status: 401 | 403, ..
+            })) => return LostDestroyOutcome::Unverified,
+            // A failed or timed-out check says nothing about the app now.
+            Ok(Err(_)) | Err(_) => outcome = LostDestroyOutcome::Unverified,
+        }
+        if tokio::time::Instant::now() + interval >= deadline {
+            return outcome;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
 
 /// Operator guidance for a failed destroy, keyed on the stable API code (or
 /// the in-band cause text hosted deferrals carry). Pure so the prose mapping

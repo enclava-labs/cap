@@ -290,6 +290,52 @@ pub fn pod_runtime_failure(pod: &Pod) -> Option<PodRuntimeFailure> {
     None
 }
 
+/// Restarts of the enclava-init sidecar a rollout tolerates before its
+/// failure is terminal. enclava-init exits 1 when its in-TEE Trustee fetch
+/// cannot reach KBS; Trustee restarts for a few seconds on every signed
+/// policy publication, and the kubelet restarts the sidecar with 10 s / 20 s
+/// back-off, so the first restarts ride out that gap. A failure that is not
+/// transient (verification, attestation, policy mismatch) exits the same
+/// way on every attempt and turns terminal on the third.
+pub const ENCLAVA_INIT_TOLERATED_RESTARTS: i32 = 2;
+
+/// True only for the enclava-init sidecar's generic exit-1 (or the
+/// CrashLoopBackOff wait that follows it) while it is within its restart
+/// budget. Every other container, and every other failure class (image pull,
+/// container config, start errors, OOM, other exit codes), stays terminal on
+/// first sight.
+fn is_tolerated_enclava_init_restart(status: &ContainerStatus, failure: PodRuntimeFailure) -> bool {
+    let generic_exit = |failure: ContainerRuntimeFailure| {
+        failure.status == ContainerRuntimeStatus::Terminated
+            && failure.code == ContainerRuntimeFailureCode::Error
+            && failure.exit_code == Some(1)
+    };
+    let backing_off = failure.current.status == ContainerRuntimeStatus::Waiting
+        && failure.current.code == ContainerRuntimeFailureCode::CrashLoopBackOff
+        && failure.previous.is_none_or(generic_exit);
+    status.name == crate::manifest::containers::ENCLAVA_INIT_CONTAINER_NAME
+        && status.restart_count < ENCLAVA_INIT_TOLERATED_RESTARTS
+        && (generic_exit(failure.current) || backing_off)
+}
+
+/// Runtime failure that should fail a rollout under observation: like
+/// [`pod_runtime_failure`], but a transient enclava-init restart within its
+/// budget is not yet a failure (the rollout deadline still bounds the wait).
+pub fn rollout_runtime_failure(pod: &Pod) -> Option<PodRuntimeFailure> {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return None;
+    }
+    let status = pod.status.as_ref()?;
+    status
+        .init_container_statuses
+        .iter()
+        .flatten()
+        .chain(status.container_statuses.iter().flatten())
+        .filter_map(|container| Some((container, container_runtime_failure(container)?)))
+        .find(|(container, failure)| !is_tolerated_enclava_init_restart(container, *failure))
+        .map(|(_, failure)| failure)
+}
+
 /// Compatibility formatter for deployment-watch error storage. The returned
 /// string contains only the bounded fields from [`PodRuntimeFailure`].
 pub fn pod_runtime_failure_message(pod: &Pod) -> Option<String> {
@@ -437,7 +483,7 @@ pub async fn watch_rollout(
             let snap = PodSnapshot::from_pod(pod);
             let phase = classify_pod_phase(&snap);
 
-            if let Some(msg) = pod_runtime_failure_message(pod) {
+            if let Some(msg) = rollout_runtime_failure(pod).map(PodRuntimeFailure::public_message) {
                 tracing::warn!(%msg, "container runtime failure detected");
                 return Ok(DeployStatus::failed(&msg));
             }

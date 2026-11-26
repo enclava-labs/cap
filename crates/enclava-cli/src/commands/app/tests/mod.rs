@@ -146,6 +146,8 @@ fn test_app_config() -> AppConfig {
             memory: "1Gi".to_string(),
         },
         health: None,
+        egress: Default::default(),
+        unknown: HashMap::new(),
     }
 }
 
@@ -157,6 +159,7 @@ fn test_deployment_context() -> DeploymentContextResponse {
         current_platform_release_id: None,
         platform_release_envelope: None,
         log_spool_state_bind_supported: false,
+        pod_supplemental_groups_supported: false,
     }
 }
 
@@ -226,6 +229,7 @@ fn deployment_context_platform_release_is_verified_and_selected() {
         current_platform_release_id: Some(expected_release_id.clone()),
         platform_release_envelope: Some(envelope),
         log_spool_state_bind_supported: false,
+        pod_supplemental_groups_supported: false,
     };
 
     let release =
@@ -252,6 +256,7 @@ fn deployment_context_platform_release_tampering_fails_closed() {
         current_platform_release_id: Some(envelope.payload.platform_release_version.clone()),
         platform_release_envelope: Some(envelope),
         log_spool_state_bind_supported: false,
+        pod_supplemental_groups_supported: false,
     };
 
     let err =
@@ -273,6 +278,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
             &test_app_response(),
             &test_app_config(),
             ConfidentialAppForCcHash {
+                pod_supplemental_groups: None,
                 image: enclava_common::image::ImageRef::parse(
                     "ghcr.io/acme/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 )
@@ -341,12 +347,14 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
         current_platform_release_id: None,
         platform_release_envelope: None,
         log_spool_state_bind_supported: false,
+        pod_supplemental_groups_supported: false,
     };
 
     let app = confidential_app_for_cc_hash(
             &test_app_response(),
             &test_app_config(),
             ConfidentialAppForCcHash {
+                pod_supplemental_groups: None,
                 image: enclava_common::image::ImageRef::parse(
                     "ghcr.io/acme/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 )
@@ -500,6 +508,87 @@ fn stable_ssh_endpoint_from_app_requires_debian_ssh_template_metadata() {
 }
 
 #[test]
+fn status_projects_ready_frp_stable_ssh_endpoint() {
+    let mut app = test_app_response();
+    app.template_slug = Some("debian-ssh-frp".to_string());
+    app.template_expected.stable_ssh_endpoint = Some("relay.enclava.me:20001".to_string());
+
+    let state = stable_ssh_endpoint_state_from_app(&app);
+    assert_eq!(
+        state,
+        StableSshEndpointState::Ready("relay.enclava.me:20001".to_string())
+    );
+
+    let status = enclava_cli::api_types::AppStatus {
+        app_name: "demo".to_string(),
+        status: "running".to_string(),
+        pod_phase: None,
+        tee_status: None,
+        unlock_status: None,
+        domain: "demo.example".to_string(),
+        last_deployed: None,
+        tee_error: None,
+        observation: None,
+        deployment: None,
+    };
+    let payload = status_json_payload(&status, &state, None, None).expect("serializes");
+    assert_eq!(payload["stable_ssh_endpoint"]["state"], "ready");
+    assert_eq!(
+        payload["stable_ssh_endpoint"]["endpoint"],
+        "relay.enclava.me:20001"
+    );
+
+    app.template_expected.stable_ssh_endpoint = None;
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Missing
+    );
+
+    app.template_expected.stable_ssh_endpoint = Some("   ".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Missing
+    );
+
+    app.template_expected.stable_ssh_endpoint = Some(" TCP://Relay.Enclava.Me:020001 ".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Invalid
+    );
+
+    app.template_expected.stable_ssh_endpoint = Some("example.com:22".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Invalid
+    );
+
+    app.template_expected.stable_ssh_endpoint = Some("6.tcp.eu.ngrok.io:17958".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Ready("6.tcp.eu.ngrok.io:17958".to_string()),
+        "an FRP slug accepts a canonical ngrok host, matching ssh-command"
+    );
+
+    app.template_slug = Some("debian-ssh-ngrok".to_string());
+    app.template_expected.stable_ssh_endpoint = Some("relay.enclava.me:20001".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Ready("relay.enclava.me:20001".to_string()),
+        "an ngrok slug accepts a canonical FRP relay, matching ssh-command"
+    );
+
+    // A non-SSH template stays not_stable_template even with an FRP-shaped
+    // endpoint. The slug gate is the same one ssh-command uses
+    // (`is_supported_stable_ssh_template`), not a deploy-only check.
+    app.template_slug = Some("mini-enclava-go".to_string());
+    app.template_expected.stable_ssh_endpoint = Some("relay.enclava.me:20001".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::NotStableTemplate
+    );
+}
+
+#[test]
 fn deploy_claims_fresh_created_password_app_when_unlock_status_is_unavailable() {
     assert!(deploy_needs_initial_claim(true, None, "creating"));
 }
@@ -536,6 +625,104 @@ fn deploy_preflight_gate_fails_closed_on_unresolved_ownership() {
         Some("locked"),
         "failed"
     ));
+}
+
+fn lost_destroy_lookup_error(status: u16) -> ApiError {
+    ApiError::Api {
+        status,
+        code: None,
+        message: String::new(),
+        idempotency_disposition: None,
+    }
+}
+
+/// Runs the checks on paused time: one check per second for `seconds`.
+async fn lost_destroy_outcome(
+    answers: Vec<Result<(), ApiError>>,
+    seconds: u64,
+) -> (LostDestroyOutcome, u32) {
+    let mut answers = VecDeque::from(answers);
+    let mut asked = 0;
+    let outcome = outcome_after_lost_destroy_response(
+        || {
+            asked += 1;
+            let answer = answers.pop_front().unwrap_or(Ok(()));
+            async move { answer }
+        },
+        Duration::from_secs(seconds),
+        Duration::from_secs(1),
+        Duration::from_secs(5),
+    )
+    .await;
+    (outcome, asked)
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_destroy_response_is_resolved_only_by_what_the_server_says() {
+    // Still there, then a server error, then gone: resolved on the third check.
+    let (outcome, asked) = lost_destroy_outcome(
+        vec![
+            Ok(()),
+            Err(lost_destroy_lookup_error(503)),
+            Err(lost_destroy_lookup_error(404)),
+        ],
+        10,
+    )
+    .await;
+    assert_eq!(outcome, LostDestroyOutcome::Gone);
+    assert_eq!(asked, 3);
+
+    // An app that never goes away is reported as still present when the window ends.
+    let (outcome, asked) = lost_destroy_outcome(Vec::new(), 4).await;
+    assert_eq!(outcome, LostDestroyOutcome::StillPresent);
+    assert_eq!(asked, 4);
+
+    // Seen once, but the final check got no answer: presence is not claimed.
+    let (outcome, asked) =
+        lost_destroy_outcome(vec![Ok(()), Err(lost_destroy_lookup_error(503))], 2).await;
+    assert_eq!(outcome, LostDestroyOutcome::Unverified);
+    assert_eq!(asked, 2);
+
+    // A credential that cannot read the app stops the checks at once.
+    for refused in [
+        lost_destroy_lookup_error(403),
+        lost_destroy_lookup_error(401),
+        ApiError::NotAuthenticated,
+    ] {
+        let (outcome, asked) = lost_destroy_outcome(vec![Ok(()), Err(refused)], 9).await;
+        assert_eq!(outcome, LostDestroyOutcome::Unverified);
+        assert_eq!(asked, 2);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_destroy_checks_that_hang_end_with_the_window() {
+    let started = tokio::time::Instant::now();
+    let mut asked = 0;
+    let outcome = outcome_after_lost_destroy_response(
+        || {
+            asked += 1;
+            std::future::pending::<Result<(), ApiError>>()
+        },
+        Duration::from_secs(300),
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(outcome, LostDestroyOutcome::Unverified);
+    // 15 s per hung check plus 5 s between them: 15 checks, and never past the window.
+    assert_eq!(asked, 15);
+    assert!(started.elapsed() <= Duration::from_secs(300));
+}
+
+#[test]
+fn lost_destroy_hint_only_claims_the_app_exists_when_the_server_said_so() {
+    let present = lost_destroy_hint(&LostDestroyOutcome::StillPresent, "shell");
+    assert!(present.contains("'shell' still existed"));
+    assert!(present.contains("`enclava destroy --app shell`"));
+    let unverified = lost_destroy_hint(&LostDestroyOutcome::Unverified, "shell");
+    assert!(unverified.contains("could not confirm whether 'shell' still exists"));
+    assert!(unverified.contains("`enclava status --app shell`"));
 }
 
 #[test]
@@ -610,6 +797,131 @@ fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
 }
 
 #[test]
+fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
+    let cli_config = config::CliConfig {
+        api_url: "https://api.example".to_string(),
+        org: Some("beta".to_string()),
+        org_id: Some("org-1".to_string()),
+    };
+    let creds = config::Credentials {
+        active_org_id: Some("org-1".to_string()),
+        active_org_name: Some("acme".to_string()),
+        ..config::Credentials::default()
+    };
+    let origin = "https://api.example/v1";
+    let other = "https://api.example/v2";
+    let scope = enclava_cli::template_deploy_retry::template_deploy_scope(
+        creds.active_org_id.as_deref(),
+        cli_config.org_id.as_deref(),
+        creds.active_org_name.as_deref(),
+        cli_config.org.as_deref(),
+        origin,
+    );
+    let other_scope = enclava_cli::template_deploy_retry::template_deploy_scope(
+        creds.active_org_id.as_deref(),
+        cli_config.org_id.as_deref(),
+        creds.active_org_name.as_deref(),
+        cli_config.org.as_deref(),
+        other,
+    );
+    let request = CreateTemplateInstanceRequest {
+        template_slug: "debian-ssh-frp".to_string(),
+        instance_name: "shell".to_string(),
+        config: serde_json::json!({}),
+        bootstrap_pubkey_hash: None,
+        customer_descriptor_blob: Some("descriptor-a".to_string()),
+        org_keyring_blob: Some("keyring-a".to_string()),
+        signed_policy_artifact: Some("policy-a".to_string()),
+        customer_config_roll_hold_seconds: Some(600),
+    };
+    enclava_cli::template_deploy_retry::save_template_deploy_attempt(
+        &paths,
+        &scope,
+        "app-uuid",
+        "deploy-1",
+        &request,
+        &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
+            unlock_mode: "password".to_string(),
+            paas_managed_config_keys: Vec::new(),
+            customer_config_keys: Vec::new(),
+            log_key_id: None,
+            log_private_key_file: None,
+            signed_log_key_id: None,
+        },
+    )
+    .unwrap();
+    enclava_cli::template_deploy_retry::save_template_deploy_attempt(
+        &paths,
+        &other_scope,
+        "app-uuid",
+        "deploy-1",
+        &request,
+        &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
+            unlock_mode: "password".to_string(),
+            paas_managed_config_keys: Vec::new(),
+            customer_config_keys: Vec::new(),
+            log_key_id: None,
+            log_private_key_file: None,
+            signed_log_key_id: None,
+        },
+    )
+    .unwrap();
+    forget_destroyed_app_template_deploy(&paths, &scope, "shell").unwrap();
+    assert!(matches!(
+        enclava_cli::template_deploy_retry::load_template_deploy_attempt(&paths, &scope, "shell"),
+        enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Absent
+    ));
+    assert!(
+        matches!(
+            enclava_cli::template_deploy_retry::load_template_deploy_attempt(
+                &paths,
+                &other_scope,
+                "shell"
+            ),
+            enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Ready(_)
+        ),
+        "destroying against one API base path must not clear another path's resume file"
+    );
+    // A second destroy of an already-cleared name is not an error.
+    forget_destroyed_app_template_deploy(&paths, &scope, "shell").unwrap();
+    enclava_cli::template_deploy_retry::save_template_deploy_attempt(
+        &paths,
+        &scope,
+        "app-uuid",
+        "deploy-1",
+        &request,
+        &enclava_cli::template_deploy_retry::NewTemplateDeployAttempt {
+            unlock_mode: "password".to_string(),
+            paas_managed_config_keys: Vec::new(),
+            customer_config_keys: Vec::new(),
+            log_key_id: None,
+            log_private_key_file: None,
+            signed_log_key_id: None,
+        },
+    )
+    .unwrap();
+    forget_destroyed_app_template_deploy(&paths, &scope, "Shell").unwrap();
+    assert!(
+        matches!(
+            enclava_cli::template_deploy_retry::load_template_deploy_attempt(
+                &paths, &scope, "shell"
+            ),
+            enclava_cli::template_deploy_retry::LoadedTemplateDeployAttempt::Absent
+        ),
+        "destroy sends the slug PaaS and template deploy use, so Shell must clear shell's resume file"
+    );
+    assert_eq!(template_resume_instance_name("Shell"), "shell");
+    assert_eq!(template_resume_instance_name(" shell "), "shell");
+    assert_eq!(
+        template_resume_instance_name("Not A Slug"),
+        "Not A Slug",
+        "a name template deploy would reject must not be rewritten onto another app's file"
+    );
+}
+
+#[test]
 fn deploy_accepts_storage_password_file_flag() {
     use clap::Parser as _;
 
@@ -647,6 +959,7 @@ fn deployment_failure_message_includes_api_error_code_detail() {
         template_expected: Default::default(),
         created_at: "2026-07-03T15:48:25Z".to_string(),
         completed_at: None,
+        reconciled_status: None,
     };
 
     assert_eq!(
@@ -3045,6 +3358,110 @@ mod terminal_diagnostics {
     }
 
     #[tokio::test]
+    async fn rollout_gate_rejects_a_deployment_cap_has_not_rolled_yet() {
+        // Production 2026-11-10: a redeploy's stable SSH endpoint answered
+        // ready from the OLD pod in 237 ms, the CLI exited 0, and CAP applied
+        // the StatefulSet 14 s later. An accepted-but-unrolled deployment is
+        // not authority for a readiness signal the previous pod can produce.
+        for status in ["pending", "applying", "watching"] {
+            let address = spawn_history_stub(std::time::Duration::ZERO, move |_| {
+                serde_json::json!([deployment_entry_json("deploy-1", status)])
+            })
+            .await;
+            let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut history = DeploymentHistoryProbe::new();
+            assert_eq!(
+                reconcile_rollout_with_deployment_history(
+                    &api,
+                    "demo",
+                    "deploy-1",
+                    deadline,
+                    &mut history,
+                )
+                .await
+                .expect("an in-flight roll is not an error"),
+                SuccessGate::Inconclusive,
+                "status {status} must keep the readiness wait running"
+            );
+            // The plain gate keeps its meaning for waits that only need to
+            // rule out a failed deployment.
+            assert_eq!(
+                reconcile_success_with_deployment_history(
+                    &api,
+                    "demo",
+                    "deploy-1",
+                    deadline,
+                    &mut history,
+                )
+                .await
+                .expect("non-failed observation"),
+                SuccessGate::Confirmed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rollout_gate_confirms_a_settled_roll_and_reports_a_failed_one() {
+        let address = spawn_history_stub(std::time::Duration::ZERO, |_| {
+            serde_json::json!([deployment_entry_json("deploy-1", "healthy")])
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut history = DeploymentHistoryProbe::new();
+        assert_eq!(
+            reconcile_rollout_with_deployment_history(
+                &api,
+                "demo",
+                "deploy-1",
+                deadline,
+                &mut history
+            )
+            .await
+            .expect("healthy deployment"),
+            SuccessGate::Confirmed
+        );
+        // An unbound wait (no deployment id) keeps its previous behavior.
+        assert_eq!(
+            reconcile_rollout_with_deployment_history(
+                &api,
+                "demo",
+                "pending",
+                deadline,
+                &mut history
+            )
+            .await
+            .expect("unbound wait"),
+            SuccessGate::Confirmed
+        );
+
+        let address = spawn_history_stub(std::time::Duration::ZERO, |_| {
+            serde_json::json!([{
+                "id": "deploy-1",
+                "status": "failed",
+                "error_message": "pod_failed",
+                "image_digest": null,
+                "created_at": "2026-11-10T00:00:00Z",
+                "completed_at": "2026-11-10T00:01:00Z",
+            }])
+        })
+        .await;
+        let api = ApiClient::new(&format!("http://{address}"), Some("test".to_string()));
+        let mut history = DeploymentHistoryProbe::new();
+        let error = reconcile_rollout_with_deployment_history(
+            &api,
+            "demo",
+            "deploy-1",
+            deadline,
+            &mut history,
+        )
+        .await
+        .expect_err("a failed deployment stays a terminal error");
+        assert!(error.to_string().contains("deployment deploy-1 failed"));
+    }
+
+    #[tokio::test]
     async fn success_exit_accepts_a_non_failed_observation() {
         // The reconciliation is not a failure trap: an observation showing
         // the deployment is fine passes the exit -- both when it lands
@@ -4208,4 +4625,420 @@ fn log_key_json_entries_share_one_stable_shape_across_scopes() {
     assert_eq!(org_entry["active_for_app"], serde_json::Value::Null);
     assert_eq!(org_entry["selected_at"], serde_json::Value::Null);
     assert_eq!(org_entry["selected_by_count"], serde_json::json!(2));
+}
+
+// ---------------------------------------------------------------------------
+// Contract v1 (policy-templates#23): guest-pull pod-supplemental-group
+// discovery in the CLI signing flow.
+// ---------------------------------------------------------------------------
+
+fn pod_groups_descriptor_fixture() -> enclava_cli::descriptor::DeploymentDescriptor {
+    serde_json::from_value(serde_json::json!({
+        "schema_version": "v1",
+        "org_id": "11111111-1111-1111-1111-111111111111",
+        "org_slug": "golden-org",
+        "app_id": "22222222-2222-2222-2222-222222222222",
+        "app_name": "golden-app",
+        "deploy_id": "33333333-3333-3333-3333-333333333333",
+        "created_at": "2026-01-01T00:00:00Z",
+        "nonce": "00".repeat(32),
+        "app_domain": "golden.example",
+        "tee_domain": "tee.golden.example",
+        "custom_domains": [],
+        "namespace": "ns",
+        "service_account": "sa",
+        "identity_hash": "11".repeat(32),
+        "image_ref": "ghcr.io/acme/golden",
+        "image_digest": format!("sha256:{}", "22".repeat(32)),
+        "signer_identity": {"subject": "s", "issuer": "i"},
+        "oci_runtime_spec": {
+            "command": [], "args": [], "env": [], "ports": [], "mounts": [],
+            "capabilities": {"add": [], "drop": []},
+            "security_context": {"run_as_user": 10001, "run_as_group": 10001, "read_only_root_fs": true, "allow_privilege_escalation": false, "privileged": false},
+            "resources": {}
+        },
+        "sidecars": {
+            "attestation_proxy_digest": format!("sha256:{}", "33".repeat(32)),
+            "caddy_digest": format!("sha256:{}", "44".repeat(32))
+        },
+        "api_signing_pubkey": "pub",
+        "independent_verification": true,
+        "expected_firmware_measurement": "55".repeat(32),
+        "expected_runtime_class": "rc",
+        "kbs_resource_path": "default/x/seed",
+        "unlock_mode": "password",
+        "policy_template_id": "pt",
+        "policy_template_sha256": "66".repeat(32),
+        "platform_release_version": "v9",
+        "expected_agent_policy_hash": "77".repeat(32),
+        "expected_cc_init_data_hash": "88".repeat(32),
+        "expected_kbs_policy_hash": "99".repeat(32),
+    }))
+    .expect("parse descriptor fixture")
+}
+
+/// Read one full HTTP request: headers, then exactly Content-Length body
+/// bytes. A single `read` can return a partial request, which would make
+/// the JSON assertions pass vacuously.
+async fn read_full_http_request(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    let mut byte_buf = [0u8; 4096];
+    let headers_end = loop {
+        let n = stream.read(&mut byte_buf).await.unwrap();
+        assert!(n > 0, "the client must send a request");
+        request.extend_from_slice(&byte_buf[..n]);
+        if let Some(pos) = find_subsequence(&request, b"\r\n\r\n") {
+            break pos;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..headers_end]).to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let total = headers_end + 4 + content_length;
+    while request.len() < total {
+        let n = stream.read(&mut byte_buf).await.unwrap();
+        assert!(n > 0, "the request body must arrive complete");
+        request.extend_from_slice(&byte_buf[..n]);
+    }
+    String::from_utf8_lossy(&request).to_string()
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// A single-request HTTP fixture for /agent-policy: records the raw request
+/// body, replies with `policy_text` (hash computed locally) plus optional
+/// discovered groups, and returns the captured request for assertions.
+async fn agent_policy_fixture(
+    policy_text: &str,
+    pod_supplemental_groups: Option<Vec<i64>>,
+) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    use sha2::Digest;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let text = policy_text.to_string();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_full_http_request(&mut stream).await;
+            let _ = tx.send(request);
+            let mut policy = text.clone();
+            let sha: String = hex::encode(sha2::Sha256::digest(policy.as_bytes()));
+            if let Some(groups) = &pod_supplemental_groups {
+                policy = serde_json::json!({
+                    "agent_policy_text": policy,
+                    "agent_policy_sha256": sha,
+                    "genpolicy_version_pin": "test-genpolicy",
+                    "log_encryption": null,
+                    "pod_supplemental_groups": groups,
+                })
+                .to_string();
+            } else {
+                policy = serde_json::json!({
+                    "agent_policy_text": policy,
+                    "agent_policy_sha256": sha,
+                    "genpolicy_version_pin": "test-genpolicy",
+                })
+                .to_string();
+            }
+            let body = policy;
+            use tokio::io::AsyncWriteExt;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    // The first request is drained by the CALLER after the fetch: awaiting
+    // it here would deadlock (nothing has sent a request yet).
+    (format!("http://{addr}"), rx)
+}
+
+#[tokio::test]
+async fn discovery_merges_canonicalizes_and_re_calls_before_any_hash() {
+    // (e) The discovery loop: first call reports [27, 6, 0, 27] (unsorted,
+    // duplicated); the CLI canonicalizes to [0, 6, 27], sets it on the
+    // descriptor, and RE-CALLS; only the re-call's policy is used. The
+    // request bodies prove the re-call carried the declared groups.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let first_policy = "package agent_policy\n// first\n".to_string();
+    let second_policy = "package agent_policy\n// final (re-call)\n".to_string();
+    let discovered = vec![27, 6, 0, 27];
+    let first_policy_wire = first_policy.clone();
+    let second_policy_wire = second_policy.clone();
+    tokio::spawn(async move {
+        let mut round = 0;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_full_http_request(&mut stream).await;
+            let body = request.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let _ = tx.send(payload.clone());
+            round += 1;
+            let policy_text = if round == 1 {
+                first_policy_wire.clone()
+            } else {
+                second_policy_wire.clone()
+            };
+            let groups = if round == 1 {
+                Some(discovered.clone())
+            } else {
+                None
+            };
+            let sha: String = hex::encode(sha2::Sha256::digest(policy_text.as_bytes()));
+            let mut response = serde_json::json!({
+                "agent_policy_text": policy_text,
+                "agent_policy_sha256": sha,
+                "genpolicy_version_pin": "test-genpolicy",
+            });
+            if let Some(groups) = groups {
+                response["pod_supplemental_groups"] = serde_json::json!(groups);
+            }
+            let body = response.to_string();
+            use tokio::io::AsyncWriteExt;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let release = test_release();
+    let mut descriptor = pod_groups_descriptor_fixture();
+    let pre_hash = enclava_cli::descriptor::descriptor_core_hash(&descriptor);
+
+    // Bounded: fail fast instead of hanging if a mock never answers.
+    let (policy, log_encryption) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fetch_policy_with_group_discovery(&api, &release, &mut descriptor, true),
+    )
+    .await
+    .expect("the discovery flow must complete")
+    .expect("discovery flow");
+
+    let first_request = rx.recv().await.expect("first request");
+    let second_request = rx.recv().await.expect("re-call request");
+    assert_eq!(
+        first_request["supports_pod_supplemental_groups"],
+        serde_json::json!(true)
+    );
+    assert!(
+        first_request["descriptor"]
+            .get("pod_supplemental_groups")
+            .is_none(),
+        "the FIRST call carries no declared groups"
+    );
+    assert_eq!(
+        second_request["descriptor"]["pod_supplemental_groups"],
+        serde_json::json!([0, 6, 27]),
+        "the re-call carries the CANONICAL declared groups"
+    );
+    assert_eq!(
+        second_request["supports_pod_supplemental_groups"],
+        serde_json::json!(true)
+    );
+    assert_eq!(descriptor.pod_supplemental_groups, Some(vec![0, 6, 27]));
+    assert_eq!(policy.policy_text, second_policy);
+    assert!(log_encryption.is_none());
+    // (e) The hash is computed AFTER the merge: the descriptor mutated by
+    // the loop is the one the caller hashes, and it differs from the
+    // pre-discovery hash.
+    let post_hash = enclava_cli::descriptor::descriptor_core_hash(&descriptor);
+    assert_ne!(
+        pre_hash, post_hash,
+        "the merged groups change the core hash"
+    );
+    assert_eq!(
+        policy.policy_sha256.as_slice(),
+        &sha2::Sha256::digest(second_policy.as_bytes())[..]
+    );
+}
+
+#[tokio::test]
+async fn discovery_is_disabled_without_the_capability() {
+    // (f) Capability false: a single call, the request carries NEITHER the
+    // capability flag NOR the descriptor field (legacy bytes), and a
+    // response with discovered groups is ignored (no merge, no re-call).
+    let (base, mut captured_rx) =
+        agent_policy_fixture("package agent_policy\n// legacy\n", Some(vec![27])).await;
+    let api = ApiClient::new(&base, Some("test-token".to_string()));
+    let release = test_release();
+    let mut descriptor = pod_groups_descriptor_fixture();
+    // Bounded: a mock that never answers must fail fast, not hang.
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fetch_policy_with_group_discovery(&api, &release, &mut descriptor, false),
+    )
+    .await
+    .expect("the legacy single call must complete");
+    let (policy, _) = fetched.expect("legacy single call");
+    let captured = captured_rx
+        .recv()
+        .await
+        .expect("the fixture captured exactly one request");
+    assert!(!captured.contains("supports_pod_supplemental_groups"));
+    assert!(!captured.contains("pod_supplemental_groups"));
+    // The fixture's server task keeps the sender alive, so "no second
+    // request" is asserted with a bounded wait, not an unbounded recv.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), captured_rx.recv())
+            .await
+            .is_err(),
+        "exactly ONE request, no re-call"
+    );
+    assert_eq!(policy.policy_text, "package agent_policy\n// legacy\n");
+    assert_eq!(descriptor.pod_supplemental_groups, None);
+}
+
+#[tokio::test]
+async fn discovery_fails_closed_on_invalid_discovered_groups() {
+    // A discovered list missing the platform baseline 6 fails closed; the
+    // descriptor is NOT mutated.
+    let (base, _captured) =
+        agent_policy_fixture("package agent_policy\n// x\n", Some(vec![0, 27])).await;
+    let api = ApiClient::new(&base, Some("test-token".to_string()));
+    let release = test_release();
+    let mut descriptor = pod_groups_descriptor_fixture();
+    // Bounded: fail fast instead of hanging if the fixture never answers.
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fetch_policy_with_group_discovery(&api, &release, &mut descriptor, true),
+    )
+    .await
+    .expect("the invalid-groups call must complete")
+    .expect_err("invalid discovered groups fail closed");
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("discovered pod_supplemental_groups"));
+    assert_eq!(descriptor.pod_supplemental_groups, None);
+}
+
+#[test]
+fn apply_discovered_pod_groups_canonicalizes_and_validates() {
+    let mut descriptor = pod_groups_descriptor_fixture();
+    apply_discovered_pod_groups(&mut descriptor, vec![27, 6, 0, 27]).unwrap();
+    assert_eq!(descriptor.pod_supplemental_groups, Some(vec![0, 6, 27]));
+    // Invalid lists (missing 6) fail without mutating.
+    let mut invalid = pod_groups_descriptor_fixture();
+    assert!(apply_discovered_pod_groups(&mut invalid, vec![0, 27]).is_err());
+    assert_eq!(invalid.pod_supplemental_groups, None);
+}
+
+#[test]
+fn deploy_config_load_reports_invalid_file_instead_of_missing() {
+    let invalid = AppConfig::parse("[app]\nname = \"demo\"\nport = 1\n\n[extra]\nkey = 1\n");
+    let err = load_deploy_app_config(invalid).unwrap_err().to_string();
+    assert!(err.contains("'extra'"), "{err}");
+    assert!(!err.contains("no enclava.toml found"), "{err}");
+
+    let missing = AppConfig::load(std::path::Path::new("/nonexistent-dir/enclava.toml"));
+    let err = load_deploy_app_config(missing).unwrap_err().to_string();
+    assert!(err.contains("no enclava.toml found"), "{err}");
+}
+
+#[test]
+fn terminal_failure_message_with_bind_stage_adds_the_storage_hint() {
+    // The plain-path contract's failure mode: the init died at the
+    // workload-mount bind stage. The first line stays the stable
+    // PaaS-matchable form; the hint names the most common cause (the binder
+    // has other failure modes and RootfulSudo runs a writable rootfs, so
+    // the hint must not claim a diagnosis).
+    let diagnostic = enclava_cli::tee_client::parse_terminal_bootstrap_error(&serde_json::json!({
+        "bootstrap_error": {
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+            "last_init_stage": "binding workload mount namespaces",
+        }
+    }))
+    .unwrap();
+    let message = terminal_bootstrap_failure_message("demo", &diagnostic);
+    assert_eq!(
+        message,
+        "terminal bootstrap failure for app demo: enclava_init_failed \
+             (init stage: binding workload mount namespaces); \
+             run `enclava status --app demo` for the latest state\n\
+             hint: a common cause of a failure at this stage is a [storage] paths entry \
+             the image does not contain -- the restricted profile runs a read-only root \
+             filesystem, so the bind stage cannot create it"
+    );
+}
+
+#[test]
+fn terminal_failure_message_with_other_stage_has_no_hint() {
+    // Any other init stage (or none) keeps the single-line message: the
+    // hint is specific to the storage-path bind failure mode.
+    for stage in [
+        Some("provisioning static tls certificate"),
+        Some("waiting for owner seed"),
+        None,
+    ] {
+        let mut bootstrap_error = serde_json::json!({
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+        });
+        if let Some(stage) = stage {
+            bootstrap_error["last_init_stage"] = serde_json::json!(stage);
+        }
+        let diagnostic = enclava_cli::tee_client::parse_terminal_bootstrap_error(
+            &serde_json::json!({ "bootstrap_error": bootstrap_error }),
+        )
+        .unwrap();
+        let message = terminal_bootstrap_failure_message("demo", &diagnostic);
+        assert!(
+            !message.contains("hint:"),
+            "stage {stage:?} must not carry the storage hint"
+        );
+        assert!(
+            message.starts_with("terminal bootstrap failure for app demo: enclava_init_failed")
+        );
+        assert!(!message.contains('\n'));
+    }
+}
+
+#[test]
+fn default_storage_path_warning_fires_only_for_the_default() {
+    // D3: the warning is value-based -- the serde default and an explicit
+    // "/data" are the same contract; any other paths (including a
+    // template image's /state/app-data) do not warn.
+    let default_config =
+        enclava_cli::app_config::AppConfig::parse("[app]\nname = \"demo\"\nport = 3000\n").unwrap();
+    assert!(default_storage_path_in_play(&default_config));
+
+    let explicit_default = enclava_cli::app_config::AppConfig::parse(
+        "[app]\nname = \"demo\"\nport = 3000\n\n[storage]\npaths = [\"/data\"]\n",
+    )
+    .unwrap();
+    assert!(default_storage_path_in_play(&explicit_default));
+
+    let template_paths = enclava_cli::app_config::AppConfig::parse(
+        "[app]\nname = \"demo\"\nport = 3000\n\n[storage]\npaths = [\"/state/app-data\"]\n",
+    )
+    .unwrap();
+    assert!(!default_storage_path_in_play(&template_paths));
+
+    let empty_paths = enclava_cli::app_config::AppConfig::parse(
+        "[app]\nname = \"demo\"\nport = 3000\n\n[storage]\npaths = []\n",
+    )
+    .unwrap();
+    assert!(!default_storage_path_in_play(&empty_paths));
 }

@@ -31,7 +31,7 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     let mut pod_labels = BTreeMap::new();
     pod_labels.insert("app".to_string(), app.name.clone());
     pod_labels.insert(
-        "enclava.dev/deployment-id".to_string(),
+        crate::manifest::DEPLOYMENT_ID_LABEL.to_string(),
         app.deployment_id.to_string(),
     );
 
@@ -68,6 +68,18 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     }
 
     let legacy = legacy_bootstrap_enabled();
+    // cap#392: a low CPU limit must not shrink the guest below the vCPU
+    // count whose launch measurement is approved. The simulated dev class is
+    // not measured and its handler does not allow-list the annotation.
+    if runtime_class != cc_init_data::COCO_DEV_RUNTIME_CLASS
+        && let Some(baseline) =
+            crate::manifest::shape::vm_vcpu_baseline_annotation(&app.resources.cpu, legacy)
+    {
+        annotations.insert(
+            crate::manifest::shape::KATA_DEFAULT_VCPUS_ANNOTATION.to_string(),
+            baseline,
+        );
+    }
 
     let mut node_selector = BTreeMap::new();
     node_selector.insert(
@@ -162,7 +174,17 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
                     security_context: Some(PodSecurityContext {
                         fs_group: Some(10001),
                         fs_group_change_policy: Some("OnRootMismatch".to_string()),
-                        supplemental_groups: Some(vec![0, 6]),
+                        // Contract v1 (policy-templates#23): the descriptor's
+                        // DECLARED list when present, else the platform
+                        // baseline. Pod-level only — genpolicy 4.3.1 rejects
+                        // container-level supplementalGroups, and fsGroup
+                        // and the container-level runAsUser/runAsGroup
+                        // profiles stay untouched.
+                        supplemental_groups: Some(
+                            app.pod_supplemental_groups
+                                .clone()
+                                .unwrap_or_else(|| vec![0, 6]),
+                        ),
                         ..Default::default()
                     }),
                     init_containers,

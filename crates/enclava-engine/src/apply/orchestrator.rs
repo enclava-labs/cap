@@ -234,11 +234,14 @@ pub fn enforce_floor_on_claims(
     Ok(())
 }
 
-/// Per-claim fresh-volume verdicts. `true` means the claim lacks positive
-/// initialization evidence — it is missing, terminating, or never proven
-/// initialized — so this render provisions it FRESH: the 32 MiB floor and
-/// the first-boot rollout allowance apply to it. `false` means the claim
-/// was not inspected or proven initialized.
+/// Per-claim fresh-volume verdicts. A `true` bit is the admission signal the
+/// security review called `expects_fresh_volume`: the claim lacks positive
+/// initialization evidence — it is missing (new), terminating or otherwise
+/// recreated, or present but unproven — so this render provisions it FRESH:
+/// the 32 MiB floor and the first-boot rollout allowance apply to it.
+/// `false` means the claim was not inspected or proven initialized by live
+/// Ready ordinal-zero pod evidence. State (`app_data`) and TLS (`tls_data`)
+/// are independent, so a mixed render may set only one bit.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FreshVolumeClaims {
     /// state volume (`storage`/`app_data_size` → VCT `state`)
@@ -372,6 +375,88 @@ pub async fn inspect_fresh_volume_claims(
         .await?;
     }
     Ok(claims)
+}
+
+/// Restart-admission proof: the live ordinal-0 pod exists, is not
+/// terminating, reports Ready, and mounts BOTH provisioned claims
+/// (`state`, `tls-state`). Timestamp-agnostic by design, unlike
+/// [`pod_proves_claim_initialized`]: that rule defends the size-floor /
+/// first-boot waiver against a pod predating a REPLACED claim (stale
+/// device handle), where whole-second timestamps are the only ordering
+/// evidence. For restart admission a Ready pod that mounts the claims is
+/// itself the initialization proof — the pod opened and completed
+/// first-boot on these volumes — and a same-second pod/claim pair is the
+/// NORMAL StatefulSet flow (the controller creates the ordinal-0 claim
+/// before its pod; observed on dev: both claims and pod share one whole
+/// second on every fresh deploy, which made the strict rule refuse the
+/// first domain verify of every fresh app). The residual ambiguity it
+/// cannot exclude — the claim replaced under a same-second-created
+/// running pod — is healed by the very rollout restart this check admits.
+pub async fn inspect_ready_pod_mounts_all_claims(
+    engine: &ApplyEngine,
+    namespace: &str,
+    workload: &str,
+) -> Result<bool, ApplyError> {
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+    use kube::api::{Api, ListParams};
+
+    let pod_api: Api<Pod> = Api::namespaced(engine.client().clone(), namespace);
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(engine.client().clone(), namespace);
+    let pod_name = crate::manifest::volumes::provisioned_pod_name(workload);
+    let params = ListParams::default()
+        .fields(&format!("metadata.name={pod_name}"))
+        .limit(1);
+    let pod = pod_api.list(&params).await?.items.pop();
+    // The CLAIM objects must also exist and not be terminating (Devin
+    // review on this change): a pod mounting a claim NAME proves nothing
+    // about a claim that is gone or mid-delete — the restart would land
+    // on a recreated, never-initialized volume. Fail closed on either.
+    for vct in ["state", "tls-state"] {
+        let claim_name = crate::manifest::volumes::provisioned_claim_name(vct, workload);
+        let Some(pvc) = pvc_api.get_opt(&claim_name).await? else {
+            return Ok(false);
+        };
+        if pvc.metadata.deletion_timestamp.is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(pod
+        .as_ref()
+        .is_some_and(|pod| pod_proves_restart_admission(pod, workload)))
+}
+
+/// Pure form of [`inspect_ready_pod_mounts_all_claims`] so tests can drive
+/// the admission predicate without a cluster double.
+fn pod_proves_restart_admission(pod: &k8s_openapi::api::core::v1::Pod, workload: &str) -> bool {
+    let mounts_claim = |claim_name: String| {
+        pod.spec.as_ref().is_some_and(|spec| {
+            spec.volumes.as_ref().is_some_and(|volumes| {
+                volumes.iter().any(|volume| {
+                    volume
+                        .persistent_volume_claim
+                        .as_ref()
+                        .is_some_and(|claim| claim.claim_name == claim_name)
+                })
+            })
+        })
+    };
+    pod.metadata.deletion_timestamp.is_none()
+        && mounts_claim(crate::manifest::volumes::provisioned_claim_name(
+            "state", workload,
+        ))
+        && mounts_claim(crate::manifest::volumes::provisioned_claim_name(
+            "tls-state",
+            workload,
+        ))
+        && pod
+            .status
+            .as_ref()
+            .and_then(|status| status.conditions.as_ref())
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+            })
 }
 
 /// Whether the live ordinal-0 pod proves `claim_name` is initialized: the

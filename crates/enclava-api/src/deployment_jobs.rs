@@ -289,6 +289,17 @@ const CLEANUP_RETRY_INTERVAL_SQL: &str = "30 seconds";
 const APPLY_RETRY_BASE_SECS: i64 = 5;
 /// Base retry interval (seconds) for nonterminal rollout observations.
 const ROLLOUT_OBSERVATION_RETRY_BASE_SECS: i64 = 30;
+/// Ceiling (seconds) for the nonterminal observation retry above. Both
+/// nonterminal observation reasons (password owner wait and a bounded slice
+/// elapsing with rollout budget remaining) wait on external progress that can
+/// finish right after a requeue, so unlike contention the cadence stays near
+/// the base: an owner unlock must reach status within about a minute instead
+/// of waiting out an exponential delay. Extended owner-wait observations
+/// probe with a short slice (`EXTENDED_OWNER_WAIT_PROBE_SLICE` in deploy.rs)
+/// on their own bounded dispatch lane (`MAX_OWNER_WAIT_PROBE_WORKERS`), so
+/// this cadence costs no shared apply-worker time at all per never-unlocking
+/// owner (#231, #387). The 24 h grace still bounds the loop.
+const ROLLOUT_OBSERVATION_RETRY_MAX_SECS: i64 = 60;
 /// Retry backoff grows exponentially with the job's attempt count so a job
 /// that keeps requeueing without reaching a terminal observation releases
 /// its apply worker instead of pinning one of the bounded worker slots at a
@@ -316,6 +327,20 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TERMINAL_LEASE_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_SETUP_WORKERS: usize = 8;
 const MAX_APPLY_WORKERS: usize = 32;
+/// Bounded workers for past-budget watching observations — the extended
+/// owner-wait probe shape (normally password-mode creates whose rollout
+/// budget is spent and that only wait for a late unlock; see
+/// [`OwnerWaitProbeFilter`] for the claim-time scope). The shared apply
+/// lane excludes these candidates, so however many apps stay locked, they
+/// can never delay a real deploy. The bound itself caps the concurrent
+/// read-only Kubernetes polls a backlog of locked apps generates: with the
+/// 3 s probe slice, two workers re-probe ~28 waiting apps — the backlog
+/// that previously saturated a production 4-slot pool — each within about
+/// a minute, keeping the #386 unlock-notice promise (#387). Headroom is
+/// deliberately fixed for the pre-signup scale the issue targets; revisit
+/// the bound and expose probe-lane queue depth in metrics before signup
+/// opens widely.
+const MAX_OWNER_WAIT_PROBE_WORKERS: usize = 2;
 
 fn apply_worker_limit(configured_apply_concurrency: usize) -> usize {
     configured_apply_concurrency
@@ -607,6 +632,19 @@ impl DeploymentJobError {
                 crate::mutation_leases::MutationLeaseError::Database(_) => "database_error",
             },
         }
+    }
+
+    /// Trustee did not report Ready within the publication wait. Every KBS
+    /// write in that attempt was awaited to a known outcome and the next
+    /// attempt re-converges from the ConfigMap annotations, so this is a
+    /// retryable platform condition, never a verdict on the deployment.
+    fn is_trustee_rollout_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::Apply(crate::deploy::DeployError::KbsPolicy(
+                crate::kbs::KbsPolicyError::RolloutTimedOut
+            )) | Self::Kbs(crate::kbs::KbsPolicyError::RolloutTimedOut)
+        )
     }
 
     fn should_requeue_without_terminal_failure(&self) -> bool {
@@ -1146,12 +1184,25 @@ async fn process_claimed_setup_job(
         "deployment_setup",
         job.deployment_id,
         false,
-        resources,
+        resources.clone(),
     )
     .await
     {
         Ok(mutation) => mutation,
         Err(error) => {
+            if matches!(error, crate::mutation_leases::MutationLeaseError::Busy) {
+                // The requeue below is silent by design (it repeats every
+                // few seconds); name the holder so a deploy stuck behind a
+                // quarantined global fence is visible in the logs.
+                crate::mutation_leases::warn_claim_busy(
+                    &state.db,
+                    "deployment_setup",
+                    job.deployment_id,
+                    Some(job.app_id),
+                    &resources,
+                )
+                .await;
+            }
             requeue_setup_job(&state.db, &job, DeploymentJobError::from(error).code()).await?;
             return Ok(());
         }
@@ -1216,10 +1267,8 @@ async fn process_claimed_setup_job(
             mutation.assert_current_in_tx(&mut side_effect_lane).await?;
             mark_setup_failed_in_tx(&mut side_effect_lane, &job).await?;
             side_effect_lane.commit().await?;
-            if reconcile_pending_kbs_with_mutation(state, &mutation)
-                .await
-                .is_ok()
-            {
+            let kbs = reconcile_pending_kbs_with_mutation(state, &mutation).await;
+            if kbs_fence_is_releasable(&kbs) {
                 // DNS may have accepted the failed request, so retain its
                 // app/hostname quarantine while unblocking KBS revocation.
                 release_kbs_resource(&state.db, &mut mutation).await?;
@@ -1771,6 +1820,18 @@ pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::
                     "failed to repair orphaned deployment namespace mutation leases"
                 ),
             }
+            match crate::mutation_leases::reconcile_orphaned_custom_domain_fences(&repair_state.db)
+                .await
+            {
+                Ok(repaired) if repaired > 0 => {
+                    tracing::warn!(repaired, "bounded orphaned custom-domain namespace fences")
+                }
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    error_code = "orphaned_custom_domain_fence_repair_failed",
+                    "failed to repair orphaned custom-domain namespace fences"
+                ),
+            }
             match expire_customer_config_holds(&repair_state.db).await {
                 Ok(expired) if expired > 0 => tracing::warn!(
                     expired,
@@ -1818,6 +1879,8 @@ pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::
     let configured_apply_workers =
         apply_worker_limit(state.deployment_apply_permits.available_permits());
     let apply_worker_slots = Arc::new(tokio::sync::Semaphore::new(configured_apply_workers));
+    let owner_wait_probe_slots =
+        Arc::new(tokio::sync::Semaphore::new(MAX_OWNER_WAIT_PROBE_WORKERS));
     crate::reconciler::spawn_reconciler("deployment-dispatcher", shutdown.clone(), async move {
         loop {
             let mut found_work = false;
@@ -1888,6 +1951,29 @@ pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::
                 }
             }
 
+            // Extended owner-wait probes run on their own bounded lane so a
+            // backlog of locked apps can never occupy shared apply-worker
+            // slots or head-of-line block fresh deployments (#387).
+            if let Ok(worker_slot) = owner_wait_probe_slots.clone().try_acquire_owned() {
+                match claim_owner_wait_probe_job(&state.db).await {
+                    Ok(Some(job)) => {
+                        found_work = true;
+                        let worker_state = state.clone();
+                        tokio::spawn(async move {
+                            process_apply_job(worker_state, job, worker_slot).await;
+                        });
+                    }
+                    Ok(None) => drop(worker_slot),
+                    Err(error) => {
+                        drop(worker_slot);
+                        tracing::error!(
+                            error_code = error.code(),
+                            "failed to claim durable deployment owner-wait probe job"
+                        );
+                    }
+                }
+            }
+
             if found_work {
                 tokio::task::yield_now().await;
             } else {
@@ -1902,11 +1988,71 @@ async fn claim_setup_job(pool: &PgPool) -> Result<Option<ClaimedJob>, Deployment
 }
 
 async fn claim_apply_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
-    claim_job(pool, "pending", "running", None).await
+    // The shared apply lane must never pick up extended owner-wait probes:
+    // their job rows stay oldest across the requeue loop, so without the
+    // exclusion their due re-checks head-of-line block fresh deployments for
+    // as long as the owner stays absent (#387).
+    claim_job_candidate(
+        pool,
+        "pending",
+        "running",
+        None,
+        false,
+        OwnerWaitProbeFilter::Exclude,
+    )
+    .await
+}
+
+/// Claim one past-budget watching observation for the bounded probe lane —
+/// the extended owner-wait probe shape (normally a locked password-mode
+/// create whose rollout budget is spent and that only waits for a late
+/// unlock). The claim-time predicate reads durable deployment rows only:
+/// the owner-wait classification inputs (password mode, creating snapshot)
+/// live in the frozen job payload, so a past-budget straggler that is not
+/// an owner wait can also land here. That is deliberate — `watch()` gives
+/// such a row a zero-length slice and the publish terminalizes it on its
+/// first claim, at no meaningful cost — and it keeps every past-budget row
+/// on exactly one lane (#387).
+async fn claim_owner_wait_probe_job(
+    pool: &PgPool,
+) -> Result<Option<ClaimedJob>, DeploymentJobError> {
+    claim_job_candidate(
+        pool,
+        "pending",
+        "running",
+        None,
+        false,
+        OwnerWaitProbeFilter::Only,
+    )
+    .await
 }
 
 async fn claim_cleanup_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
     claim_job(pool, "cleanup_pending", "cleaning_up", None).await
+}
+
+/// Routing filter for extended owner-wait probe candidates in
+/// [`claim_job_candidate`]. The shared apply lane's `Exclude` and the probe
+/// lane's `Only` are exact complements over the same predicate, so every
+/// row is claimable by exactly one lane and no job can be stranded by both
+/// lanes refusing it. Targeted claims (a concrete `only_deployment_id`, and
+/// the setup/cleanup lanes, whose states never observe rollouts) pass
+/// `Any` and keep claim semantics unchanged.
+#[derive(Debug, Clone, Copy)]
+enum OwnerWaitProbeFilter {
+    Any,
+    Only,
+    Exclude,
+}
+
+impl OwnerWaitProbeFilter {
+    fn as_sql_arg(self) -> Option<bool> {
+        match self {
+            OwnerWaitProbeFilter::Any => None,
+            OwnerWaitProbeFilter::Only => Some(true),
+            OwnerWaitProbeFilter::Exclude => Some(false),
+        }
+    }
 }
 
 async fn claim_job(
@@ -1921,6 +2067,7 @@ async fn claim_job(
         claimed_state,
         only_deployment_id,
         only_deployment_id.is_some(),
+        OwnerWaitProbeFilter::Any,
     )
     .await
 }
@@ -1931,9 +2078,23 @@ async fn claim_job_candidate(
     claimed_state: &str,
     only_deployment_id: Option<Uuid>,
     bypass_recovery_delay: bool,
+    owner_wait_probe: OwnerWaitProbeFilter,
 ) -> Result<Option<ClaimedJob>, DeploymentJobError> {
     let lock_token = Uuid::new_v4();
     let job = sqlx::query_as::<_, ClaimedJob>(
+        // The $9 probe predicate (a deployment durably `watching` past its
+        // persisted rollout budget, still only observing for a late unlock)
+        // is evaluated once here and drives both lane directions: the shared
+        // apply lane passes false and the probe lane true over the exact
+        // same expression, so the lanes partition the candidate set with no
+        // gap a job could fall through (#387).
+        //
+        // Cost note (#402): the EXISTS runs per head-of-queue candidate row,
+        // so a shared-lane claim with N past-budget rows pays N probes
+        // before reaching a fresh deploy. The bound is the backlog size, not
+        // the claim rate; the probe-lane queue-depth metric named on
+        // `MAX_OWNER_WAIT_PROBE_WORKERS` must land before signup widens the
+        // backlog.
         "WITH candidate AS (
              SELECT deployment_id
                FROM deployment_apply_jobs
@@ -1952,6 +2113,22 @@ async fn claim_job_candidate(
                 AND (
                     NOT customer_config_hold
                     OR customer_config_released_at IS NOT NULL
+                )
+                AND (
+                    $9::boolean IS NULL
+                    OR (
+                        EXISTS (
+                            SELECT 1
+                              FROM deployments AS observe
+                             WHERE observe.id = deployment_apply_jobs.deployment_id
+                               AND observe.status = 'watching'::deploy_status_enum
+                               AND observe.manifest_hash IS NOT NULL
+                               AND observe.observing_since IS NOT NULL
+                               AND observe.observing_since
+                                   + observe.rollout_timeout_millis * interval '1 millisecond'
+                                   <= clock_timestamp()
+                        )
+                    ) = $9
                 )
               ORDER BY created_at, deployment_id
               FOR UPDATE SKIP LOCKED
@@ -1980,6 +2157,7 @@ async fn claim_job_candidate(
     .bind(LEASE_INTERVAL_SQL)
     .bind(only_deployment_id)
     .bind(bypass_recovery_delay)
+    .bind(owner_wait_probe.as_sql_arg())
     .fetch_optional(pool)
     .await?;
     Ok(job)
@@ -2051,6 +2229,12 @@ async fn process_apply_job(
             }
         }
         Ok(Ok(JobApplyOutcome::ApplyFailed(error, mutation)))
+            if error.is_trustee_rollout_timeout() =>
+        {
+            requeue_after_trustee_rollout_timeout(&state, &job, &payload.app, &error, mutation)
+                .await;
+        }
+        Ok(Ok(JobApplyOutcome::ApplyFailed(error, mutation)))
             if error.should_requeue_without_terminal_failure() =>
         {
             // The reconciliation timed out or encountered a newer rollout.
@@ -2073,6 +2257,19 @@ async fn process_apply_job(
                 .await;
         }
         Ok(Err(error)) if error.should_requeue_without_terminal_failure() => {
+            if matches!(
+                error,
+                DeploymentJobError::Mutation(crate::mutation_leases::MutationLeaseError::Busy)
+            ) {
+                crate::mutation_leases::warn_claim_busy(
+                    &state.db,
+                    "deployment_apply",
+                    deployment_id,
+                    Some(job.app_id),
+                    &deployment_apply_resource_fences(&payload.app),
+                )
+                .await;
+            }
             match requeue_or_exhaust_apply_job(&state.db, &job).await {
                 Ok(true) => {
                     tracing::warn!(
@@ -2111,6 +2308,50 @@ async fn process_apply_job(
                 "durable deployment job lost its lease"
             );
         }
+    }
+}
+
+/// Requeue an apply whose signed-policy publication timed out waiting for
+/// Trustee, releasing this attempt's fences immediately.
+///
+/// `apply_deployment_manifests` converges KBS before it arms the namespace
+/// fence or sends any namespace/edge write, and `RolloutTimedOut` is returned
+/// only after every KBS write was awaited to a known outcome. Nothing of this
+/// attempt can therefore still land, so the lease is finished instead of
+/// being left to the reclaim quarantine — which would hold the global
+/// `kbs_policy` fence against every other deployment for up to 540 s.
+async fn requeue_after_trustee_rollout_timeout(
+    state: &AppState,
+    job: &ClaimedJob,
+    app: &App,
+    error: &DeploymentJobError,
+    mutation: crate::mutation_leases::AppMutationLease,
+) {
+    if matches!(
+        apply_job_retries_exhausted(&state.db, job.deployment_id).await,
+        Ok(true)
+    ) {
+        fail_apply_job_with_mutation(state, job, error, Some(mutation), Some(app)).await;
+        return;
+    }
+    tracing::warn!(
+        deployment_id = %job.deployment_id,
+        error_code = "kbs_trustee_rollout_timeout",
+        "Trustee was not Ready within the signed-policy publication wait; requeueing the deployment apply"
+    );
+    if let Err(requeue_error) = requeue_apply_job(&state.db, job, error.code()).await {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = requeue_error.code(),
+            "failed to requeue deployment apply after a Trustee rollout timeout"
+        );
+    }
+    if let Err(release_error) = mutation.finish().await {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = DeploymentJobError::from(release_error).code(),
+            "failed to release deployment mutation fences after a Trustee rollout timeout; they stay owned through the reclaim quarantine"
+        );
     }
 }
 
@@ -2642,7 +2883,7 @@ async fn compensate_after_retry_exhaustion(state: &AppState, job: &ClaimedJob, a
                 error_code = "exhaustion_provenance_lookup_failed",
                 "retry-exhaustion compensation skipped: cannot load the attempts' provenance; the durable sweep marker stays armed"
             );
-            if let Ok(()) = reconcile_pending_kbs_with_mutation(state, &mutation).await
+            if kbs_fence_is_releasable(&reconcile_pending_kbs_with_mutation(state, &mutation).await)
                 && let Err(release_error) = release_kbs_resource(&state.db, &mut mutation).await
             {
                 tracing::error!(
@@ -2672,22 +2913,21 @@ async fn compensate_after_retry_exhaustion(state: &AppState, job: &ClaimedJob, a
     .await;
     // The terminal publisher enqueued signed-policy revocation; converge it
     // under the same lease rather than waiting for the poller.
-    if reconcile_pending_kbs_with_mutation(state, &mutation)
-        .await
-        .is_ok()
-    {
-        if let Err(release_error) = release_kbs_resource(&state.db, &mut mutation).await {
-            tracing::error!(
-                deployment_id = %job.deployment_id,
-                error_code = release_error.code(),
-                "failed to release reconciled global KBS mutation fence"
-            );
-        }
-    } else {
+    let kbs = reconcile_pending_kbs_with_mutation(state, &mutation).await;
+    if kbs.is_err() {
         tracing::error!(
             deployment_id = %job.deployment_id,
             error_code = "kbs_policy_reconciliation_failed",
             "retry-exhaustion revocation remains durably pending"
+        );
+    }
+    if kbs_fence_is_releasable(&kbs)
+        && let Err(release_error) = release_kbs_resource(&state.db, &mut mutation).await
+    {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = release_error.code(),
+            "failed to release the global KBS mutation fence"
         );
     }
     // RetainNamespaceFence implies the retained-namespace marker was already
@@ -2934,6 +3174,7 @@ async fn apply_claimed_job(
                 sigstore_material: validated.sigstore_material,
                 provenance_oci_material: validated.provenance_oci_material,
                 log_encryption: payload.log_encryption.clone(),
+                pod_supplemental_groups: validated.pod_supplemental_groups,
             },
             &state.kube_client,
             &mutation,
@@ -3375,6 +3616,9 @@ struct ValidatedApplyArtifacts {
     local_trustee_policy_json: Option<String>,
     sigstore_material: Vec<u8>,
     provenance_oci_material: Vec<u8>,
+    /// Contract v1 (policy-templates#23): the signed descriptor's
+    /// declared pod-level supplemental groups (fail-closed validated).
+    pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 async fn validate_apply_artifacts(
@@ -3416,6 +3660,7 @@ async fn validate_apply_artifacts(
             local_trustee_policy_json: None,
             sigstore_material,
             provenance_oci_material,
+            pod_supplemental_groups: None,
         });
     };
     let loaded = crate::signing_service::load_workload_artifacts_exact(
@@ -3454,6 +3699,22 @@ async fn validate_apply_artifacts(
         )
         .await
         .map_err(|_| DeploymentJobError::Artifact)?;
+    // Contract v1 (policy-templates#23): the declared groups ride the
+    // signed descriptor; an invalid list fails closed rather than
+    // rendering a StatefulSet genpolicy will reject at runtime.
+    enclava_common::descriptor::validate_pod_supplemental_groups(
+        loaded.descriptor.pod_supplemental_groups.as_ref(),
+    )
+    .map_err(|_| DeploymentJobError::Artifact)?;
+    // Init-first rollout guard: fail the apply closed when this API
+    // deployment has not enabled pod supplemental groups — a
+    // group-bearing descriptor under a pre-change ENCLAVA_INIT_IMAGE pin
+    // would fail guest verification on every start (deny_unknown_fields).
+    if loaded.descriptor.pod_supplemental_groups.is_some()
+        && !crate::routes::platform::pod_supplemental_groups_supported()
+    {
+        return Err(DeploymentJobError::Artifact);
+    }
     let mut binding = loaded.binding.clone();
     validate_signed_render(job, payload, &loaded, &mut binding)?;
     Ok(ValidatedApplyArtifacts {
@@ -3463,6 +3724,7 @@ async fn validate_apply_artifacts(
         local_trustee_policy_json: Some(loaded.trustee_policy_json),
         sigstore_material,
         provenance_oci_material,
+        pod_supplemental_groups: loaded.descriptor.pod_supplemental_groups.clone(),
     })
 }
 
@@ -3658,15 +3920,29 @@ async fn reconcile_pending_kbs_for_apply(
         vec![crate::mutation_leases::ResourceFence::kbs_policy()],
     )
     .await?;
-    lease
-        .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
-            &state.db,
-            state.kbs_policy.as_ref(),
-            &state.kube_client,
-        ))
-        .await??;
-    lease.finish().await?;
-    Ok(())
+    crate::kbs::reconcile_pending_under_resource_lease(state, lease)
+        .await
+        .map_err(|error| match error {
+            crate::kbs::KbsPolicyReconciliationError::Mutation(error) => {
+                DeploymentJobError::Mutation(error)
+            }
+            crate::kbs::KbsPolicyReconciliationError::Policy(error) => {
+                DeploymentJobError::Kbs(error)
+            }
+        })
+}
+
+/// Whether the global `kbs_policy` fence may be released after a
+/// reconciliation under an app mutation lease: on success, and on a failure
+/// that provably left no KBS write in flight (see
+/// `KbsPolicyError::provider_write_may_be_in_flight`). A lost lease or an
+/// uncertain write keeps the fence owned through the reclaim quarantine.
+fn kbs_fence_is_releasable(result: &Result<(), DeploymentJobError>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(DeploymentJobError::Kbs(error)) => !error.provider_write_may_be_in_flight(),
+        Err(_) => false,
+    }
 }
 
 async fn release_kbs_resource(
@@ -3777,22 +4053,21 @@ async fn fail_apply_job_with_mutation(
     // deletion was still unresolved). RetainNamespaceFence now always
     // implies the marker is already durable.
     if published && let Some(mutation) = mutation.as_mut() {
-        if reconcile_pending_kbs_with_mutation(state, mutation)
-            .await
-            .is_ok()
-        {
-            if let Err(release_error) = release_kbs_resource(&state.db, mutation).await {
-                tracing::error!(
-                    deployment_id = %job.deployment_id,
-                    error_code = release_error.code(),
-                    "failed to release reconciled global KBS mutation fence"
-                );
-            }
-        } else {
+        let kbs = reconcile_pending_kbs_with_mutation(state, mutation).await;
+        if kbs.is_err() {
             tracing::error!(
                 deployment_id = %job.deployment_id,
                 error_code = "kbs_policy_reconciliation_failed",
                 "terminal deployment revocation remains durably pending"
+            );
+        }
+        if kbs_fence_is_releasable(&kbs)
+            && let Err(release_error) = release_kbs_resource(&state.db, mutation).await
+        {
+            tracing::error!(
+                deployment_id = %job.deployment_id,
+                error_code = release_error.code(),
+                "failed to release the global KBS mutation fence"
             );
         }
     }
@@ -4024,7 +4299,7 @@ async fn publish_rollout_outcome_with_mutation(
     .bind(job.deployment_id)
     .bind(job.lock_token)
     .bind(APPLY_RETRY_BACKOFF_SHIFT_CAP)
-    .bind(APPLY_RETRY_BACKOFF_CEILING_SECS)
+    .bind(ROLLOUT_OBSERVATION_RETRY_MAX_SECS)
     .bind(exhausted)
     .bind(DEPLOYMENT_RETRY_EXHAUSTED_MESSAGE)
     .execute(&mut *tx)
@@ -4351,6 +4626,154 @@ pub(crate) mod tests {
             ));
         assert!(deferred.should_requeue_without_terminal_failure());
         assert_eq!(deferred.code(), "pull_secret_reconcile_deferred");
+    }
+
+    #[test]
+    fn trustee_rollout_timeout_is_retryable_and_kbs_failures_classify_the_fence() {
+        use crate::kbs::KbsPolicyError;
+        let from_apply = DeploymentJobError::Apply(crate::deploy::DeployError::KbsPolicy(
+            KbsPolicyError::RolloutTimedOut,
+        ));
+        assert!(from_apply.is_trustee_rollout_timeout());
+        assert!(
+            DeploymentJobError::Kbs(KbsPolicyError::RolloutTimedOut).is_trustee_rollout_timeout()
+        );
+        // Every other KBS failure keeps failing the deployment terminally.
+        for terminal in [
+            KbsPolicyError::ArtifactNotCurrent,
+            KbsPolicyError::ProviderWriteTimeout,
+            KbsPolicyError::PolicyCasExhausted,
+            KbsPolicyError::InvalidPolicyGeneration,
+        ] {
+            let error = DeploymentJobError::Apply(crate::deploy::DeployError::KbsPolicy(terminal));
+            assert!(!error.is_trustee_rollout_timeout());
+            assert!(!error.should_requeue_without_terminal_failure());
+        }
+
+        // The global fence is released on success and on a failure that
+        // provably left no KBS write in flight; an uncertain write or a lost
+        // lease keeps the reclaim quarantine.
+        assert!(kbs_fence_is_releasable(&Ok(())));
+        assert!(kbs_fence_is_releasable(&Err(DeploymentJobError::Kbs(
+            KbsPolicyError::RolloutTimedOut
+        ))));
+        assert!(kbs_fence_is_releasable(&Err(DeploymentJobError::Kbs(
+            KbsPolicyError::PublicationDeferredByHold
+        ))));
+        assert!(!kbs_fence_is_releasable(&Err(DeploymentJobError::Kbs(
+            KbsPolicyError::ProviderWriteTimeout
+        ))));
+        assert!(!kbs_fence_is_releasable(&Err(DeploymentJobError::Kbs(
+            KbsPolicyError::ProviderWriteFailed(api_error(500))
+        ))));
+        assert!(!kbs_fence_is_releasable(&Err(
+            DeploymentJobError::Mutation(crate::mutation_leases::MutationLeaseError::Lost)
+        )));
+    }
+
+    /// Production 2026-11-10: Trustee not Ready within 180 s during an apply
+    /// failed the deployment terminally and left the global KBS fence owned
+    /// for 540 s. The apply is requeued with back-off instead, and its
+    /// fences are free for the next deployment at once.
+    #[tokio::test]
+    async fn trustee_rollout_timeout_requeues_the_apply_and_frees_its_fences() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+        let fences = deployment_apply_resource_fences(&app);
+        let mutation = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            fences.clone(),
+        )
+        .await
+        .expect("claim apply fences");
+
+        // While the attempt owns its fences a contending claim can name it.
+        let holders = crate::mutation_leases::busy_fence_holders(&pool, Some(app.id), &fences)
+            .await
+            .expect("inspect holders");
+        assert_eq!(
+            holders.len(),
+            fences.len() + 1,
+            "every fence plus the app lane"
+        );
+        let kbs_holder = holders
+            .iter()
+            .find(|holder| holder.fence_scope == "kbs_policy")
+            .expect("the global KBS fence is owned");
+        assert_eq!(
+            kbs_holder.operation_kind.as_deref(),
+            Some("deployment_apply")
+        );
+        assert_eq!(kbs_holder.operation_id, Some(deployment_id));
+        assert!(kbs_holder.heartbeat_live);
+        assert!(
+            kbs_holder
+                .reclaimable_in_seconds
+                .is_some_and(|secs| secs > 0.0)
+        );
+
+        let error = DeploymentJobError::Apply(crate::deploy::DeployError::KbsPolicy(
+            crate::kbs::KbsPolicyError::RolloutTimedOut,
+        ));
+        requeue_after_trustee_rollout_timeout(&state, &apply, &app, &error, mutation).await;
+
+        let (job_state, next_attempt_in_future): (String, bool) = sqlx::query_as(
+            "SELECT state, next_attempt_at > clock_timestamp()
+               FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load job");
+        assert_eq!(job_state, "pending", "the apply is requeued, not terminal");
+        assert!(next_attempt_in_future, "the retry backs off");
+        assert!(
+            !deployment_is_terminal(&pool, deployment_id).await.unwrap(),
+            "a Trustee rollout timeout must not fail the deployment"
+        );
+        assert!(
+            crate::mutation_leases::busy_fence_holders(&pool, Some(app.id), &fences)
+                .await
+                .expect("inspect holders")
+                .is_empty(),
+            "no fence of the timed-out attempt stays owned through quarantine"
+        );
+        let retry = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            fences,
+        )
+        .await
+        .expect("the requeued apply can claim its fences immediately");
+        retry.finish().await.expect("release retry claim");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean fixture");
     }
 
     /// Preflight volume-evidence lookups classify Kubernetes failures
@@ -4987,6 +5410,7 @@ pub(crate) mod tests {
         let agent_policy_hash: [u8; 32] = Sha256::digest(agent_policy_text.as_bytes()).into();
         let rego_hash: [u8; 32] = Sha256::digest(rego_text.as_bytes()).into();
         let mut descriptor = DeploymentDescriptor {
+            pod_supplemental_groups: None,
             schema_version: "v1".to_string(),
             org_id: payload.app.org_id,
             org_slug: payload.app.tenant_id.clone(),
@@ -5327,6 +5751,297 @@ pub(crate) mod tests {
         assert_eq!(apply_worker_limit(1), 4);
         assert_eq!(apply_worker_limit(4), 16);
         assert_eq!(apply_worker_limit(usize::MAX), MAX_APPLY_WORKERS);
+    }
+
+    #[test]
+    fn owner_wait_probe_lane_is_bounded() {
+        // The probe lane serves read-only polls only: it must stay smaller
+        // than the smallest shared apply pool and bounded away from zero.
+        assert!(
+            (1..apply_worker_limit(1)).contains(&MAX_OWNER_WAIT_PROBE_WORKERS),
+            "the read-only probe lane must stay smaller than the smallest shared apply pool"
+        );
+    }
+
+    /// Stage an abandoned locked create: setup accepted, manifests applied,
+    /// the rollout durably `watching` past its persisted budget, and the
+    /// latest nonterminal observation requeued due with the job row kept
+    /// oldest — the exact candidate shape the extended owner-wait probe lane
+    /// serves (#387).
+    async fn insert_owner_wait_probe_fixture(pool: &PgPool) -> (App, Uuid) {
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(pool).await;
+        let setup = claim_job(pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim owner-wait fixture setup")
+            .expect("owner-wait fixture setup exists");
+        mark_setup_accepted(pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept owner-wait fixture setup");
+        let apply = claim_job(pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim owner-wait fixture apply")
+            .expect("owner-wait fixture apply exists");
+        let manifest_hash = "owner-wait-probe-lane-manifest";
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = $2,
+                    observing_since = clock_timestamp() - interval '2 hours',
+                    rollout_timeout_millis = 600000
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(manifest_hash)
+        .execute(pool)
+        .await
+        .expect("stage owner-wait observation past its rollout budget");
+        publish_rollout_outcome(
+            pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect("publish nonterminal owner-wait observation");
+        // Due immediately and the oldest candidate in the table.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET next_attempt_at = clock_timestamp() - interval '1 second',
+                    created_at = created_at - interval '1 hour'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(pool)
+        .await
+        .expect("make owner-wait probe due and oldest");
+        (app, deployment_id)
+    }
+
+    /// Stage a fresh deploy queued behind the owner-wait backlog: setup
+    /// accepted, apply due now (#387).
+    async fn insert_fresh_apply_fixture(pool: &PgPool) -> (App, Uuid) {
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(pool).await;
+        let setup = claim_job(pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim fresh fixture setup")
+            .expect("fresh fixture setup exists");
+        mark_setup_accepted(pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept fresh fixture setup");
+        (app, deployment_id)
+    }
+
+    #[tokio::test]
+    async fn extended_owner_wait_probe_lane_partition_is_exact() {
+        // A locked password-mode create past its rollout budget requeues as
+        // a read-only unlock probe for up to 24 h and its job row stays the
+        // oldest candidate. The shared apply lane and the bounded probe lane
+        // partition these rows exactly, so the probes can neither head-of-
+        // line block fresh deployments nor strand a job both lanes refuse
+        // (#387).
+        let pool = database_test_pool().await;
+        let (app_a, deployment_a) = insert_owner_wait_probe_fixture(&pool).await;
+        let (app_b, deployment_b) = insert_fresh_apply_fixture(&pool).await;
+
+        assert!(
+            claim_job_candidate(
+                &pool,
+                "pending",
+                "running",
+                Some(deployment_a),
+                false,
+                OwnerWaitProbeFilter::Exclude,
+            )
+            .await
+            .expect("exclude claim for owner-wait probe")
+            .is_none(),
+            "the shared apply lane must refuse extended owner-wait probes"
+        );
+        assert!(
+            claim_job_candidate(
+                &pool,
+                "pending",
+                "running",
+                Some(deployment_b),
+                false,
+                OwnerWaitProbeFilter::Only,
+            )
+            .await
+            .expect("probe-only claim for fresh deploy")
+            .is_none(),
+            "the probe lane must refuse fresh deploys"
+        );
+        let probe = claim_job_candidate(
+            &pool,
+            "pending",
+            "running",
+            Some(deployment_a),
+            false,
+            OwnerWaitProbeFilter::Only,
+        )
+        .await
+        .expect("probe-only claim for owner-wait probe")
+        .expect("the owner-wait probe is claimable on the probe lane");
+        assert_eq!(probe.deployment_id, deployment_a);
+        let shared = claim_job_candidate(
+            &pool,
+            "pending",
+            "running",
+            Some(deployment_b),
+            false,
+            OwnerWaitProbeFilter::Exclude,
+        )
+        .await
+        .expect("shared claim for fresh deploy")
+        .expect("the fresh deploy is claimable on the shared lane");
+        assert_eq!(shared.deployment_id, deployment_b);
+
+        sqlx::query("DELETE FROM organizations WHERE id IN ($1, $2)")
+            .bind(app_a.org_id)
+            .bind(app_b.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete lane partition fixtures");
+    }
+
+    #[tokio::test]
+    async fn probe_lane_serves_past_budget_rows_beyond_the_owner_wait_shape() {
+        // The claim-time predicate reads durable deployment rows only; the
+        // owner-wait classification inputs (password mode, creating
+        // snapshot) live in the frozen job payload. A past-budget straggler
+        // that no longer matches the owner-wait shape must still land on
+        // exactly one lane: `watch()` gives it a zero-length slice and the
+        // publish terminalizes it on that first claim. Pinning this superset
+        // keeps future predicate narrowing from pushing such rows back onto
+        // the shared apply lane (#387).
+        let pool = database_test_pool().await;
+        let (app_a, deployment_a) = insert_owner_wait_probe_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE apps
+                SET unlock_mode = 'auto'::unlock_enum,
+                    status = 'running'::app_status_enum
+              WHERE id = $1",
+        )
+        .bind(app_a.id)
+        .execute(&pool)
+        .await
+        .expect("move live app rows past the owner-wait shape");
+
+        assert!(
+            claim_job_candidate(
+                &pool,
+                "pending",
+                "running",
+                Some(deployment_a),
+                false,
+                OwnerWaitProbeFilter::Exclude,
+            )
+            .await
+            .expect("exclude claim for past-budget straggler")
+            .is_none(),
+            "the shared apply lane must still refuse past-budget stragglers"
+        );
+        let probe = claim_job_candidate(
+            &pool,
+            "pending",
+            "running",
+            Some(deployment_a),
+            false,
+            OwnerWaitProbeFilter::Only,
+        )
+        .await
+        .expect("probe-only claim for past-budget straggler")
+        .expect("the past-budget straggler must land on the probe lane");
+        assert_eq!(probe.deployment_id, deployment_a);
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app_a.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete straggler fixture");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_claim_wrappers_route_owner_wait_probes() {
+        // End-to-end wiring of the lane partition through the dispatcher's
+        // claim entry points. Claim order is oldest-first, so the due probe
+        // fixture is always offered before its fresh sibling: the shared
+        // lane must pass it over and serve the fresh deploy instead (the
+        // head-of-line complaint in #387), and the probe lane must serve it
+        // while leaving fresh deploys alone. Bounded claim loops keep the
+        // assertions stable against rows a previously failed run left
+        // behind in a shared test database.
+        //
+        // Those loops are drain-and-ignore (#402): they may lease foreign
+        // leftover rows before reaching this run's fixtures, which is
+        // harmless only because the shared test database serializes runs
+        // (`--test-threads=1`). Filter to fixture orgs before ever running
+        // this suite concurrently.
+        let pool = database_test_pool().await;
+        let (app_a1, deployment_a1) = insert_owner_wait_probe_fixture(&pool).await;
+        let (app_b1, deployment_b1) = insert_fresh_apply_fixture(&pool).await;
+
+        let mut shared_served = Vec::new();
+        for _ in 0..64 {
+            match claim_apply_job(&pool).await.expect("shared apply claim") {
+                Some(job) if job.deployment_id == deployment_b1 => {
+                    shared_served.push(job.deployment_id);
+                    break;
+                }
+                Some(job) => {
+                    assert_ne!(
+                        job.deployment_id, deployment_a1,
+                        "the shared apply lane must never serve an owner-wait probe"
+                    );
+                    shared_served.push(job.deployment_id);
+                }
+                None => break,
+            }
+        }
+        assert!(
+            shared_served.contains(&deployment_b1),
+            "the shared lane must serve the fresh deploy while the older probe is due"
+        );
+
+        let (app_a2, deployment_a2) = insert_owner_wait_probe_fixture(&pool).await;
+        let (app_b2, deployment_b2) = insert_fresh_apply_fixture(&pool).await;
+
+        let mut probe_served_a2 = false;
+        for _ in 0..64 {
+            match claim_owner_wait_probe_job(&pool)
+                .await
+                .expect("probe lane claim")
+            {
+                Some(job) => {
+                    assert_ne!(
+                        job.deployment_id, deployment_b2,
+                        "the probe lane must never serve a fresh deploy"
+                    );
+                    if job.deployment_id == deployment_a2 {
+                        probe_served_a2 = true;
+                    }
+                }
+                None => break,
+            }
+        }
+        assert!(
+            probe_served_a2,
+            "the probe lane must serve the owner-wait probe"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id IN ($1, $2, $3, $4)")
+            .bind(app_a1.org_id)
+            .bind(app_b1.org_id)
+            .bind(app_a2.org_id)
+            .bind(app_b2.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete dispatcher wiring fixtures");
     }
 
     #[tokio::test]
@@ -6330,8 +7045,12 @@ pub(crate) mod tests {
             sweep_armed,
             "the compensating cleanup ran: an unreachable cluster keeps the retryable-sweep marker armed"
         );
+        // The revocation reconcile fails without sending a KBS write (no
+        // provider is configured), so the compensation now releases the
+        // global fence outright: an unowned row (NULL horizon) is as bounded
+        // as a finite quarantine, and never the infinite retained marker.
         let (kbs_generation, kbs_bounded): (i64, bool) = sqlx::query_as(
-            "SELECT generation, reclaim_after < 'infinity'::timestamptz
+            "SELECT generation, COALESCE(reclaim_after < 'infinity'::timestamptz, true)
                FROM external_resource_mutation_leases
               WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
         )
@@ -7584,6 +8303,108 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn owner_wait_observation_requeue_caps_backoff_at_sixty_seconds() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let manifest_hash = "capped-observation-manifest";
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = $2,
+                    observing_since = clock_timestamp(),
+                    rollout_timeout_millis = 600000
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(manifest_hash)
+        .execute(&pool)
+        .await
+        .expect("stage watching anchor");
+
+        // A first observation attempt keeps the 30 s base delay.
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim first observation")
+            .expect("first observation exists");
+        publish_rollout_outcome(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect("publish first nonterminal observation");
+        let fresh_delay_secs: i64 = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (next_attempt_at - clock_timestamp()))::bigint
+               FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load first observation delay");
+        assert!(
+            (29..=30).contains(&fresh_delay_secs),
+            "first observation must keep the 30 s base delay, got {fresh_delay_secs}"
+        );
+
+        // The owner can unlock right after any attempt; a repeatedly
+        // requeued owner wait must not drift past a minute or CAP's status
+        // stays stale long after the TEE unlocked (2026-11-12: +480 s).
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("reclaim aged observation")
+            .expect("aged observation exists");
+        sqlx::query("UPDATE deployment_apply_jobs SET attempts = 20 WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("age observation attempts");
+        publish_rollout_outcome(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect("publish aged nonterminal observation");
+        let aged_delay_secs: i64 = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (next_attempt_at - clock_timestamp()))::bigint
+               FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load aged observation delay");
+        assert!(
+            (59..=60).contains(&aged_delay_secs),
+            "aged observation must cap at 60 s, got {aged_delay_secs}"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete capped observation fixture");
+    }
+
+    #[tokio::test]
     async fn superseded_watching_lease_cannot_publish_after_reclaim_window() {
         let pool = database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
@@ -8527,6 +9348,7 @@ pub(crate) mod tests {
                 "setting_up",
                 Some(deployment_id),
                 false,
+                OwnerWaitProbeFilter::Any,
             )
             .await
             .expect("dispatcher claim query")
@@ -8576,6 +9398,7 @@ pub(crate) mod tests {
             "setting_up",
             Some(deployment_id),
             false,
+            OwnerWaitProbeFilter::Any,
         )
         .await
         .expect("dispatcher claim")
@@ -9798,17 +10621,14 @@ pub(crate) mod tests {
         .execute(&pool)
         .await
         .expect("stage mutated app row");
-        let budget = probing_rollout_engine(Arc::new(|| {}))
-            .config()
-            .rollout_timeout_for_storage(
-                &payload.snapshot.resources.app_data_size,
-                &payload.snapshot.resources.tls_data_size,
-                enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
-            )
-            .expect("fixture rollout budget");
-        let budget_millis = i64::try_from(budget.as_millis()).unwrap();
+        // cap#257: the resumed deadline is the persisted column, not a
+        // recompute from current sizes or the 600s baseline. A sentinel that
+        // matches neither must come back unchanged. The anchor is already
+        // past that sentinel, so exhaustion classification is unchanged.
+        let recorded = std::time::Duration::from_millis(123_456);
+        let budget_millis = i64::try_from(recorded.as_millis()).unwrap();
         let expired_anchor = chrono::Utc::now()
-            - chrono::Duration::from_std(budget).expect("supported fixture duration")
+            - chrono::Duration::from_std(recorded).expect("supported fixture duration")
             - chrono::Duration::seconds(1);
         sqlx::query(
             "UPDATE deployments
@@ -9846,7 +10666,7 @@ pub(crate) mod tests {
         assert_eq!(observed.status, AppStatus::Running);
         assert_eq!(observed.unlock_mode, crate::models::UnlockMode::Password);
         assert_eq!(manifest_hash, "resumed-manifest");
-        assert_eq!(rollout_timeout, budget);
+        assert_eq!(rollout_timeout, recorded);
 
         // A resumed observer must NOT wait for the owner: with the rollout
         // budget already exhausted, the redeploy classifies a timeout as a

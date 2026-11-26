@@ -711,6 +711,10 @@ struct UnlockModeCommitRequest<'a> {
     signing_service_pubkey_hex: Option<&'a str>,
     signed_required: bool,
     fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims,
+    /// Production passes the API client so supersession can stamp a
+    /// generation whose StatefulSet write already landed. Tests pass None;
+    /// they have no live cluster and do not exercise that crash window.
+    kube_client: Option<&'a kube::Client>,
 }
 
 #[derive(Debug)]
@@ -1091,6 +1095,37 @@ async fn commit_unlock_mode_transition(
         "setup_state": crate::deployment_jobs::DEPLOYMENT_SETUP_ACCEPTED,
     });
 
+    if let Some(client) = request.kube_client {
+        crate::deploy::recover_unpublished_workload_spec(
+            pool,
+            client,
+            locked_app.id,
+            &locked_app.namespace,
+            &locked_app.name,
+            crate::deploy::PublicationRecoveryMode::BeforeSupersession,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                app_id = %locked_app.id,
+                error = %error,
+                "refusing unlock supersession until workload publication can be classified"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "live workload publication could not be verified; retry"
+                })),
+            )
+        })?;
+    } else if !cfg!(test) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "live workload publication could not be verified; retry"
+            })),
+        ));
+    }
     crate::deploy::supersede_incomplete_deployments(&mut tx, locked_app.id)
         .await
         .map_err(|error| match error {
@@ -1766,6 +1801,7 @@ pub async fn update_unlock_mode(
                 .and_then(|config| config.signing_service_pubkey_hex.as_deref()),
             signed_required,
             fresh_volume_claims,
+            kube_client: Some(&state.kube_client),
         },
     )
     .await?;
@@ -3116,6 +3152,7 @@ mod tests {
                 signing_service_pubkey_hex: None,
                 signed_required: false,
                 fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+                kube_client: None,
             },
         )
         .await;
@@ -3254,6 +3291,7 @@ mod tests {
                 signing_service_pubkey_hex: None,
                 signed_required: false,
                 fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+                kube_client: None,
             },
         )
         .await;
@@ -3374,6 +3412,7 @@ mod tests {
                 signing_service_pubkey_hex: None,
                 signed_required: false,
                 fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+                kube_client: None,
             },
         )
         .await;
@@ -3498,6 +3537,7 @@ mod tests {
                 signing_service_pubkey_hex: None,
                 signed_required: false,
                 fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+                kube_client: None,
             },
         )
         .await;
@@ -3614,6 +3654,7 @@ mod tests {
                 signing_service_pubkey_hex: None,
                 signed_required: false,
                 fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+                kube_client: None,
             },
         );
         let second = commit_unlock_mode_transition(
@@ -3644,6 +3685,7 @@ mod tests {
                 signing_service_pubkey_hex: None,
                 signed_required: false,
                 fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+                kube_client: None,
             },
         );
 
@@ -3799,6 +3841,7 @@ mod tests {
                 signing_service_pubkey_hex: None,
                 signed_required: false,
                 fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+                kube_client: None,
             },
         )
         .await
@@ -3847,6 +3890,7 @@ mod tests {
                 signing_service_pubkey_hex: None,
                 signed_required: false,
                 fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+                kube_client: None,
             },
         )
         .await
@@ -3917,6 +3961,7 @@ mod tests {
                 signing_service_pubkey_hex: None,
                 signed_required: false,
                 fresh_volume_claims: enclava_engine::apply::orchestrator::FreshVolumeClaims::ALL,
+                kube_client: None,
             },
         )
         .await

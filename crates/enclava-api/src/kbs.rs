@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Pod};
 use kube::api::{Api, PostParams};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize};
@@ -1026,9 +1026,12 @@ fn hold_deferral_correlates(revoked_owners: &[String], hold_apps: &[String]) -> 
 /// completes. Setup acceptance is not publication. Apply failures are never
 /// reverted, and the delete flip itself supersedes leased work; a later
 /// publication supersedes older failed attempts, bounding the authority one
-/// deleting app can force into the shared policy. The prior healthy workload
-/// remains required until a replacement is healthy, including when replacement
-/// setup fails without stopping the running workload.
+/// deleting app can force into the shared policy. When teardown has named the
+/// owned ordinal-0 pod (`teardown_live_deployment_pins`), that pod's published
+/// generation is required too, even between those two (#235). Unpublished
+/// generations and publications the pod is not running stay out. The prior
+/// healthy workload remains required until a replacement is healthy, including
+/// when replacement setup fails without stopping the running workload.
 async fn load_signed_policy_candidates(
     db: &PgPool,
     retention: i64,
@@ -1139,7 +1142,7 @@ async fn load_signed_policy_candidates_for(
                         -- Policy-governed KBS deletes stay possible until
                         -- teardown completes.
                         --
-                        -- Failed generations stack. Two rows cover the
+                        -- Failed generations stack. Three arms cover the
                         -- workloads that can still be serving, and bound what
                         -- one app can force into the shared policy:
                         --   * the newest completed job is the last workload
@@ -1155,7 +1158,24 @@ async fn load_signed_policy_candidates_for(
                         --     that write — neither replaces the spec nor
                         --     suppresses it. The probe below uses the same
                         --     column.
-                        -- shortcut: intermediate publications between the last completed job and the newest publication are dropped, upgrade when teardown can name the pod that is still live
+                        --   * the deployment named in
+                        --     teardown_live_deployment_pins, when that
+                        --     generation published a StatefulSet. Delete
+                        --     observes the controller-owned ordinal-0 pod's
+                        --     enclava.dev/deployment-id before admission and
+                        --     commits that pin only after the budget check,
+                        --     in the same transaction as the generation bump.
+                        --     A refusal retains the stored pin.
+                        --     That label is the applying operation id
+                        --     (job.deployment_id), not artifact_deployment_id:
+                        --     rollback keeps the source artifact and mints a
+                        --     new operation id. The pin matches the operation
+                        --     and admits that job's artifact (#235). A
+                        --     publication the pod is not running stays out:
+                        --     publication is not proof the rollout replaced
+                        --     the previous pod, and admitting every
+                        --     intermediate would reopen the shared-budget
+                        --     exhaustion this bound closed.
                         app_status = 'deleting'
                         AND workload_teardown_required
                         AND workload_teardown_completed_at IS NULL
@@ -1194,6 +1214,18 @@ async fn load_signed_policy_candidates_for(
                                        ),
                                        0
                                    )
+                            )
+                            OR (
+                                ranked_job_operations.workload_spec_published_at
+                                    IS NOT NULL
+                                AND EXISTS (
+                                    SELECT 1
+                                      FROM teardown_live_deployment_pins AS pin
+                                     WHERE pin.app_id
+                                         = ranked_job_operations.app_id
+                                       AND pin.deployment_id
+                                         = ranked_job_operations.deployment_id
+                                )
                             )
                         )
                     )
@@ -1455,8 +1487,10 @@ async fn load_signed_policy_candidates_for(
 }
 
 /// The policy authority one app pins for confidential teardown: the newest
-/// completed workload plus the newest later generation that published a
-/// StatefulSet — the same two arms `load_signed_policy_candidates` admits for
+/// completed workload, the newest later generation that published a
+/// StatefulSet, and the published generation named by
+/// `teardown_live_deployment_pins` when delete has observed the owned
+/// ordinal-0 pod — the same arms `load_signed_policy_candidates` admits for
 /// a deleting app with teardown still pending — or the newest healthy
 /// deployment's artifacts for a legacy app whose authority no job-backed
 /// deployment has durably replaced (a failed job-backed replacement leaves the
@@ -1464,20 +1498,50 @@ async fn load_signed_policy_candidates_for(
 /// eligibility). The delete transition marks the app deleting and sets
 /// `workload_teardown_required` together, so this projection is exactly what
 /// the selector admits once that transition lands.
+///
+/// `pending_publication` names a deployment whose `workload_spec_published_at`
+/// stamp is decided but not yet committed (delete admission defers it into
+/// its authority transaction so it can land with the generation bump).
+/// Projection must treat it as stamped — otherwise admission would compare a
+/// post-stamp projection against it and admit a pin growth that crosses
+/// `signed_policy_max_bytes`.
 async fn load_teardown_policy_unit(
     db: &PgPool,
     app_id: Uuid,
+    pending_publication: Option<Uuid>,
 ) -> Result<Vec<crate::signing_service::SignedPolicyArtifact>, KbsPolicyError> {
+    load_teardown_policy_unit_proposing(
+        db,
+        app_id,
+        pending_publication,
+        TeardownPinProposal::Stored,
+    )
+    .await
+}
+
+async fn load_teardown_policy_unit_proposing(
+    db: &PgPool,
+    app_id: Uuid,
+    pending_publication: Option<Uuid>,
+    proposed_pin: TeardownPinProposal,
+) -> Result<Vec<crate::signing_service::SignedPolicyArtifact>, KbsPolicyError> {
+    let replace_pin = matches!(proposed_pin, TeardownPinProposal::Replace(_));
+    let replacement_pin = match proposed_pin {
+        TeardownPinProposal::Replace(deployment_id) => deployment_id,
+        TeardownPinProposal::Stored => None,
+    };
     let rows: Vec<serde_json::Value> = sqlx::query_scalar(
         r#"
         WITH ranked_job_operations AS (
             SELECT
+                job.deployment_id,
                 job.generation,
                 job.state AS job_state,
                 job.artifact_deployment_id,
                 job.artifact_descriptor_core_hash,
                 deployment.status::text AS deployment_status,
-                deployment.workload_spec_published_at
+                (deployment.workload_spec_published_at IS NOT NULL
+                    OR deployment.id = $2) AS spec_published
             FROM deployment_apply_jobs AS job
             JOIN deployments AS deployment
               ON deployment.id = job.deployment_id
@@ -1502,13 +1566,31 @@ async fn load_teardown_policy_unit(
             UNION
             SELECT artifact_deployment_id, artifact_descriptor_core_hash
               FROM ranked_job_operations
-             WHERE workload_spec_published_at IS NOT NULL
+             WHERE spec_published
                AND generation > COALESCE((SELECT generation FROM max_completed), 0)
                AND generation = (
                    SELECT MAX(generation)
                      FROM ranked_job_operations
-                    WHERE workload_spec_published_at IS NOT NULL
+                    WHERE spec_published
                )
+            UNION
+            SELECT artifact_deployment_id, artifact_descriptor_core_hash
+              FROM ranked_job_operations
+             WHERE spec_published
+               AND CASE
+                     -- $3 replaces the committed pin. NULL means clear: the
+                     -- comparison is unknown and this arm admits nothing.
+                     -- Otherwise the stored row is the pin, including when
+                     -- $4 is ignored. $2 is the not-yet-committed publication
+                     -- stamp, folded into spec_published above.
+                     WHEN $3::bool THEN ranked_job_operations.deployment_id = $4::uuid
+                     ELSE EXISTS (
+                         SELECT 1
+                           FROM teardown_live_deployment_pins AS pin
+                          WHERE pin.app_id = $1
+                            AND pin.deployment_id = ranked_job_operations.deployment_id
+                     )
+                   END
         ),
         job_unit AS (
             SELECT artifact.descriptor_core_hash, artifact.signed_policy_artifact
@@ -1584,11 +1666,353 @@ async fn load_teardown_policy_unit(
         "#,
     )
     .bind(app_id)
+    .bind(pending_publication)
+    .bind(replace_pin)
+    .bind(replacement_pin)
     .fetch_all(db)
     .await?;
     rows.into_iter()
         .map(|value| serde_json::from_value(value).map_err(KbsPolicyError::Serialize))
         .collect()
+}
+
+const TEARDOWN_POD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const TEARDOWN_DEPLOYMENT_ID_LABEL: &str = "enclava.dev/deployment-id";
+
+/// Identity of the controller-owned ordinal-0 pod the Service can still hit.
+/// CAP renders `replicas: 1`, so that pod is the only legitimate teardown target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnedPodIdentity {
+    /// No owned pod is receiving traffic.
+    Absent,
+    /// Label `enclava.dev/deployment-id` on the owned ordinal-0 pod.
+    Named(Uuid),
+    /// A pod occupies the ordinal-0 name but its controller owner or deployment
+    /// label cannot be proved. Teardown must not guess.
+    Unnamed,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TeardownLivePodError {
+    #[error("database error")]
+    Db(#[from] sqlx::Error),
+    #[error("kubernetes unavailable")]
+    KubernetesUnavailable,
+    #[error("owned ordinal pod has no provable deployment identity")]
+    Unnamed,
+    #[error("named live pod is not in the teardown unit")]
+    Uncovered,
+    #[error("teardown unit could not be projected")]
+    Projection,
+}
+
+/// Published generation strictly between the newest completed job and the
+/// newest publication. Those are the rows the two-arm bound drops (#235).
+async fn app_has_intermediate_publications(db: &PgPool, app_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+              FROM deployment_apply_jobs AS job
+              JOIN deployments AS deployment
+                ON deployment.id = job.deployment_id
+               AND deployment.app_id = job.app_id
+               AND deployment.org_id = job.org_id
+             WHERE job.app_id = $1
+               AND NOT (
+                   job.customer_config_hold
+                   AND job.customer_config_released_at IS NULL
+               )
+               AND deployment.workload_spec_published_at IS NOT NULL
+               AND job.generation > COALESCE((
+                       SELECT MAX(completed.generation)
+                         FROM deployment_apply_jobs AS completed
+                        WHERE completed.app_id = $1
+                          AND completed.state = 'completed'
+                          AND NOT (
+                              completed.customer_config_hold
+                              AND completed.customer_config_released_at IS NULL
+                          )
+                   ), 0)
+               AND job.generation < (
+                       SELECT MAX(newest.generation)
+                         FROM deployment_apply_jobs AS newest
+                         JOIN deployments AS newest_deployment
+                           ON newest_deployment.id = newest.deployment_id
+                          AND newest_deployment.app_id = newest.app_id
+                        WHERE newest.app_id = $1
+                          AND NOT (
+                              newest.customer_config_hold
+                              AND newest.customer_config_released_at IS NULL
+                          )
+                          AND newest_deployment.workload_spec_published_at IS NOT NULL
+                   )
+        )
+        "#,
+    )
+    .bind(app_id)
+    .fetch_one(db)
+    .await
+}
+
+/// Observed pin for this delete. Not durable until admission commits it with
+/// the generation bump. `Clear` is "no pin", not "leave the stored row".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeardownPinDecision {
+    Clear,
+    Pin(Uuid),
+}
+
+impl TeardownPinDecision {
+    pub(crate) fn deployment_id(self) -> Option<Uuid> {
+        match self {
+            Self::Clear => None,
+            Self::Pin(id) => Some(id),
+        }
+    }
+}
+
+/// Which pin a teardown-unit projection should admit.
+///
+/// `Stored` is the committed row. `Replace` is the pin this delete will commit
+/// if admission succeeds, and must be projected separately: writing it first
+/// makes the deleting selector treat the replacement as already required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeardownPinProposal {
+    Stored,
+    Replace(Option<Uuid>),
+}
+
+#[cfg(test)]
+async fn replace_teardown_live_pin(
+    db: &PgPool,
+    app_id: Uuid,
+    deployment_id: Option<Uuid>,
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+    commit_teardown_live_pin(&mut tx, app_id, deployment_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Replace the pin inside the caller's transaction. Delete commits this with
+/// the generation bump so a rejected or crashed retry cannot change the
+/// deleting selector without a publication.
+pub(crate) async fn commit_teardown_live_pin(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    deployment_id: Option<Uuid>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM teardown_live_deployment_pins WHERE app_id = $1")
+        .bind(app_id)
+        .execute(&mut **tx)
+        .await?;
+    if let Some(deployment_id) = deployment_id {
+        sqlx::query(
+            "INSERT INTO teardown_live_deployment_pins (app_id, deployment_id)
+             VALUES ($1, $2)",
+        )
+        .bind(app_id)
+        .bind(deployment_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+fn pod_condition_ready(pod: &Pod) -> bool {
+    pod.status.as_ref().is_some_and(|status| {
+        status.conditions.as_ref().is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+        })
+    })
+}
+
+/// Name the pod teardown's Service request can hit. The label is the applying
+/// operation id. `statefulset_uid` is the live StatefulSet's metadata.uid:
+/// ownerReference is client-settable, so a matching controller UID is required
+/// before the label is trusted. Workload pods do not mount a service-account
+/// token; this still fails closed when the set is gone or the UID does not
+/// match, which is the case a same-name pod can occupy while ordinal-0 is absent.
+pub(crate) fn owned_ordinal_pod_deployment_id(
+    pod: &Pod,
+    app_name: &str,
+    statefulset_uid: &str,
+) -> OwnedPodIdentity {
+    let expected_name = enclava_engine::manifest::volumes::provisioned_pod_name(app_name);
+    if pod.metadata.name.as_deref() != Some(expected_name.as_str()) {
+        return OwnedPodIdentity::Unnamed;
+    }
+    let owned = pod
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_some_and(|owners| {
+            owners.iter().any(|owner| {
+                owner.controller == Some(true)
+                    && owner.kind == "StatefulSet"
+                    && owner.name == app_name
+                    && owner.uid == statefulset_uid
+            })
+        });
+    if !owned {
+        return OwnedPodIdentity::Unnamed;
+    }
+    // EndpointSlice removal lags deletionTimestamp. A not-Ready terminating
+    // pod can still receive the Service POST, so do not treat it as absent
+    // and do not clear its pin.
+    if pod.metadata.deletion_timestamp.is_some() && !pod_condition_ready(pod) {
+        return OwnedPodIdentity::Unnamed;
+    }
+    let label = pod
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(TEARDOWN_DEPLOYMENT_ID_LABEL));
+    match label.map(|value| Uuid::parse_str(value)) {
+        Some(Ok(deployment_id)) => OwnedPodIdentity::Named(deployment_id),
+        Some(Err(_)) | None => OwnedPodIdentity::Unnamed,
+    }
+}
+
+pub(crate) async fn observe_owned_ordinal_pod(
+    client: &kube::Client,
+    namespace: &str,
+    app_name: &str,
+) -> Result<OwnedPodIdentity, TeardownLivePodError> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let sets: Api<k8s_openapi::api::apps::v1::StatefulSet> =
+        Api::namespaced(client.clone(), namespace);
+    let pod_name = enclava_engine::manifest::volumes::provisioned_pod_name(app_name);
+    let observed = tokio::time::timeout(TEARDOWN_POD_PROBE_TIMEOUT, async {
+        tokio::try_join!(pods.get_opt(&pod_name), sets.get_opt(app_name))
+    })
+    .await;
+    match observed {
+        Ok(Ok((None, _))) => Ok(OwnedPodIdentity::Absent),
+        Ok(Ok((Some(_), None))) => Ok(OwnedPodIdentity::Unnamed),
+        Ok(Ok((Some(pod), Some(statefulset)))) => {
+            let Some(uid) = statefulset.metadata.uid.as_deref() else {
+                return Ok(OwnedPodIdentity::Unnamed);
+            };
+            Ok(owned_ordinal_pod_deployment_id(&pod, app_name, uid))
+        }
+        Ok(Err(_)) | Err(_) => Err(TeardownLivePodError::KubernetesUnavailable),
+    }
+}
+
+/// Observe the pin delete should commit, without writing it.
+///
+/// No intermediates means the two-arm set already covers every pod the
+/// StatefulSet can still be serving, so the decision is `Clear` and a kube
+/// read is unnecessary. When intermediates exist, an unnameable pod refuses
+/// the delete instead of publishing a policy that might miss the pod the
+/// Service will hit. The stored pin is left untouched: a deleting retry
+/// already contributes that row to the selector, and replacing it before
+/// admission changes required authority with no generation bump. Callers
+/// commit the decision in the same transaction as the generation bump.
+pub(crate) async fn observe_teardown_live_deployment_pin(
+    db: &PgPool,
+    client: &kube::Client,
+    app_id: Uuid,
+    namespace: &str,
+    app_name: &str,
+) -> Result<TeardownPinDecision, TeardownLivePodError> {
+    if !app_has_intermediate_publications(db, app_id).await? {
+        return Ok(TeardownPinDecision::Clear);
+    }
+    match observe_owned_ordinal_pod(client, namespace, app_name).await? {
+        OwnedPodIdentity::Named(deployment_id) => Ok(TeardownPinDecision::Pin(deployment_id)),
+        OwnedPodIdentity::Absent => Ok(TeardownPinDecision::Clear),
+        OwnedPodIdentity::Unnamed => Err(TeardownLivePodError::Unnamed),
+    }
+}
+
+/// The pod label is the applying operation id. Resolve it through
+/// `deployment_apply_jobs.deployment_id` to that job's artifact, then test the
+/// artifact hash against the projected unit. Comparing the label to
+/// `metadata.deploy_id` misses a rollback, whose operation id and source
+/// artifact id are different on purpose.
+async fn teardown_unit_covers_operation(
+    db: &PgPool,
+    app_id: Uuid,
+    operation_id: Uuid,
+) -> Result<bool, KbsPolicyError> {
+    let row: Option<(Option<Uuid>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT artifact_deployment_id, artifact_descriptor_core_hash
+           FROM deployment_apply_jobs
+          WHERE app_id = $1
+            AND deployment_id = $2",
+    )
+    .bind(app_id)
+    .bind(operation_id)
+    .fetch_optional(db)
+    .await?;
+    // No such operation: the label is not a job we can authorize. Fail closed.
+    // Both artifact columns null is a valid unsigned apply (customer-signed
+    // deploys are optional). There is no signed-policy artifact to admit, so
+    // coverage does not apply — reporting Uncovered would 502 the delete
+    // forever once an intermediate publication exists. A half-set row violates
+    // the insert invariant (MATCH FULL) and fails closed.
+    let Some((artifact_deployment_id, artifact_hash)) = row else {
+        return Ok(false);
+    };
+    let Some(artifact_hash) = artifact_hash else {
+        return Ok(artifact_deployment_id.is_none());
+    };
+    if artifact_deployment_id.is_none() {
+        return Ok(false);
+    }
+    let expected = hex::encode(artifact_hash);
+    let unit = load_teardown_policy_unit(db, app_id, None).await?;
+    Ok(unit.iter().any(|artifact| {
+        artifact
+            .metadata
+            .descriptor_core_hash
+            .eq_ignore_ascii_case(&expected)
+    }))
+}
+
+/// Re-name the pod immediately before the teardown POST. Publication proves
+/// the StatefulSet write, not that the rollout has settled, so the pod can
+/// change between admission and the POST. A named operation whose artifact is
+/// not in the unit just published must not receive the POST; the retry records
+/// the new pin before the next publication.
+pub(crate) async fn named_live_pod_is_authorized(
+    db: &PgPool,
+    client: &kube::Client,
+    app_id: Uuid,
+    namespace: &str,
+    app_name: &str,
+) -> Result<(), TeardownLivePodError> {
+    if !app_has_intermediate_publications(db, app_id).await? {
+        return Ok(());
+    }
+    match observe_owned_ordinal_pod(client, namespace, app_name).await? {
+        OwnedPodIdentity::Absent => Ok(()),
+        OwnedPodIdentity::Unnamed => Err(TeardownLivePodError::Unnamed),
+        OwnedPodIdentity::Named(operation_id) => {
+            let covered = teardown_unit_covers_operation(db, app_id, operation_id)
+                .await
+                .map_err(|error| match error {
+                    KbsPolicyError::Db(source) => TeardownLivePodError::Db(source),
+                    other => {
+                        tracing::warn!(
+                            error = %other,
+                            "teardown unit coverage check failed"
+                        );
+                        TeardownLivePodError::Projection
+                    }
+                })?;
+            if covered {
+                Ok(())
+            } else {
+                Err(TeardownLivePodError::Uncovered)
+            }
+        }
+    }
 }
 
 fn dedup_signed_policy_artifacts_by_hash(
@@ -1623,10 +2047,42 @@ fn dedup_signed_policy_artifacts_by_hash(
 ///
 /// A delete that does not grow the required set is always admitted: an
 /// already-overflowed deployment must still be able to shrink its way back.
+///
+/// `pending_publication` is the not-yet-committed recovered stamp delete
+/// admission decided on an already-deleting app (see
+/// `load_teardown_policy_unit`): the projection must count it, while
+/// `current` stays the committed truth, so a pin growth that crosses the
+/// budget is refused before the stamp exists.
 pub async fn teardown_unit_fits_signed_policy_budget(
     db: &PgPool,
     config: Option<&KbsPolicyConfig>,
     app_id: Uuid,
+    pending_publication: Option<Uuid>,
+) -> Result<bool, KbsPolicyError> {
+    teardown_unit_fits_signed_policy_budget_proposing(
+        db,
+        config,
+        app_id,
+        pending_publication,
+        TeardownPinProposal::Stored,
+    )
+    .await
+}
+
+/// Like [`teardown_unit_fits_signed_policy_budget`], projecting `proposed_pin`
+/// instead of the committed row.
+///
+/// Delete observes the live pod before admission and must not write that pin
+/// until the generation bump commits. Passing the observation here keeps the
+/// committed pin in `current` (what reconciliation already requires) and the
+/// observation in `projected`. Writing first folds the replacement into
+/// `current`, so a larger pin looks non-growing and a 409 leaves it selected.
+pub(crate) async fn teardown_unit_fits_signed_policy_budget_proposing(
+    db: &PgPool,
+    config: Option<&KbsPolicyConfig>,
+    app_id: Uuid,
+    pending_publication: Option<Uuid>,
+    proposed_pin: TeardownPinProposal,
 ) -> Result<bool, KbsPolicyError> {
     let Some(config) = config else {
         return Ok(true);
@@ -1656,7 +2112,9 @@ pub async fn teardown_unit_fits_signed_policy_budget(
         }
         current.push(candidate.artifact);
     }
-    projected.extend(load_teardown_policy_unit(db, app_id).await?);
+    projected.extend(
+        load_teardown_policy_unit_proposing(db, app_id, pending_publication, proposed_pin).await?,
+    );
     let projected = dedup_signed_policy_artifacts_by_hash(projected);
     let projected_len = signed_policy_artifact_policy_body(&projected)?.len();
     if projected_len <= config.signed_policy_max_bytes {
@@ -1715,7 +2173,10 @@ pub async fn teardown_unit_already_published(
     client: kube::Client,
     app_id: Uuid,
 ) -> Result<bool, KbsPolicyError> {
-    let unit = dedup_signed_policy_artifacts_by_hash(load_teardown_policy_unit(db, app_id).await?);
+    // Called after the delete's phase transaction committed, so the
+    // recovered stamp (if any) is already visible: no pending projection.
+    let unit =
+        dedup_signed_policy_artifacts_by_hash(load_teardown_policy_unit(db, app_id, None).await?);
     let applied: Option<(i64, Vec<u8>)> = sqlx::query_as(
         "SELECT applied_generation, applied_policy_sha256
            FROM kbs_signed_policy_reconciliation
@@ -1774,10 +2235,15 @@ async fn teardown_unit_already_published_with_applied(
         .as_ref()
         .and_then(|spec| spec.template.metadata.as_ref())
         .and_then(|metadata| metadata.annotations.as_ref());
-    Ok(
-        annotated_policy_generation(template)? == Some((generation, hash.as_str()))
-            && template.and_then(|a| a.get(POLICY_PUBLICATION_TOKEN_ANNOTATION)) == Some(token),
-    )
+    // The template keeps the generation it was last rolled at: a later
+    // generation with a byte-identical body advances only the ConfigMap (see
+    // `template_serves_publication`), so an older template generation with
+    // this exact hash and publication token is the same serving policy.
+    Ok(matches!(
+        annotated_policy_generation(template)?,
+        Some((template_generation, template_hash))
+            if template_generation <= generation && template_hash == hash
+    ) && template.and_then(|a| a.get(POLICY_PUBLICATION_TOKEN_ANNOTATION)) == Some(token))
 }
 
 pub async fn reconcile_signed_policy_artifacts(
@@ -1823,15 +2289,52 @@ pub async fn reconcile_signed_policy_once(
         vec![crate::mutation_leases::ResourceFence::kbs_policy()],
     )
     .await?;
-    lease
+    reconcile_pending_under_resource_lease(state, lease).await
+}
+
+/// Converge the pending signed policy under an already claimed global
+/// `kbs_policy` lease and release the lease on every outcome that provably
+/// leaves no Kubernetes write of this holder in flight.
+///
+/// The lease+quarantine horizon (540 s) exists for a holder that can no
+/// longer vouch for its own writes: a crashed process, a lost heartbeat
+/// (`guard_provider` cancels the future mid-request), or a mutating request
+/// whose outcome is unknown (`provider_write_may_be_in_flight`). Those keep
+/// the row owned by dropping the lease untouched. Every other failure — a
+/// Trustee rollout that did not become Ready in time, a read error, a
+/// deferred publication — returned only after each write was awaited to a
+/// known outcome, and the next holder re-converges from the ConfigMap
+/// annotations under resourceVersion CAS. Holding the fence there protects
+/// nothing and blocks every deployment on the platform for the quarantine.
+pub(crate) async fn reconcile_pending_under_resource_lease(
+    state: &crate::state::AppState,
+    lease: crate::mutation_leases::ResourceMutationLease,
+) -> Result<(), KbsPolicyReconciliationError> {
+    let outcome = lease
         .guard_provider(reconcile_pending_signed_policy_artifacts(
             &state.db,
             state.kbs_policy.as_ref(),
             &state.kube_client,
         ))
-        .await??;
-    lease.finish().await?;
-    Ok(())
+        .await?;
+    match outcome {
+        Ok(()) => {
+            lease.finish().await?;
+            Ok(())
+        }
+        Err(error) if error.provider_write_may_be_in_flight() => Err(error.into()),
+        Err(error) => {
+            if let Err(release_error) = lease.finish().await {
+                tracing::warn!(
+                    error = %release_error,
+                    error_code = "kbs_policy_lease_finish_failed",
+                    "failed to release the KBS policy fence after a failed reconciliation; \
+                     it stays owned through the reclaim quarantine"
+                );
+            }
+            Err(error.into())
+        }
+    }
 }
 
 /// Call after releasing the org transaction: publication claims the global KBS
@@ -1968,6 +2471,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
     // Do not let stray debt opt an unsigned installation into signed mode.
     clear_stray_policy_debts(db).await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
+    let mut publication_recovered = false;
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
         let state = load_signed_policy_reconciliation(db).await?;
         if state.desired_generation == 0 {
@@ -2009,6 +2513,33 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             state.desired_generation + state.selector_bumps_owed + state.withdrawal_bumps_owed;
         let reset_bootstrap = state.configmap_generation == 0 && state.applied_generation == 0;
         let previously_applied = state.applied_generation >= generation;
+        // A crash between StatefulSet apply and the publication stamp leaves
+        // a deleting app's serving generation unpublished. Recover it from
+        // the live object before the selector reads the column. Once per
+        // pass: one unread namespace must not fail every app's reconciliation.
+        if !publication_recovered {
+            publication_recovered = true;
+            match crate::deploy::recover_deleting_workload_publications(db, &client).await {
+                Ok(true) => {
+                    // The stamp changed the deleting selector. Do not publish
+                    // that body at the generation loaded above — it may
+                    // already be applied, and a same-generation body change
+                    // is rejected. The bump committed with the stamp; reload
+                    // it.
+                    tracing::info!(
+                        "recovered workload publication advanced the signed policy generation"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "workload publication recovery failed before signed policy selection"
+                    );
+                }
+            }
+        }
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
         // Every signed authority is withheld behind an unreleased
         // customer-config hold: publishing the empty body would flip a
@@ -2284,6 +2815,24 @@ async fn converge_signed_policy_configmap(
             .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
             .filter(|token| !token.is_empty())
             .cloned();
+        // A newer generation whose body is byte-identical to the published
+        // one advances only the fence: the generation annotation still moves
+        // forward under the same resourceVersion CAS (so older writers stay
+        // superseded), but the publication token is kept. The token names
+        // the ConfigMap write that last changed what Trustee must serve; a
+        // pod template carrying it already runs this exact body, so
+        // re-minting it would only restart Trustee for nothing.
+        let retained_publication_token = match (existing, existing_publication_token.as_ref()) {
+            (Some((existing_generation, annotated_hash)), Some(token))
+                if !allow_generation_reset
+                    && existing_generation < generation
+                    && annotated_hash == policy_sha256_hex
+                    && current_content_hash == policy_sha256_hex =>
+            {
+                Some(token.clone())
+            }
+            _ => None,
+        };
         match generation_decision(
             existing,
             Some(&current_content_hash),
@@ -2321,9 +2870,11 @@ async fn converge_signed_policy_configmap(
         );
         // Kubernetes assigns the next resourceVersion only after a successful
         // CAS. Binding the publication to the version it replaces yields a
-        // stable token that changes on every CAP policy publication, including
-        // a same-generation repair after a stale legacy overwrite.
-        let publication_token = prior_resource_version;
+        // stable token that changes on every CAP policy publication that
+        // changes (or repairs) the body, including a same-generation repair
+        // after a stale legacy overwrite. resourceVersions only grow, so a
+        // retained token can never collide with a later minted one.
+        let publication_token = retained_publication_token.unwrap_or(prior_resource_version);
         annotations.insert(
             POLICY_PUBLICATION_TOKEN_ANNOTATION.to_string(),
             publication_token.clone(),
@@ -2432,6 +2983,16 @@ async fn converge_trustee_policy_generation(
         {
             decision = GenerationDecision::Replace;
         }
+        if template_serves_publication(
+            existing,
+            existing_publication_token,
+            generation,
+            policy_sha256_hex,
+            publication_token,
+        ) {
+            // Leave the template alone: only confirm the rollout is Ready.
+            decision = GenerationDecision::Current;
+        }
         match decision {
             GenerationDecision::Superseded => return Ok(GenerationDecision::Superseded),
             GenerationDecision::Current => {
@@ -2501,6 +3062,31 @@ async fn converge_trustee_policy_generation(
     Err(KbsPolicyError::PolicyCasExhausted)
 }
 
+/// True when the Trustee pod template was rolled for exactly the publication
+/// the ConfigMap now carries, under an older generation number.
+///
+/// The publication token is minted from the ConfigMap resourceVersion that
+/// the body-changing write replaced and is kept only while the body stays
+/// byte-identical, so `(sha256, token)` identifies one ConfigMap body. A
+/// template is stamped with a token only after that ConfigMap write
+/// succeeded, so its pods started with that body mounted. The template's
+/// lower generation annotation is then merely stale bookkeeping; a
+/// different hash or token (changed body, stale-overwrite repair, crash
+/// before the template patch) never matches and still forces a roll.
+fn template_serves_publication(
+    template: Option<(i64, &str)>,
+    template_publication_token: Option<&str>,
+    desired_generation: i64,
+    desired_hash: &str,
+    desired_publication_token: &str,
+) -> bool {
+    matches!(
+        template,
+        Some((generation, policy_hash))
+            if generation < desired_generation && policy_hash == desired_hash
+    ) && template_publication_token == Some(desired_publication_token)
+}
+
 fn deployment_rollout_is_ready(deployment: &Deployment) -> bool {
     let desired = deployment
         .spec
@@ -2542,19 +3128,29 @@ async fn wait_for_deployment_policy_generation(
             .and_then(|spec| spec.template.metadata.as_ref())
             .and_then(|metadata| metadata.annotations.as_ref());
         let annotated = annotated_policy_generation(template_annotations)?;
-        let decision = generation_decision(
-            annotated,
-            annotated.map(|(_, policy_hash)| policy_hash),
-            desired_generation,
-            desired_hash,
-            allow_generation_reset,
-        )?;
-        if decision == GenerationDecision::Superseded {
-            return Ok(decision);
-        }
         let publication_token = template_annotations
             .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
             .map(String::as_str);
+        let decision = if template_serves_publication(
+            annotated,
+            publication_token,
+            desired_generation,
+            desired_hash,
+            desired_publication_token,
+        ) {
+            GenerationDecision::Current
+        } else {
+            generation_decision(
+                annotated,
+                annotated.map(|(_, policy_hash)| policy_hash),
+                desired_generation,
+                desired_hash,
+                allow_generation_reset,
+            )?
+        };
+        if decision == GenerationDecision::Superseded {
+            return Ok(decision);
+        }
         if decision == GenerationDecision::Current
             && publication_token != Some(desired_publication_token)
         {
@@ -3186,7 +3782,7 @@ pub fn config_from_env() -> Option<KbsPolicyConfig> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_support::KbsPolicyProvider;
     use chrono::Utc;
@@ -4029,6 +4625,12 @@ resource_bindings := {
         configmap: Option<ConfigMap>,
         deployment: Option<Deployment>,
         next_resource_version: u64,
+        configmap_writes: usize,
+        /// Every Deployment write is a pod-template change, i.e. a Trustee roll.
+        deployment_writes: usize,
+        /// Answer every PUT with a 500, as an API server that may or may not
+        /// have persisted the write.
+        fail_writes: bool,
     }
 
     #[derive(Clone)]
@@ -4095,6 +4697,7 @@ resource_bindings := {
                         }),
                     }),
                     next_resource_version: 2,
+                    ..Default::default()
                 },
             )))
         }
@@ -4132,6 +4735,45 @@ resource_bindings := {
                         } else if method == axum::http::Method::PUT {
                             let mut value: serde_json::Value =
                                 serde_json::from_slice(&body).map_err(std::io::Error::other)?;
+                            // Optimistic concurrency like a real API server: a
+                            // write carrying a stale resourceVersion conflicts.
+                            let live_version = if is_configmap {
+                                state
+                                    .configmap
+                                    .as_ref()
+                                    .and_then(|object| object.metadata.resource_version.clone())
+                            } else {
+                                state
+                                    .deployment
+                                    .as_ref()
+                                    .and_then(|object| object.metadata.resource_version.clone())
+                            };
+                            let stale = value["metadata"]["resourceVersion"].as_str()
+                                != live_version.as_deref();
+                            if state.fail_writes || stale {
+                                let code = if state.fail_writes { 500 } else { 409 };
+                                return Ok::<_, std::io::Error>(
+                                    axum::http::Response::builder()
+                                        .status(code)
+                                        .body(kube::client::Body::from(
+                                            serde_json::to_vec(&serde_json::json!({
+                                                "kind": "Status",
+                                                "apiVersion": "v1",
+                                                "status": "Failure",
+                                                "message": "fake write rejection",
+                                                "reason": if code == 409 { "Conflict" } else { "InternalError" },
+                                                "code": code,
+                                            }))
+                                            .unwrap(),
+                                        ))
+                                        .unwrap(),
+                                );
+                            }
+                            if is_configmap {
+                                state.configmap_writes += 1;
+                            } else if is_deployment {
+                                state.deployment_writes += 1;
+                            }
                             value["metadata"]["resourceVersion"] =
                                 serde_json::json!(resource_version);
                             state.next_resource_version += 1;
@@ -4177,6 +4819,34 @@ resource_bindings := {
             )
         }
 
+        /// (generation, sha256, publication token) annotated on the ConfigMap.
+        async fn configmap_publication(&self) -> (String, String, String) {
+            let state = self.0.lock().await;
+            publication_annotations(
+                state
+                    .configmap
+                    .as_ref()
+                    .and_then(|configmap| configmap.metadata.annotations.as_ref()),
+            )
+        }
+
+        /// (generation, sha256, publication token) on the Trustee pod template.
+        async fn template_publication(&self) -> (String, String, String) {
+            let state = self.0.lock().await;
+            publication_annotations(
+                state
+                    .deployment
+                    .as_ref()
+                    .and_then(|deployment| deployment.spec.as_ref())
+                    .and_then(|spec| spec.template.metadata.as_ref())
+                    .and_then(|metadata| metadata.annotations.as_ref()),
+            )
+        }
+
+        async fn trustee_rolls(&self) -> usize {
+            self.0.lock().await.deployment_writes
+        }
+
         async fn configmap_policy(&self) -> Option<String> {
             self.0
                 .lock()
@@ -4187,6 +4857,385 @@ resource_bindings := {
                 .and_then(|data| data.get("resource-policy"))
                 .cloned()
         }
+    }
+
+    fn publication_annotations(
+        annotations: Option<&BTreeMap<String, String>>,
+    ) -> (String, String, String) {
+        let value = |key: &str| {
+            annotations
+                .and_then(|annotations| annotations.get(key))
+                .cloned()
+                .unwrap_or_default()
+        };
+        (
+            value(POLICY_GENERATION_ANNOTATION),
+            value(POLICY_SHA256_ANNOTATION),
+            value(POLICY_PUBLICATION_TOKEN_ANNOTATION),
+        )
+    }
+
+    fn fake_kbs_config() -> KbsPolicyConfig {
+        KbsPolicyConfig {
+            namespace: "trustee".to_string(),
+            configmap_name: "resource-policy".to_string(),
+            policy_key: "resource-policy".to_string(),
+            deployment_name: "trustee".to_string(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 900 * 1024,
+        }
+    }
+
+    fn policy_sha(policy: &str) -> String {
+        hex::encode(Sha256::digest(policy.as_bytes()))
+    }
+
+    /// The ConfigMap half of one publication, as the reconciler runs it.
+    async fn publish_configmap(
+        fake: &FakeKubeState,
+        generation: i64,
+        policy: &str,
+    ) -> ConfigMapConvergence {
+        let config = fake_kbs_config();
+        let cm_api: Api<ConfigMap> = Api::namespaced(fake.client(), &config.namespace);
+        converge_signed_policy_configmap(
+            &cm_api,
+            &config,
+            generation,
+            policy,
+            &policy_sha(policy),
+            false,
+        )
+        .await
+        .expect("converge ConfigMap")
+    }
+
+    /// One full publication: ConfigMap, then the Trustee pod template.
+    async fn publish(fake: &FakeKubeState, generation: i64, policy: &str) -> GenerationDecision {
+        let token = match publish_configmap(fake, generation, policy).await {
+            ConfigMapConvergence::Current {
+                publication_token, ..
+            }
+            | ConfigMapConvergence::Replaced {
+                publication_token, ..
+            } => publication_token,
+            ConfigMapConvergence::Superseded => return GenerationDecision::Superseded,
+        };
+        converge_trustee_policy_generation(
+            fake.client(),
+            &fake_kbs_config(),
+            generation,
+            &policy_sha(policy),
+            &token,
+            false,
+        )
+        .await
+        .expect("converge Trustee")
+    }
+
+    #[tokio::test]
+    async fn first_publication_stamps_configmap_and_rolls_trustee_once() {
+        // A fresh ConfigMap carries no CAP annotations at all.
+        let fake = FakeKubeState::new();
+        assert_eq!(
+            publish(&fake, 1, "policy-a").await,
+            GenerationDecision::Replace
+        );
+        let sha = policy_sha("policy-a");
+        // The token is the resourceVersion the publication replaced.
+        assert_eq!(
+            fake.configmap_publication().await,
+            ("1".to_string(), sha.clone(), "1".to_string())
+        );
+        assert_eq!(
+            fake.template_publication().await,
+            ("1".to_string(), sha, "1".to_string())
+        );
+        assert_eq!(fake.trustee_rolls().await, 1);
+        assert_eq!(fake.configmap_policy().await.as_deref(), Some("policy-a"));
+    }
+
+    #[tokio::test]
+    async fn identical_policy_at_a_newer_generation_advances_the_fence_without_a_roll() {
+        let fake = FakeKubeState::new();
+        publish(&fake, 1, "policy-a").await;
+        let (_, sha, token) = fake.configmap_publication().await;
+
+        // Production: 11 of 23 publications were byte-identical re-rolls.
+        for generation in 2..=4 {
+            assert_eq!(
+                publish(&fake, generation, "policy-a").await,
+                GenerationDecision::Current,
+                "generation {generation} must only confirm readiness"
+            );
+            // The fence still moves forward on the ConfigMap, under CAS.
+            assert_eq!(
+                fake.configmap_publication().await,
+                (generation.to_string(), sha.clone(), token.clone())
+            );
+            // The reconciler's post-rollout re-read agrees with what it wrote.
+            assert!(matches!(
+                publish_configmap(&fake, generation, "policy-a").await,
+                ConfigMapConvergence::Current { publication_token, .. }
+                    if publication_token == token
+            ));
+        }
+        assert_eq!(fake.trustee_rolls().await, 1, "Trustee must not restart");
+        assert_eq!(
+            fake.template_publication().await,
+            ("1".to_string(), sha, token),
+            "the pod template is left untouched"
+        );
+
+        // The advanced generation fences out a stale writer exactly as a
+        // body-changing publication would have.
+        assert!(matches!(
+            publish_configmap(&fake, 3, "policy-stale").await,
+            ConfigMapConvergence::Superseded
+        ));
+        assert_eq!(fake.configmap_policy().await.as_deref(), Some("policy-a"));
+        assert_eq!(fake.configmap_publication().await.0, "4");
+    }
+
+    #[tokio::test]
+    async fn changed_policy_mints_a_new_token_and_rolls_trustee() {
+        let fake = FakeKubeState::new();
+        publish(&fake, 1, "policy-a").await;
+        let (_, _, first_token) = fake.configmap_publication().await;
+        publish(&fake, 2, "policy-a").await;
+
+        assert_eq!(
+            publish(&fake, 3, "policy-b").await,
+            GenerationDecision::Replace
+        );
+        let (generation, sha, token) = fake.configmap_publication().await;
+        assert_eq!((generation.as_str(), sha), ("3", policy_sha("policy-b")));
+        assert_ne!(token, first_token);
+        assert_eq!(
+            fake.template_publication().await,
+            fake.configmap_publication().await
+        );
+        assert_eq!(fake.trustee_rolls().await, 2);
+    }
+
+    #[tokio::test]
+    async fn stale_writer_with_a_lower_generation_is_rejected() {
+        let fake = FakeKubeState::new();
+        publish(&fake, 5, "policy-current").await;
+        let before = fake.configmap_publication().await;
+
+        assert_eq!(
+            publish(&fake, 4, "policy-stale").await,
+            GenerationDecision::Superseded
+        );
+        // Not even an identical body may move the generation backwards.
+        assert_eq!(
+            publish(&fake, 4, "policy-current").await,
+            GenerationDecision::Superseded
+        );
+        assert_eq!(fake.configmap_publication().await, before);
+        assert_eq!(
+            fake.configmap_policy().await.as_deref(),
+            Some("policy-current")
+        );
+        assert_eq!(fake.trustee_rolls().await, 1);
+
+        // A stale writer cannot bypass the fence at the Trustee step either.
+        let rejected = converge_trustee_policy_generation(
+            fake.client(),
+            &fake_kbs_config(),
+            4,
+            &policy_sha("policy-stale"),
+            "forged-token",
+            false,
+        )
+        .await
+        .expect("stale Trustee convergence");
+        assert_eq!(rejected, GenerationDecision::Superseded);
+        assert_eq!(fake.trustee_rolls().await, 1);
+    }
+
+    #[tokio::test]
+    async fn crash_between_configmap_write_and_trustee_patch_converges_on_the_next_pass() {
+        let fake = FakeKubeState::new();
+        publish(&fake, 1, "policy-a").await;
+
+        // The holder dies after the ConfigMap CAS, before patching Trustee:
+        // the ConfigMap claims policy-b while the pods still run policy-a.
+        assert!(matches!(
+            publish_configmap(&fake, 2, "policy-b").await,
+            ConfigMapConvergence::Replaced { .. }
+        ));
+        assert_eq!(fake.trustee_rolls().await, 1);
+        assert_ne!(
+            fake.template_publication().await,
+            fake.configmap_publication().await
+        );
+
+        // Recovery arrives at a NEWER generation with the same body (every
+        // enqueue bumps it). The generation-only fast path must not mistake
+        // the unrolled template for current.
+        assert_eq!(
+            publish(&fake, 3, "policy-b").await,
+            GenerationDecision::Replace
+        );
+        assert_eq!(fake.trustee_rolls().await, 2);
+        assert_eq!(
+            fake.template_publication().await,
+            fake.configmap_publication().await
+        );
+        assert_eq!(fake.configmap_publication().await.1, policy_sha("policy-b"));
+
+        // Same crash, recovered at the SAME generation.
+        assert!(matches!(
+            publish_configmap(&fake, 4, "policy-c").await,
+            ConfigMapConvergence::Replaced { .. }
+        ));
+        assert_eq!(
+            publish(&fake, 4, "policy-c").await,
+            GenerationDecision::Replace
+        );
+        assert_eq!(fake.trustee_rolls().await, 3);
+        assert_eq!(
+            fake.template_publication().await,
+            fake.configmap_publication().await
+        );
+    }
+
+    #[tokio::test]
+    async fn same_hash_under_a_different_publication_token_still_rolls() {
+        let fake = FakeKubeState::new();
+        publish(&fake, 1, "policy-a").await;
+        let (_, _, first_token) = fake.configmap_publication().await;
+
+        // policy-b reaches only the ConfigMap, then the desired body reverts
+        // to policy-a. The template's hash matches again, but it names a
+        // publication the ConfigMap no longer carries: what the pods mounted
+        // in between is unknown, so Trustee must restart.
+        publish_configmap(&fake, 2, "policy-b").await;
+        assert_eq!(
+            publish(&fake, 3, "policy-a").await,
+            GenerationDecision::Replace
+        );
+        let (generation, sha, token) = fake.configmap_publication().await;
+        assert_eq!((generation.as_str(), sha), ("3", policy_sha("policy-a")));
+        assert_ne!(token, first_token);
+        assert_eq!(fake.trustee_rolls().await, 2);
+        assert_eq!(
+            fake.template_publication().await,
+            fake.configmap_publication().await
+        );
+
+        // A same-generation repair of a body overwritten behind CAP's
+        // annotations also re-mints the token and rolls.
+        {
+            let mut state = fake.0.lock().await;
+            let configmap = state.configmap.as_mut().unwrap();
+            configmap
+                .data
+                .as_mut()
+                .unwrap()
+                .insert("resource-policy".to_string(), "overwritten".to_string());
+        }
+        assert_eq!(
+            publish(&fake, 4, "policy-a").await,
+            GenerationDecision::Replace
+        );
+        assert_ne!(fake.configmap_publication().await.2, token);
+        assert_eq!(fake.configmap_policy().await.as_deref(), Some("policy-a"));
+        assert_eq!(fake.trustee_rolls().await, 3);
+    }
+
+    #[test]
+    fn template_serves_publication_requires_matching_hash_and_token() {
+        let hash = "aa".repeat(32);
+        let other = "bb".repeat(32);
+        let serves = |template: Option<(i64, &str)>, token: Option<&str>| {
+            template_serves_publication(template, token, 5, &hash, "41")
+        };
+        assert!(serves(Some((3, &hash)), Some("41")));
+        assert!(!serves(Some((3, &other)), Some("41")), "changed body");
+        assert!(!serves(Some((3, &hash)), Some("40")), "other publication");
+        assert!(!serves(Some((3, &hash)), None), "pre-token template");
+        assert!(!serves(None, Some("41")), "never published");
+        // Equal and newer generations keep going through generation_decision
+        // (Current / Superseded), never through this shortcut.
+        assert!(!serves(Some((5, &hash)), Some("41")));
+        assert!(!serves(Some((6, &hash)), Some("41")));
+    }
+
+    async fn kbs_fence_claimable(state: &crate::state::AppState) -> bool {
+        match crate::mutation_leases::claim_resources(
+            state,
+            "test_probe",
+            Uuid::new_v4(),
+            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+        )
+        .await
+        {
+            Ok(lease) => {
+                lease.finish().await.expect("release probe lease");
+                true
+            }
+            Err(crate::mutation_leases::MutationLeaseError::Busy) => false,
+            Err(error) => panic!("unexpected claim error: {error}"),
+        }
+    }
+
+    /// Production 2026-11-10 09:47:34Z: a reconcile failed with `Trustee
+    /// deployment rollout timed out` and the next deployment sat for exactly
+    /// 540 s behind the abandoned `kbs_policy` lease. A failure that leaves
+    /// no write in flight must release the fence; an uncertain write must
+    /// keep the quarantine.
+    #[tokio::test]
+    async fn failed_reconcile_releases_the_fence_unless_a_write_may_be_in_flight() {
+        let (_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("kbs_fence_release").await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.kbs_policy = Some(fake_kbs_config());
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 1, configmap_generation = 0,
+                    applied_generation = 0
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("enter signed mode");
+
+        // Read-side failure: the reconciler returns before any write.
+        let fake = FakeKubeState::new();
+        fake.0.lock().await.configmap.as_mut().unwrap().data = None;
+        let error = TEST_KUBE_CLIENT
+            .scope(fake.client(), reconcile_signed_policy_once(&state))
+            .await
+            .expect_err("a ConfigMap without the policy key fails");
+        assert!(matches!(
+            error,
+            KbsPolicyReconciliationError::Policy(KbsPolicyError::MissingPolicyKey(_))
+        ));
+        assert!(
+            kbs_fence_claimable(&state).await,
+            "a failure with no write in flight must not hold the global fence"
+        );
+
+        // A write whose outcome is unknown keeps the reclaim quarantine.
+        let fake = FakeKubeState::new();
+        fake.0.lock().await.fail_writes = true;
+        let error = TEST_KUBE_CLIENT
+            .scope(fake.client(), reconcile_signed_policy_once(&state))
+            .await
+            .expect_err("a rejected write fails");
+        assert!(matches!(
+            &error,
+            KbsPolicyReconciliationError::Policy(policy) if policy.provider_write_may_be_in_flight()
+        ));
+        assert!(
+            !kbs_fence_claimable(&state).await,
+            "an uncertain write must keep the fence owned through quarantine"
+        );
     }
 
     /// #232: a pending generation must cause the reconciler to publish an
@@ -4322,7 +5371,7 @@ resource_bindings := {
         );
     }
 
-    async fn insert_test_app(pool: &PgPool, status: &str) -> (Uuid, Uuid) {
+    pub(crate) async fn insert_test_app(pool: &PgPool, status: &str) -> (Uuid, Uuid) {
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
         let suffix = app_id.simple().to_string();
@@ -4363,7 +5412,7 @@ resource_bindings := {
         (org_id, app_id)
     }
 
-    async fn insert_test_deployment(
+    pub(crate) async fn insert_test_deployment(
         pool: &PgPool,
         org_id: Uuid,
         app_id: Uuid,
@@ -4428,7 +5477,7 @@ resource_bindings := {
         .expect("stamp KBS test setup state");
     }
 
-    async fn mark_test_workload_published(pool: &PgPool, deployment_id: Uuid) {
+    pub(crate) async fn mark_test_workload_published(pool: &PgPool, deployment_id: Uuid) {
         sqlx::query(
             "UPDATE deployments
                 SET workload_spec_published_at = clock_timestamp()
@@ -4456,13 +5505,48 @@ resource_bindings := {
         ))
     }
 
-    async fn insert_test_artifact(
+    pub(crate) async fn insert_test_artifact(
         pool: &PgPool,
         app_id: Uuid,
         deployment_id: Uuid,
         hash_byte: &str,
     ) -> crate::signing_service::SignedPolicyArtifact {
-        insert_test_artifact_signed_by(pool, app_id, deployment_id, hash_byte, "bb").await
+        insert_sized_test_artifact(pool, app_id, deployment_id, hash_byte, 16).await
+    }
+
+    async fn insert_sized_test_artifact(
+        pool: &PgPool,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        hash_byte: &str,
+        payload_bytes: usize,
+    ) -> crate::signing_service::SignedPolicyArtifact {
+        let mut artifact = test_signed_policy_artifact(hash_byte, payload_bytes);
+        artifact.metadata.descriptor_core_hash =
+            unique_test_descriptor_hash(hash_byte, deployment_id);
+        artifact.metadata.app_id = app_id.to_string();
+        artifact.metadata.deploy_id = deployment_id.to_string();
+        artifact.metadata.descriptor_signing_pubkey = "bb".repeat(32);
+        let descriptor_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'test-key',
+                       '{}'::jsonb, $5, $6)",
+        )
+        .bind(&descriptor_hash)
+        .bind(app_id)
+        .bind(deployment_id)
+        .bind(vec![1u8; 64])
+        .bind(vec![2u8; 64])
+        .bind(serde_json::to_value(&artifact).unwrap())
+        .execute(pool)
+        .await
+        .expect("insert sized KBS test artifact");
+        artifact
     }
 
     /// Like insert_test_artifact, but lets each fixture pick its descriptor
@@ -4503,7 +5587,7 @@ resource_bindings := {
         artifact
     }
 
-    async fn insert_test_job(
+    pub(crate) async fn insert_test_job(
         pool: &PgPool,
         org_id: Uuid,
         app_id: Uuid,
@@ -4544,7 +5628,7 @@ resource_bindings := {
     /// owner; the raw signature bytes are irrelevant to candidate selection.
     /// Returns the ids of the user and signing key rows it created so callers
     /// can clean them up without touching other tests' fixtures.
-    async fn insert_test_keyring_version(
+    pub(crate) async fn insert_test_keyring_version(
         pool: &PgPool,
         org_id: Uuid,
         version: i64,
@@ -7421,6 +8505,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len)),
             app_id,
+            None,
         )
         .await
         .expect("admit a teardown unit that fits the shared budget");
@@ -7433,6 +8518,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len - 1)),
             app_id,
+            None,
         )
         .await
         .expect("refuse a teardown unit that exceeds the shared budget");
@@ -7442,6 +8528,114 @@ resource_bindings := {
         );
 
         crate::test_support::drop_isolated_database("cap_teardown_over_budget", pool).await;
+    }
+
+    /// The recovered publication stamp that delete admission defers into its
+    /// authority transaction must be projected into the budget check. On an
+    /// already-deleting app the stamp grows the required pin set, so
+    /// admission has to see that growth — and refuse it — before the stamp
+    /// is committed.
+    #[tokio::test]
+    async fn teardown_admission_projects_a_pending_recovered_publication() {
+        // Exact byte math on the shared candidate set: run on a per-process
+        // database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_pending_stamp").await;
+        let now = Utc::now();
+
+        // The crash window: the last completed workload is stamped, the
+        // newer generation wrote its StatefulSet but lost only the stamp.
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        let completed_artifact = insert_test_artifact(&pool, app_id, completed, "aa").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            completed,
+            completed,
+            Some((completed, &completed_artifact)),
+        )
+        .await;
+        mark_test_workload_published(&pool, completed).await;
+        let pending = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            pending,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let pending_artifact = insert_test_artifact(&pool, app_id, pending, "de").await;
+        insert_failed_apply_job(&pool, org_id, app_id, pending, &pending_artifact, 7).await;
+
+        let without_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                completed_artifact.clone(),
+            ]))
+            .expect("serialize the unit without the pending stamp")
+            .len();
+        let with_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(vec![
+                completed_artifact.clone(),
+                pending_artifact.clone(),
+            ]))
+            .expect("serialize the unit with the pending stamp")
+            .len();
+
+        // The pending stamp grows the unit past the budget: refuse it while
+        // `current` still lacks the artifact.
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(without_len)),
+            app_id,
+            Some(pending),
+        )
+        .await
+        .expect("project the pending recovered stamp");
+        assert!(
+            !fits,
+            "a pending stamp that grows the pin past the byte budget must be refused"
+        );
+
+        // The committed truth alone does not grow: the same budget admits.
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(without_len)),
+            app_id,
+            None,
+        )
+        .await
+        .expect("project the committed truth");
+        assert!(
+            fits,
+            "without the pending stamp the delete does not grow the required set"
+        );
+
+        // A pending stamp that fits is admitted like any other unit.
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(with_len)),
+            app_id,
+            Some(pending),
+        )
+        .await
+        .expect("project a pending stamp that fits the budget");
+        assert!(
+            fits,
+            "a pending stamp within the shared byte budget must be admitted"
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_pending_stamp", pool).await;
     }
 
     /// Other apps' pending teardown pins already occupy the budget: admitting
@@ -7523,6 +8717,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len)),
             app_id,
+            None,
         )
         .await
         .expect("weigh other apps' pending teardown pins");
@@ -7535,6 +8730,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(pin_len + unit_len)),
             app_id,
+            None,
         )
         .await
         .expect("admit a teardown unit alongside existing pins");
@@ -7580,6 +8776,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(1)),
             app_id,
+            None,
         )
         .await
         .expect("admit a delete that does not grow the required set");
@@ -7659,6 +8856,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len / 2)),
             app_id,
+            None,
         )
         .await
         .expect("admission check on a completed teardown");
@@ -7724,6 +8922,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len)),
             app_id,
+            None,
         )
         .await
         .expect("admit the full mixed legacy/job unit");
@@ -7736,6 +8935,7 @@ resource_bindings := {
             &pool,
             Some(&teardown_budget_config(unit_len - 1)),
             app_id,
+            None,
         )
         .await
         .expect("refuse a mixed unit that exceeds the shared budget");
@@ -7756,7 +8956,7 @@ resource_bindings := {
     /// predicate undercounts (teardown denied live authority) or inflates
     /// (phantom 409) the projected unit.
     async fn teardown_projection(pool: &PgPool, app_id: Uuid) -> HashSet<String> {
-        load_teardown_policy_unit(pool, app_id)
+        load_teardown_policy_unit(pool, app_id, None)
             .await
             .expect("project teardown unit")
             .into_iter()
@@ -8161,47 +9361,51 @@ resource_bindings := {
             ]))
             .expect("serialize the partial policy body");
 
+        let client_at =
+            |policy: String, deployment_token: &'static str, template_generation: &'static str| {
+                kube::Client::new(
+                    tower::service_fn(move |request: axum::http::Request<kube::client::Body>| {
+                        let hash = hex::encode(Sha256::digest(policy.as_bytes()));
+                        let annotations = serde_json::json!({
+                            (POLICY_GENERATION_ANNOTATION): "7",
+                            (POLICY_SHA256_ANNOTATION): hash,
+                            (POLICY_PUBLICATION_TOKEN_ANNOTATION): "published",
+                        });
+                        let object = if request.uri().path().contains("deployments") {
+                            serde_json::json!({
+                                "apiVersion": "apps/v1", "kind": "Deployment",
+                                "metadata": {"name": "trustee", "namespace": "cap-test"},
+                                "spec": {"template": {"metadata": {"annotations": {
+                                    (POLICY_GENERATION_ANNOTATION): template_generation,
+                                    (POLICY_SHA256_ANNOTATION): hash,
+                                    (POLICY_PUBLICATION_TOKEN_ANNOTATION): deployment_token,
+                                }}}}
+                            })
+                        } else {
+                            serde_json::json!({
+                                "apiVersion": "v1", "kind": "ConfigMap",
+                                "metadata": {"name": "resource-policy", "namespace": "cap-test",
+                                             "resourceVersion": "3", "annotations": annotations},
+                                "data": {"resource-policy.rego": policy}
+                            })
+                        };
+                        async move {
+                            Ok::<_, std::io::Error>(axum::http::Response::new(
+                                kube::client::Body::from(serde_json::to_vec(&object).unwrap()),
+                            ))
+                        }
+                    }),
+                    "default",
+                )
+            };
         let client_for = |policy: String, deployment_token: &'static str| {
-            kube::Client::new(
-                tower::service_fn(move |request: axum::http::Request<kube::client::Body>| {
-                    let hash = hex::encode(Sha256::digest(policy.as_bytes()));
-                    let annotations = serde_json::json!({
-                        (POLICY_GENERATION_ANNOTATION): "7",
-                        (POLICY_SHA256_ANNOTATION): hash,
-                        (POLICY_PUBLICATION_TOKEN_ANNOTATION): "published",
-                    });
-                    let object = if request.uri().path().contains("deployments") {
-                        serde_json::json!({
-                            "apiVersion": "apps/v1", "kind": "Deployment",
-                            "metadata": {"name": "trustee", "namespace": "cap-test"},
-                            "spec": {"template": {"metadata": {"annotations": {
-                                (POLICY_GENERATION_ANNOTATION): "7",
-                                (POLICY_SHA256_ANNOTATION): hash,
-                                (POLICY_PUBLICATION_TOKEN_ANNOTATION): deployment_token,
-                            }}}}
-                        })
-                    } else {
-                        serde_json::json!({
-                            "apiVersion": "v1", "kind": "ConfigMap",
-                            "metadata": {"name": "resource-policy", "namespace": "cap-test",
-                                         "resourceVersion": "3", "annotations": annotations},
-                            "data": {"resource-policy.rego": policy}
-                        })
-                    };
-                    async move {
-                        Ok::<_, std::io::Error>(axum::http::Response::new(
-                            kube::client::Body::from(serde_json::to_vec(&object).unwrap()),
-                        ))
-                    }
-                }),
-                "default",
-            )
+            client_at(policy, deployment_token, "7")
         };
 
         // Exercise the production unit loader too: the publication predicate
         // must not silently pass because the app's teardown set is empty.
         let loaded_unit = dedup_signed_policy_artifacts_by_hash(
-            load_teardown_policy_unit(&pool, app_id)
+            load_teardown_policy_unit(&pool, app_id, None)
                 .await
                 .expect("load teardown unit"),
         );
@@ -8264,6 +9468,25 @@ resource_bindings := {
         .await
         .expect("check deployment publication token");
         assert!(!covers, "a different Trustee publication must fail closed");
+
+        // A byte-identical policy at a newer generation advances only the
+        // ConfigMap; the template keeps the generation it was rolled at and
+        // is still this publication. A template claiming a NEWER generation
+        // than the applied one is not.
+        for (template_generation, expected) in [("5", true), ("8", false)] {
+            let covers = teardown_unit_already_published_with_applied(
+                &config,
+                client_at(full_body.clone(), "published", template_generation),
+                &unit,
+                applied.clone(),
+            )
+            .await
+            .expect("check template generation");
+            assert_eq!(
+                covers, expected,
+                "template generation {template_generation}"
+            );
+        }
 
         let covers = teardown_unit_already_published_with_applied(
             &config,
@@ -8486,6 +9709,7 @@ resource_bindings := {
             };
             let dummy_digest = format!("sha256:{}", "a".repeat(64));
             let engine_app = ConfidentialApp {
+                pod_supplemental_groups: None,
                 app_id: Uuid::new_v4(),
                 deployment_id: Uuid::new_v4(),
                 name: "mirror".into(),
@@ -9030,7 +10254,281 @@ resource_bindings := {
         crate::test_support::drop_isolated_database("cap_teardown_bounded", pool).await;
     }
 
-    async fn insert_failed_apply_job(
+    fn teardown_ordinal_pod(
+        app_name: &str,
+        deployment_id: Option<&str>,
+        ready: bool,
+        terminating: bool,
+    ) -> k8s_openapi::api::core::v1::Pod {
+        use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
+        use std::collections::BTreeMap;
+
+        let mut labels = BTreeMap::new();
+        labels.insert("app".to_string(), app_name.to_string());
+        if let Some(deployment_id) = deployment_id {
+            labels.insert(
+                "enclava.dev/deployment-id".to_string(),
+                deployment_id.to_string(),
+            );
+        }
+        k8s_openapi::api::core::v1::Pod {
+            metadata: ObjectMeta {
+                name: Some(format!("{app_name}-0")),
+                labels: Some(labels),
+                owner_references: Some(vec![OwnerReference {
+                    api_version: "apps/v1".to_string(),
+                    kind: "StatefulSet".to_string(),
+                    name: app_name.to_string(),
+                    uid: "sts-uid".to_string(),
+                    controller: Some(true),
+                    block_owner_deletion: Some(true),
+                }]),
+                deletion_timestamp: terminating
+                    .then_some(Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH)),
+                ..ObjectMeta::default()
+            },
+            status: Some(PodStatus {
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".to_string(),
+                    status: if ready { "True" } else { "False" }.to_string(),
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    message: None,
+                    observed_generation: None,
+                    reason: None,
+                }]),
+                ..PodStatus::default()
+            }),
+            ..k8s_openapi::api::core::v1::Pod::default()
+        }
+    }
+
+    #[test]
+    fn owned_ordinal_pod_names_only_the_controller_pod() {
+        let app = "app-live";
+        let deployment_id = Uuid::new_v4();
+        let named = teardown_ordinal_pod(app, Some(&deployment_id.to_string()), true, false);
+        assert_eq!(
+            owned_ordinal_pod_deployment_id(&named, app, "sts-uid"),
+            OwnedPodIdentity::Named(deployment_id)
+        );
+
+        let unlabeled = teardown_ordinal_pod(app, None, true, false);
+        assert_eq!(
+            owned_ordinal_pod_deployment_id(&unlabeled, app, "sts-uid"),
+            OwnedPodIdentity::Unnamed
+        );
+
+        let mut malformed = teardown_ordinal_pod(app, Some("not-a-uuid"), true, false);
+        assert_eq!(
+            owned_ordinal_pod_deployment_id(&malformed, app, "sts-uid"),
+            OwnedPodIdentity::Unnamed
+        );
+
+        let mut foreign = named.clone();
+        foreign.metadata.owner_references.as_mut().unwrap()[0].name = "other".to_string();
+        assert_eq!(
+            owned_ordinal_pod_deployment_id(&foreign, app, "sts-uid"),
+            OwnedPodIdentity::Unnamed
+        );
+
+        let mut not_controller = named.clone();
+        not_controller.metadata.owner_references.as_mut().unwrap()[0].controller = Some(false);
+        assert_eq!(
+            owned_ordinal_pod_deployment_id(&not_controller, app, "sts-uid"),
+            OwnedPodIdentity::Unnamed
+        );
+
+        malformed.metadata.name = Some("app-live-1".to_string());
+        assert_eq!(
+            owned_ordinal_pod_deployment_id(&malformed, app, "sts-uid"),
+            OwnedPodIdentity::Unnamed
+        );
+
+        let terminating_ready =
+            teardown_ordinal_pod(app, Some(&deployment_id.to_string()), true, true);
+        assert_eq!(
+            owned_ordinal_pod_deployment_id(&terminating_ready, app, "sts-uid"),
+            OwnedPodIdentity::Named(deployment_id),
+            "a still-Ready terminating pod can receive the Service teardown POST"
+        );
+        let terminating_not_ready =
+            teardown_ordinal_pod(app, Some(&deployment_id.to_string()), false, true);
+        assert_eq!(
+            owned_ordinal_pod_deployment_id(&terminating_not_ready, app, "sts-uid"),
+            OwnedPodIdentity::Unnamed,
+            "a not-Ready terminating pod may still be an endpoint; do not treat it as absent"
+        );
+        assert_eq!(
+            owned_ordinal_pod_deployment_id(&named, app, "other-uid"),
+            OwnedPodIdentity::Unnamed,
+            "a claimed ownerReference uid that is not the live StatefulSet uid is not provenance"
+        );
+    }
+
+    async fn candidate_hashes(pool: &PgPool) -> HashSet<String> {
+        load_signed_policy_candidates(pool, 1)
+            .await
+            .expect("select teardown authority")
+            .into_iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pinned_intermediate_publication_is_required_teardown_authority() {
+        // The Service can still hit a published generation between the last
+        // completed job and the newest publication. That artifact is required
+        // only when teardown has named the owned pod; every other intermediate
+        // stays out so one app cannot refill the shared byte budget.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_live_pin").await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+
+        let live = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, live, "healthy", now).await;
+        let live_artifact = insert_test_artifact(&pool, app_id, live, "11").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            live,
+            live,
+            Some((live, &live_artifact)),
+        )
+        .await;
+
+        let intermediate = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, intermediate, "failed", now).await;
+        set_test_setup_state(&pool, intermediate, "accepted").await;
+        mark_test_workload_published(&pool, intermediate).await;
+        let intermediate_artifact = insert_test_artifact(&pool, app_id, intermediate, "22").await;
+        insert_failed_apply_job(
+            &pool,
+            org_id,
+            app_id,
+            intermediate,
+            &intermediate_artifact,
+            6,
+        )
+        .await;
+
+        let newest = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            newest,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        set_test_setup_state(&pool, newest, "accepted").await;
+        mark_test_workload_published(&pool, newest).await;
+        let newest_artifact = insert_test_artifact(&pool, app_id, newest, "33").await;
+        insert_failed_apply_job(&pool, org_id, app_id, newest, &newest_artifact, 7).await;
+
+        let unpublished = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            unpublished,
+            "failed",
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+        set_test_setup_state(&pool, unpublished, "accepted").await;
+        let unpublished_artifact = insert_test_artifact(&pool, app_id, unpublished, "44").await;
+        insert_failed_apply_job(&pool, org_id, app_id, unpublished, &unpublished_artifact, 8).await;
+
+        assert!(
+            app_has_intermediate_publications(&pool, app_id)
+                .await
+                .expect("probe intermediate publications")
+        );
+        let unpinned = candidate_hashes(&pool).await;
+        assert!(unpinned.contains(&live_artifact.metadata.descriptor_core_hash));
+        assert!(unpinned.contains(&newest_artifact.metadata.descriptor_core_hash));
+        assert!(
+            !unpinned.contains(&intermediate_artifact.metadata.descriptor_core_hash),
+            "an unnamed intermediate publication must stay out of the shared budget"
+        );
+
+        replace_teardown_live_pin(&pool, app_id, Some(unpublished))
+            .await
+            .expect("pin unpublished deployment");
+        let unpublished_pin = candidate_hashes(&pool).await;
+        assert!(
+            !unpublished_pin.contains(&unpublished_artifact.metadata.descriptor_core_hash),
+            "a pin is not publication; a generation that never wrote a StatefulSet stays out"
+        );
+        assert!(!unpublished_pin.contains(&intermediate_artifact.metadata.descriptor_core_hash));
+
+        let (_other_org, other_app) = insert_test_app(&pool, "deleting").await;
+        replace_teardown_live_pin(&pool, other_app, Some(intermediate))
+            .await
+            .expect("pin another app");
+        assert!(
+            !candidate_hashes(&pool)
+                .await
+                .contains(&intermediate_artifact.metadata.descriptor_core_hash),
+            "another app's pin must not admit this app's intermediate"
+        );
+
+        replace_teardown_live_pin(&pool, app_id, Some(intermediate))
+            .await
+            .expect("pin the live intermediate");
+        let pinned = candidate_hashes(&pool).await;
+        assert!(
+            pinned.contains(&intermediate_artifact.metadata.descriptor_core_hash),
+            "the named live pod's published generation must be required"
+        );
+        assert!(pinned.contains(&live_artifact.metadata.descriptor_core_hash));
+        assert!(pinned.contains(&newest_artifact.metadata.descriptor_core_hash));
+        assert!(!pinned.contains(&unpublished_artifact.metadata.descriptor_core_hash));
+        assert_eq!(
+            pinned.len(),
+            3,
+            "completed + named intermediate + newest publication, nothing else: {pinned:?}"
+        );
+        assert_projection_matches_selector(&pool, app_id, "named intermediate publication").await;
+
+        let retained = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("retention 1 with a named intermediate");
+        let retained_hashes: HashSet<_> = retained
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            retained_hashes.contains(intermediate_artifact.metadata.descriptor_core_hash.as_str()),
+            "retention 1 must not drop the named live pod: {retained_hashes:?}"
+        );
+        assert_eq!(retained_hashes.len(), 3);
+
+        replace_teardown_live_pin(&pool, app_id, None)
+            .await
+            .expect("clear pin");
+        assert!(
+            !candidate_hashes(&pool)
+                .await
+                .contains(&intermediate_artifact.metadata.descriptor_core_hash),
+            "clearing the pin drops the intermediate again"
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_live_pin", pool).await;
+    }
+
+    pub(crate) async fn insert_failed_apply_job(
         pool: &PgPool,
         org_id: Uuid,
         app_id: Uuid,
@@ -9058,6 +10556,408 @@ resource_bindings := {
         .execute(pool)
         .await
         .expect("insert failed apply job");
+    }
+
+    async fn insert_rollback_apply_job(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        operation_id: Uuid,
+        artifact: &crate::signing_service::SignedPolicyArtifact,
+        payload_byte: u8,
+    ) {
+        let artifact_deployment_id = Uuid::parse_str(&artifact.metadata.deploy_id).unwrap();
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, last_error_code
+             ) VALUES ($1, $2, $3, $4, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $5, false, true, $4, $6, NULL, 'failed',
+                       'deployment_apply_failed')",
+        )
+        .bind(operation_id)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(artifact_deployment_id)
+        .bind(vec![payload_byte; 32])
+        .bind(hex::decode(&artifact.metadata.descriptor_core_hash).unwrap())
+        .execute(pool)
+        .await
+        .expect("insert rollback apply job");
+    }
+
+    #[tokio::test]
+    async fn pinned_rollback_operation_admits_its_source_artifact() {
+        // Rollback mints a new operation id and keeps the target artifact.
+        // The pod label is the operation id; the selector must admit the
+        // source artifact, and the coverage check must resolve the same way.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_rollback_pin").await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+
+        let live = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, live, "healthy", now).await;
+        let live_artifact = insert_test_artifact(&pool, app_id, live, "11").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            live,
+            live,
+            Some((live, &live_artifact)),
+        )
+        .await;
+
+        let source = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, source, "failed", now).await;
+        let source_artifact = insert_test_artifact(&pool, app_id, source, "55").await;
+        let rollback = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            rollback,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        set_test_setup_state(&pool, rollback, "accepted").await;
+        mark_test_workload_published(&pool, rollback).await;
+        insert_rollback_apply_job(&pool, org_id, app_id, rollback, &source_artifact, 6).await;
+
+        let newest = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            newest,
+            "failed",
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+        set_test_setup_state(&pool, newest, "accepted").await;
+        mark_test_workload_published(&pool, newest).await;
+        let newest_artifact = insert_test_artifact(&pool, app_id, newest, "33").await;
+        insert_failed_apply_job(&pool, org_id, app_id, newest, &newest_artifact, 7).await;
+
+        let back_to_live = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            back_to_live,
+            "failed",
+            now + chrono::Duration::seconds(3),
+        )
+        .await;
+        insert_rollback_apply_job(&pool, org_id, app_id, back_to_live, &live_artifact, 8).await;
+
+        replace_teardown_live_pin(&pool, app_id, Some(rollback))
+            .await
+            .expect("pin rollback operation");
+        let pinned = candidate_hashes(&pool).await;
+        assert!(
+            pinned.contains(&source_artifact.metadata.descriptor_core_hash),
+            "pinning the rollback operation must admit its source artifact: {pinned:?}"
+        );
+        assert!(pinned.contains(&live_artifact.metadata.descriptor_core_hash));
+        assert!(pinned.contains(&newest_artifact.metadata.descriptor_core_hash));
+        assert_projection_matches_selector(&pool, app_id, "rollback operation pin").await;
+        assert!(
+            teardown_unit_covers_operation(&pool, app_id, rollback)
+                .await
+                .expect("coverage for rollback operation")
+        );
+        assert!(
+            teardown_unit_covers_operation(&pool, app_id, back_to_live)
+                .await
+                .expect("coverage for rollback onto the completed artifact"),
+            "a rollback whose source is already in the two-arm unit is authorized"
+        );
+        assert!(
+            !teardown_unit_covers_operation(&pool, app_id, Uuid::new_v4())
+                .await
+                .expect("unknown operation is not covered")
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_rollback_pin", pool).await;
+    }
+
+    /// A deleting retry must measure a replacement pin against the stored pin.
+    /// Writing the replacement first makes the selector treat it as already
+    /// required, so a larger pin looks non-growing and a 409 would leave the
+    /// over-budget set selected.
+    #[tokio::test]
+    async fn pin_replacement_growth_is_measured_against_the_stored_pin() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_pin_growth").await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_teardown_pending_app(&pool).await;
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        let completed_artifact = insert_test_artifact(&pool, app_id, completed, "11").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            completed,
+            completed,
+            Some((completed, &completed_artifact)),
+        )
+        .await;
+
+        let stored_pin = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, stored_pin, "failed", now).await;
+        set_test_setup_state(&pool, stored_pin, "accepted").await;
+        mark_test_workload_published(&pool, stored_pin).await;
+        let stored_artifact = insert_test_artifact(&pool, app_id, stored_pin, "22").await;
+        insert_failed_apply_job(&pool, org_id, app_id, stored_pin, &stored_artifact, 6).await;
+
+        let replacement = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, replacement, "failed", now).await;
+        set_test_setup_state(&pool, replacement, "accepted").await;
+        mark_test_workload_published(&pool, replacement).await;
+        let replacement_artifact =
+            insert_sized_test_artifact(&pool, app_id, replacement, "66", 2048).await;
+        insert_failed_apply_job(&pool, org_id, app_id, replacement, &replacement_artifact, 7).await;
+
+        let newest = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            newest,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        set_test_setup_state(&pool, newest, "accepted").await;
+        mark_test_workload_published(&pool, newest).await;
+        let newest_artifact = insert_test_artifact(&pool, app_id, newest, "33").await;
+        insert_failed_apply_job(&pool, org_id, app_id, newest, &newest_artifact, 8).await;
+
+        replace_teardown_live_pin(&pool, app_id, Some(stored_pin))
+            .await
+            .expect("commit the stored pin");
+        let stored_hashes = candidate_hashes(&pool).await;
+        assert!(stored_hashes.contains(&stored_artifact.metadata.descriptor_core_hash));
+        assert!(
+            !stored_hashes.contains(&replacement_artifact.metadata.descriptor_core_hash),
+            "the replacement must not be required until it is the committed pin"
+        );
+        let stored_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(
+                load_teardown_policy_unit(&pool, app_id, None)
+                    .await
+                    .expect("load stored unit"),
+            ))
+            .expect("serialize stored unit")
+            .len();
+        let proposed_len =
+            signed_policy_artifact_policy_body(&dedup_signed_policy_artifacts_by_hash(
+                load_teardown_policy_unit_proposing(
+                    &pool,
+                    app_id,
+                    None,
+                    TeardownPinProposal::Replace(Some(replacement)),
+                )
+                .await
+                .expect("load proposed unit"),
+            ))
+            .expect("serialize proposed unit")
+            .len();
+        assert!(
+            proposed_len > stored_len,
+            "fixture must grow the unit: stored {stored_len}, proposed {proposed_len}"
+        );
+
+        let fits = teardown_unit_fits_signed_policy_budget_proposing(
+            &pool,
+            Some(&teardown_budget_config(stored_len)),
+            app_id,
+            None,
+            TeardownPinProposal::Replace(Some(replacement)),
+        )
+        .await
+        .expect("admit against the stored pin");
+        assert!(
+            !fits,
+            "a larger replacement pin must be refused while the stored pin is still selected"
+        );
+        let unchanged: Uuid = sqlx::query_scalar(
+            "SELECT deployment_id FROM teardown_live_deployment_pins WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("stored pin row");
+        assert_eq!(
+            unchanged, stored_pin,
+            "admission must not commit the replacement pin"
+        );
+
+        // The same bytes admit once the replacement is already the committed
+        // pin: both sides of the comparison include it, so it looks non-growing.
+        replace_teardown_live_pin(&pool, app_id, Some(replacement))
+            .await
+            .expect("commit the replacement, as the old handler did before admission");
+        let fits = teardown_unit_fits_signed_policy_budget(
+            &pool,
+            Some(&teardown_budget_config(stored_len)),
+            app_id,
+            None,
+        )
+        .await
+        .expect("admission after the replacement was committed");
+        assert!(
+            fits,
+            "committing the replacement before admission hides the growth; the handler must not"
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_pin_growth", pool).await;
+    }
+
+    /// An unsigned apply has no signed artifact to authorize. Once intermediate
+    /// publications exist, treating a null hash as Uncovered 502s deletion forever.
+    #[tokio::test]
+    async fn unsigned_operation_does_not_need_signed_policy_coverage() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_unsigned_cover").await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_teardown_pending_app(&pool).await;
+
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        insert_test_job(&pool, org_id, app_id, completed, completed, None).await;
+        mark_test_workload_published(&pool, completed).await;
+
+        let intermediate = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, intermediate, "failed", now).await;
+        mark_test_workload_published(&pool, intermediate).await;
+        insert_unsigned_failed_job(&pool, org_id, app_id, intermediate, 6).await;
+
+        let newest = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            newest,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        mark_test_workload_published(&pool, newest).await;
+        insert_unsigned_failed_job(&pool, org_id, app_id, newest, 7).await;
+
+        assert!(
+            app_has_intermediate_publications(&pool, app_id)
+                .await
+                .expect("probe unsigned intermediates"),
+            "the fixture must be the case the coverage probe actually reaches"
+        );
+        assert!(
+            teardown_unit_covers_operation(&pool, app_id, intermediate)
+                .await
+                .expect("coverage for unsigned intermediate"),
+            "an unsigned operation has no signed artifact to authorize"
+        );
+        assert!(
+            teardown_unit_covers_operation(&pool, app_id, newest)
+                .await
+                .expect("coverage for unsigned newest publication")
+        );
+        assert!(
+            !teardown_unit_covers_operation(&pool, app_id, Uuid::new_v4())
+                .await
+                .expect("unknown operation stays uncovered")
+        );
+
+        let signed = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            signed,
+            "failed",
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+        let signed_artifact = insert_test_artifact(&pool, app_id, signed, "77").await;
+        insert_failed_apply_job(&pool, org_id, app_id, signed, &signed_artifact, 8).await;
+        assert!(
+            !teardown_unit_covers_operation(&pool, app_id, signed)
+                .await
+                .expect("coverage for a signed operation outside the unit"),
+            "a signed operation whose artifact is not in the unit must still fail closed"
+        );
+
+        crate::test_support::drop_isolated_database("cap_teardown_unsigned_cover", pool).await;
+    }
+
+    async fn insert_unsigned_failed_job(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        payload_byte: u8,
+    ) {
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state, last_error_code
+             ) VALUES ($1, $2, $3, $1, 1,
+                       '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                       $4, false, false, NULL, NULL, NULL, 'failed',
+                       'deployment_apply_failed')",
+        )
+        .bind(deployment_id)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![payload_byte; 32])
+        .execute(pool)
+        .await
+        .expect("insert unsigned failed apply job");
+    }
+
+    #[tokio::test]
+    async fn teardown_pin_commit_rolls_back_with_its_transaction() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_pin_rollback").await;
+        let (_org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        let stored = Uuid::new_v4();
+        replace_teardown_live_pin(&pool, app_id, Some(stored))
+            .await
+            .expect("commit stored pin");
+        let mut tx = pool.begin().await.expect("begin pin transaction");
+        commit_teardown_live_pin(&mut tx, app_id, Some(Uuid::new_v4()))
+            .await
+            .expect("stage replacement pin");
+        tx.rollback().await.expect("roll back replacement pin");
+        let kept: Uuid = sqlx::query_scalar(
+            "SELECT deployment_id FROM teardown_live_deployment_pins WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("stored pin survives rollback");
+        assert_eq!(kept, stored);
+        crate::test_support::drop_isolated_database("cap_teardown_pin_rollback", pool).await;
     }
 
     #[tokio::test]
@@ -9193,6 +11093,146 @@ resource_bindings := {
         }
 
         crate::test_support::drop_isolated_database("cap_teardown_queued", pool).await;
+    }
+
+    #[tokio::test]
+    async fn crash_before_publication_stamp_is_recovered_from_the_live_statefulset() {
+        // Generation 6 applied its StatefulSet and died before the stamp.
+        // Generation 7 was superseded in preflight and never wrote one.
+        // Deleting must authorize 6, and must not treat 7's apply entry as a
+        // write just because apply_committed_at is set.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_teardown_crash_stamp").await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "deleting").await;
+        insert_test_keyring_version(&pool, org_id, 1, &["bb".repeat(32).as_str()]).await;
+        sqlx::query("UPDATE apps SET workload_teardown_required = true WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark workload teardown pending");
+
+        let completed = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, completed, "healthy", now).await;
+        mark_test_workload_published(&pool, completed).await;
+        let completed_artifact = insert_test_artifact(&pool, app_id, completed, "11").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            completed,
+            completed,
+            Some((completed, &completed_artifact)),
+        )
+        .await;
+
+        let crashed = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            crashed,
+            "failed",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        set_test_setup_state(&pool, crashed, "accepted").await;
+        sqlx::query(
+            "UPDATE deployments
+                SET apply_committed_at = clock_timestamp(),
+                    manifest_hash = 'crashed-spec',
+                    namespace_fence_generations = ARRAY[6]::bigint[]
+              WHERE id = $1",
+        )
+        .bind(crashed)
+        .execute(&pool)
+        .await
+        .expect("record the crash window without a publication stamp");
+        let crashed_artifact = insert_test_artifact(&pool, app_id, crashed, "22").await;
+        insert_failed_apply_job(&pool, org_id, app_id, crashed, &crashed_artifact, 6).await;
+
+        let never_wrote = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            never_wrote,
+            "failed",
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+        set_test_setup_state(&pool, never_wrote, "accepted").await;
+        sqlx::query(
+            "UPDATE deployments
+                SET apply_committed_at = clock_timestamp(),
+                    manifest_hash = 'never-wrote'
+              WHERE id = $1",
+        )
+        .bind(never_wrote)
+        .execute(&pool)
+        .await
+        .expect("mark a later apply that entered the StatefulSet step and did not write it");
+        let never_wrote_artifact = insert_test_artifact(&pool, app_id, never_wrote, "33").await;
+        insert_failed_apply_job(&pool, org_id, app_id, never_wrote, &never_wrote_artifact, 7).await;
+
+        let before = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority before recovery");
+        let before_hashes: HashSet<_> = before
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            !before_hashes.contains(crashed_artifact.metadata.descriptor_core_hash.as_str()),
+            "the lost stamp must be the bug this recovery closes"
+        );
+
+        crate::deploy::apply_live_publication_recovery(
+            &pool,
+            app_id,
+            &crate::deploy::LiveWorkloadPublication {
+                deployment_id: Some(crashed),
+                mutation_generation: Some(6),
+                manifest_hash: Some("crashed-spec".to_string()),
+            },
+            crate::deploy::PublicationRecoveryMode::BeforeTeardownSelection,
+        )
+        .await
+        .expect("recover publication from the live StatefulSet");
+
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select authority after recovery");
+        let hashes: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            hashes.contains(completed_artifact.metadata.descriptor_core_hash.as_str()),
+            "the last completed workload stays authorized"
+        );
+        assert!(
+            hashes.contains(crashed_artifact.metadata.descriptor_core_hash.as_str()),
+            "the generation still named by the live StatefulSet must be authorized"
+        );
+        assert!(
+            !hashes.contains(never_wrote_artifact.metadata.descriptor_core_hash.as_str()),
+            "entering the StatefulSet step is not a write"
+        );
+        let unit = load_teardown_policy_unit(&pool, app_id, None)
+            .await
+            .expect("project the teardown unit");
+        let unit_hashes: HashSet<_> = unit
+            .iter()
+            .map(|artifact| artifact.metadata.descriptor_core_hash.as_str())
+            .collect();
+        assert!(
+            unit_hashes.contains(crashed_artifact.metadata.descriptor_core_hash.as_str()),
+            "delete admission must include the recovered artifact"
+        );
+        assert!(!unit_hashes.contains(never_wrote_artifact.metadata.descriptor_core_hash.as_str()));
+
+        crate::test_support::drop_isolated_database("cap_teardown_crash_stamp", pool).await;
     }
 
     #[tokio::test]

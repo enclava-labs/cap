@@ -11,6 +11,7 @@ pub mod org;
 pub mod ownership;
 pub mod prepare;
 pub mod template;
+pub mod update;
 pub mod verify;
 
 use std::time::Duration;
@@ -37,7 +38,7 @@ pub(crate) fn format_duration(duration: Duration) -> String {
 #[derive(Parser)]
 #[command(
     name = "enclava",
-    version,
+    version = update::VERSION,
     about = "Deploy confidential apps in hardware-encrypted enclaves"
 )]
 pub struct Cli {
@@ -120,6 +121,8 @@ pub enum Command {
     Verify(verify::VerifyArgs),
     /// Observe what a live target or saved proof bundle contains (no appraisal)
     Describe(describe::DescribeArgs),
+    /// Check for a newer CLI release and install it
+    Update(update::UpdateArgs),
 }
 
 pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -152,6 +155,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Descriptor(cmd) => descriptor::run(cmd).await,
         Command::Verify(args) => verify::run(args).await,
         Command::Describe(args) => describe::run(args).await,
+        Command::Update(args) => update::run(args).await,
     }
 }
 
