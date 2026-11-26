@@ -76,6 +76,11 @@ back to an earlier release, rerun the installer with `ENCLAVA_VERSION=vX.Y.Z`,
 plus `ENCLAVA_INSTALL_DIR` if the CLI is not in the default directory
 (`enclava update` prints the path it replaced).
 
+In a terminal, a released CLI also looks up the latest release on GitHub at most
+once a day while a command runs and, when a newer one exists, ends the command
+with a one-line suggestion to run `enclava update`. Set
+`ENCLAVA_NO_UPDATE_CHECK=1` to turn that off.
+
 ## CLI Flow
 
 After authenticating against a CAP API, the normal app flow is:

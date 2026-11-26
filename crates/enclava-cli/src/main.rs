@@ -42,8 +42,13 @@ async fn main() {
         std::process::exit(1);
     }
     let cli = Cli::parse();
-    if let Err(e) = commands::run(cli).await {
+    let update_check = commands::update::spawn_notice_check(&cli.command);
+    let result = commands::run(cli).await;
+    if let Err(e) = &result {
         eprintln!("error: {e}");
+    }
+    commands::update::print_notice(update_check).await;
+    if result.is_err() {
         std::process::exit(1);
     }
 }
