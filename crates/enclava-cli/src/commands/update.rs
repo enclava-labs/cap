@@ -340,6 +340,33 @@ mod tests {
         assert!(extract_binary(&empty).is_err());
     }
 
+    /// Windows refuses to overwrite a loaded executable but allows renaming
+    /// it; the in-place update relies on that, so prove it on a live process.
+    #[cfg(windows)]
+    #[test]
+    fn replaces_an_executable_while_it_runs() {
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join(BIN);
+        std::fs::copy(std::env::var_os("ComSpec").expect("ComSpec"), &exe).unwrap();
+        // `pause` blocks on the open stdin pipe, keeping the image loaded.
+        let mut child = Command::new(&exe)
+            .args(["/c", "pause"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let still_running = child.try_wait().unwrap().is_none();
+        let replaced = replace_exe(&exe, b"new build");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(still_running, "fixture process exited before the swap");
+        replaced.unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new build");
+    }
+
     #[test]
     fn checksum_lookup_matches_the_exact_asset() {
         let sums = "AA11  enclava-linux-x86_64.tar.gz\nbb22  enclava-verifier-web.tar.gz\n";
