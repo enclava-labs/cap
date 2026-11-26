@@ -6,6 +6,9 @@ on:
 
 env:
   ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_PROFILES_JSON }}
+  # Compiled into the CLI as its version; `enclava update` compares it with
+  # the latest release tag.
+  ENCLAVA_RELEASE_VERSION: ${{ github.ref_name }}
 
 jobs:
   verify-platform-release-profiles:
