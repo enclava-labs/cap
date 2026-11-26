@@ -69,6 +69,13 @@ Windows) and adds it to your PATH. Set `ENCLAVA_VERSION=vX.Y.Z` for a specific
 release, `ENCLAVA_INSTALL_DIR` to change the destination. Other platforms:
 `cargo install --locked --git https://github.com/enclava-labs/cap enclava-cli`.
 
+To upgrade an installed CLI, run `enclava update`: it checks for a newer release
+and, after confirmation, replaces the binary in place with the same checksum and
+cosign checks as the installer (`--check` only reports, `--yes` skips the prompt). To go
+back to an earlier release, rerun the installer with `ENCLAVA_VERSION=vX.Y.Z`,
+plus `ENCLAVA_INSTALL_DIR` if the CLI is not in the default directory
+(`enclava update` prints the path it replaced).
+
 ## CLI Flow
 
 After authenticating against a CAP API, the normal app flow is:
