@@ -118,18 +118,34 @@ async fn release_mutation_and_rollback_lane(
 /// bound. Used only on the guard's renewal-loss arms; provider failures
 /// that RETURNED (settled) release normally.
 async fn quarantine_mutation_and_rollback_lane(
+    // The mutation is accepted for call-site symmetry with the releasing
+    // variant and deliberately untouched: every claimed row, the shared
+    // edge_config fence included, stays quarantined until reclaim_after.
+    _mutation: &crate::mutation_leases::AppMutationLease,
+    app_lane: sqlx::Transaction<'static, sqlx::Postgres>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    app_lane.rollback().await.map_err(|_| internal_error())?;
+    Ok(())
+}
+
+/// cap#422 R2 (review T1 + round 3): the no-edge-write arms of the
+/// renewal-loss path. The provider write in flight touches Postgres or
+/// the DNS provider only (the DNS-tracking record, a Cloudflare record
+/// deletion) -- no HAProxy/ConfigMap request was ever issued, so no
+/// later reconcile can adopt a poisoned base from it. The global
+/// `edge_config` fence is cross-app (deployment apply for UNRELATED apps
+/// needs it), so it is RELEASED here instead of idling through the
+/// reclaim quarantine. The app's own fences stay quarantined until
+/// reclaim_after. The edge-write arms (route publish, ingress ConfigMap,
+/// route removal) deliberately keep using
+/// `quarantine_mutation_and_rollback_lane`: an in-flight ConfigMap write
+/// can still land, and a freed edge_config fence would let an unrelated
+/// deployment's reconcile adopt the post-write config as its base.
+async fn quarantine_mutation_and_rollback_lane_releasing_edge_config(
     mutation: &crate::mutation_leases::AppMutationLease,
     app_lane: sqlx::Transaction<'static, sqlx::Postgres>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     app_lane.rollback().await.map_err(|_| internal_error())?;
-    // cap#422 R2 (review T1): the global `edge_config` fence is cross-app
-    // -- deployment apply for UNRELATED apps needs it, so a renewal loss
-    // on THIS app's verify must not hold it through the reclaim
-    // quarantine. On the DNS-tracking arm no edge request was issued at
-    // all (the fence was pre-claimed for a later publish); on the
-    // route-publish arm the uncertain edge write is covered by the
-    // app-scoped `edge(domain)` fence keeping THIS domain off the edge
-    // until reclaim. The app's own fences stay quarantined.
     if let Err(error) = mutation
         .release_fences_quarantined(&[crate::mutation_leases::ResourceFence::edge_config()])
         .await
@@ -850,8 +866,12 @@ pub async fn verify_challenge(
         Ok(result) => result,
         Err(_) => {
             // Renewal lost mid-DNS-write: the request may still land
-            // server-side, so the fences stay quarantined (cap#422).
-            quarantine_mutation_and_rollback_lane(&mutation, app_lane).await?;
+            // server-side, so the app's fences stay quarantined
+            // (cap#422). No edge request was issued on this arm, so the
+            // cross-app edge_config fence is released instead of idling
+            // through the reclaim quarantine.
+            quarantine_mutation_and_rollback_lane_releasing_edge_config(&mutation, app_lane)
+                .await?;
             return Err(internal_error());
         }
     };
@@ -1121,9 +1141,13 @@ pub async fn verify_challenge(
         {
             Ok(result) => result,
             Err(_) => {
-                // Renewal lost mid-delete: the deletion may still land,
-                // so the fences stay quarantined (cap#422).
-                quarantine_mutation_and_rollback_lane(&mutation, app_lane).await?;
+                // Renewal lost mid-delete: the Cloudflare deletion may
+                // still land, so the app's fences stay quarantined
+                // (cap#422). No edge request was issued on this arm, so
+                // the cross-app edge_config fence is released instead of
+                // idling through the reclaim quarantine.
+                quarantine_mutation_and_rollback_lane_releasing_edge_config(&mutation, app_lane)
+                    .await?;
                 return Err(internal_error());
             }
         };
@@ -1948,6 +1972,62 @@ mod tests {
     /// reclaim (RECLAIM_QUARANTINE_SECONDS) instead of being released
     /// while a Kubernetes/DNS request can still land server-side. The
     /// staged business writes are still rolled back.
+    /// cap#422 R2 round 3: the EDGE-WRITE arms keep the full quarantine —
+    /// an in-flight ConfigMap write can still land, and a freed
+    /// edge_config fence would let an unrelated deployment's reconcile
+    /// adopt the post-write config as its base (review 4702593725). The
+    /// plain helper leaves every claimed row quarantined, edge_config
+    /// included.
+    #[sqlx::test]
+    async fn edge_write_quarantine_keeps_the_shared_edge_config_fence(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::lazy_state();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        state.db = pool.clone();
+        let (app, _deployment_id, _lease, _payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        let domain = "edge-quarantine.example.com";
+        let operation_id = Uuid::new_v4();
+        let resources = vec![
+            crate::mutation_leases::ResourceFence::dns(domain),
+            crate::mutation_leases::ResourceFence::edge(domain),
+            crate::mutation_leases::ResourceFence::edge_config(),
+            crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &app.namespace),
+        ];
+        let mutation = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            crate::mutation_leases::CUSTOM_DOMAIN_SET_OPERATION,
+            operation_id,
+            false,
+            resources.clone(),
+        )
+        .await
+        .expect("claim the domain mutation");
+        let mut lane = state.db.begin().await.expect("begin lane");
+        crate::entitlements::lock_org_entitlement_lane(&mut lane, app.org_id)
+            .await
+            .expect("lock entitlement lane");
+        crate::deploy::lock_app_deployment_lane(&mut lane, app.id)
+            .await
+            .expect("lock deployment lane");
+        quarantine_mutation_and_rollback_lane(&mutation, lane)
+            .await
+            .expect("roll the lane back on the edge-write arm");
+        drop(mutation);
+        let still_owned: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM external_resource_mutation_leases
+              WHERE operation_id = $1",
+        )
+        .bind(operation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count owned rows after quarantine");
+        assert_eq!(
+            still_owned, 4,
+            "every fence stays quarantined on an edge-write arm, edge_config included"
+        );
+    }
+
     /// cap#422 R2 (review T1 + T2): drives the REAL verify path
     /// (verify_challenge) with a renewal loss injected INSIDE the
     /// DNS-tracking step (record_custom_domain). The dns_records row is
@@ -2093,8 +2173,12 @@ mod tests {
         }
 
         // The guard aborted (renewal lost mid-DNS-write) and the arm ran.
-        let response = task
+        // The join is deadline-bounded (review round 3): if the fixed
+        // sleep ever misses the heartbeat timeout, the test fails here
+        // instead of waiting on the still-held DNS lock forever.
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), task)
             .await
+            .expect("the verify must settle within the test deadline")
             .expect("the verify task must join")
             .expect_err("the renewal loss must fail the verify");
         assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
@@ -2208,7 +2292,7 @@ mod tests {
             .execute(&mut *lane)
             .await
             .expect("stage the domain assignment");
-        quarantine_mutation_and_rollback_lane(&mutation, lane)
+        quarantine_mutation_and_rollback_lane_releasing_edge_config(&mutation, lane)
             .await
             .expect("roll the lane back on renewal loss");
         drop(mutation);
