@@ -1182,7 +1182,13 @@ pub struct OrgKeyringResponse {
     /// Creation witness of this keyring version (server-assigned at
     /// insertion). Owner-rotation directives bind it to prove post-version
     /// creation; the exact stored value is what gets signed.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Optional for pre-#188 servers: an API that predates the witness
+    /// simply omits the field, and keyring reads must keep decoding —
+    /// only the owner-rotation directive (which the old server cannot
+    /// verify anyway) needs it and fails with a clear message instead
+    /// of a decode error (cap#382 review round 1).
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1304,6 +1310,41 @@ pub struct ApiOutcomeCause {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn org_keyring_response_decodes_without_the_creation_witness() {
+        // Pre-#188 servers omit created_at. Keyring reads must keep
+        // decoding (cap#382 review round 1: a missing witness turned a
+        // successful read — and a successful upload's response — into a
+        // decode error, blocking signed deploys against older APIs).
+        let legacy: crate::api_types::OrgKeyringResponse =
+            serde_json::from_value(serde_json::json!({
+                "org_id": "018f3f61-0000-7000-8000-000000000001",
+                "version": 3,
+                "keyring_payload": {"members": []},
+                "signature": "aa".repeat(64),
+                "signing_pubkey": "bb".repeat(32),
+                "fingerprint": "cc".repeat(32),
+            }))
+            .unwrap();
+        assert!(legacy.created_at.is_none());
+
+        let current: crate::api_types::OrgKeyringResponse =
+            serde_json::from_value(serde_json::json!({
+                "org_id": "018f3f61-0000-7000-8000-000000000001",
+                "version": 4,
+                "keyring_payload": {"members": []},
+                "signature": "aa".repeat(64),
+                "signing_pubkey": "bb".repeat(32),
+                "fingerprint": "cc".repeat(32),
+                "created_at": "2026-11-20T12:00:00Z",
+            }))
+            .unwrap();
+        assert_eq!(
+            current.created_at.map(|witness| witness.to_rfc3339()),
+            Some("2026-11-20T12:00:00+00:00".to_string())
+        );
+    }
+
     #[test]
     fn challenge_response_acme_cname_fields_are_backward_compatible() {
         use super::ChallengeResponse;

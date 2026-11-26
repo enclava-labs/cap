@@ -182,6 +182,44 @@ mod tests {
     }
 
     #[test]
+    fn owner_rotation_directive_v2_golden_vector_fractional_witness() {
+        // Round 1 review: the golden vector pinned only whole-second
+        // timestamps, so an independent implementation (the signing
+        // service re-derives these bytes) could format sub-second
+        // precision differently and still pass. Pin the fractional form.
+        let org_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let created_at = Utc
+            .with_ymd_and_hms(2026, 8, 12, 11, 0, 0)
+            .unwrap()
+            .checked_add_signed(chrono::Duration::nanoseconds(123_456_789))
+            .unwrap();
+        let at = Utc.with_ymd_and_hms(2026, 8, 12, 12, 0, 0).unwrap();
+        let bytes = owner_rotation_directive_bytes(
+            org_id,
+            &[0x11; 32],
+            &[0x22; 32],
+            7,
+            created_at,
+            at,
+            "routine",
+        );
+        assert_eq!(
+            hex::encode(&bytes),
+            "0007707572706f736500000013656e636c6176612d7265636f766572792d763200066f72675f696400000010\
+             11111111111111111111111111111111000e7265766f6b65645f7075626b6579000000201111111111111111\
+             11111111111111111111111111111111111111111111111100127265706c6163656d656e745f7075626b6579\
+             0000002022222222222222222222222222222222222222222222222222222222222222220014626173655f6b\
+             657972696e675f76657273696f6e00000001370017626173655f6b657972696e675f637265617465645f6174\
+             00000023323032362d30382d31325431313a30303a30302e3132333435363738392b30303a30300009736967\
+             6e65645f617400000019323032362d30382d31325431323a30303a30302b30303a30300006726561736f6e\
+             00000007726f7574696e65"
+                .replace(char::is_whitespace, "")
+        );
+        // 308 + the extra 10 characters of ".123456789".
+        assert_eq!(bytes.len(), 318);
+    }
+
+    #[test]
     fn owner_rotation_directive_binds_base_version_and_creation_witness() {
         // Issue #188: the signed bytes must cover the superseded version
         // and its creation witness so no directive can be reused across a

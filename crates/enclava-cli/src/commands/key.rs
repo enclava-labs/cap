@@ -979,7 +979,13 @@ async fn rotate_owner(
     // The witness is server-assigned at version insertion, so a directive
     // covering it provably post-dates the version it supersedes.
     let base_keyring_version = i64::try_from(remote_response.version)?;
-    let base_keyring_created_at = remote_response.created_at;
+    let base_keyring_created_at = remote_response.created_at.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the server did not report the base keyring's creation witness: the API \
+             predates the owner-rotation directive contract (#188), so it cannot verify \
+             this rotation — upgrade the server, then retry"
+        )
+    })?;
     let signed_at = chrono::Utc::now();
     let directive = owner_rotation_directive_bytes(
         org_id,

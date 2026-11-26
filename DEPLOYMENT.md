@@ -699,7 +699,15 @@ terminal outcome.
 
 Cross-project rollout gate (AGENTS.md): the CAP internal API response shape
 changed, so update and test enclava-paas against this response **before**
-deploying CAP API. Retries must keep the original idempotency key:
+deploying CAP API. The shape change is not limited to the deferred-keyring
+endpoints above: `GET /internal/paas/orgs/{org}/keyring` (the internal
+keyring read, routes/internal.rs get_paas_keyring) and the keyring upload's
+response (`PUT /internal/paas/orgs/{org}/keyring`, routes/internal.rs
+put_paas_keyring) both now carry the `created_at` creation witness in the
+forwarded org-keyring response — the PaaS proxy must pass that field
+through untouched and the hosted CLI keyring read must tolerate its
+absence against older CAP pods (enclava-cli decodes it as optional).
+Retries must keep the original idempotency key:
 enclava-paas forwards a caller-supplied `Idempotency-Key` deterministically
 (namespaced `paas:{org}:sha256(key)`), but when the caller sends none it
 derives a per-attempt random key (`cli_cap_idempotency_key`), so a plain
