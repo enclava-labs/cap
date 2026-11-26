@@ -2015,6 +2015,21 @@ async fn complete_idempotent_result(
                     return Err(idempotency_in_progress_error());
                 }
                 IdempotencyErrorDisposition::OutcomeUnknown => {
+                    // cd 2026-11-25 (plain-deploy 409): a 5xx masked as a
+                    // recovery receipt used to be invisible — the real
+                    // status and code reached neither the log nor the 409
+                    // body. Log at ERROR (operation id, upstream status,
+                    // code-shaped error; no provider text, no secrets).
+                    let cause_code = body
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unavailable");
+                    tracing::error!(
+                        operation_id = %lease.operation_id,
+                        upstream_status = status.as_u16(),
+                        upstream_error = %cause_code,
+                        "idempotent request failed with a server error; fail-closed receipt recorded"
+                    );
                     let terminal = idempotency_recovery_required_body();
                     finish_idempotent_request(lease, StatusCode::CONFLICT, &terminal).await?;
                     return Err((StatusCode::CONFLICT, Json(terminal)));
