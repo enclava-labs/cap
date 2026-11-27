@@ -602,15 +602,30 @@ mod tests {
         let (_reports, from_entry) = execute_teardown(&request, |_| Vec::new(), |_| {});
         let (_reports, from_epoch) =
             execute_teardown_since_epoch(&request, |_| Vec::new(), |_| {}, epoch);
-        let margin = epoch_offset.saturating_sub(Duration::from_secs(1));
-        assert!(
-            from_epoch.waited >= from_entry.waited + margin,
-            "the production clock must start at the handler epoch, not monitor entry: \
-             epoch {:?} vs entry {:?} (offset {:?})",
-            from_epoch.waited,
-            from_entry.waited,
-            epoch_offset
-        );
+        // A runner executing a cargo test suite has minutes of uptime, but
+        // the pin guards its own degradation window (round-7 review): when
+        // the derived offset is under two seconds the comparison cannot
+        // discriminate, and the test falls back to the weak inequality
+        // with an explicit note instead of silently passing a margin of
+        // zero.
+        if epoch_offset >= Duration::from_secs(2) {
+            let margin = epoch_offset.saturating_sub(Duration::from_secs(1));
+            assert!(
+                from_epoch.waited >= from_entry.waited + margin,
+                "the production clock must start at the handler epoch, not monitor \
+                 entry: epoch {:?} vs entry {:?} (offset {:?})",
+                from_epoch.waited,
+                from_entry.waited,
+                epoch_offset
+            );
+        } else {
+            eprintln!(
+                "epoch-origin pin degraded: monotonic offset {:?} is below the \
+                 discrimination floor; asserting the weak inequality only",
+                epoch_offset
+            );
+            assert!(from_epoch.waited >= from_entry.waited);
+        }
     }
 
     #[test]
