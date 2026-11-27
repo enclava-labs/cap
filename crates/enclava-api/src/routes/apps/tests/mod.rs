@@ -3907,6 +3907,7 @@ async fn non_running_app_with_seed_evidence_requires_teardown_on_destroy() {
     let fresh_app_id = uuid::Uuid::new_v4();
     let app_suffix = fresh_app_id.simple().to_string();
     let app_name = format!("seed-nv-{}", &app_suffix[..8]);
+    let fresh_domain = format!("{}-nv.example.test", &app_suffix[..8]);
     sqlx::query(
         "INSERT INTO apps (
              id, org_id, name, namespace, instance_id, tenant_id,
@@ -3922,7 +3923,7 @@ async fn non_running_app_with_seed_evidence_requires_teardown_on_destroy() {
     .bind(&app_name)
     .bind(format!("cap-{}", &app_suffix[..8]))
     .bind(&app_suffix)
-    .bind(format!("{}-nv.example.test", &app_suffix[..8]))
+    .bind(&fresh_domain)
     .bind(format!("{}-nv.tee.example.test", &app_suffix[..8]))
     .execute(&pool)
     .await
@@ -3941,6 +3942,24 @@ async fn non_running_app_with_seed_evidence_requires_teardown_on_destroy() {
         teardown_state(fresh_app_id).await,
         (false, None),
         "never-deployed apps keep teardown_required=false"
+    );
+    // The stranded DNS fence reconciler (cap#438) resolves a fence's owning
+    // app by `operation_id`. Its own fixtures stage that shape by hand, so
+    // pin it on the real route: a destroy that stops at a provider step
+    // leaves its hostname fence owned as `app_delete` with the app id.
+    let dns_fence_owner: (Option<String>, Option<uuid::Uuid>) = sqlx::query_as(
+        "SELECT operation_kind, operation_id
+           FROM external_resource_mutation_leases
+          WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+    )
+    .bind(&fresh_domain)
+    .fetch_one(&pool)
+    .await
+    .expect("read the destroy's dns_hostname fence");
+    assert_eq!(
+        dns_fence_owner,
+        (Some("app_delete".to_string()), Some(fresh_app_id)),
+        "the delete route must claim its DNS fences as app_delete with the app id"
     );
 
     crate::test_support::drop_isolated_database("cap_seed_evidence_delete", pool).await;
