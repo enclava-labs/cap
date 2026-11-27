@@ -530,18 +530,6 @@ mod tests {
 
     use super::*;
 
-    async fn database_test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("connect entitlement regression database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate entitlement regression database");
-        pool
-    }
-
     fn limits(
         max_apps: u32,
         max_cpu: &str,
@@ -666,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn acceptance_waits_for_n_plus_one_entitlement_revocation_and_rejects() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let org_id = Uuid::new_v4();
         let suffix = org_id.simple().to_string();
         sqlx::query(

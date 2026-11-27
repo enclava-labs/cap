@@ -1526,18 +1526,6 @@ mod tests {
         ));
     }
 
-    async fn edge_database_test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("connect edge authority test database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate edge authority test database");
-        pool
-    }
-
     async fn insert_edge_deployment_job(
         pool: &PgPool,
         org_id: Uuid,
@@ -1753,7 +1741,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_replacement_keeps_latest_routable_app_selected() {
-        let pool = edge_database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
         let suffix = app_id.simple().to_string();
@@ -1830,7 +1818,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_app_with_prior_healthy_deployment_keeps_edge_route() {
-        let pool = edge_database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
         let suffix = app_id.simple().to_string();
@@ -1905,7 +1893,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_app_with_legacy_jobless_healthy_deployment_keeps_edge_route() {
-        let pool = edge_database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
         let suffix = app_id.simple().to_string();
@@ -1981,13 +1969,10 @@ mod tests {
 
     #[tokio::test]
     async fn pool_two_edge_reconcile_does_not_take_nested_database_connection() {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&database_url)
-            .await
-            .expect("connect edge liveness database");
+        // cap#391: per-test database (the shared test database is no
+        // longer migrated by anything, so a raw DATABASE_URL pool
+        // would fail on a fresh CI runner).
+        let (_test_db, pool) = crate::test_support::provision_test_database(2).await;
         let authority_lane = pool.begin().await.expect("hold caller authority lane");
         let state = Arc::new(Mutex::new(FakeKubeState::new("global\n")));
         let (entered, release) = {
@@ -2358,18 +2343,6 @@ mod tests {
         }
     }
 
-    async fn database_test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("connect edge test database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate edge test database");
-        pool
-    }
-
     async fn insert_edge_app_with_healthy_deployment(
         pool: &PgPool,
         status: &str,
@@ -2440,7 +2413,7 @@ mod tests {
 
     #[tokio::test]
     async fn teardown_pending_apps_keep_their_edge_routes() {
-        let pool = database_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
 
         let (running_org, running_app) =
             insert_edge_app_with_healthy_deployment(&pool, "running").await;

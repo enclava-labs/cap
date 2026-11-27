@@ -2943,21 +2943,9 @@ mod tests {
     use sqlx::PgPool;
     use uuid::Uuid;
 
-    async fn cleanup_test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:***@localhost:5432/test".to_string());
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("connect cleanup test database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate cleanup test database");
-        pool
-    }
-
     #[tokio::test]
     async fn deleting_app_cascades_creation_ledger_rows() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let record = enclava_engine::apply::creation_ledger::CreationRecord {
             kind: "ConfigMap".to_string(),
@@ -3034,7 +3022,7 @@ mod tests {
     /// CAP-created object.
     #[tokio::test]
     async fn provenance_lookup_failure_still_persists_evidence_loss_marker() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let deployment_id = Uuid::new_v4();
         insert_cleanup_deployment(&pool, app_id, deployment_id, "failed", None, false).await;
@@ -3139,7 +3127,7 @@ mod tests {
 
     #[tokio::test]
     async fn compensated_failed_row_no_longer_blocks_later_cleanup() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
 
         // A historical failed apply whose compensation completed: its
@@ -3181,7 +3169,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_incomplete_row_no_longer_blocks_later_cleanup() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
 
         // An earlier failed apply whose sweep could not finish: evidence
@@ -3222,7 +3210,7 @@ mod tests {
 
     #[tokio::test]
     async fn sole_generation_allows_cleanup() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let failed_id = Uuid::new_v4();
         insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), false).await;
@@ -3246,7 +3234,7 @@ mod tests {
     /// sts_uid/sts_created_at record.
     #[tokio::test]
     async fn recreated_statefulset_uids_all_accumulate() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let failed_id = Uuid::new_v4();
         insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), false).await;
@@ -3322,7 +3310,7 @@ mod tests {
     /// workload, and clear its provider evidence.
     #[tokio::test]
     async fn observed_failed_generation_cannot_compensate_itself() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let failed_id = Uuid::new_v4();
         insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), true).await;
@@ -3356,7 +3344,7 @@ mod tests {
 
     #[tokio::test]
     async fn prior_healthy_generation_blocks_cleanup() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let failed_id = Uuid::new_v4();
         insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), false).await;
@@ -3376,7 +3364,7 @@ mod tests {
 
     #[tokio::test]
     async fn newer_active_generation_blocks_cleanup() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let failed_id = Uuid::new_v4();
         insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), false).await;
@@ -3401,7 +3389,7 @@ mod tests {
     /// block cleanup.
     #[tokio::test]
     async fn superseded_predecessor_with_evidence_blocks_published_failure_cleanup() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
 
         // Case A: superseded `applying` predecessor — failed with hash.
@@ -3442,7 +3430,7 @@ mod tests {
 
     #[tokio::test]
     async fn rolled_back_generation_blocks_cleanup() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let failed_id = Uuid::new_v4();
         insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), false).await;
@@ -3461,7 +3449,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_app_blocks_cleanup() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let failed_id = Uuid::new_v4();
         insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), false).await;
@@ -4596,7 +4584,7 @@ mod tests {
     /// (app_id, uid) and load back as matchable lineage.
     #[tokio::test]
     async fn creation_ledger_roundtrip_is_idempotent_per_uid() {
-        let pool = cleanup_test_pool().await;
+        let (_test_db, pool) = crate::test_support::database_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let deployment_id = Uuid::new_v4();
         let record = enclava_engine::apply::creation_ledger::CreationRecord {

@@ -2691,20 +2691,6 @@ pub(crate) mod tests {
         (format!("http://{address}"), state, server)
     }
 
-    async fn database_test_pool(max_connections: u32) -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .connect(&database_url)
-            .await
-            .expect("connect mutation lease test database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate mutation lease test database");
-        pool
-    }
-
     async fn insert_app(pool: &PgPool, hostname: &str) -> (Uuid, Uuid) {
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
@@ -3071,7 +3057,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn pool_two_waiter_holds_no_connection_and_owner_can_renew() {
-        let pool = database_test_pool(2).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(2).await;
         let (_, app_one) = insert_app(&pool, "pool-one.example.test").await;
         let (_, app_two) = insert_app(&pool, "pool-two.example.test").await;
         let state = std::sync::Arc::new(state_with_pool(pool.clone()));
@@ -3135,7 +3121,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn hung_renew_cancels_provider_and_retains_reclaim_quarantine() {
-        let pool = database_test_pool(2).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(2).await;
         let hostname = format!("hung-renew-{}.example.test", Uuid::new_v4().simple());
         let (_, app_id) = insert_app(&pool, &hostname).await;
         let state = state_with_pool(pool.clone());
@@ -3243,7 +3229,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn prearmed_dns_rejects_reuse_after_detached_provider_outlives_caller() {
-        let pool = database_test_pool(4).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(4).await;
         let hostname = format!("detached-{}.example.test", Uuid::new_v4().simple());
         let (org_id, app_id) = insert_app(&pool, &hostname).await;
         let state = state_with_pool(pool.clone());
@@ -3474,7 +3460,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn prearmed_kubernetes_namespace_survives_process_loss_and_rejects_reclaim() {
-        let pool = database_test_pool(4).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(4).await;
         let namespace = format!("detached-kube-{}", Uuid::new_v4().simple());
         let hostname = format!("{namespace}.example.test");
         let (org_id, app_id) = insert_app(&pool, &hostname).await;
@@ -3575,7 +3561,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn successful_publication_clears_prearmed_kubernetes_namespace_atomically() {
-        let pool = database_test_pool(4).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(4).await;
         let namespace = format!("finished-kube-{}", Uuid::new_v4().simple());
         let hostname = format!("{namespace}.example.test");
         let (org_id, app_id) = insert_app(&pool, &hostname).await;
@@ -3631,7 +3617,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn terminal_release_preserves_bounded_provider_quarantine() {
-        let pool = database_test_pool(4).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(4).await;
         let namespace = format!("failed-kube-{}", Uuid::new_v4().simple());
         let hostname = format!("{namespace}.example.test");
         let (org_id, app_id) = insert_app(&pool, &hostname).await;
@@ -3746,7 +3732,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn reclaim_quarantine_rejects_late_owner_then_allows_new_generation() {
-        let pool = database_test_pool(4).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(4).await;
         let hostname = format!("reclaim-{}.example.test", Uuid::new_v4().simple());
         let (_, app_id) = insert_app(&pool, &hostname).await;
         let state = state_with_pool(pool.clone());
@@ -3838,7 +3824,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn provider_tombstone_survives_app_delete_and_hostname_reuse() {
-        let pool = database_test_pool(4).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(4).await;
         let (old_org, old_app) = insert_app(&pool, "reuse.example.test").await;
         let state = state_with_pool(pool.clone());
         let mut old = claim(
@@ -3904,7 +3890,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn desired_state_fence_scopes_to_desired_state_leases() {
-        let pool = database_test_pool(2).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(2).await;
         let (_, app_id) = insert_app(&pool, "desired-state-fence.example.test").await;
         async fn hold_lease(pool: &PgPool, app_id: Uuid, operation_kind: &str) {
             sqlx::query(
@@ -4350,7 +4336,7 @@ pub(crate) mod tests {
     /// The same fence held by a still-current owner is never selected.
     #[tokio::test]
     async fn app_delete_namespace_fence_releases_after_observed_deletion() {
-        let pool = database_test_pool(4).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(4).await;
         let state = state_with_pool(pool.clone());
 
         // Expired fence, all other provider fences of its token already
@@ -4474,7 +4460,7 @@ pub(crate) mod tests {
     /// the Kubernetes GET is never released by the stale snapshot.
     #[tokio::test]
     async fn app_delete_namespace_fence_preserves_current_and_raced_owners() {
-        let pool = database_test_pool(4).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(4).await;
         // The race fixture's GET bumps its fence generation in the mock
         // server, injecting the SELECT-then-UPDATE race the CAS must lose.
         let (org_race, app_race, _, namespace_race) =
@@ -4548,7 +4534,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn unledgered_compensation_marker_survives_terminal_cleanup() {
-        let pool = database_test_pool(4).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(4).await;
         let namespace = format!("unledgered-compensation-{}", Uuid::new_v4().simple());
         let (org_id, app_id) = insert_app(&pool, &format!("{namespace}.example.test")).await;
         sqlx::query("UPDATE apps SET namespace = $1 WHERE id = $2")
@@ -4715,7 +4701,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn retained_namespace_fence_releases_after_observed_deletion() {
-        let pool = database_test_pool(4).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(4).await;
         let state = state_with_pool(pool.clone());
 
         // Primary fixture: the namespace fence plus a sibling edge fence
@@ -4901,7 +4887,7 @@ pub(crate) mod tests {
     /// infinite (fail closed).
     #[tokio::test]
     async fn settled_foreign_namespace_marker_bounds_instead_of_stranding() {
-        let pool = database_test_pool(2).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(2).await;
         let (_, _, _, namespace) = stage_retained_namespace_fixture(&pool, Vec::new()).await;
         let (server_url, _mode, server) =
             mock_namespace_api_server(None, Arc::new(std::sync::atomic::AtomicI64::new(0))).await;
@@ -4983,7 +4969,7 @@ pub(crate) mod tests {
     /// never deleted.
     #[tokio::test]
     async fn retained_namespace_fence_retries_pinned_delete_for_live_owned_namespace() {
-        let pool = database_test_pool(2).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(2).await;
 
         // Cycle one: exactly one retained fence, served as a live namespace
         // carrying that fence generation's ownership annotations with CAP
@@ -5159,7 +5145,7 @@ pub(crate) mod tests {
     }
 
     async fn check_retained_fence_provenance(incomplete: bool, rewritten: bool, observing: bool) {
-        let pool = database_test_pool(2).await;
+        let (_test_db, pool) = crate::test_support::provision_test_database(2).await;
 
         // Fixture one mirrors the exhaustion shape: the attempts claimed
         // generation 1 (recorded in the deployment's provenance set), the

@@ -807,7 +807,7 @@ async fn internal_generic_deployment_rejects_member_before_database_access() {
 
 #[tokio::test]
 async fn external_id_replay_rejects_an_unreleased_terminal_hold() {
-    let pool = crate::test_support::database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let (app, _, _, payload) = crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
     let deployment_id = Uuid::new_v4();
     let mut request = idempotency_request(&app.name);
@@ -902,7 +902,7 @@ async fn public_error_codes_are_persistable_job_codes() {
     // rejected by the database and the real reason never survives. The
     // constraint list lives in migrations/0082 (widening 0038); this test
     // fails if either side drifts.
-    let pool = crate::test_support::database_test_pool().await;
+    let (_test_db, pool) = crate::test_support::database_test_pool().await;
     let constraint_def: String = sqlx::query_scalar(
         "SELECT pg_get_constraintdef(oid)
            FROM pg_constraint

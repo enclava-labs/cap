@@ -66,6 +66,10 @@ const PULL_SECRET_SCOPE_GENERATION_ANNOTATION: &str =
 /// Operator-controlled monotonic epoch; bump BEFORE broadening repository scope
 /// in a rolling deployment, after all replicas have received this fence.
 fn pull_secret_scope_generation() -> u64 {
+    // cap#391: share the env snapshot with any env-mutating test (no-op
+    // outside the test build).
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     std::env::var("TENANT_IMAGE_PULL_SCOPE_GENERATION")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -83,6 +87,10 @@ fn newer_pull_secret_scope(secret: &Secret) -> bool {
 }
 
 fn pull_secret_credential_generation() -> u64 {
+    // cap#391: share the env snapshot with any env-mutating test (no-op
+    // outside the test build).
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     std::env::var("TENANT_IMAGE_PULL_CREDENTIAL_GENERATION")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -398,6 +406,12 @@ fn classify_rollout_result(
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
+    // cap#391: share the env snapshot with any env-mutating test (no-op
+    // outside the test build). `configured_tenant_image_pull_secret_name`
+    // below reads the GHCR_* pair through here; a mutating test must not be
+    // able to slip between the two halves of the pair.
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     std::env::var(name).ok().and_then(|value| {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -405,6 +419,10 @@ fn env_nonempty(name: &str) -> Option<String> {
 }
 
 fn configured_tenant_image_pull_secret_name() -> Option<String> {
+    // cap#391: hold one env snapshot across the whole decision — the GHCR
+    // pair below must be read atomically against env-mutating tests.
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     if let Some(name) = env_nonempty(TENANT_IMAGE_PULL_SECRET_NAME_ENV) {
         return Some(name);
     }
@@ -419,6 +437,10 @@ fn configured_tenant_image_pull_secret_name() -> Option<String> {
 /// explicit, valid `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES` scope are refused.
 /// The platform GHCR PAT must never default into every tenant namespace.
 pub fn tenant_image_pull_secret_startup_error() -> Option<String> {
+    // cap#391: keep the generation reads one snapshot (no-op outside the
+    // test build).
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     for name in [
         "TENANT_IMAGE_PULL_CREDENTIAL_GENERATION",
         "TENANT_IMAGE_PULL_SCOPE_GENERATION",
@@ -487,6 +509,10 @@ pub fn tenant_image_pull_secret_startup_error() -> Option<String> {
 }
 
 fn tenant_image_pull_secret_config_from_env() -> Option<TenantImagePullSecretConfig> {
+    // cap#391: one env snapshot across the credential pair (nested
+    // `env_nonempty`/`configured_...` readers are reentrancy-safe).
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     let username = env_nonempty("GHCR_USERNAME")?;
     let token = env_nonempty("GHCR_TOKEN")?;
     let name = configured_tenant_image_pull_secret_name()
@@ -1103,6 +1129,9 @@ fn is_managed_tenant_image_pull_secret(
 /// The GHCR credential pair CAP would have embedded in a generated pull
 /// secret, when configured.
 fn ghcr_pull_secret_credentials() -> Option<(String, String)> {
+    // cap#391: one env snapshot across the credential pair.
+    #[cfg(test)]
+    let _env_read = crate::test_support::env_read_guard();
     Some((env_nonempty("GHCR_USERNAME")?, env_nonempty("GHCR_TOKEN")?))
 }
 
