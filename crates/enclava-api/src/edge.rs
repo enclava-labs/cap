@@ -342,25 +342,64 @@ async fn settle_custom_domain_swaps(state: &AppState) -> Result<(), sqlx::Error>
             continue;
         }
         // The rollout has settled: the serving certificate carries the
-        // row's domain. Retire the outgoing domains' DNS records first
-        // (idempotent; a failure keeps the markers for the next pass) and
-        // then drop the fetched markers so the reconciler stops serving
-        // the outgoing domains.
+        // row's domain. A stale proof must apply NOTHING: if the row moved
+        // since the probe (a concurrent replacement or a flip-back), the
+        // settlement waits for a fresh proof against the new row state —
+        // releasing the outgoing DNS records while their route markers
+        // survive would let another app claim the released domain while
+        // this app still routes it (review: stale route for a released
+        // domain).
         let outgoing: Vec<String> = sqlx::query_scalar(
             "SELECT outgoing_domain FROM custom_domain_swaps WHERE app_id = $1 ORDER BY outgoing_domain",
         )
         .bind(app_id)
         .fetch_all(&state.db)
         .await?;
-        // Re-read the row right before the destructive steps: a flip-back
-        // (`verify <outgoing> --replace`) re-activates that domain — its
-        // DNS record is the live serving record and must be kept, and the
-        // row guard must fail so the markers survive their own proof.
         let row_domain: Option<String> =
             sqlx::query_scalar("SELECT custom_domain FROM apps WHERE id = $1")
                 .bind(app_id)
                 .fetch_one(&state.db)
                 .await?;
+        if row_domain != probed_row_domain {
+            tracing::info!(
+                app_id = %app_id,
+                "swap settlement proof is stale (the row moved); keeping the outgoing domain served"
+            );
+            continue;
+        }
+        // Claim the outgoing domains' dns/edge fences for the destructive
+        // steps: a concurrent `verify <outgoing> --replace` (this app or
+        // another) holds the same fences, so the DNS release and any
+        // concurrent claim of the domain cannot interleave. Busy means a
+        // request is mid-flight — skip the pass and retry.
+        let mut resources = Vec::new();
+        for domain in &outgoing {
+            resources.push(crate::mutation_leases::ResourceFence::dns(domain));
+            resources.push(crate::mutation_leases::ResourceFence::edge(domain));
+        }
+        let lease = match crate::mutation_leases::claim_resources(
+            state,
+            "custom_domain_swap_settle",
+            Uuid::new_v4(),
+            resources,
+        )
+        .await
+        {
+            Ok(lease) => lease,
+            Err(crate::mutation_leases::MutationLeaseError::Busy) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app_id,
+                    %error,
+                    "swap settlement lease claim failed; retrying on the next pass"
+                );
+                continue;
+            }
+        };
+        // Retire the outgoing domains' DNS records first (idempotent; a
+        // failure keeps the markers for the next pass) and then drop the
+        // fetched markers so the reconciler stops serving the outgoing
+        // domains.
         let mut dns_failed = false;
         for domain in &outgoing {
             if row_domain.as_deref() == Some(domain.as_str()) {
@@ -384,11 +423,18 @@ async fn settle_custom_domain_swaps(state: &AppState) -> Result<(), sqlx::Error>
                 dns_failed = true;
             }
         }
-        if dns_failed {
-            continue;
+        let removed = if dns_failed {
+            0
+        } else {
+            retire_settled_swap_markers(&state.db, app_id, &outgoing, &probed_row_domain).await?
+        };
+        if let Err(error) = lease.finish().await {
+            tracing::warn!(
+                app_id = %app_id,
+                %error,
+                "swap settlement lease release failed; the reclaim clock will free the fences"
+            );
         }
-        let removed =
-            retire_settled_swap_markers(&state.db, app_id, &outgoing, &probed_row_domain).await?;
         tracing::info!(
             app_id = %app_id,
             removed,
@@ -2153,6 +2199,41 @@ mod tests {
             Some(vec!["concurrent.example.com".to_string()]),
             "the concurrent replacement's marker survives with its own proof"
         );
+
+        // (c) A REUSED domain (review: no retirement test for reused
+        // domains): the retired hostname becomes an outgoing marker again
+        // (a later swap back to it), the row moves, and the guard must
+        // fail again — a name-based guard that had "remembered" the
+        // retirement would wrongly release the reused marker.
+        // The row moves ON from the concurrent replacement's landing
+        // (another swap): the surviving marker is now a REUSED outgoing
+        // domain, and only a fresh proof against the new row retires it.
+        sqlx::query("UPDATE apps SET custom_domain = 'moved-on.example.com' WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("move the row for the reuse leg");
+        let removed = retire_settled_swap_markers(
+            &pool,
+            app_id,
+            &["concurrent.example.com".to_string()],
+            &Some("moved-on.example.com".to_string()),
+        )
+        .await
+        .expect("reuse retirement");
+        assert_eq!(
+            removed, 1,
+            "a fresh proof against the moved row retires the reused marker"
+        );
+        let remaining: Option<Vec<String>> = sqlx::query_scalar(
+            "SELECT array_agg(outgoing_domain ORDER BY outgoing_domain)
+               FROM custom_domain_swaps WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("list markers after reuse retirement");
+        assert_eq!(remaining, None, "every marker is retired by a valid proof");
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(org_id)
