@@ -799,16 +799,29 @@ fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
 #[test]
 fn signer_deferred_hint_pins_the_committed_rotation_wording() {
     // A deferred 409 that survives the client's bounded same-key retries
-    // means the identity change is already COMMITTED and only the KBS key
-    // publication is settling. The hint must say all three load-bearing
-    // facts (committed, settling publication, safe to re-run) because the
-    // raw API code carries none of them.
+    // means the identity change is already COMMITTED and only the KBS policy
+    // publication is pending. The hint must carry the load-bearing facts:
+    // committed-and-live, publication completes WITHOUT user action (next
+    // deploy / next CAP restart), and a re-run is a NEW rotation, not a
+    // publication retry — it replaces the current signer (rework of the
+    // original wording: a re-run was presented as the remedy).
     let hint = signer_deferred_hint_for(Some("signer_rotation_publication_pending"));
-    assert!(hint.contains("COMMITTED"), "got: {hint}");
-    assert!(hint.contains("KBS key publication"), "got: {hint}");
-    assert!(hint.contains("still settling"), "got: {hint}");
-    assert!(hint.contains("safe to re-run"), "got: {hint}");
+    assert!(hint.contains("IS COMMITTED"), "got: {hint}");
+    assert!(hint.contains("signer change is live"), "got: {hint}");
+    assert!(hint.contains("KBS policy publication"), "got: {hint}");
+    assert!(hint.contains("pending"), "got: {hint}");
+    assert!(hint.contains("next deploy"), "got: {hint}");
+    assert!(hint.contains("next CAP restart"), "got: {hint}");
+    assert!(hint.contains("no action is needed"), "got: {hint}");
+    assert!(hint.contains("NEW rotation"), "got: {hint}");
     assert!(hint.contains("fresh confirmation token"), "got: {hint}");
+    assert!(hint.contains("replaces the current signer"), "got: {hint}");
+    assert!(
+        hint.contains("does not only retry publication"),
+        "got: {hint}"
+    );
+    assert!(!hint.contains("safe to re-run"), "got: {hint}");
+    assert!(!hint.contains("still settling"), "got: {hint}");
 
     // A cause-less deferral (an older server that does not stamp the
     // cause) keeps the committed wording: the publication checkpoint case

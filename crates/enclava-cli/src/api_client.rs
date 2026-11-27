@@ -281,7 +281,9 @@ impl ApiClient {
         // SAME request after the server's retry_after hint, at most
         // SIGNER_DEFERRED_MAX_RETRIES times; a still-deferred response and
         // every terminal result (superseded conflict, 400/403, any
-        // non-deferred error) surface unchanged.
+        // non-deferred error) surface unchanged. The ~30 s retry budget
+        // counts sleeps only - each request itself rides the client's
+        // request timeout.
         let idempotency_key = signer_idempotency_key();
         let mut deferred_retries: u32 = 0;
         loop {
