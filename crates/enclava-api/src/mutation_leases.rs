@@ -1557,13 +1557,19 @@ pub async fn reconcile_orphaned_custom_domain_fences(
 /// A delete request cancelled between the infinity pre-arm and the release
 /// leaves the app's `dns_hostname` fences owned with no reclaim deadline.
 /// Every later destroy then fails `claim()` with `Busy`, so no request can
-/// ever reach the release that would clear them. This sweep re-issues the
-/// idempotent app-scoped DNS delete for an app that is still `deleting`, then
-/// CAS-releases the exact row. A vanished app row needs no provider work (its
-/// hostnames cannot be reused by a live row), and a live app is never touched:
-/// its records are not ours to delete. An app_delete fence is only selected
-/// once its owner's lease has expired; a live owner still renews
-/// `locked_until` and is left alone.
+/// ever reach the release that would clear them. This sweep resolves the
+/// owning app by the fence's immutable `operation_id` (never by hostname: a
+/// replacement app can reuse the name after the original destroy finished)
+/// and re-issues the idempotent app-scoped DNS delete for an app that is
+/// still `deleting`, then CAS-releases the exact row. A vanished app row needs
+/// no provider work -- its records are unreachable and a same-name replacement
+/// is never touched. A live app is never touched either: its records are not
+/// ours to delete. The sweep re-issues only the app-scoped delete; provider
+/// records with no local `dns_records` row (a lost create response) are removed
+/// by the retried destroy's `delete_managed_dns_pair_by_hostname` call, which is
+/// also the only path that can complete the deletion this fence blocks. An
+/// app_delete fence is only selected once its owner's lease has expired; a live
+/// owner still renews `locked_until` and is left alone.
 pub async fn release_stranded_dns_delete_fences(
     state: &AppState,
 ) -> Result<u64, MutationLeaseError> {
@@ -1598,13 +1604,14 @@ where
         // cannot reconcile.
         return Ok(0);
     }
-    let stranded: Vec<(String, Uuid, i64)> = sqlx::query_as(
-        "SELECT resource_key, owner_token, generation
+    let stranded: Vec<(String, Uuid, i64, Uuid)> = sqlx::query_as(
+        "SELECT resource_key, owner_token, generation, operation_id
            FROM external_resource_mutation_leases
           WHERE resource_scope = 'dns_hostname'
             AND reclaim_after = 'infinity'::timestamptz
             AND owner_token IS NOT NULL
             AND operation_kind = 'app_delete'
+            AND operation_id IS NOT NULL
             AND locked_until <= clock_timestamp()
           ORDER BY random()
           LIMIT 20",
@@ -1612,17 +1619,22 @@ where
     .fetch_all(pool)
     .await?;
     let mut released = 0_u64;
-    for (hostname, owner_token, generation) in stranded {
-        let app: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT id, status::text FROM apps WHERE domain = $1 OR tee_domain = $1 LIMIT 1",
-        )
-        .bind(&hostname)
-        .fetch_optional(pool)
-        .await?;
-        match app {
+    for (hostname, owner_token, generation, operation_id) in stranded {
+        // Resolve the app by the fence's immutable operation id, never by
+        // hostname: after the original destroy finished, a replacement app can
+        // claim the same name, and an app-scoped DNS delete against that
+        // replacement would remove records this fence never owned. A missing
+        // original row means the fence's owner is gone: release the fence
+        // without any provider work.
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+                .bind(operation_id)
+                .fetch_optional(pool)
+                .await?;
+        match status.as_deref() {
             None => {}
-            Some((app_id, status)) if status == "deleting" => {
-                if let Err(error) = delete_dns(app_id).await {
+            Some("deleting") => {
+                if let Err(error) = delete_dns(operation_id).await {
                     tracing::warn!(
                         hostname = %hostname,
                         error = %error,
@@ -2763,7 +2775,11 @@ pub(crate) mod tests {
         .expect("dns fence row")
     }
 
-    async fn poison_app_delete_dns_fence(pool: &PgPool, hostname: &str) -> Uuid {
+    async fn poison_app_delete_dns_fence(
+        pool: &PgPool,
+        hostname: &str,
+        operation_id: Uuid,
+    ) -> Uuid {
         let token = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO external_resource_mutation_leases(resource_scope, resource_key)
@@ -2787,7 +2803,7 @@ pub(crate) mod tests {
         )
         .bind(hostname)
         .bind(token)
-        .bind(Uuid::new_v4())
+        .bind(operation_id)
         .execute(pool)
         .await
         .expect("poison dns fence");
@@ -2871,11 +2887,23 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("mark app deleting");
-        poison_app_delete_dns_fence(&pool, "stranded-deleting.example.test").await;
-        let released = release_stranded_dns_delete_fences_with(&pool, true, |_| async { Ok(()) })
-            .await
-            .expect("reconcile stranded fences");
+        poison_app_delete_dns_fence(&pool, "stranded-deleting.example.test", app_id).await;
+        let deleted = Arc::new(Mutex::new(Vec::<Uuid>::new()));
+        let sink = deleted.clone();
+        let released = release_stranded_dns_delete_fences_with(&pool, true, move |app_id| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().await.push(app_id);
+                Ok(())
+            }
+        })
+        .await
+        .expect("reconcile stranded fences");
         assert!(released >= 1);
+        assert!(
+            deleted.lock().await.contains(&app_id),
+            "the fence's own app is the one passed to the DNS delete"
+        );
         assert_eq!(
             dns_fence_owner(&pool, "stranded-deleting.example.test").await,
             None,
@@ -2884,9 +2912,50 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn stranded_dns_fence_reconciler_never_deletes_a_replacement_apps_records() {
+        let pool = database_test_pool(2).await;
+        let hostname = format!(
+            "stranded-replacement-{}.example.test",
+            Uuid::new_v4().simple()
+        );
+        // The original owner of the stale fence is gone; a replacement app now
+        // owns the hostname and is itself deleting. Resolving by hostname would
+        // pass the replacement to the app-scoped DNS delete and remove records
+        // the old fence never owned.
+        let (_, replacement_id) = insert_app(&pool, &hostname).await;
+        sqlx::query("UPDATE apps SET status = 'deleting' WHERE id = $1")
+            .bind(replacement_id)
+            .execute(&pool)
+            .await
+            .expect("mark replacement deleting");
+        let original_id = Uuid::new_v4();
+        poison_app_delete_dns_fence(&pool, &hostname, original_id).await;
+        let deleted = Arc::new(Mutex::new(Vec::<Uuid>::new()));
+        let sink = deleted.clone();
+        release_stranded_dns_delete_fences_with(&pool, true, move |app_id| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().await.push(app_id);
+                Ok(())
+            }
+        })
+        .await
+        .expect("reconcile stranded fences");
+        assert!(
+            !deleted.lock().await.contains(&replacement_id),
+            "a replacement app reusing the hostname must never be passed to the DNS delete"
+        );
+        assert_eq!(
+            dns_fence_owner(&pool, &hostname).await,
+            None,
+            "the stale fence of the vanished original app is released without provider work"
+        );
+    }
+
+    #[tokio::test]
     async fn stranded_dns_fence_reconciler_releases_vanished_app() {
         let pool = database_test_pool(2).await;
-        poison_app_delete_dns_fence(&pool, "stranded-vanished.example.test").await;
+        poison_app_delete_dns_fence(&pool, "stranded-vanished.example.test", Uuid::new_v4()).await;
         release_stranded_dns_delete_fences_with(&pool, true, |_| async { Ok(()) })
             .await
             .expect("reconcile stranded fences");
@@ -2900,8 +2969,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn stranded_dns_fence_reconciler_never_touches_live_app() {
         let pool = database_test_pool(2).await;
-        let (_, _app_id) = insert_app(&pool, "stranded-live.example.test").await;
-        let owner = poison_app_delete_dns_fence(&pool, "stranded-live.example.test").await;
+        let (_, app_id) = insert_app(&pool, "stranded-live.example.test").await;
+        let owner = poison_app_delete_dns_fence(&pool, "stranded-live.example.test", app_id).await;
         release_stranded_dns_delete_fences_with(&pool, true, |_| async { Ok(()) })
             .await
             .expect("reconcile stranded fences");
@@ -2921,7 +2990,7 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("mark app deleting");
-        let owner = poison_app_delete_dns_fence(&pool, "stranded-error.example.test").await;
+        let owner = poison_app_delete_dns_fence(&pool, "stranded-error.example.test", app_id).await;
         release_stranded_dns_delete_fences_with(&pool, true, |_| async {
             Err(crate::dns::DnsError::NotConfigured)
         })
