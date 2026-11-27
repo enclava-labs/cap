@@ -576,29 +576,25 @@ mod tests {
         // epoch being dropped).
         let epoch =
             signal_safe_monotonic_nanos().saturating_sub(Duration::from_secs(5).as_nanos() as u64);
-        // Instant GuestSync ops (Recorder) so no real writeback can mask a
-        // clock regression: with no siblings and a zero initial wait the
-        // loop never sleeps, and the reported wait is exactly the distance
-        // from the epoch.
-        let mut ops = Recorder {
-            calls: Vec::new(),
-            fail_suffix: "never",
-        };
-        let (_reports, outcome) = execute_teardown_with(
+        // Call the PRODUCTION entry point (execute_teardown_since_epoch
+        // owns its clock) with no mounts, no siblings, and a zero initial
+        // wait: the two global syncs on an idle test runner are far below
+        // the bound, so a regression to monitor entry (waited ~ 0) fails
+        // while the honest epoch reports the full five seconds.
+        let (_reports, outcome) = execute_teardown_since_epoch(
             &TeardownRequest {
                 mounts: &[],
                 siblings: &[],
                 initial_wait: Duration::ZERO,
                 deadline: TEARDOWN_DEADLINE,
             },
-            &mut ops,
             |_| Vec::new(),
             |_| {},
-            || Duration::from_nanos(signal_safe_monotonic_nanos().saturating_sub(epoch)),
+            epoch,
         );
         assert!(
             outcome.waited >= Duration::from_secs(5) && outcome.waited < Duration::from_secs(7),
-            "the epoch must be the clock's origin, with nothing else adding time: {:?}",
+            "the epoch must be the production clock's origin: {:?}",
             outcome.waited
         );
     }
