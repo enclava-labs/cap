@@ -2917,4 +2917,602 @@ mod tests {
         .expect("read the app mutation lease");
         assert!(app_lease_held, "the app mutation lease stays quarantined");
     }
+
+    // cap#415 test-debt follow-up (review SHOULD-FIX 1 + Devin e2, the
+    // "Fresh-domain regression skips verification handler" thread): the
+    // response-replay contract is pinned through the REAL internal verify
+    // route the hosted caller drives, not through the admission probes
+    // called directly.
+
+    /// Headers for the internal PaaS verify route: the idempotency key and
+    /// the acting PaaS user id.
+    fn paas_verify_headers(idempotency_key: &str, paas_user_id: &str) -> axum::http::HeaderMap {
+        use axum::http::HeaderValue;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_str(idempotency_key).expect("valid idempotency key"),
+        );
+        headers.insert(
+            "x-enclava-paas-user-id",
+            HeaderValue::from_str(paas_user_id).expect("valid paas user id"),
+        );
+        headers
+    }
+
+    /// Map the org and a user for the internal actor context: a PaaS
+    /// organization mapping, a PaaS user mapping, and an owner membership.
+    async fn insert_paas_actor(pool: &sqlx::PgPool, org_id: Uuid) -> (String, String, Uuid) {
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'paas verify tester')")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("insert the paas verify user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(pool)
+            .await
+            .expect("insert the owner membership");
+        let paas_org_id = format!("paas-org-{}", Uuid::new_v4().simple());
+        let paas_user_id = format!("paas-user-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO paas_external_mappings
+                 (resource_type, paas_external_id, cap_id, org_id)
+             VALUES ('organization', $1, $2, $2)",
+        )
+        .bind(&paas_org_id)
+        .bind(org_id)
+        .execute(pool)
+        .await
+        .expect("map the paas organization");
+        sqlx::query(
+            "INSERT INTO paas_external_mappings
+                 (resource_type, paas_external_id, cap_id)
+             VALUES ('user', $1, $2)",
+        )
+        .bind(&paas_user_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("map the paas user");
+        (paas_org_id, paas_user_id, user_id)
+    }
+
+    /// A response-map kube fake for the restart-admission probes: the
+    /// StatefulSet exists, BOTH claims were created at 00:00:00Z, and the
+    /// ordinal-0 pod (mounting both claims) was created in the SAME whole
+    /// second — the fresh first-deploy shape whose strict verdict is
+    /// Unproven. `pod_ready` decides whether the relaxed
+    /// inspect_ready_pod_mounts_all_claims probe would admit.
+    fn restart_admission_kube(app: &App, pod_ready: bool) -> kube::Client {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+
+        let namespace = app.namespace.clone();
+        let workload = app.name.clone();
+        let ready = if pod_ready { "True" } else { "False" };
+        let claim = enclava_engine::manifest::volumes::provisioned_claim_name("state", &workload);
+        let tls_claim =
+            enclava_engine::manifest::volumes::provisioned_claim_name("tls-state", &workload);
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": format!("{workload}-0"),
+                "namespace": namespace,
+                "creationTimestamp": "2025-01-01T00:00:00Z",
+            },
+            "spec": {
+                "containers": [],
+                "volumes": [
+                    {"name": "state", "persistentVolumeClaim": {"claimName": claim}},
+                    {"name": "tls-state", "persistentVolumeClaim": {"claimName": tls_claim}},
+                ],
+            },
+            "status": {"conditions": [{"type": "Ready", "status": ready}]},
+        });
+        let statefulset = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {"name": workload, "namespace": namespace},
+        });
+        let state_claim = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": claim,
+                "namespace": namespace,
+                "creationTimestamp": "2025-01-01T00:00:00Z",
+            },
+        });
+        let tls_state_claim = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": tls_claim,
+                "namespace": namespace,
+                "creationTimestamp": "2025-01-01T00:00:00Z",
+            },
+        });
+        let mut responses: std::collections::HashMap<String, (u16, serde_json::Value)> =
+            std::collections::HashMap::new();
+        responses.insert(
+            format!("/apis/apps/v1/namespaces/{namespace}/statefulsets/{workload}"),
+            (200, statefulset),
+        );
+        responses.insert(
+            format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}"),
+            (200, state_claim),
+        );
+        responses.insert(
+            format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{tls_claim}"),
+            (200, tls_state_claim),
+        );
+        responses.insert(
+            format!("/api/v1/namespaces/{namespace}/pods"),
+            (
+                200,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "PodList",
+                    "items": [pod],
+                }),
+            ),
+        );
+        kube::Client::new(
+            service_fn(move |request: Request<Body>| {
+                let responses = responses.clone();
+                async move {
+                    let path = request.uri().path().to_string();
+                    let _ = request.into_body().collect().await;
+                    let (status, body) = responses.get(&path).cloned().unwrap_or_else(|| {
+                        (
+                            404,
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "reason": "NotFound",
+                                "code": 404,
+                                "message": format!("{path} not found"),
+                            }),
+                        )
+                    });
+                    Ok::<_, std::io::Error>(
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
+        )
+    }
+
+    /// Stage a pending custom-domain challenge and its hermetic TXT answer.
+    /// Returns the TXT name (the caller must deregister it before
+    /// returning).
+    async fn stage_verify_challenge(pool: &sqlx::PgPool, app_id: Uuid, domain: &str) -> String {
+        let token = format!("token-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO custom_domain_challenges
+                 (id, app_id, domain, challenge_token, expires_at)
+             VALUES ($1, $2, $3, $4, now() + interval '1 hour')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app_id)
+        .bind(domain)
+        .bind(&token)
+        .execute(pool)
+        .await
+        .expect("insert the domain challenge");
+        let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
+        TXT_TEST_ANSWERS.lock().expect("txt answers lock").push((
+            txt_name.clone(),
+            vec![format!("enclava-domain-verification={token}")],
+        ));
+        txt_name
+    }
+
+    /// Drive the REAL internal PaaS verify route (the route the hosted
+    /// caller hits, with its idempotency wrapper) once.
+    async fn drive_paas_verify(
+        state: &crate::state::AppState,
+        paas_org_id: &str,
+        paas_user_id: &str,
+        app_name: &str,
+        domain: &str,
+        idempotency_key: &str,
+    ) -> Result<(StatusCode, serde_json::Value), (StatusCode, serde_json::Value)> {
+        crate::routes::internal::verify_paas_domain_challenge(
+            crate::routes::internal::InternalAuth {
+                client_san: "spiffe://paas.example.test/enclava-paas".to_string(),
+            },
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                paas_org_id.to_string(),
+                app_name.to_string(),
+                domain.to_string(),
+            )),
+            paas_verify_headers(idempotency_key, paas_user_id),
+            Json(serde_json::json!({})),
+        )
+        .await
+        .map(|(status, Json(body))| (status, body))
+        .map_err(|(status, Json(body))| (status, body))
+    }
+
+    fn paas_managed_state(pool: &sqlx::PgPool, kube: kube::Client) -> crate::state::AppState {
+        let mut state = crate::test_support::lazy_state();
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(pool);
+        state.db = pool.clone();
+        state.kube_client = kube;
+        state
+    }
+
+    #[sqlx::test]
+    async fn paas_verify_first_domain_volume_init_refusal_surfaces_and_replays(pool: sqlx::PgPool) {
+        // Review cap#415 SHOULD-FIX 1 / Devin e2: a first custom-domain add
+        // on a fresh deployment whose ingress restart is refused must carry
+        // the code-shaped 409 (code AND the reviewed recovery message) on
+        // the FIRST response AND replay the same code + message on a
+        // same-key idempotency retry — driven through the REAL internal
+        // verify route, never through the probes called directly.
+        let (app, deployment_id, _lease, _payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        // A settled deployment: the only refusal on this path is restart
+        // admission.
+        sqlx::query("UPDATE deployments SET status = 'healthy'::deploy_status_enum WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("settle the deployment phase");
+        // Fresh first-deploy shape: both claims and the pod share the same
+        // whole second (strict verdict Unproven), and the pod is NOT Ready
+        // (first-boot still formatting), so the relaxed probe refuses too.
+        let state = paas_managed_state(&pool, restart_admission_kube(&app, false));
+        let (paas_org_id, paas_user_id, _cap_user) = insert_paas_actor(&pool, app.org_id).await;
+        let domain = "first-add.example-test.com";
+        let txt_name = stage_verify_challenge(&pool, app.id, domain).await;
+
+        let idempotency_key = format!("verify-first-{}", Uuid::new_v4().simple());
+        let first = drive_paas_verify(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &app.name,
+            domain,
+            &idempotency_key,
+        )
+        .await;
+        let (first_status, first_body) = first.expect_err(
+            "the first-domain refusal must surface as the code-shaped 409, not a success",
+        );
+        assert_eq!(first_status, StatusCode::CONFLICT);
+        assert_eq!(
+            first_body["error"], "volume_init_unproven",
+            "the refusal must be code-shaped: {first_body}"
+        );
+        assert_eq!(
+            first_body["message"],
+            "volume initialization has not proven complete; recover the deployment before changing domains",
+            "the reviewed recovery message must reach the caller on the FIRST response: {first_body}"
+        );
+        assert_eq!(first_body["idempotency_disposition"], "completed");
+        assert_eq!(
+            first_body["retryable"], false,
+            "the surfaced refusal must advertise itself as non-retryable: {first_body}"
+        );
+
+        // The same-key retry REPLAYS the cached refusal: the same status,
+        // the same code, and the same message — the caller never has to
+        // re-prove DNS or re-run the probe to see the recovery guidance.
+        let second = drive_paas_verify(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &app.name,
+            domain,
+            &idempotency_key,
+        )
+        .await;
+        let (second_status, second_body) = second
+            .expect("a replayed completed refusal surfaces as the cached response, not a success");
+        assert_eq!(second_status, StatusCode::CONFLICT);
+        assert_eq!(
+            second_body["error"], "volume_init_unproven",
+            "the replay must carry the same code: {second_body}"
+        );
+        assert_eq!(
+            second_body["message"],
+            "volume initialization has not proven complete; recover the deployment before changing domains",
+            "the replay must carry the same recovery message: {second_body}"
+        );
+        assert_eq!(
+            second_body, first_body,
+            "the replay is byte-equal to the first response"
+        );
+
+        TXT_TEST_ANSWERS
+            .lock()
+            .expect("txt answers lock")
+            .retain(|(name, _)| name != &txt_name);
+    }
+
+    #[sqlx::test]
+    async fn paas_verify_deployment_in_progress_re_executes_on_same_key_retry(pool: sqlx::PgPool) {
+        // The other code-shaped refusal: deployment_in_progress is a
+        // waitable pre-mutation conflict, so a same-key retry must
+        // RE-EXECUTE the handler instead of replaying the refusal. Proven
+        // by changing the blocking state between the calls: the retry then
+        // runs the verification again and reaches the NEXT refusal
+        // (restart admission), which a replay could never produce.
+        let (app, deployment_id, _lease, _payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        sqlx::query("UPDATE deployments SET status = 'applying'::deploy_status_enum WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("stage an in-progress deployment");
+        let state = paas_managed_state(&pool, restart_admission_kube(&app, false));
+        let (paas_org_id, paas_user_id, _cap_user) = insert_paas_actor(&pool, app.org_id).await;
+        let domain = "reexec.example-test.com";
+        let txt_name = stage_verify_challenge(&pool, app.id, domain).await;
+
+        let idempotency_key = format!("verify-reexec-{}", Uuid::new_v4().simple());
+        let first = drive_paas_verify(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &app.name,
+            domain,
+            &idempotency_key,
+        )
+        .await;
+        let (first_status, first_body) = first.expect_err("the in-progress conflict must 409");
+        assert_eq!(first_status, StatusCode::CONFLICT);
+        assert_eq!(
+            first_body["idempotency_disposition"], "deferred",
+            "a waitable conflict defers, never caches: {first_body}"
+        );
+
+        // The deployment settles between the two calls.
+        sqlx::query("UPDATE deployments SET status = 'healthy'::deploy_status_enum WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("settle the deployment phase");
+        let second = drive_paas_verify(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &app.name,
+            domain,
+            &idempotency_key,
+        )
+        .await;
+        let (second_status, second_body) =
+            second.expect_err("the re-executed verify reaches the restart-admission refusal");
+        assert_eq!(second_status, StatusCode::CONFLICT);
+        assert_eq!(
+            second_body["error"], "volume_init_unproven",
+            "the retry RE-EXECUTED (a replay would repeat the deferred body): {second_body}"
+        );
+        assert_eq!(
+            second_body["message"],
+            "volume initialization has not proven complete; recover the deployment before changing domains",
+            "the re-executed refusal carries the reviewed recovery message: {second_body}"
+        );
+
+        TXT_TEST_ANSWERS
+            .lock()
+            .expect("txt answers lock")
+            .retain(|(name, _)| name != &txt_name);
+    }
+
+    #[sqlx::test]
+    async fn domain_change_keeps_the_strict_restart_rule_not_the_relaxed_probe(pool: sqlx::PgPool) {
+        // Review cap#415 SHOULD-FIX 2: a domain CHANGE
+        // (previous_custom.is_some()) always takes the strict rule; the
+        // relaxed probe (inspect_ready_pod_mounts_all_claims) is never
+        // consulted for a change. The kube fake stages the exact shape the
+        // relaxed probe ADMITS (a same-second Ready pod mounting both
+        // claims — the fresh first-deploy shape): if the route ever widened
+        // the relaxed admission to changes, this verify would be ADMITTED
+        // instead of refused.
+        let (app, deployment_id, _lease, _payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        sqlx::query("UPDATE deployments SET status = 'healthy'::deploy_status_enum WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("settle the deployment phase");
+        // The app already owns a custom domain: the verify below is a
+        // CHANGE, not a first add.
+        let old_domain = "old.example-test.com";
+        sqlx::query("UPDATE apps SET custom_domain = $1 WHERE id = $2")
+            .bind(old_domain)
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("pin the app to the old domain");
+        let kube = restart_admission_kube(&app, true);
+        // Self-verifying premise: on THIS cluster shape the relaxed probe
+        // itself would admit (a Ready same-second pod mounting both claims),
+        // while the strict whole-second rule stays Unproven.
+        {
+            let engine = enclava_engine::apply::engine::ApplyEngine::new(
+                kube.clone(),
+                enclava_engine::apply::types::ApplyConfig::default(),
+            );
+            assert_eq!(
+                crate::deploy::ingress_restart_verdict(&engine, &app.namespace, &app.name)
+                    .await
+                    .expect("verdict must resolve"),
+                crate::deploy::IngressRestartVerdict::Unproven,
+                "premise: the strict verdict for a same-second pod is Unproven"
+            );
+            assert!(
+                enclava_engine::apply::orchestrator::inspect_ready_pod_mounts_all_claims(
+                    &engine,
+                    &app.namespace,
+                    &app.name,
+                )
+                .await
+                .expect("relaxed probe must resolve"),
+                "premise: the relaxed probe WOULD admit this shape"
+            );
+        }
+        let state = paas_managed_state(&pool, kube);
+        let (paas_org_id, paas_user_id, _cap_user) = insert_paas_actor(&pool, app.org_id).await;
+        let domain = "changed.example-test.com";
+        let txt_name = stage_verify_challenge(&pool, app.id, domain).await;
+
+        let idempotency_key = format!("verify-change-{}", Uuid::new_v4().simple());
+        let result = drive_paas_verify(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &app.name,
+            domain,
+            &idempotency_key,
+        )
+        .await;
+        let (status, body) = result.expect_err(
+            "a domain change must keep the strict rule: the same-second pod cannot admit it",
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"], "volume_init_unproven",
+            "the strict refusal for a domain change: {body}"
+        );
+        assert_eq!(
+            body["message"],
+            "volume initialization has not proven complete; recover the deployment before changing domains",
+            "the reviewed recovery message: {body}"
+        );
+
+        TXT_TEST_ANSWERS
+            .lock()
+            .expect("txt answers lock")
+            .retain(|(name, _)| name != &txt_name);
+    }
+
+    #[sqlx::test]
+    async fn first_domain_add_on_admissible_fresh_pod_is_admitted_past_restart_admission(
+        pool: sqlx::PgPool,
+    ) {
+        // Devin 4723916888: the refusal tests alone cannot tell whether the
+        // relaxed first-add admission still exists - dropping the relaxed
+        // rule entirely (always refuse an Unproven verdict) would also pass
+        // them. This is the positive case: a FIRST add whose pod has the
+        // exact admissible shape (a same-second Ready pod mounting both
+        // claims - the fresh first-deploy shape, verdict Unproven) must get
+        // PAST restart admission. The observable: the verify is not refused
+        // with volume_init_unproven; it proceeds to the tenant-ingress
+        // step, which with no attestation config staged fails
+        // deterministically with the code-shaped 500 below.
+        let (app, deployment_id, _lease, _payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        sqlx::query("UPDATE deployments SET status = 'healthy'::deploy_status_enum WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("settle the deployment phase");
+        // The admissible shape: same-second claims + a READY pod mounting
+        // both (premise asserted in the change-routing test; the verdict is
+        // Unproven and the relaxed probe admits).
+        let state = paas_managed_state(&pool, restart_admission_kube(&app, true));
+        let (paas_org_id, paas_user_id, _cap_user) = insert_paas_actor(&pool, app.org_id).await;
+        let domain = "admitted.example-test.com";
+        let txt_name = stage_verify_challenge(&pool, app.id, domain).await;
+
+        let idempotency_key = format!("verify-admit-{}", Uuid::new_v4().simple());
+        let result = drive_paas_verify(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &app.name,
+            domain,
+            &idempotency_key,
+        )
+        .await;
+        let (status, body) = result.expect_err("no attestation config is staged");
+        assert_ne!(
+            body["error"], "volume_init_unproven",
+            "the first add on the admissible shape must NOT be refused: {body}"
+        );
+        // The tenant-ingress step fails (no attestation config staged),
+        // and a 5xx surfaces through the internal route's fail-closed
+        // receipt: 409 idempotency_recovery_required carrying the upstream
+        // cause. That receipt is the PROOF the verify was admitted and ran
+        // past restart admission — a refusal would carry volume_init_
+        // unproven with no outcome_cause.
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"], "idempotency_recovery_required",
+            "the 5xx from the admitted path surfaces as the fail-closed receipt: {body}"
+        );
+        assert_eq!(
+            body["outcome_cause"]["error"], "tenant_ingress_update_failed",
+            "the admitted verify reached the tenant-ingress step: {body}"
+        );
+        assert_eq!(
+            body["outcome_cause"]["status"], 500,
+            "the recorded upstream status: {body}"
+        );
+
+        TXT_TEST_ANSWERS
+            .lock()
+            .expect("txt answers lock")
+            .retain(|(name, _)| name != &txt_name);
+    }
+
+    #[tokio::test]
+    async fn paas_verify_route_is_registered_on_the_production_router() {
+        // Devin 4723916973: the handler-level tests bypass the router, so a
+        // removed or misrouted registration would pass them. The production
+        // router (test_router = build_router_inner) must route the internal
+        // PaaS verify POST: an unauthenticated request must be answered by
+        // the route's auth layer (401), never fall through as 404.
+        use tower::ServiceExt;
+
+        let state = {
+            let mut state = crate::test_support::lazy_state();
+            state.management_mode = crate::state::CapManagementMode::PaasManaged;
+            state.internal_auth = Some(
+                crate::state::InternalAuthConfig::from_plaintext_tokens_with_proxy_secret(
+                    &["cap-internal-current"],
+                    &["spiffe://paas.example.test/enclava-paas"],
+                    Some("cap-internal-proxy-secret"),
+                ),
+            );
+            state
+        };
+        let app = crate::test_router(state);
+        let uri =
+            "/internal/paas/orgs/paas-org-x/apps/some-app/domains/dom.example-test.com/verify";
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri(uri)
+            .body(axum::body::Body::from("{}"))
+            .expect("build the verify request");
+        let response = app.oneshot(request).await.expect("the router answers");
+        assert_ne!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "the internal PaaS verify route must be registered: {uri}"
+        );
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "an unauthenticated request is rejected by the route's internal auth layer"
+        );
+    }
 }
