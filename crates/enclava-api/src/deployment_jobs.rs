@@ -12338,9 +12338,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn stranded_setup_fence_requeues_then_reclaims_without_manual_action() {
         let pool = database_test_pool().await;
-        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let (app, deployment_id, _setup_handle, mut payload) = insert_job_fixture(&pool).await;
         // The app owns a custom domain, so the setup runner's real claim
-        // competes for its dns_hostname fence (the arm site).
+        // competes for its dns_hostname fence (the arm site) — in the JOB'S
+        // payload too, exactly as a create-with-custom-domain would have
+        // committed it (the runner reads the payload's app snapshot).
         let hostname = format!("setup-retry-{}.example.test", Uuid::new_v4().simple());
         sqlx::query("UPDATE apps SET custom_domain = $1 WHERE id = $2")
             .bind(&hostname)
@@ -12348,6 +12350,16 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("pin the app's custom domain");
+        payload.app.custom_domain = Some(hostname.clone());
+        replace_job_with_raw_payload(
+            &pool,
+            deployment_id,
+            serde_json::to_value(&payload).expect("serialize the updated payload"),
+            JOB_PAYLOAD_VERSION,
+            true,
+            "setup_pending",
+        )
+        .await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
         state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
@@ -12498,6 +12510,20 @@ pub(crate) mod tests {
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
         state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+        // The dead attempt's earlier SETUP wrote the app's record for the
+        // fenced hostname — the cleanup runner builds its fences from these
+        // rows (and the payload's app), so the retried claim competes for
+        // the poisoned fence exactly as production would.
+        sqlx::query(
+            "INSERT INTO dns_records (id, app_id, hostname, zone_id, record_id, record_type, target, is_custom)
+             VALUES ($1, $2, $3, NULL, NULL, 'A', 'managed-target', false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.id)
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("persist the fenced hostname's record");
 
         // A previous cleanup attempt died right after the arm.
         let dead = crate::mutation_leases::claim(
