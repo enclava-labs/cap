@@ -574,13 +574,16 @@ mod tests {
         // the past and asserting the returned wait already includes those
         // five seconds (round-2 review: the unit pins could not catch the
         // epoch being dropped).
-        // A twenty-second epoch (still under the 28 s deadline, so the loop
-        // is not capped): the discrimination margin between the two runs
-        // becomes nineteen seconds, and the entry run's two empty-mount
-        // global syncs would have to differ by that much for a regression
-        // to pass — while the deadline caps every run at 28 s anyway.
-        let epoch =
-            signal_safe_monotonic_nanos().saturating_sub(Duration::from_secs(20).as_nanos() as u64);
+        // A twenty-second epoch, clamped by the runner's own uptime (a
+        // fresh boot cannot report a 20 s monotonic age): the test derives
+        // the offset it actually got and asserts against THAT, so a short
+        // uptime shrinks the margin instead of rejecting a correct clock.
+        // With no siblings the runs never reach the linger loop, so the
+        // 28 s deadline does NOT bound these runs (round-6 review): the
+        // assertion's only protection is the margin itself.
+        let now_nanos = signal_safe_monotonic_nanos();
+        let epoch = now_nanos.saturating_sub(Duration::from_secs(20).as_nanos() as u64);
+        let epoch_offset = Duration::from_nanos(now_nanos - epoch);
         // Call BOTH production entry points with no mounts, no siblings,
         // and a zero initial wait: the epoch run must outrun the
         // monitor-entry run by the epoch's five-second offset, whatever
@@ -599,11 +602,14 @@ mod tests {
         let (_reports, from_entry) = execute_teardown(&request, |_| Vec::new(), |_| {});
         let (_reports, from_epoch) =
             execute_teardown_since_epoch(&request, |_| Vec::new(), |_| {}, epoch);
+        let margin = epoch_offset.saturating_sub(Duration::from_secs(1));
         assert!(
-            from_epoch.waited >= from_entry.waited + Duration::from_secs(19),
-            "the production clock must start at the handler epoch, not monitor entry:              epoch {:?} vs entry {:?}",
+            from_epoch.waited >= from_entry.waited + margin,
+            "the production clock must start at the handler epoch, not monitor entry: \
+             epoch {:?} vs entry {:?} (offset {:?})",
             from_epoch.waited,
-            from_entry.waited
+            from_entry.waited,
+            epoch_offset
         );
     }
 
