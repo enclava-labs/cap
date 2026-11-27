@@ -3834,6 +3834,21 @@ async fn generic_github_deployment_validates_and_reaches_strict_deploy_gate() {
 
 #[tokio::test]
 async fn generic_gitlab_deployment_validates_and_reaches_strict_deploy_gate() {
+    assert_generic_gitlab_deployment_reaches_strict_deploy_gate(
+        "registry.gitlab.com/acme/platform/confidential-app/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn generic_gitlab_tag_and_digest_deployment_reaches_strict_deploy_gate() {
+    assert_generic_gitlab_deployment_reaches_strict_deploy_gate(
+        "registry.gitlab.com/acme/platform/confidential-app:v1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .await;
+}
+
+async fn assert_generic_gitlab_deployment_reaches_strict_deploy_gate(image: &str) {
     let (mut state, pool) = setup_test_state().await;
     state.require_customer_signed_policy_artifact = true;
     let app = test_router(state);
@@ -3852,7 +3867,7 @@ async fn generic_gitlab_deployment_validates_and_reaches_strict_deploy_gate() {
             &app_name,
             "gitlab",
             "acme/platform/confidential-app",
-            "registry.gitlab.com/acme/platform/confidential-app/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            image,
             "https://gitlab.com/acme/platform/confidential-app/-/blob/main/.gitlab-ci.yml@refs/heads/main",
             "https://gitlab.com",
         ))
