@@ -2899,6 +2899,14 @@ pub(crate) mod tests {
             dns_fence_is_infinite(&pool, &hostname).await,
             "an explicit retain keeps the fence infinite for the reconciler"
         );
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("clean the retained dns fence");
     }
 
     #[tokio::test]
@@ -3018,6 +3026,14 @@ pub(crate) mod tests {
             Some(owner),
             "a live app's DNS records are not ours to delete"
         );
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("clean the retained dns fence");
     }
 
     #[tokio::test]
@@ -3043,6 +3059,14 @@ pub(crate) mod tests {
             Some(owner),
             "a failed provider delete must keep the fence for the next pass"
         );
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("clean the retained dns fence");
     }
 
     #[tokio::test]
