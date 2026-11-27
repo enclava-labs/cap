@@ -3205,6 +3205,10 @@ mod tests {
             "the reviewed recovery message must reach the caller on the FIRST response: {first_body}"
         );
         assert_eq!(first_body["idempotency_disposition"], "completed");
+        assert_eq!(
+            first_body["retryable"], false,
+            "the surfaced refusal must advertise itself as non-retryable: {first_body}"
+        );
 
         // The same-key retry REPLAYS the cached refusal: the same status,
         // the same code, and the same message — the caller never has to
@@ -3398,5 +3402,117 @@ mod tests {
             .lock()
             .expect("txt answers lock")
             .retain(|(name, _)| name != &txt_name);
+    }
+
+    #[sqlx::test]
+    async fn first_domain_add_on_admissible_fresh_pod_is_admitted_past_restart_admission(
+        pool: sqlx::PgPool,
+    ) {
+        // Devin 4723916888: the refusal tests alone cannot tell whether the
+        // relaxed first-add admission still exists - dropping the relaxed
+        // rule entirely (always refuse an Unproven verdict) would also pass
+        // them. This is the positive case: a FIRST add whose pod has the
+        // exact admissible shape (a same-second Ready pod mounting both
+        // claims - the fresh first-deploy shape, verdict Unproven) must get
+        // PAST restart admission. The observable: the verify is not refused
+        // with volume_init_unproven; it proceeds to the tenant-ingress
+        // step, which with no attestation config staged fails
+        // deterministically with the code-shaped 500 below.
+        let (app, deployment_id, _lease, _payload) =
+            crate::deployment_jobs::tests::insert_job_fixture(&pool).await;
+        sqlx::query("UPDATE deployments SET status = 'healthy'::deploy_status_enum WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("settle the deployment phase");
+        // The admissible shape: same-second claims + a READY pod mounting
+        // both (premise asserted in the change-routing test; the verdict is
+        // Unproven and the relaxed probe admits).
+        let state = paas_managed_state(&pool, restart_admission_kube(&app, true));
+        let (paas_org_id, paas_user_id, _cap_user) = insert_paas_actor(&pool, app.org_id).await;
+        let domain = "admitted.example-test.com";
+        let txt_name = stage_verify_challenge(&pool, app.id, domain).await;
+
+        let idempotency_key = format!("verify-admit-{}", Uuid::new_v4().simple());
+        let result = drive_paas_verify(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &app.name,
+            domain,
+            &idempotency_key,
+        )
+        .await;
+        let (status, body) = result.expect_err("no attestation config is staged");
+        assert_ne!(
+            body["error"], "volume_init_unproven",
+            "the first add on the admissible shape must NOT be refused: {body}"
+        );
+        // The tenant-ingress step fails (no attestation config staged),
+        // and a 5xx surfaces through the internal route's fail-closed
+        // receipt: 409 idempotency_recovery_required carrying the upstream
+        // cause. That receipt is the PROOF the verify was admitted and ran
+        // past restart admission — a refusal would carry volume_init_
+        // unproven with no outcome_cause.
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"], "idempotency_recovery_required",
+            "the 5xx from the admitted path surfaces as the fail-closed receipt: {body}"
+        );
+        assert_eq!(
+            body["outcome_cause"]["error"], "tenant_ingress_update_failed",
+            "the admitted verify reached the tenant-ingress step: {body}"
+        );
+        assert_eq!(
+            body["outcome_cause"]["status"], 500,
+            "the recorded upstream status: {body}"
+        );
+
+        TXT_TEST_ANSWERS
+            .lock()
+            .expect("txt answers lock")
+            .retain(|(name, _)| name != &txt_name);
+    }
+
+    #[tokio::test]
+    async fn paas_verify_route_is_registered_on_the_production_router() {
+        // Devin 4723916973: the handler-level tests bypass the router, so a
+        // removed or misrouted registration would pass them. The production
+        // router (test_router = build_router_inner) must route the internal
+        // PaaS verify POST: an unauthenticated request must be answered by
+        // the route's auth layer (401), never fall through as 404.
+        use tower::ServiceExt;
+
+        let state = {
+            let mut state = crate::test_support::lazy_state();
+            state.management_mode = crate::state::CapManagementMode::PaasManaged;
+            state.internal_auth = Some(
+                crate::state::InternalAuthConfig::from_plaintext_tokens_with_proxy_secret(
+                    &["cap-internal-current"],
+                    &["spiffe://paas.example.test/enclava-paas"],
+                    Some("cap-internal-proxy-secret"),
+                ),
+            );
+            state
+        };
+        let app = crate::test_router(state);
+        let uri =
+            "/internal/paas/orgs/paas-org-x/apps/some-app/domains/dom.example-test.com/verify";
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri(uri)
+            .body(axum::body::Body::from("{}"))
+            .expect("build the verify request");
+        let response = app.oneshot(request).await.expect("the router answers");
+        assert_ne!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "the internal PaaS verify route must be registered: {uri}"
+        );
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "an unauthenticated request is rejected by the route's internal auth layer"
+        );
     }
 }
