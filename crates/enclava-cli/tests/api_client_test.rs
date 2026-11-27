@@ -678,3 +678,152 @@ async fn api_client_rejects_oversized_streamed_success_body_without_content_leng
         ApiError::ResponseTooLarge(cap) if cap == 16 * 1024 * 1024
     ));
 }
+
+// --- signer PATCH deferred-409 same-key retry (paas#447 / cap#422) ---
+
+const SIGNER_DEFERRED_409_BODY: &str = r#"{"error":"idempotency_request_in_progress","retryable":true,"disposition":"retry_same_key","idempotency_disposition":"deferred","retry_after":1}"#;
+
+/// Read one full HTTP request (headers + Content-Length body) off the
+/// stream: the signer PATCH carries a JSON body, so a single `read` is not
+/// guaranteed to have it all.
+fn read_full_request(stream: &mut std::net::TcpStream) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut chunk).expect("read request");
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        if let Some(header_end) = text.find("\r\n\r\n") {
+            let content_length = text
+                .lines()
+                .find_map(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if buf.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Answer one TCP connection per entry (`Connection: close` forces the
+/// client to reconnect for its retry) and return the raw requests in
+/// order.
+fn signer_patch_stub(
+    responses: Vec<(&'static str, &'static str)>,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            requests.push(read_full_request(&mut stream));
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        requests
+    });
+    (format!("http://{addr}"), handle)
+}
+
+fn idempotency_key_of(request: &str) -> Option<String> {
+    request
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("idempotency-key:"))
+        .map(|line| line["idempotency-key:".len()..].trim().to_string())
+}
+
+#[tokio::test]
+async fn set_signer_retries_a_deferred_409_with_the_same_key_and_succeeds() {
+    let (base, handle) = signer_patch_stub(vec![
+        ("409 Conflict", SIGNER_DEFERRED_409_BODY),
+        ("200 OK", r#"{"ok":true}"#),
+    ]);
+    let client = ApiClient::new(&base, Some("test-token".to_string()));
+    let req = enclava_cli::api_types::SetSignerRequest {
+        subject: "new-subject".to_string(),
+        issuer: "new-issuer".to_string(),
+        email_confirmation_token: None,
+    };
+    let value = client
+        .set_signer("shell", &req)
+        .await
+        .expect("the same-key retry completes the publication");
+    assert_eq!(
+        value.get("ok").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    let requests = handle.join().unwrap();
+    assert_eq!(requests.len(), 2, "one deferred 409, then the retry");
+    for request in &requests {
+        assert!(
+            request.starts_with("PATCH /apps/shell/signer "),
+            "got: {request}"
+        );
+    }
+    let first_key =
+        idempotency_key_of(&requests[0]).expect("the first PATCH carries an Idempotency-Key");
+    let retry_key =
+        idempotency_key_of(&requests[1]).expect("the retry PATCH carries an Idempotency-Key");
+    assert_eq!(first_key, retry_key, "the retry must reuse the SAME key");
+}
+
+#[tokio::test]
+async fn set_signer_stops_after_two_same_key_retries_and_surfaces_the_deferral() {
+    let (base, handle) = signer_patch_stub(vec![
+        ("409 Conflict", SIGNER_DEFERRED_409_BODY),
+        ("409 Conflict", SIGNER_DEFERRED_409_BODY),
+        ("409 Conflict", SIGNER_DEFERRED_409_BODY),
+    ]);
+    let client = ApiClient::new(&base, Some("test-token".to_string()));
+    let req = enclava_cli::api_types::SetSignerRequest {
+        subject: "new-subject".to_string(),
+        issuer: "new-issuer".to_string(),
+        email_confirmation_token: None,
+    };
+    let error = client
+        .set_signer("shell", &req)
+        .await
+        .expect_err("still deferred after two same-key retries");
+    match &error {
+        ApiError::Api {
+            status,
+            code,
+            idempotency_disposition,
+            ..
+        } => {
+            assert_eq!(*status, 409);
+            assert_eq!(code.as_deref(), Some("idempotency_request_in_progress"));
+            assert_eq!(idempotency_disposition.as_deref(), Some("deferred"));
+        }
+        other => panic!("expected the deferred 409 to surface, got: {other:?}"),
+    }
+
+    let requests = handle.join().unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "exactly two retries: three PATCHes total"
+    );
+    let keys: Vec<String> = requests
+        .iter()
+        .map(|request| idempotency_key_of(request).expect("every PATCH carries the key"))
+        .collect();
+    assert!(
+        keys.windows(2).all(|pair| pair[0] == pair[1]),
+        "same key on every PATCH: {keys:?}"
+    );
+}
