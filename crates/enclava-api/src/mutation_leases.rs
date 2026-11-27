@@ -3004,13 +3004,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn stranded_dns_fence_reconciler_never_touches_live_app() {
         let pool = database_test_pool(2).await;
-        let (_, app_id) = insert_app(&pool, "stranded-live.example.test").await;
-        let owner = poison_app_delete_dns_fence(&pool, "stranded-live.example.test", app_id).await;
+        // Unique per run: the live-app path intentionally leaves its infinity
+        // fence behind, so a fixed hostname would make a second run against the
+        // same database fail claim() with Busy.
+        let hostname = format!("stranded-live-{}.example.test", Uuid::new_v4().simple());
+        let (_, app_id) = insert_app(&pool, &hostname).await;
+        let owner = poison_app_delete_dns_fence(&pool, &hostname, app_id).await;
         release_stranded_dns_delete_fences_with(&pool, true, |_| async { Ok(()) })
             .await
             .expect("reconcile stranded fences");
         assert_eq!(
-            dns_fence_owner(&pool, "stranded-live.example.test").await,
+            dns_fence_owner(&pool, &hostname).await,
             Some(owner),
             "a live app's DNS records are not ours to delete"
         );
@@ -3019,20 +3023,23 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn stranded_dns_fence_reconciler_retains_on_dns_delete_error() {
         let pool = database_test_pool(2).await;
-        let (_, app_id) = insert_app(&pool, "stranded-error.example.test").await;
+        // Unique per run: the retain path leaves its infinity fence behind by
+        // design, so a fixed hostname would make a second run fail claim().
+        let hostname = format!("stranded-error-{}.example.test", Uuid::new_v4().simple());
+        let (_, app_id) = insert_app(&pool, &hostname).await;
         sqlx::query("UPDATE apps SET status = 'deleting' WHERE id = $1")
             .bind(app_id)
             .execute(&pool)
             .await
             .expect("mark app deleting");
-        let owner = poison_app_delete_dns_fence(&pool, "stranded-error.example.test", app_id).await;
+        let owner = poison_app_delete_dns_fence(&pool, &hostname, app_id).await;
         release_stranded_dns_delete_fences_with(&pool, true, |_| async {
             Err(crate::dns::DnsError::NotConfigured)
         })
         .await
         .expect("reconcile stranded fences");
         assert_eq!(
-            dns_fence_owner(&pool, "stranded-error.example.test").await,
+            dns_fence_owner(&pool, &hostname).await,
             Some(owner),
             "a failed provider delete must keep the fence for the next pass"
         );
