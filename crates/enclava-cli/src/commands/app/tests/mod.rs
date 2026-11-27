@@ -5042,3 +5042,34 @@ fn default_storage_path_warning_fires_only_for_the_default() {
     .unwrap();
     assert!(!default_storage_path_in_play(&empty_paths));
 }
+#[test]
+fn terminal_failure_message_with_a_step_keeps_the_pinned_prefix_and_shape() {
+    // The message prefix a verifier matches stays byte-identical; the step
+    // rides the stable summary after the stage, and the bind-stage hint is
+    // unchanged.
+    let diagnostic = enclava_cli::tee_client::parse_terminal_bootstrap_error(&serde_json::json!({
+        "bootstrap_error": {
+            "error": "enclava_init_failed",
+            "terminal": true,
+            "retry_after": null,
+            "last_init_stage": "binding workload mount namespaces",
+            "failed_step": "bind_target_create_failed",
+        }
+    }))
+    .unwrap();
+    let message = terminal_bootstrap_failure_message("demo", &diagnostic);
+    assert!(
+        message.starts_with("terminal bootstrap failure for app demo: enclava_init_failed"),
+        "the verifier-matched prefix is unchanged: {message}"
+    );
+    assert_eq!(
+        message,
+        "terminal bootstrap failure for app demo: enclava_init_failed \
+             (init stage: binding workload mount namespaces) \
+             (failed step: bind_target_create_failed); \
+             run `enclava status --app demo` for the latest state\n\
+             hint: a common cause of a failure at this stage is a [storage] paths entry \
+             the image does not contain -- the restricted profile runs a read-only root \
+             filesystem, so the bind stage cannot create it"
+    );
+}
