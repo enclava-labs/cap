@@ -964,6 +964,18 @@ async fn rotate_owner(
         }
     }
 
+    // The witness requirement is checked BEFORE the replacement key is
+    // registered (round-2 review): registration persists the public key on
+    // the account, and a rotation rejected for the missing witness would
+    // otherwise leave a registered key the owner never rotated to.
+    let base_keyring_version = i64::try_from(remote_response.version)?;
+    let base_keyring_created_at = remote_response.created_at.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the server did not report the base keyring's creation witness: the API \
+             predates the owner-rotation directive contract (#188), so it cannot verify \
+             this rotation — upgrade the server, then retry"
+        )
+    })?;
     register_public_key(&api, &replacement_owner.public).await?;
     let mut next = remote.keyring.clone();
     next.version += 1;
@@ -974,11 +986,17 @@ async fn rotate_owner(
         }
     }
     let next = sign_keyring(&replacement_owner, next);
+    // Directive binding (issue #188): the superseded keyring version and
+    // its creation witness, exactly as the API stored and reported them.
+    // The witness is server-assigned at version insertion, so a directive
+    // covering it provably post-dates the version it supersedes.
     let signed_at = chrono::Utc::now();
     let directive = owner_rotation_directive_bytes(
         org_id,
         &current_owner.public.to_bytes(),
         &replacement_owner.public.to_bytes(),
+        base_keyring_version,
+        base_keyring_created_at,
         signed_at,
         reason.trim(),
     );
@@ -991,6 +1009,8 @@ async fn rotate_owner(
                 signature: hex::encode(next.signature.to_bytes()),
                 replacement_signing_pubkey: hex::encode(replacement_owner.public.to_bytes()),
                 current_signing_pubkey: hex::encode(current_owner.public.to_bytes()),
+                base_keyring_version,
+                base_keyring_created_at: base_keyring_created_at.to_rfc3339(),
                 signed_at: signed_at.to_rfc3339(),
                 reason: reason.trim().to_string(),
                 rotation_signature: hex::encode(current_owner.sign(&directive).to_bytes()),
