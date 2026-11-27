@@ -41,13 +41,25 @@ fn config_token_tee_url(app: &App) -> Option<String> {
     Some(format!("https://{domain}/.well-known/confidential/config"))
 }
 
+enum FreshConfigGeneration {
+    LookupApp,
+    Bound(Option<i64>),
+}
+
 /// POST /apps/{name}/config-token -- issue a short-lived JWT for config writes.
 pub async fn issue_config_token_route(
     auth: AuthContext,
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<Json<ConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
-    issue_config_token_route_inner(auth, state, app_name, None).await
+    issue_config_token_route_inner(
+        auth,
+        state,
+        app_name,
+        None,
+        FreshConfigGeneration::LookupApp,
+    )
+    .await
 }
 
 pub(crate) async fn issue_config_token_route_for_issuance(
@@ -56,7 +68,30 @@ pub(crate) async fn issue_config_token_route_for_issuance(
     app_name: String,
     issuance: ConfigTokenIssuance,
 ) -> Result<Json<ConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
-    issue_config_token_route_inner(auth, state, app_name, Some(issuance)).await
+    issue_config_token_route_inner(
+        auth,
+        state,
+        app_name,
+        Some(issuance),
+        FreshConfigGeneration::LookupApp,
+    )
+    .await
+}
+
+pub(crate) async fn issue_config_token_route_for_deployment_generation(
+    auth: AuthContext,
+    state: AppState,
+    app_name: String,
+    deployment_generation: Option<i64>,
+) -> Result<Json<ConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+    issue_config_token_route_inner(
+        auth,
+        state,
+        app_name,
+        None,
+        FreshConfigGeneration::Bound(deployment_generation),
+    )
+    .await
 }
 
 async fn issue_config_token_route_inner(
@@ -64,6 +99,7 @@ async fn issue_config_token_route_inner(
     state: AppState,
     app_name: String,
     issuance: Option<ConfigTokenIssuance>,
+    fresh_generation: FreshConfigGeneration,
 ) -> Result<Json<ConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "config:write")?;
@@ -94,14 +130,30 @@ async fn issue_config_token_route_inner(
             vec!["config:write".to_string()],
             issuance,
         ),
-        None => issue_config_token_with_expiry(
-            &state.signing_key,
-            auth.user_id,
-            auth.org_id,
-            app.id,
-            &config_token_instance_id(&app),
-            vec!["config:write".to_string()],
-        ),
+        None => {
+            let deployment_generation = match fresh_generation {
+                FreshConfigGeneration::Bound(generation) => generation,
+                FreshConfigGeneration::LookupApp => {
+                    crate::config_generation::app_config_write_generation(&state.db, app.id)
+                        .await
+                        .map_err(|_| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"error": "database error"})),
+                            )
+                        })?
+                }
+            };
+            issue_config_token_with_expiry(
+                &state.signing_key,
+                auth.user_id,
+                auth.org_id,
+                app.id,
+                &config_token_instance_id(&app),
+                vec!["config:write".to_string()],
+                deployment_generation,
+            )
+        }
     }
     .map_err(|e| {
         (
