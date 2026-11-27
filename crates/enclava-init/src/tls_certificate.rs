@@ -71,6 +71,7 @@ use webpki_roots::TLS_SERVER_ROOTS;
 use x509_parser::prelude::FromDer;
 
 use crate::config::Config;
+use crate::safe_diagnostics::{InitFailedStep, InitStepError};
 use crate::safe_diagnostics::{SafeBootstrapDiagnostic, SafeDiagnosticCode};
 use crate::{trustee_verify, writes};
 
@@ -551,7 +552,8 @@ fn provision_with_policy(
     let cert_path = cert_path(persistent_root);
     let key_path = key_path(persistent_root);
     if retained_path_is_regular_file(&cert_path)
-        .with_context(|| format!("checking retained TLS certificate {}", cert_path.display()))?
+        .with_context(|| format!("checking retained TLS certificate {}", cert_path.display()))
+        .context(InitStepError(InitFailedStep::TlsDecodeFailed))?
     {
         // Retained state stays fail-closed: an incomplete, malformed,
         // untrusted, or mismatched certificate never reaches the broker and
@@ -561,21 +563,26 @@ fn provision_with_policy(
         // hostname-coverage miss — the configured set grew after the first
         // deploy (custom domain on an already-deployed app).
         if !retained_path_is_regular_file(&key_path)
-            .with_context(|| format!("checking retained TLS private key {}", key_path.display()))?
+            .with_context(|| format!("checking retained TLS private key {}", key_path.display()))
+            .context(InitStepError(InitFailedStep::TlsDecodeFailed))?
         {
             return Err(anyhow!(
                 "retained TLS certificate {} exists but private key {} is missing; \
                  refusing to order a replacement certificate or replace the private key",
                 cert_path.display(),
                 key_path.display()
-            ));
+            )
+            .context(InitStepError(InitFailedStep::TlsDecodeFailed)));
         }
         let chain_pem = std::fs::read_to_string(&cert_path)
-            .with_context(|| format!("reading retained TLS certificate {}", cert_path.display()))?;
+            .with_context(|| format!("reading retained TLS certificate {}", cert_path.display()))
+            .context(InitStepError(InitFailedStep::TlsDecodeFailed))?;
         let key_pem = std::fs::read_to_string(&key_path)
-            .with_context(|| format!("reading retained TLS private key {}", key_path.display()))?;
+            .with_context(|| format!("reading retained TLS private key {}", key_path.display()))
+            .context(InitStepError(InitFailedStep::TlsDecodeFailed))?;
         let key_pair = KeyPair::from_pem(&key_pem)
-            .with_context(|| format!("parsing retained TLS private key {}", key_path.display()))?;
+            .with_context(|| format!("parsing retained TLS private key {}", key_path.display()))
+            .context(InitStepError(InitFailedStep::TlsDecodeFailed))?;
 
         let validity = leaf_validity_secs(&chain_pem);
         let expired = validity
@@ -632,7 +639,9 @@ fn provision_with_policy(
                     && validate_certificate_chain(&chain_pem, &key_pair, &[], trust_anchors, at)
                         .is_ok();
                 if !coverage_only_miss {
-                    return Err(err.context("validating retained static TLS certificate"));
+                    return Err(err
+                        .context(InitStepError(InitFailedStep::TlsValidateFailed))
+                        .context("validating retained static TLS certificate"));
                 }
                 tracing::info!(
                     cert = %cert_path.display(),
@@ -642,7 +651,9 @@ fn provision_with_policy(
                 true
             }
             (Err(err), Err(_)) => {
-                return Err(err.context("validating retained static TLS certificate"));
+                return Err(err
+                    .context(InitStepError(InitFailedStep::TlsValidateFailed))
+                    .context("validating retained static TLS certificate"));
             }
         };
         if !due {
@@ -860,9 +871,11 @@ fn issue_via_broker(
         trust_anchors,
         UnixTime::now(),
     )
+    .context(InitStepError(InitFailedStep::TlsValidateFailed))
     .context("validating TLS certificate broker response")?;
     writes::atomic_write(&cert_path, body.certificate_chain_pem.as_bytes(), 0o644)
-        .with_context(|| format!("writing {}", cert_path.display()))?;
+        .with_context(|| format!("writing {}", cert_path.display()))
+        .context(InitStepError(InitFailedStep::TlsWriteFailed))?;
     Ok(())
 }
 
@@ -1154,7 +1167,8 @@ fn load_or_generate_key(path: &Path) -> Result<KeyPair> {
     }
     let key_pair = KeyPair::generate().context("generating TLS private key")?;
     writes::atomic_write(path, key_pair.serialize_pem().as_bytes(), 0o600)
-        .with_context(|| format!("writing TLS private key {}", path.display()))?;
+        .with_context(|| format!("writing TLS private key {}", path.display()))
+        .context(InitStepError(InitFailedStep::TlsWriteFailed))?;
     Ok(key_pair)
 }
 
@@ -2512,6 +2526,7 @@ hkdf-info = "tls-state-luks-key"
                 "terminal": true,
                 "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 "failed_stage": null,
+                "failed_step": serde_json::Value::Null,
             })
         );
     }
@@ -2541,6 +2556,7 @@ hkdf-info = "tls-state-luks-key"
                 "terminal": true,
                 "retry_after": elapsed.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 "failed_stage": null,
+                "failed_step": serde_json::Value::Null,
             })
         );
     }
@@ -2748,6 +2764,7 @@ hkdf-info = "tls-state-luks-key"
                 "terminal": true,
                 "retry_after": null,
                 "failed_stage": null,
+                "failed_step": serde_json::Value::Null,
             })
         );
     }
@@ -3736,5 +3753,226 @@ hkdf-info = "tls-state-luks-key"
         );
         assert_eq!(std::fs::read(cert_path(&persistent)).unwrap(), cert_before);
         assert_eq!(std::fs::read(key_path(&persistent)).unwrap(), key_before);
+    }
+    // --- cap#428: the failing step rides the failed_step sibling field ---
+
+    fn assert_step(error: &anyhow::Error, step: InitFailedStep) {
+        let diagnostic = SafeBootstrapDiagnostic::diagnose(error);
+        assert_eq!(diagnostic.code, SafeDiagnosticCode::EnclavaInitFailed);
+        assert_eq!(diagnostic.step(), Some(step));
+        let rendered = diagnostic.render_json();
+        assert_eq!(
+            rendered,
+            format!(
+                "{{\"error\":\"enclava_init_failed\",\"failed_stage\":null,\"failed_step\":\"{}\",\"retry_after\":null,\"terminal\":true}}",
+                step.as_str()
+            ),
+            "the rendered contract must carry the step literal and nothing else"
+        );
+    }
+
+    #[test]
+    fn retained_missing_key_failure_reports_decode_step() {
+        let dir = tempdir().unwrap();
+        let cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let anchors = [root.anchor()];
+        let persistent = dir.path().join("persistent");
+        writes::atomic_write(
+            &cert_path(&persistent),
+            full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]).as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        let error = provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap_err();
+        assert_step(&error, InitFailedStep::TlsDecodeFailed);
+    }
+
+    #[test]
+    fn retained_unparseable_key_reports_decode_step() {
+        let dir = tempdir().unwrap();
+        let cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            "not a pem private key",
+        );
+        let error = provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap_err();
+        assert_step(&error, InitFailedStep::TlsDecodeFailed);
+    }
+
+    #[test]
+    fn retained_unreadable_certificate_reports_decode_step() {
+        if nix::unistd::Uid::effective().is_root() {
+            // Root bypasses file permissions, so the read would succeed.
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let cert = cert_path(&persistent);
+        let mut perms = std::fs::metadata(&cert).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&cert, perms).unwrap();
+        let error = provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap_err();
+        assert_step(&error, InitFailedStep::TlsDecodeFailed);
+    }
+
+    #[test]
+    fn malformed_retained_chain_reports_validate_step() {
+        let dir = tempdir().unwrap();
+        let cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        let (root, valid_chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            "not a pem certificate",
+            &valid_chain.leaf_key_pem,
+        );
+        let error = provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap_err();
+        assert_step(&error, InitFailedStep::TlsValidateFailed);
+    }
+
+    #[test]
+    fn untrusted_retained_chain_reports_validate_step() {
+        // The chain is well-formed and key-bound, but issued under an
+        // anchor the config does not trust: not a pure coverage miss, so
+        // the fail-closed branch keeps the original validation error.
+        let dir = tempdir().unwrap();
+        let cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let (other_root, _other_chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let other_anchors = [other_root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let error = provision_with_trust_anchors(&cfg, &persistent, &other_anchors).unwrap_err();
+        assert_step(&error, InitFailedStep::TlsValidateFailed);
+    }
+
+    #[test]
+    fn key_persistence_write_failure_reports_write_step() {
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        // No retained state, so provisioning reaches the order path's key
+        // generation and persistence; the read-only persistent directory
+        // fails the write before any broker request is sent (the config's
+        // broker URL is unreachable and is never contacted).
+        let dir = tempdir().unwrap();
+        let cfg = broker_config(dir.path(), TEST_HOSTNAMES);
+        let persistent = dir.path().join("persistent");
+        std::fs::create_dir_all(&persistent).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&persistent).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&persistent, perms).unwrap();
+        let (root, _chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let anchors = [root.anchor()];
+        let error = provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap_err();
+        assert_step(&error, InitFailedStep::TlsWriteFailed);
+    }
+
+    #[test]
+    fn broker_response_validation_failure_reports_validate_step() {
+        // The response chain is key-matched (issued for the RETAINED key an
+        // expired certificate's renewal carries) but signed under an issuer
+        // the config does not trust: validation fails at the ANCHOR check,
+        // not a key mismatch. The expired retained certificate no longer
+        // serves, so the failed renewal propagates as the provisioning
+        // error instead of staying warn-only.
+        let dir = tempdir().unwrap();
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        });
+        let (other_root, _other_chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let retained_key = KeyPair::from_pem(&chain.leaf_key_pem).unwrap();
+        let unanchored_pem = mint_leaf_for_key(
+            &other_root.params,
+            &other_root.key,
+            &retained_key,
+            TEST_HOSTNAMES,
+        );
+        let body = json!({
+            "certificate_chain_pem":
+                full_chain_pem(&[&unanchored_pem, &other_root.cert.pem()]),
+        })
+        .to_string();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), body)], events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let error = provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap_err();
+        // The broker POST was observed, so the failure came from the
+        // RESPONSE's anchored validation — not from the retained chain,
+        // whose own (expired) validation arm would produce the same step
+        // without ever contacting the broker.
+        assert_eq!(*events.lock().unwrap(), vec!["post"]);
+        assert_step(&error, InitFailedStep::TlsValidateFailed);
+    }
+
+    #[test]
+    fn broker_body_decode_failure_keeps_acme_code_and_carries_no_step() {
+        let dir = tempdir().unwrap();
+        let (root, _chain) = mint_test_chain(TEST_HOSTNAMES, |_| {});
+        let (base, _server) = spawn_local_broker("200 OK", "200 OK", "not json".to_string());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let persistent = dir.path().join("persistent");
+        let anchors = [root.anchor()];
+        let error = provision_with_trust_anchors(&cfg, &persistent, &anchors).unwrap_err();
+        let diagnostic = SafeBootstrapDiagnostic::diagnose(&error);
+        assert_eq!(
+            diagnostic.code,
+            SafeDiagnosticCode::AcmeCertificateIssuanceFailed
+        );
+        assert_eq!(diagnostic.step(), None);
+        assert!(
+            !diagnostic.render_json().contains("failed_step\":\""),
+            "broker failures carry no step: {}",
+            diagnostic.render_json()
+        );
+    }
+
+    #[test]
+    fn uninstrumented_failure_keeps_step_null() {
+        // A failing site that carries no typed step context — the
+        // deliberately uninstrumented arms — renders failed_step null.
+        let error = anyhow!("a site with no instrumented step");
+        let diagnostic = SafeBootstrapDiagnostic::diagnose(&error);
+        assert_eq!(diagnostic.code, SafeDiagnosticCode::EnclavaInitFailed);
+        assert_eq!(diagnostic.step(), None);
+        assert!(
+            !diagnostic.render_json().contains("failed_step\":\""),
+            "no step literal may appear: {}",
+            diagnostic.render_json()
+        );
     }
 }

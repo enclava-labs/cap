@@ -43,6 +43,11 @@ pub(super) enum MountSourceStrategy {
 }
 
 pub(super) fn wait_for_container_start_sentinels(cfg: &Config) -> Result<Vec<WorkloadNamespace>> {
+    wait_for_container_start_sentinels_inner(cfg)
+        .map_err(|err| err.context(InitStepError(InitFailedStep::BindSentinelFailed)))
+}
+
+fn wait_for_container_start_sentinels_inner(cfg: &Config) -> Result<Vec<WorkloadNamespace>> {
     let names = std::env::var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS").unwrap_or_default();
     let containers = names
         .split(',')
@@ -403,7 +408,8 @@ pub(super) fn bind_mounts_into_workload_namespaces(
 }
 
 fn bind_for_workload(cfg: &Config, self_pid: u32, workload: &WorkloadNamespace) -> Result<()> {
-    let mounts = bind_mount_plan_for_workload(cfg, self_pid, workload)?;
+    let mounts = bind_mount_plan_for_workload(cfg, self_pid, workload)
+        .context(InitStepError(InitFailedStep::BindSourceFailed))?;
 
     for mount in mounts {
         bind_mount_into_namespace(workload.pid, &mount.source, &mount.target).with_context(
@@ -454,7 +460,8 @@ fn bind_mount_into_namespace(pid: u32, source: &Path, target: &Path) -> Result<(
         .arg(source)
         .arg(target)
         .output()
-        .with_context(|| format!("spawning namespace binder for pid {pid}"))?;
+        .with_context(|| format!("spawning namespace binder for pid {pid}"))
+        .context(InitStepError(InitFailedStep::BindMountFailed))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -463,16 +470,34 @@ fn bind_mount_into_namespace(pid: u32, source: &Path, target: &Path) -> Result<(
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join("; ");
-        if detail.is_empty() {
-            return Err(anyhow!("namespace binder exited with {}", output.status));
-        }
-        return Err(anyhow!(
-            "namespace binder exited with {}: {}",
-            output.status,
-            detail
-        ));
+        let failure = if detail.is_empty() {
+            anyhow!("namespace binder exited with {}", output.status)
+        } else {
+            anyhow!("namespace binder exited with {}: {}", output.status, detail)
+        };
+        // The receiving half of the child exit-code table: a mapped code
+        // attaches the typed step, None / 1 / any unmapped code stays the
+        // untyped failure exactly as before.
+        return match InitFailedStep::from_child_exit_code(output.status.code().unwrap_or(1)) {
+            Some(step) => Err(failure.context(InitStepError(step))),
+            None => Err(failure),
+        };
     }
     Ok(())
+}
+
+/// Create the bind target inside the workload namespace (cap#428's
+/// incident site: a read-only rootfs or an image without the target
+/// directory fails here). Split out of the child entry so the typed step
+/// is directly testable without the namespace privileges the full child
+/// path needs.
+fn create_bind_target(pid: u32, target: &Path) -> Result<PathBuf> {
+    let target_mount_path = workload_target_path(pid, target)
+        .context(InitStepError(InitFailedStep::BindTargetCreateFailed))?;
+    std::fs::create_dir_all(&target_mount_path)
+        .with_context(|| format!("creating target {}", target_mount_path.display()))
+        .context(InitStepError(InitFailedStep::BindTargetCreateFailed))?;
+    Ok(target_mount_path)
 }
 
 pub(super) fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
@@ -487,46 +512,59 @@ pub(super) fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     let source = PathBuf::from(&args[1]);
     let target = PathBuf::from(&args[2]);
     let _source_dir = std::fs::File::open(&source)
-        .with_context(|| format!("open source {}", source.display()))?;
-    std::fs::metadata(&source).with_context(|| format!("stat source {}", source.display()))?;
+        .with_context(|| format!("open source {}", source.display()))
+        .context(InitStepError(InitFailedStep::BindSourceFailed))?;
+    std::fs::metadata(&source)
+        .with_context(|| format!("stat source {}", source.display()))
+        .context(InitStepError(InitFailedStep::BindSourceFailed))?;
     let detached_source = match mount_source_strategy(&source) {
         MountSourceStrategy::Path => None,
         MountSourceStrategy::DetachedTreeFd => Some(
             open_detached_mount_tree(&source)
-                .with_context(|| format!("open detached mount tree {}", source.display()))?,
+                .with_context(|| format!("open detached mount tree {}", source.display()))
+                .context(InitStepError(InitFailedStep::BindSourceFailed))?,
         ),
     };
     let ns = std::fs::File::open(format!("/proc/{pid}/ns/mnt"))
-        .with_context(|| format!("opening mount namespace for pid {pid}"))?;
+        .with_context(|| format!("opening mount namespace for pid {pid}"))
+        .context(InitStepError(InitFailedStep::BindMountFailed))?;
     nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNS)
-        .with_context(|| format!("setns to pid {pid} mount namespace"))?;
+        .with_context(|| format!("setns to pid {pid} mount namespace"))
+        .context(InitStepError(InitFailedStep::BindMountFailed))?;
     let workload_root = workload_proc_root_path(pid);
     std::env::set_current_dir(&workload_root)
-        .with_context(|| format!("entering workload root {}", workload_root.display()))?;
+        .with_context(|| format!("entering workload root {}", workload_root.display()))
+        .context(InitStepError(InitFailedStep::BindMountFailed))?;
     nix::unistd::chroot(&workload_root)
-        .with_context(|| format!("chroot to workload root {}", workload_root.display()))?;
-    std::env::set_current_dir("/").context("entering chroot /")?;
+        .with_context(|| format!("chroot to workload root {}", workload_root.display()))
+        .context(InitStepError(InitFailedStep::BindMountFailed))?;
+    std::env::set_current_dir("/")
+        .context("entering chroot /")
+        .context(InitStepError(InitFailedStep::BindMountFailed))?;
     let source_mount_path = source.clone();
-    let target_mount_path = workload_target_path(pid, &target)?;
-    std::fs::create_dir_all(&target_mount_path)
-        .with_context(|| format!("creating target {}", target_mount_path.display()))?;
-    if paths_resolve_to_same_object(&source_mount_path, &target_mount_path).with_context(|| {
-        format!(
-            "checking whether {} is already mounted at {}",
-            source.display(),
-            target_mount_path.display()
-        )
-    })? {
-        return Ok(());
-    }
-    if let Some(detached_source) = detached_source {
-        move_detached_mount_tree(&detached_source, &target_mount_path).with_context(|| {
+    let target_mount_path = create_bind_target(pid, &target)?;
+    if paths_resolve_to_same_object(&source_mount_path, &target_mount_path)
+        .with_context(|| {
             format!(
-                "move mounting detached {} to {}",
+                "checking whether {} is already mounted at {}",
                 source.display(),
                 target_mount_path.display()
             )
-        })?;
+        })
+        .context(InitStepError(InitFailedStep::BindMountFailed))?
+    {
+        return Ok(());
+    }
+    if let Some(detached_source) = detached_source {
+        move_detached_mount_tree(&detached_source, &target_mount_path)
+            .with_context(|| {
+                format!(
+                    "move mounting detached {} to {}",
+                    source.display(),
+                    target_mount_path.display()
+                )
+            })
+            .context(InitStepError(InitFailedStep::BindMountFailed))?;
     } else {
         nix::mount::mount(
             Some(source_mount_path.as_path()),
@@ -541,7 +579,8 @@ pub(super) fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
                 source.display(),
                 target_mount_path.display()
             )
-        })?;
+        })
+        .context(InitStepError(InitFailedStep::BindMountFailed))?;
     }
     Ok(())
 }
@@ -645,4 +684,232 @@ pub(super) fn app_bind_mount_dir(state_root: &Path, subdir: &str) -> Result<Path
         return Err(anyhow!("invalid app bind mount subdir: {subdir}"));
     }
     Ok(state_root.join(rel))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serializes tests that mutate the wait-for-containers environment
+    /// variables and the process-global stage tracker.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Captures an environment variable and restores it on drop, so a
+    /// panicking (or early-returning) test can never leak its override into
+    /// the rest of the test-binary process.
+    struct EnvRestoreGuard {
+        var: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestoreGuard {
+        fn set(var: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(var);
+            unsafe { std::env::set_var(var, value) };
+            Self { var, previous }
+        }
+    }
+
+    impl Drop for EnvRestoreGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.var, value) },
+                None => unsafe { std::env::remove_var(self.var) },
+            }
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            mode: Mode::Autounlock,
+            state: VolumeConfig {
+                device: "/dev/csi0".to_string(),
+                mapping_name: "cap-state".to_string(),
+                mount_path: "/state".to_string(),
+                hkdf_info: "state-luks-key".to_string(),
+            },
+            tls_state: VolumeConfig {
+                device: "/dev/csi1".to_string(),
+                mapping_name: "cap-tls-state".to_string(),
+                mount_path: "/state/tls-state".to_string(),
+                hkdf_info: "tls-state-luks-key".to_string(),
+            },
+            unlock_socket: "/run/enclava/unlock.sock".to_string(),
+            state_root: "/state".to_string(),
+            attempts_path: "/run/enclava/unlock-attempts".to_string(),
+            app_uid: 10001,
+            app_gid: 10001,
+            managed_config_gid: None,
+            managed_config_dir_mode: None,
+            caddy_uid: 10002,
+            caddy_gid: 10002,
+            app_bind_mounts: Vec::new(),
+            kbs_url: Some("http://127.0.0.1:8006/cdh/resource".to_string()),
+            kbs_resource_path: Some("default/app-owner/seed-encrypted".to_string()),
+            argon2_salt_hex: Some("aa".repeat(32)),
+            trustee_policy_read_available: true,
+            workload_artifacts_url: Some("file:///artifacts.json".to_string()),
+            tls_certificate_broker_url: None,
+            tls_certificate_hostnames: Vec::new(),
+            tls_certificate_trust_anchors_pem: None,
+            trustee_policy_url: Some("file:///policy.json".to_string()),
+            kbs_attestation_token_url: "http://127.0.0.1:8006/aa/token?token_type=kbs".to_string(),
+            cc_init_data_path: None,
+            platform_trustee_policy_pubkey_hex: None,
+            signing_service_pubkey_hex: None,
+            log_encryption: None,
+        }
+    }
+
+    #[test]
+    fn sentinel_wait_timeout_reports_sentinel_step() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // A container that never appears: the wait exhausts its (short)
+        // timeout and the failure carries the sentinel step. The guards
+        // restore every override on drop, so nothing leaks.
+        let _containers = EnvRestoreGuard::set("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", "never-starts");
+        let _started_dir = EnvRestoreGuard::set(
+            "ENCLAVA_INIT_STARTED_DIR",
+            &dir.path().join("started").to_string_lossy(),
+        );
+        let _timeout =
+            EnvRestoreGuard::set("ENCLAVA_INIT_WAIT_FOR_CONTAINERS_TIMEOUT_SECONDS", "1");
+        let cfg = test_config();
+        let error = wait_for_container_start_sentinels(&cfg).unwrap_err();
+        let diagnostic = enclava_init::safe_diagnostics::SafeBootstrapDiagnostic::diagnose(&error);
+        assert_eq!(
+            diagnostic.step(),
+            Some(enclava_init::safe_diagnostics::InitFailedStep::BindSentinelFailed)
+        );
+        assert!(format!("{error:#}").contains("timed out"));
+    }
+
+    #[test]
+    fn bind_plan_subdir_failure_reports_source_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config();
+        cfg.tls_state.mount_path = "/state/tls-state".to_string();
+        cfg.state.mount_path = dir.path().to_string_lossy().to_string();
+        cfg.state_root = dir.path().to_string_lossy().to_string();
+        cfg.app_bind_mounts = vec![enclava_init::config::AppBindMountConfig {
+            subdir: String::new(),
+            mount_path: "/app/data".to_string(),
+        }];
+        let workload = WorkloadNamespace {
+            name: "app".to_string(),
+            pid: 42,
+        };
+        let error = bind_for_workload(&cfg, 7, &workload).unwrap_err();
+        let diagnostic = enclava_init::safe_diagnostics::SafeBootstrapDiagnostic::diagnose(&error);
+        assert_eq!(
+            diagnostic.step(),
+            Some(enclava_init::safe_diagnostics::InitFailedStep::BindSourceFailed)
+        );
+    }
+
+    #[test]
+    fn child_missing_source_reports_source_step() {
+        let error = run_bind_mount_into_ns(&[
+            "1".to_string(),
+            "/nonexistent-source-for-cap428".to_string(),
+            "/data".to_string(),
+        ])
+        .unwrap_err();
+        let diagnostic = enclava_init::safe_diagnostics::SafeBootstrapDiagnostic::diagnose(&error);
+        assert_eq!(
+            diagnostic.step(),
+            Some(enclava_init::safe_diagnostics::InitFailedStep::BindSourceFailed)
+        );
+    }
+
+    #[test]
+    fn child_missing_namespace_reports_mount_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        // A pid whose /proc/<pid> entry does not exist: the namespace open
+        // fails before any privileged step.
+        let error = run_bind_mount_into_ns(&[
+            "999999999".to_string(),
+            source.to_string_lossy().to_string(),
+            "/data".to_string(),
+        ])
+        .unwrap_err();
+        let diagnostic = enclava_init::safe_diagnostics::SafeBootstrapDiagnostic::diagnose(&error);
+        assert_eq!(
+            diagnostic.step(),
+            Some(enclava_init::safe_diagnostics::InitFailedStep::BindMountFailed)
+        );
+    }
+
+    #[test]
+    fn create_bind_target_read_only_parent_reports_target_create_step() {
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("rootfs");
+        std::fs::create_dir_all(&parent).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&parent).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&parent, perms).unwrap();
+        // The incident's exact shape: the workload rootfs is read-only and
+        // the image has no /data, so creating the target fails.
+        let target = parent.join("data");
+        let error = create_bind_target(42, &target).map(|_| ()).unwrap_err();
+        let diagnostic = enclava_init::safe_diagnostics::SafeBootstrapDiagnostic::diagnose(&error);
+        assert_eq!(
+            diagnostic.step(),
+            Some(enclava_init::safe_diagnostics::InitFailedStep::BindTargetCreateFailed)
+        );
+        assert_eq!(
+            diagnostic.render_json(),
+            "{\"error\":\"enclava_init_failed\",\"failed_stage\":null,\"failed_step\":\"bind_target_create_failed\",\"retry_after\":null,\"terminal\":true}"
+        );
+    }
+
+    // The REAL child subprocess (current_exe --bind-mount-into-ns) cannot
+    // be driven from this unit-test binary: the harness owns its own argv.
+    // The child's exit-code half of the contract is driven end-to-end by
+    // tests/binder_exit_code.rs against the real binary; this suite pins
+    // the parent's mapping table and the typed-error construction.
+
+    #[test]
+    fn parent_maps_child_exit_codes_and_unmapped_stay_untyped() {
+        // The parent's receiving half: a mapped child exit code attaches the
+        // typed step; exit 1 and unmapped codes stay the untyped failure.
+        for (code, step) in [
+            (
+                3,
+                enclava_init::safe_diagnostics::InitFailedStep::BindSourceFailed,
+            ),
+            (
+                4,
+                enclava_init::safe_diagnostics::InitFailedStep::BindTargetCreateFailed,
+            ),
+            (
+                5,
+                enclava_init::safe_diagnostics::InitFailedStep::BindMountFailed,
+            ),
+        ] {
+            let failure = anyhow::anyhow!("namespace binder exited with code {code}").context(
+                enclava_init::safe_diagnostics::InitStepError(
+                    enclava_init::safe_diagnostics::InitFailedStep::from_child_exit_code(code)
+                        .expect("mapped code"),
+                ),
+            );
+            let diagnostic =
+                enclava_init::safe_diagnostics::SafeBootstrapDiagnostic::diagnose(&failure);
+            assert_eq!(diagnostic.step(), Some(step));
+        }
+        for code in [0, 1, 2, 6, 130] {
+            assert!(
+                enclava_init::safe_diagnostics::InitFailedStep::from_child_exit_code(code)
+                    .is_none(),
+                "code {code} must stay untyped"
+            );
+        }
+    }
 }

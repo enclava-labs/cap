@@ -12,7 +12,7 @@ use enclava_init::config::{
     Config, LOG_SPOOL_STORAGE_STATE_BIND, LogEncryptionHandoff, LogEncryptionHandoffFile, Mode,
     VolumeConfig,
 };
-use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
+use enclava_init::safe_diagnostics::{InitFailedStep, InitStepError, SafeBootstrapDiagnostic};
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
     dev_no_luks_override, env_override, log_relay, luks, luks2_seal, seeds, served_certificate,
@@ -61,7 +61,15 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("enclava-init namespace bind: {e:#}");
-                ExitCode::from(1)
+                // The typed step crosses the process boundary through the
+                // fixed exit-code table (cap#428): 3/4/5 carry the
+                // child-eligible steps, everything else stays the untyped
+                // exit 1 exactly as before.
+                let code = e
+                    .downcast_ref::<InitStepError>()
+                    .and_then(|wrapper| wrapper.0.child_exit_code())
+                    .unwrap_or(1);
+                ExitCode::from(code)
             }
         };
     }
@@ -124,6 +132,7 @@ fn report_failure(error: &anyhow::Error) {
         terminal = true,
         retry_after = diagnostic.retry_after_rfc3339().as_deref(),
         failed_stage = stage,
+        failed_step = diagnostic.step().map(InitFailedStep::as_str),
         "enclava-init failed"
     );
     eprintln!("enclava-init: {safe_json}");
@@ -1781,7 +1790,8 @@ fn provision_static_tls_certificate_with(
     ] {
         if path.exists() {
             chown::chown(&path, caddy_identity)
-                .with_context(|| format!("chown {}", path.display()))?;
+                .with_context(|| format!("chown {}", path.display()))
+                .context(InitStepError(InitFailedStep::TlsWriteFailed))?;
         }
     }
     let cert_path = tls_certificate::cert_path(&persistent);
@@ -1793,10 +1803,12 @@ fn publish_public_tls_certificate(source: &Path, destination: &Path) -> Result<(
     if !source.is_file() {
         return Ok(());
     }
-    let certificate =
-        std::fs::read(source).context("reading public TLS certificate for proxy handoff")?;
+    let certificate = std::fs::read(source)
+        .context("reading public TLS certificate for proxy handoff")
+        .context(InitStepError(InitFailedStep::TlsHandoffFailed))?;
     writes::atomic_write(destination, &certificate, 0o644)
         .context("publishing public TLS certificate for proxy handoff")
+        .context(InitStepError(InitFailedStep::TlsHandoffFailed))
 }
 
 fn sync_caddy_runtime_back(cfg: &Config) -> Result<()> {

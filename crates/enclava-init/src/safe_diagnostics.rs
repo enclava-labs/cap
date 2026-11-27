@@ -17,8 +17,17 @@
 //! ```json
 //! {"error":"acme_rate_limited"|"acme_certificate_issuance_failed"|"enclava_init_failed",
 //!  "terminal":true,"retry_after":null|"2026-09-10T09:30:00Z",
-//!  "failed_stage":null|"binding workload mount namespaces"}
+//!  "failed_stage":null|"binding workload mount namespaces",
+//!  "failed_step":null|"tls_decode_failed"|"tls_validate_failed"|"tls_write_failed"|
+//!                "tls_handoff_failed"|"bind_sentinel_failed"|"bind_source_failed"|
+//!                "bind_target_create_failed"|"bind_mount_failed"}
 //! ```
+//!
+//! `failed_step` is a sibling of the code, never a replacement for it: the
+//! `error` code set is fixed (the proxy and the CLI enumerate it), so the
+//! failing step rides its own allowlisted field and every old consumer
+//! that reads by key keeps working unchanged. It is `null` whenever the
+//! failing site is not instrumented.
 //!
 //! Only exact recognized codes and a validated UTC deadline are ever
 //! emitted; unknown, malformed, or out-of-bounds input degrades to the
@@ -99,6 +108,101 @@ impl SafeDiagnosticCode {
     }
 }
 
+/// The fixed failing-step vocabulary, one entry per instrumented site in
+/// the certificate and bind stages (cap#428). Content-free by the same
+/// discipline as [`SafeDiagnosticCode`]: no provider text, paths, errno
+/// strings, or secrets — only this table's literals ever leave the init
+/// binary on the `failed_step` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitFailedStep {
+    /// Reading or parsing retained TLS certificate/key state.
+    TlsDecodeFailed,
+    /// Anchored validation of a retained or broker-issued certificate chain.
+    TlsValidateFailed,
+    /// Persisting the certificate or key, and the ownership handoff loop.
+    TlsWriteFailed,
+    /// Publishing the public certificate for the proxy handoff.
+    TlsHandoffFailed,
+    /// Waiting for workload container start sentinels, including timeout.
+    BindSentinelFailed,
+    /// Building the bind plan or inspecting the source mount tree.
+    BindSourceFailed,
+    /// Creating the bind target inside the workload namespace.
+    BindTargetCreateFailed,
+    /// Entering the namespace or performing the mount itself.
+    BindMountFailed,
+}
+
+impl InitFailedStep {
+    /// The exact `failed_step` literal for this step.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TlsDecodeFailed => "tls_decode_failed",
+            Self::TlsValidateFailed => "tls_validate_failed",
+            Self::TlsWriteFailed => "tls_write_failed",
+            Self::TlsHandoffFailed => "tls_handoff_failed",
+            Self::BindSentinelFailed => "bind_sentinel_failed",
+            Self::BindSourceFailed => "bind_source_failed",
+            Self::BindTargetCreateFailed => "bind_target_create_failed",
+            Self::BindMountFailed => "bind_mount_failed",
+        }
+    }
+
+    /// Recognize only exact step literals: classification is byte-exact, so
+    /// lookalikes, prefixed values, and anything else stay unrecognized.
+    pub fn parse_str(value: &str) -> Option<Self> {
+        match value {
+            "tls_decode_failed" => Some(Self::TlsDecodeFailed),
+            "tls_validate_failed" => Some(Self::TlsValidateFailed),
+            "tls_write_failed" => Some(Self::TlsWriteFailed),
+            "tls_handoff_failed" => Some(Self::TlsHandoffFailed),
+            "bind_sentinel_failed" => Some(Self::BindSentinelFailed),
+            "bind_source_failed" => Some(Self::BindSourceFailed),
+            "bind_target_create_failed" => Some(Self::BindTargetCreateFailed),
+            "bind_mount_failed" => Some(Self::BindMountFailed),
+            _ => None,
+        }
+    }
+
+    /// The fixed exit-code table the bind child shares with its parent.
+    /// Only the three steps a bind child can hit are mapped (below 128 on
+    /// purpose: a signal death has no code); every other step stays `None`
+    /// and the child exits 1 like any untyped failure.
+    pub fn child_exit_code(self) -> Option<u8> {
+        match self {
+            Self::BindSourceFailed => Some(3),
+            Self::BindTargetCreateFailed => Some(4),
+            Self::BindMountFailed => Some(5),
+            _ => None,
+        }
+    }
+
+    /// The receiving half of the child exit-code table.
+    pub fn from_child_exit_code(code: i32) -> Option<Self> {
+        match code {
+            3 => Some(Self::BindSourceFailed),
+            4 => Some(Self::BindTargetCreateFailed),
+            5 => Some(Self::BindMountFailed),
+            _ => None,
+        }
+    }
+}
+
+/// The typed wrapper that carries an [`InitFailedStep`] through the anyhow
+/// chain as a context frame, so [`SafeBootstrapDiagnostic::diagnose`] can
+/// recover it by typed downcast — never by string scraping. The display
+/// text is content-free by the same rule as the diagnostic itself.
+#[derive(Debug)]
+pub struct InitStepError(pub InitFailedStep);
+
+impl std::fmt::Display for InitStepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "init step {}", self.0.as_str())
+    }
+}
+
+impl std::error::Error for InitStepError {}
+
 /// Safe, bounded diagnostic for one failed bootstrap run.
 ///
 /// Every field is safe for ordinary logs and the init-error/termination
@@ -107,6 +211,9 @@ impl SafeDiagnosticCode {
 /// this type.
 #[derive(Debug, Clone)]
 pub struct SafeBootstrapDiagnostic {
+    /// The instrumented failing step, when the error chain carried a typed
+    /// [`InitStepError`] (a broker failure never carries one).
+    step: Option<InitFailedStep>,
     /// Bounded diagnostic code for the failure.
     pub code: SafeDiagnosticCode,
     /// Validated UTC instant after which the bootstrap may be retried, or
@@ -126,6 +233,7 @@ impl SafeBootstrapDiagnostic {
     /// else may name one.
     pub fn new(code: SafeDiagnosticCode, retry_after: Option<DateTime<Utc>>) -> Self {
         Self {
+            step: None,
             code,
             retry_after,
             stage: None,
@@ -135,6 +243,12 @@ impl SafeBootstrapDiagnostic {
     /// The stage [`Self::diagnose`] attached, if the run had reached one.
     pub fn stage(&self) -> Option<&'static str> {
         self.stage
+    }
+
+    /// The instrumented failing step [`Self::diagnose`] recovered from the
+    /// typed context frame, if any.
+    pub fn step(&self) -> Option<InitFailedStep> {
+        self.step
     }
 
     /// Attach the stage the tracker currently holds. Not a caller-supplied
@@ -148,6 +262,7 @@ impl SafeBootstrapDiagnostic {
     /// usable deadline: unknown, malformed, or unbounded broker bodies.
     pub fn acme_failed() -> Self {
         Self {
+            step: None,
             code: SafeDiagnosticCode::AcmeCertificateIssuanceFailed,
             retry_after: None,
             stage: None,
@@ -157,6 +272,7 @@ impl SafeBootstrapDiagnostic {
     /// The generic safe failure for every non-broker bootstrap error.
     pub fn generic() -> Self {
         Self {
+            step: None,
             code: SafeDiagnosticCode::EnclavaInitFailed,
             retry_after: None,
             stage: None,
@@ -175,11 +291,18 @@ impl SafeBootstrapDiagnostic {
     /// validation failures — degrades to the generic safe failure, keeping
     /// its possibly path-bearing chain out of all output.
     pub fn diagnose(error: &anyhow::Error) -> Self {
-        error
-            .downcast_ref::<crate::tls_certificate::TlsBrokerFailure>()
-            .map(|failure| failure.diagnostic.clone())
-            .unwrap_or_else(Self::generic)
-            .with_recorded_stage()
+        match error.downcast_ref::<crate::tls_certificate::TlsBrokerFailure>() {
+            // A broker failure keeps its acme code and carries no step —
+            // the broker's typed contract already classifies it.
+            Some(failure) => failure.diagnostic.clone().with_recorded_stage(),
+            None => {
+                let mut diagnostic = Self::generic();
+                diagnostic.step = error
+                    .downcast_ref::<InitStepError>()
+                    .map(|wrapper| wrapper.0);
+                diagnostic.with_recorded_stage()
+            }
+        }
     }
 
     /// Parse and validate a broker-supplied `retry_after` value into a
@@ -224,6 +347,7 @@ impl SafeBootstrapDiagnostic {
             "terminal": true,
             "retry_after": self.retry_after_rfc3339(),
             "failed_stage": self.stage,
+            "failed_step": self.step.map(InitFailedStep::as_str),
         })
         .to_string()
     }
@@ -251,6 +375,7 @@ mod tests {
                 "error": "enclava_init_failed",
                 "terminal": true,
                 "retry_after": null,
+                "failed_step": serde_json::Value::Null,
                 "failed_stage": null,
             })
         );
@@ -265,6 +390,7 @@ mod tests {
     fn rate_limited_failure_renders_validated_deadline() {
         let deadline = now() + TimeDelta::hours(3);
         let diagnostic = SafeBootstrapDiagnostic {
+            step: None,
             code: SafeDiagnosticCode::AcmeRateLimited,
             retry_after: Some(deadline),
             stage: Some("provisioning static tls certificate"),
@@ -276,10 +402,147 @@ mod tests {
                 "error": "acme_rate_limited",
                 "terminal": true,
                 "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "failed_step": serde_json::Value::Null,
                 "failed_stage": "provisioning static tls certificate",
             })
         );
         assert!(rendered.contains(&deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)));
+    }
+
+    #[test]
+    fn step_vocabulary_round_trips_byte_exactly() {
+        for step in [
+            InitFailedStep::TlsDecodeFailed,
+            InitFailedStep::TlsValidateFailed,
+            InitFailedStep::TlsWriteFailed,
+            InitFailedStep::TlsHandoffFailed,
+            InitFailedStep::BindSentinelFailed,
+            InitFailedStep::BindSourceFailed,
+            InitFailedStep::BindTargetCreateFailed,
+            InitFailedStep::BindMountFailed,
+        ] {
+            assert_eq!(InitFailedStep::parse_str(step.as_str()), Some(step));
+        }
+        for lookalike in [
+            "",
+            " tls_decode_failed",
+            "tls_decode_failed ",
+            "TLS_DECODE_FAILED",
+            "tls_decode_failed2",
+            "tls-decode-failed",
+            "tls_decode",
+            "enclava_init_failed",
+            "failed_step:tls_write_failed",
+            "tls_handoff_failed tls_handoff_failed",
+        ] {
+            assert_eq!(
+                InitFailedStep::parse_str(lookalike),
+                None,
+                "lookalike must stay unrecognized: {lookalike:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn child_exit_code_table_round_trips() {
+        // The bind child's fixed table: only the three child-eligible
+        // steps map (below 128 on purpose), and only those codes map back.
+        for (step, code) in [
+            (InitFailedStep::BindSourceFailed, 3u8),
+            (InitFailedStep::BindTargetCreateFailed, 4),
+            (InitFailedStep::BindMountFailed, 5),
+        ] {
+            assert_eq!(step.child_exit_code(), Some(code));
+            assert_eq!(
+                InitFailedStep::from_child_exit_code(code as i32),
+                Some(step)
+            );
+        }
+        // Every other step stays untyped on the child boundary.
+        for step in [
+            InitFailedStep::TlsDecodeFailed,
+            InitFailedStep::TlsValidateFailed,
+            InitFailedStep::TlsWriteFailed,
+            InitFailedStep::TlsHandoffFailed,
+            InitFailedStep::BindSentinelFailed,
+        ] {
+            assert_eq!(step.child_exit_code(), None);
+        }
+        // exit 1, 2, 6, 0, negative, and signal-range codes stay untyped.
+        for code in [0, 1, 2, 6, 127, 130, -1] {
+            assert_eq!(
+                InitFailedStep::from_child_exit_code(code),
+                None,
+                "code {code} must stay untyped"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnose_recovers_a_typed_step_and_renders_the_literal_contract() {
+        let _stage = STAGE_LOCK.lock().unwrap();
+        set_last_stage(None);
+        let error = anyhow!("mkdir /data: Read-only file system")
+            .context(InitStepError(InitFailedStep::BindTargetCreateFailed));
+        let diagnostic = SafeBootstrapDiagnostic::diagnose(&error);
+        assert_eq!(diagnostic.code, SafeDiagnosticCode::EnclavaInitFailed);
+        assert_eq!(
+            diagnostic.step(),
+            Some(InitFailedStep::BindTargetCreateFailed)
+        );
+        let rendered = diagnostic.render_json();
+        // The whole rendered string, compared against the rebuilt literal
+        // contract: no path, no errno text, no provider text ever rides it.
+        assert_eq!(
+            rendered,
+            "{\"error\":\"enclava_init_failed\",\"failed_stage\":null,\"failed_step\":\"bind_target_create_failed\",\"retry_after\":null,\"terminal\":true}"
+        );
+    }
+
+    #[test]
+    fn diagnose_keeps_failed_step_null_for_uninstrumented_failures() {
+        let _stage = STAGE_LOCK.lock().unwrap();
+        set_last_stage(None);
+        let error = anyhow!("opening /some/path failed: Permission denied (os error 13)");
+        let diagnostic = SafeBootstrapDiagnostic::diagnose(&error);
+        assert_eq!(diagnostic.code, SafeDiagnosticCode::EnclavaInitFailed);
+        assert_eq!(diagnostic.step(), None);
+        assert!(
+            !diagnostic.render_json().contains("failed_step\":\""),
+            "no step literal may appear: {}",
+            diagnostic.render_json()
+        );
+    }
+
+    #[test]
+    fn a_broker_failure_keeps_its_acme_code_and_carries_no_step() {
+        let _stage = STAGE_LOCK.lock().unwrap();
+        set_last_stage(None);
+        // Even a step context wrapped around a broker failure must not
+        // attach a step: the broker's typed contract classifies it.
+        let error = anyhow::Error::new(crate::tls_certificate::TlsBrokerFailure {
+            diagnostic: SafeBootstrapDiagnostic::acme_failed(),
+        })
+        .context(InitStepError(InitFailedStep::TlsValidateFailed));
+        let diagnostic = SafeBootstrapDiagnostic::diagnose(&error);
+        assert_eq!(
+            diagnostic.code,
+            SafeDiagnosticCode::AcmeCertificateIssuanceFailed
+        );
+        assert_eq!(diagnostic.step(), None);
+        assert!(
+            !diagnostic.render_json().contains("failed_step\":\""),
+            "broker failures carry no step: {}",
+            diagnostic.render_json()
+        );
+    }
+
+    #[test]
+    fn init_step_error_display_is_content_free() {
+        assert_eq!(
+            InitStepError(InitFailedStep::TlsDecodeFailed).to_string(),
+            "init step tls_decode_failed"
+        );
     }
 
     #[test]
@@ -316,6 +579,7 @@ mod tests {
         set_last_stage(Some("provisioning static tls certificate"));
         let deadline = now() + TimeDelta::minutes(30);
         let diagnostic = SafeBootstrapDiagnostic {
+            step: None,
             code: SafeDiagnosticCode::AcmeRateLimited,
             retry_after: Some(deadline),
             stage: None,
