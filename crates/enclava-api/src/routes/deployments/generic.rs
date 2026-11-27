@@ -228,22 +228,29 @@ pub async fn generate_agent_policy(
 
     let log_encryption = validate_log_encryption_config(body.log_encryption.clone())?;
     let descriptor = body.descriptor;
-    enclava_common::descriptor::validate_pod_supplemental_groups(
-        descriptor.pod_supplemental_groups.as_ref(),
-    )
-    .map_err(|message| json_error(StatusCode::BAD_REQUEST, message))?;
-    // Init-first rollout guard (policy-templates#23): a group-bearing
-    // descriptor only reaches a field-tolerant init image when the
-    // deployment capability is enabled; otherwise admission fails closed
-    // here instead of the guest failing verification on every start.
-    if descriptor.pod_supplemental_groups.is_some()
-        && !crate::routes::platform::pod_supplemental_groups_supported()
-    {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "pod_supplemental_groups requires an init image that tolerates the field, \
-             which this API deployment has not enabled",
-        ));
+    // #424: the shared admission decision — but this preflight's response is
+    // pinned byte-identical (D5), so the error mapping stays local: a shape
+    // error answers with the validation message and the gate refusal with
+    // the original init-first rollout guard text, no `code` key.
+    match crate::routes::platform::admit_pod_supplemental_groups(
+        descriptor.pod_supplemental_groups.as_deref(),
+        crate::routes::platform::pod_supplemental_groups_supported(),
+    ) {
+        Err(crate::routes::platform::PodSupplementalGroupsAdmission::Invalid(message)) => {
+            return Err(json_error(StatusCode::BAD_REQUEST, message));
+        }
+        Err(crate::routes::platform::PodSupplementalGroupsAdmission::NotSupported) => {
+            // Init-first rollout guard (policy-templates#23): a group-bearing
+            // descriptor only reaches a field-tolerant init image when the
+            // deployment capability is enabled; otherwise admission fails closed
+            // here instead of the guest failing verification on every start.
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "pod_supplemental_groups requires an init image that tolerates the field, \
+                 which this API deployment has not enabled",
+            ));
+        }
+        Ok(()) => {}
     }
     let expected_identity_hash = hex::decode(&app.tenant_instance_identity_hash).map_err(|_| {
         (

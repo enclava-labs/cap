@@ -1821,6 +1821,47 @@ pub(crate) mod test_support {
     pub(crate) static SIGNED_POLICY_SINGLETON_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
 
+    /// Serializes the #424 admission tests (cap#424): the gate-off tests
+    /// (T1/T2/T5) read the process gate, the gate-on controls (T3) set it;
+    /// cargo runs lib tests in parallel threads in one process, so a
+    /// set-while-read race is a flake in the whole binary. The only other
+    /// readers (`deployment_jobs`' worker check, the generic preflight, the
+    /// agent-policy negotiation) have no group-bearing handler fixtures, so
+    /// this lock covers every handler that observes the variable.
+    pub(crate) static POD_SUPPLEMENTAL_GROUPS_GATE_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    /// Sets `ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED=1` for one test and
+    /// restores the exact prior state on drop (value or unset), the
+    /// POLICY_ENV_TEST_MUTEX guard pattern (main.rs): a panic mid-test
+    /// cannot leak the enabling value into other tests.
+    pub(crate) struct PodSupplementalGroupsGateGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+    impl PodSupplementalGroupsGateGuard {
+        pub(crate) fn enable() -> Self {
+            let guard = Self {
+                prior: std::env::var_os("ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED"),
+            };
+            unsafe {
+                std::env::set_var("ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED", "1");
+            }
+            guard
+        }
+    }
+    impl Drop for PodSupplementalGroupsGateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prior {
+                    Some(value) => {
+                        std::env::set_var("ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED", value)
+                    }
+                    None => std::env::remove_var("ENCLAVA_POD_SUPPLEMENTAL_GROUPS_SUPPORTED"),
+                }
+            }
+        }
+    }
+
     use crate::auth::api_key::ValidatedApiKey;
     use crate::auth::middleware::{AuthContext, ManagementOrigin};
     use crate::clients::{AllowList, ClientConfig, RegistryClient};
