@@ -3751,6 +3751,23 @@ hkdf-info = "tls-state-luks-key"
         assert_eq!(request_bodies.len(), 1, "one re-order POST");
         let request: serde_json::Value =
             serde_json::from_str(&request_bodies[0]).expect("parsing re-order request JSON");
+        // The request carries the hostname list twice: `hostnames` (what
+        // the broker places the ACME order for — enclava-api
+        // routes/workload_tls.rs) and the CSR's SANs. Both must cover the
+        // full configured set.
+        let mut posted_hostnames: Vec<String> = request["hostnames"]
+            .as_array()
+            .expect("re-order request carries hostnames")
+            .iter()
+            .map(|value| value.as_str().expect("hostname entry").to_string())
+            .collect();
+        posted_hostnames.sort();
+        let mut configured: Vec<String> = full_set.iter().map(|h| h.to_string()).collect();
+        configured.sort();
+        assert_eq!(
+            posted_hostnames, configured,
+            "the re-order request's hostnames field must carry the FULL configured set"
+        );
         let csr_der = base64::engine::general_purpose::STANDARD
             .decode(
                 request["csr_der_base64"]
@@ -3778,8 +3795,6 @@ hkdf-info = "tls-state-luks-key"
             })
             .collect();
         requested.sort();
-        let mut configured: Vec<String> = full_set.iter().map(|h| h.to_string()).collect();
-        configured.sort();
         assert_eq!(
             requested, configured,
             "the re-order CSR must request the FULL configured hostname set"
