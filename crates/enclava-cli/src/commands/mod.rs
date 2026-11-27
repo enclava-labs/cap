@@ -98,6 +98,8 @@ pub enum Command {
     Recover(ownership::RecoverArgs),
     /// Change unlock password (password mode)
     ChangePassword(ownership::ChangePasswordArgs),
+    /// Re-export the one-time recovery mnemonic over the attested ownership channel (password mode)
+    ExportMnemonic(ownership::ExportMnemonicArgs),
     /// Manage auto-unlock
     #[command(subcommand)]
     AutoUnlock(ownership::AutoUnlockCommand),
@@ -146,6 +148,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Unlock(args) => ownership::unlock(args).await,
         Command::Recover(args) => ownership::recover(args).await,
         Command::ChangePassword(args) => ownership::change_password(args).await,
+        Command::ExportMnemonic(args) => ownership::export_mnemonic(args).await,
         Command::AutoUnlock(cmd) => ownership::auto_unlock(cmd).await,
         Command::Rollback(args) => app::rollback(args).await,
         Command::Destroy(args) => app::destroy(args).await,
