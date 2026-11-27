@@ -1204,6 +1204,7 @@ async fn main() {
     }
     if !edge_reconciliation_disabled {
         enclava_api::edge::spawn_haproxy_reconciler(state.clone(), shutdown.clone());
+        enclava_api::edge::spawn_custom_domain_swap_settler(state.clone(), shutdown.clone());
     }
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone(), shutdown.clone());
     enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone(), shutdown.clone());

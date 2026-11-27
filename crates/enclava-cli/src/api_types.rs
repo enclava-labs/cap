@@ -1057,6 +1057,10 @@ pub struct ConfigKeyMeta {
 #[derive(Debug, Serialize)]
 pub struct CreateChallengeRequest {
     pub domain: String,
+    /// cap F1: the explicit replacement consent. Absent means `false`
+    /// (the server refuses a second domain without it).
+    #[serde(default)]
+    pub replace: bool,
 }
 
 #[derive(Debug, Deserialize)]
