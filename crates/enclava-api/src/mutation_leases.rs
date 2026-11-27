@@ -341,6 +341,47 @@ impl AppMutationLease {
         Ok(())
     }
 
+    /// Arm the `dns_hostname` pre-arm and hand back a cancellation guard
+    /// (cap#438). The delete flow must keep the fences infinite while the
+    /// Cloudflare call is genuinely in flight (there is no conditional
+    /// delete), but a request dropped mid-call runs no error path: without
+    /// this guard the infinity outlives the request forever and every retry
+    /// fails `claim()` with `Busy`. The guard only ever BOUNDS the exact
+    /// rows it armed -- to the ordinary reclaim quarantine -- and only while
+    /// they are still the caller's token+generation; it never releases them.
+    /// Callers disarm once they take explicit responsibility (released, or
+    /// deliberately retained for the reconciler).
+    pub async fn arm_dns_scope_cancel_safe(
+        &self,
+        resource_scope: &str,
+    ) -> Result<ArmedDnsFenceGuard, MutationLeaseError> {
+        let resources: Vec<ClaimedResource> = self
+            .resources
+            .iter()
+            .filter(|resource| resource.fence.scope == resource_scope)
+            .cloned()
+            .collect();
+        // Created before the commit so a future dropped inside the commit
+        // still leaves a bounded fallback: the guard's UPDATE matches only
+        // `reclaim_after='infinity'`, so it is a no-op if the arm never
+        // landed.
+        let guard = ArmedDnsFenceGuard {
+            pool: self.pool.clone(),
+            token: self.token,
+            resources,
+            runtime: tokio::runtime::Handle::current(),
+            disarmed: false,
+        };
+        let mut tx = self.pool.begin().await?;
+        let retained =
+            poison_resource_scope(&mut tx, self.token, &self.resources, resource_scope).await?;
+        if retained == 0 {
+            return Err(MutationLeaseError::Lost);
+        }
+        tx.commit().await?;
+        Ok(guard)
+    }
+
     /// cap#422 R2 (review T1): on a renewal-loss arm the claimed rows stay
     /// quarantined until `reclaim_after` by design -- but a CROSS-APP
     /// fence (the global `edge_config`) blocks unrelated apps' deployment
@@ -624,6 +665,93 @@ impl Drop for AppMutationLease {
     fn drop(&mut self) {
         self.stop_heartbeat();
     }
+}
+
+/// Cancellation fallback for a committed `dns_hostname` infinity pre-arm
+/// (cap#438). Held by the app-delete flow from before the arm commits until
+/// the caller explicitly disarms it. A dropped request future runs no error
+/// path, so without this the fence stays infinite forever and every retry
+/// fails `claim()` with `Busy`. Drop bounds the exact rows this guard armed
+/// back to the ordinary reclaim quarantine -- never releases them -- and
+/// only while they are still the owner's token+generation.
+pub struct ArmedDnsFenceGuard {
+    pool: PgPool,
+    token: Uuid,
+    resources: Vec<ClaimedResource>,
+    runtime: tokio::runtime::Handle,
+    disarmed: bool,
+}
+
+impl ArmedDnsFenceGuard {
+    /// The caller has taken responsibility for these fences: released them,
+    /// or deliberately retained them for the reconciler. Do not bound.
+    pub fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for ArmedDnsFenceGuard {
+    fn drop(&mut self) {
+        if self.disarmed || self.resources.is_empty() {
+            return;
+        }
+        let pool = self.pool.clone();
+        let token = self.token;
+        let resources = std::mem::take(&mut self.resources);
+        // Captured when the guard was created (inside the request's runtime):
+        // Drop can run after the future's poll context is gone, and
+        // Handle::current() would panic there.
+        self.runtime.spawn(async move {
+            match bound_dns_fences_after_cancel(&pool, token, &resources).await {
+                Ok(bounded) if bounded > 0 => tracing::warn!(
+                    bounded,
+                    "cancelled app delete: bounded pre-armed DNS fences to the reclaim quarantine"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    error_code = "dns_fence_cancel_bound_failed",
+                    "cancelled app delete: could not bound pre-armed DNS fences; the reconciler must release them"
+                ),
+            }
+        });
+    }
+}
+
+/// Bound (never clear) the guard's fenced rows: a still-infinite row owned by
+/// this exact token+generation becomes claimable again after the ordinary
+/// quarantine, which is the same fail-closed outcome as an ordinary cancelled
+/// provider call.
+async fn bound_dns_fences_after_cancel(
+    pool: &PgPool,
+    token: Uuid,
+    resources: &[ClaimedResource],
+) -> Result<u64, MutationLeaseError> {
+    let mut tx = pool.begin().await?;
+    let mut bounded = 0_u64;
+    for resource in resources {
+        let result = sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET reclaim_after = clock_timestamp()
+                        + ($5::bigint * interval '1 second'),
+                    updated_at = clock_timestamp()
+              WHERE resource_scope = $1
+                AND resource_key = $2
+                AND owner_token = $3
+                AND generation = $4
+                AND reclaim_after = 'infinity'::timestamptz",
+        )
+        .bind(&resource.fence.scope)
+        .bind(&resource.fence.key)
+        .bind(token)
+        .bind(resource.generation)
+        .bind(RECLAIM_QUARANTINE_SECONDS)
+        .execute(&mut *tx)
+        .await?;
+        bounded += result.rows_affected();
+    }
+    tx.commit().await?;
+    Ok(bounded)
 }
 
 /// A provider-resource owner not tied to a live app row.  This is used by
@@ -1422,6 +1550,120 @@ pub async fn reconcile_orphaned_custom_domain_fences(
     .execute(pool)
     .await?;
     Ok(resources.rows_affected())
+}
+
+/// Periodic repair for stranded app-delete DNS fences (cap#438).
+///
+/// A delete request cancelled between the infinity pre-arm and the release
+/// leaves the app's `dns_hostname` fences owned with no reclaim deadline.
+/// Every later destroy then fails `claim()` with `Busy`, so no request can
+/// ever reach the release that would clear them. This sweep re-issues the
+/// idempotent app-scoped DNS delete for an app that is still `deleting`, then
+/// CAS-releases the exact row. A vanished app row needs no provider work (its
+/// hostnames cannot be reused by a live row), and a live app is never touched:
+/// its records are not ours to delete. An app_delete fence is only selected
+/// once its owner's lease has expired; a live owner still renews
+/// `locked_until` and is left alone.
+pub async fn release_stranded_dns_delete_fences(
+    state: &AppState,
+) -> Result<u64, MutationLeaseError> {
+    let dns = state.dns.clone();
+    let db = state.db.clone();
+    let http_client = state.http_client.clone();
+    release_stranded_dns_delete_fences_with(&state.db, dns.is_some(), move |app_id| {
+        let db = db.clone();
+        let http_client = http_client.clone();
+        let dns = dns.clone();
+        async move {
+            crate::dns::delete_all_dns_records_for_app(&db, &http_client, dns.as_ref(), app_id)
+                .await
+        }
+    })
+    .await
+}
+
+async fn release_stranded_dns_delete_fences_with<F, Fut>(
+    pool: &PgPool,
+    dns_configured: bool,
+    delete_dns: F,
+) -> Result<u64, MutationLeaseError>
+where
+    F: Fn(Uuid) -> Fut,
+    Fut: Future<Output = Result<(), crate::dns::DnsError>>,
+{
+    if !dns_configured {
+        // The delete flow only arms this scope when DNS is configured. With
+        // no provider client there is no app-scoped delete to re-issue, so
+        // leave the fences for an operator rather than releasing a scope we
+        // cannot reconcile.
+        return Ok(0);
+    }
+    let stranded: Vec<(String, Uuid, i64)> = sqlx::query_as(
+        "SELECT resource_key, owner_token, generation
+           FROM external_resource_mutation_leases
+          WHERE resource_scope = 'dns_hostname'
+            AND reclaim_after = 'infinity'::timestamptz
+            AND owner_token IS NOT NULL
+            AND operation_kind = 'app_delete'
+            AND locked_until <= clock_timestamp()
+          ORDER BY random()
+          LIMIT 20",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut released = 0_u64;
+    for (hostname, owner_token, generation) in stranded {
+        let app: Option<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, status::text FROM apps WHERE domain = $1 OR tee_domain = $1 LIMIT 1",
+        )
+        .bind(&hostname)
+        .fetch_optional(pool)
+        .await?;
+        match app {
+            None => {}
+            Some((app_id, status)) if status == "deleting" => {
+                if let Err(error) = delete_dns(app_id).await {
+                    tracing::warn!(
+                        hostname = %hostname,
+                        error = %error,
+                        error_code = "stranded_dns_fence_delete_failed",
+                        "stranded DNS fence: app-scoped DNS delete failed; retaining the fence"
+                    );
+                    continue;
+                }
+            }
+            Some(_) => continue,
+        }
+        // Exactly-once CAS on the observed owner: a fence another request
+        // reclaimed first is not ours to touch.
+        let result = sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL,
+                    updated_at = clock_timestamp()
+              WHERE resource_scope = 'dns_hostname'
+                AND resource_key = $1
+                AND owner_token = $2
+                AND generation = $3
+                AND reclaim_after = 'infinity'::timestamptz",
+        )
+        .bind(&hostname)
+        .bind(owner_token)
+        .bind(generation)
+        .execute(pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            released += 1;
+            tracing::info!(
+                hostname = %hostname,
+                "released stranded dns_hostname delete fence after reconciliation"
+            );
+        }
+    }
+    Ok(released)
 }
 
 /// Release retained-namespace fences whose Kubernetes namespace has since
@@ -2495,6 +2737,201 @@ pub(crate) mod tests {
         state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
         state.db = pool;
         state
+    }
+
+    async fn dns_fence_is_infinite(pool: &PgPool, hostname: &str) -> bool {
+        sqlx::query_scalar(
+            "SELECT reclaim_after = 'infinity'::timestamptz
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(hostname)
+        .fetch_one(pool)
+        .await
+        .expect("dns fence row")
+    }
+
+    async fn dns_fence_owner(pool: &PgPool, hostname: &str) -> Option<Uuid> {
+        sqlx::query_scalar(
+            "SELECT owner_token
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(hostname)
+        .fetch_one(pool)
+        .await
+        .expect("dns fence row")
+    }
+
+    async fn poison_app_delete_dns_fence(pool: &PgPool, hostname: &str) -> Uuid {
+        let token = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO external_resource_mutation_leases(resource_scope, resource_key)
+             VALUES ('dns_hostname', $1)
+             ON CONFLICT (resource_scope, resource_key) DO NOTHING",
+        )
+        .bind(hostname)
+        .execute(pool)
+        .await
+        .expect("insert dns fence");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET generation = generation + 1,
+                    owner_token = $2,
+                    operation_kind = 'app_delete',
+                    operation_id = $3,
+                    locked_until = clock_timestamp() - interval '5 minutes',
+                    reclaim_after = 'infinity'::timestamptz,
+                    updated_at = clock_timestamp()
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(hostname)
+        .bind(token)
+        .bind(Uuid::new_v4())
+        .execute(pool)
+        .await
+        .expect("poison dns fence");
+        token
+    }
+
+    #[tokio::test]
+    async fn cancelled_dns_arm_guard_bounds_the_infinity_fence() {
+        let pool = database_test_pool(2).await;
+        let hostname = format!("cancel-guard-{}.example.test", Uuid::new_v4().simple());
+        let (_, app_id) = insert_app(&pool, &hostname).await;
+        let state = Arc::new(state_with_pool(pool.clone()));
+        let lease = claim(
+            &state,
+            app_id,
+            "app_delete",
+            Uuid::new_v4(),
+            true,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("claim delete lane");
+        let guard = lease
+            .arm_dns_scope_cancel_safe("dns_hostname")
+            .await
+            .expect("arm dns fences");
+        assert!(
+            dns_fence_is_infinite(&pool, &hostname).await,
+            "the pre-arm must stay infinite while the provider call is in flight"
+        );
+        // Dropping the guard is the cancellation path: no error return runs.
+        drop(guard);
+        let mut bounded = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !dns_fence_is_infinite(&pool, &hostname).await {
+                bounded = true;
+                break;
+            }
+        }
+        assert!(
+            bounded,
+            "a dropped delete future must bound its pre-armed DNS fences"
+        );
+    }
+
+    #[tokio::test]
+    async fn disarmed_dns_arm_guard_keeps_the_infinity_fence() {
+        let pool = database_test_pool(2).await;
+        let hostname = format!("disarm-guard-{}.example.test", Uuid::new_v4().simple());
+        let (_, app_id) = insert_app(&pool, &hostname).await;
+        let state = Arc::new(state_with_pool(pool.clone()));
+        let lease = claim(
+            &state,
+            app_id,
+            "app_delete",
+            Uuid::new_v4(),
+            true,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("claim delete lane");
+        let guard = lease
+            .arm_dns_scope_cancel_safe("dns_hostname")
+            .await
+            .expect("arm dns fences");
+        guard.disarm();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            dns_fence_is_infinite(&pool, &hostname).await,
+            "an explicit retain keeps the fence infinite for the reconciler"
+        );
+    }
+
+    #[tokio::test]
+    async fn stranded_dns_fence_reconciler_releases_deleting_app_after_dns_delete() {
+        let pool = database_test_pool(2).await;
+        let (_, app_id) = insert_app(&pool, "stranded-deleting.example.test").await;
+        sqlx::query("UPDATE apps SET status = 'deleting' WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark app deleting");
+        poison_app_delete_dns_fence(&pool, "stranded-deleting.example.test").await;
+        let released = release_stranded_dns_delete_fences_with(&pool, true, |_| async { Ok(()) })
+            .await
+            .expect("reconcile stranded fences");
+        assert!(released >= 1);
+        assert_eq!(
+            dns_fence_owner(&pool, "stranded-deleting.example.test").await,
+            None,
+            "the exact fence must be released after the app-scoped DNS delete succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn stranded_dns_fence_reconciler_releases_vanished_app() {
+        let pool = database_test_pool(2).await;
+        poison_app_delete_dns_fence(&pool, "stranded-vanished.example.test").await;
+        release_stranded_dns_delete_fences_with(&pool, true, |_| async { Ok(()) })
+            .await
+            .expect("reconcile stranded fences");
+        assert_eq!(
+            dns_fence_owner(&pool, "stranded-vanished.example.test").await,
+            None,
+            "no app row means no live owner of the hostname"
+        );
+    }
+
+    #[tokio::test]
+    async fn stranded_dns_fence_reconciler_never_touches_live_app() {
+        let pool = database_test_pool(2).await;
+        let (_, _app_id) = insert_app(&pool, "stranded-live.example.test").await;
+        let owner = poison_app_delete_dns_fence(&pool, "stranded-live.example.test").await;
+        release_stranded_dns_delete_fences_with(&pool, true, |_| async { Ok(()) })
+            .await
+            .expect("reconcile stranded fences");
+        assert_eq!(
+            dns_fence_owner(&pool, "stranded-live.example.test").await,
+            Some(owner),
+            "a live app's DNS records are not ours to delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn stranded_dns_fence_reconciler_retains_on_dns_delete_error() {
+        let pool = database_test_pool(2).await;
+        let (_, app_id) = insert_app(&pool, "stranded-error.example.test").await;
+        sqlx::query("UPDATE apps SET status = 'deleting' WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("mark app deleting");
+        let owner = poison_app_delete_dns_fence(&pool, "stranded-error.example.test").await;
+        release_stranded_dns_delete_fences_with(&pool, true, |_| async {
+            Err(crate::dns::DnsError::NotConfigured)
+        })
+        .await
+        .expect("reconcile stranded fences");
+        assert_eq!(
+            dns_fence_owner(&pool, "stranded-error.example.test").await,
+            Some(owner),
+            "a failed provider delete must keep the fence for the next pass"
+        );
     }
 
     #[tokio::test]

@@ -2666,12 +2666,20 @@ pub(crate) async fn delete_app_before(
         .await
         .map_err(|_| internal_server_error())?;
 
-    if state.dns.is_some() {
-        delete_mutation
-            .arm_resource_scope_until_reconciled("dns_hostname")
-            .await
-            .map_err(|_| internal_server_error())?;
-    }
+    let mut dns_arm_guard = if state.dns.is_some() {
+        // cap#438: this pre-arm commits `reclaim_after='infinity'` before the
+        // provider delete. The guard bounds it back to the ordinary reclaim
+        // quarantine if this request is dropped mid-call; explicit success and
+        // the deliberate retain branches disarm it below.
+        Some(
+            delete_mutation
+                .arm_dns_scope_cancel_safe("dns_hostname")
+                .await
+                .map_err(|_| internal_server_error())?,
+        )
+    } else {
+        None
+    };
     let tracked_dns_cleanup = delete_mutation
         .guard_provider(crate::dns::delete_all_dns_records_for_app(
             &state.db,
@@ -2690,6 +2698,9 @@ pub(crate) async fn delete_app_before(
             .commit()
             .await
             .map_err(|_| internal_server_error())?;
+        if let Some(guard) = dns_arm_guard.take() {
+            guard.disarm();
+        }
         return Err(app_delete_dns_failure(deleting_app.id, error));
     }
     let expected_dns_cleanup = delete_mutation
@@ -2715,6 +2726,9 @@ pub(crate) async fn delete_app_before(
             .commit()
             .await
             .map_err(|_| internal_server_error())?;
+        if let Some(guard) = dns_arm_guard.take() {
+            guard.disarm();
+        }
         return Err(app_delete_dns_failure(deleting_app.id, error));
     }
     // Keep the app lane held, but commit reconciled DNS fences independently
@@ -2734,6 +2748,11 @@ pub(crate) async fn delete_app_before(
         .commit()
         .await
         .map_err(|_| internal_server_error())?;
+    // The DNS scope is durably released (or deliberately retained above);
+    // the cancellation fallback must not fire on the normal path.
+    if let Some(guard) = dns_arm_guard.take() {
+        guard.disarm();
+    }
     let kubernetes_mutation_generation =
         enclava_engine::apply::generation::MutationGeneration::new(kubernetes_mutation_generation)
             .map_err(|_| internal_server_error())?;

@@ -1875,6 +1875,28 @@ pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::
             tokio::time::sleep(TERMINAL_LEASE_REPAIR_INTERVAL).await;
         }
     });
+    // Stranded app-delete DNS fences (cap#438): the sweep re-issues the
+    // idempotent app-scoped provider delete for an app that is still deleting,
+    // then CAS-releases the fence. Provider I/O can be slow, so it is its own
+    // task like the retained-namespace probe.
+    let dns_fence_state = state.clone();
+    crate::reconciler::spawn_reconciler("dns-fence-release", shutdown.clone(), async move {
+        loop {
+            match crate::mutation_leases::release_stranded_dns_delete_fences(&dns_fence_state).await
+            {
+                Ok(released) if released > 0 => tracing::info!(
+                    released,
+                    "released stranded dns_hostname delete fences after reconciliation"
+                ),
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    error_code = "stranded_dns_fence_repair_failed",
+                    "failed to release stranded dns_hostname delete fences"
+                ),
+            }
+            tokio::time::sleep(TERMINAL_LEASE_REPAIR_INTERVAL).await;
+        }
+    });
     let setup_worker_slots = Arc::new(tokio::sync::Semaphore::new(MAX_SETUP_WORKERS));
     let configured_apply_workers =
         apply_worker_limit(state.deployment_apply_permits.available_permits());
