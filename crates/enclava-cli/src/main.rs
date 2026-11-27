@@ -42,10 +42,15 @@ async fn main() {
         std::process::exit(1);
     }
     let cli = Cli::parse();
-    if let Err(e) = commands::run(cli).await {
+    let update_check = commands::update::spawn_notice_check(&cli.command);
+    let result = commands::run(cli).await;
+    if let Err(e) = &result {
         eprintln!("error: {e}");
-        std::process::exit(1);
     }
+    commands::update::print_notice(update_check).await;
+    // Exit here instead of returning: dropping the runtime would wait for a
+    // DNS lookup the abandoned update check may still have running.
+    std::process::exit(if result.is_err() { 1 } else { 0 });
 }
 
 #[cfg(test)]

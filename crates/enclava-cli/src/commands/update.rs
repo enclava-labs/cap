@@ -2,9 +2,12 @@
 //! binary with it. Same source and checks as `scripts/install.sh`: the release
 //! asset for this platform, its `SHA256SUMS.txt` entry, and the cosign
 //! signature on the checksums when `cosign` is on PATH.
+//!
+//! Every other command also looks for a newer release while it runs and, in a
+//! terminal, ends with a one-line suggestion to run `enclava update`.
 
-use std::io::{Read, Write};
-use std::path::Path;
+use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Args;
@@ -33,6 +36,15 @@ const BIN: &str = if cfg!(windows) {
 
 /// Release archives are tens of MiB; anything past this is not one.
 const MAX_ASSET_BYTES: usize = 256 * 1024 * 1024;
+
+/// The automatic check asks GitHub at most this often; in between it reuses
+/// the answer saved in the state directory.
+const NOTICE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The automatic check never holds a finished command longer than this.
+const NOTICE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+pub(crate) type NoticeCheck = Option<tokio::task::JoinHandle<Option<String>>>;
 
 #[derive(Args)]
 pub struct UpdateArgs {
@@ -105,6 +117,82 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     Ok(())
 }
 
+/// Look up the latest release while `command` runs, for `print_notice` to
+/// report afterwards. Only release builds in a terminal check: a source build
+/// is not replaced by a release as a matter of course, and scripts get no
+/// extra request or output. `verify` and `describe` can run on saved bundles
+/// with no network at all, so they never start one. `ENCLAVA_NO_UPDATE_CHECK`
+/// turns the check off.
+pub(crate) fn spawn_notice_check(command: &super::Command) -> NoticeCheck {
+    use super::Command;
+    if matches!(
+        command,
+        Command::Update(_) | Command::Verify(_) | Command::Describe(_)
+    ) || option_env!("ENCLAVA_RELEASE_VERSION").is_none()
+        || !std::io::stderr().is_terminal()
+        || std::env::var_os("ENCLAVA_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty())
+    {
+        return None;
+    }
+    let cache = enclava_cli::config::CliPaths::resolve()
+        .ok()?
+        .root
+        .join("update-check");
+    Some(tokio::spawn(latest_for_notice(cache)))
+}
+
+/// Suggest `enclava update` when the check started by `spawn_notice_check`
+/// found a newer release. Failures stay silent: this is advisory.
+pub(crate) async fn print_notice(check: NoticeCheck) {
+    let Some(check) = check else { return };
+    if let Ok(Some(latest)) = check.await
+        && is_newer(VERSION, &latest)
+    {
+        eprintln!(
+            "\nA new version of enclava is available: {latest} (installed: {VERSION}). \
+             Run `enclava update` to install it."
+        );
+    }
+}
+
+/// Latest release tag: the saved answer while it is recent, GitHub otherwise.
+/// `cache` holds `<REPO> <tag>`; its modification time is when it was last
+/// checked. An answer saved by a build that updates from another repository
+/// is ignored.
+async fn latest_for_notice(cache: PathBuf) -> Option<String> {
+    let cached = std::fs::read_to_string(&cache)
+        .ok()
+        .and_then(|saved| cached_tag(&saved));
+    let checked_recently = std::fs::metadata(&cache)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|checked| checked.elapsed().ok())
+        .is_some_and(|age| age < NOTICE_CHECK_INTERVAL);
+    if checked_recently && cached.is_some() {
+        return cached;
+    }
+    let latest = tokio::time::timeout(NOTICE_CHECK_TIMEOUT, latest_tag())
+        .await
+        .ok()
+        .and_then(|tag| tag.ok())
+        .or(cached);
+    // A failed check is saved as well, so an offline machine asks once per
+    // interval, not on every command. The state directory may not exist yet
+    // (before the first login); `CliPaths::ensure_dirs` restricts it to the
+    // owner as soon as anything private is stored there.
+    if let Some(dir) = cache.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tag = latest.as_deref().unwrap_or(VERSION);
+    let _ = std::fs::write(&cache, format!("{REPO} {tag}"));
+    latest
+}
+
+fn cached_tag(saved: &str) -> Option<String> {
+    let (repo, tag) = saved.trim().split_once(' ')?;
+    (repo == REPO && !tag.is_empty()).then(|| tag.to_string())
+}
+
 fn http_client(redirect: reqwest::redirect::Policy) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent(format!("enclava-cli/{VERSION}"))
@@ -132,7 +220,8 @@ fn release_asset(os: &str, arch: &str) -> Result<String> {
 /// avoids the rate-limited GitHub API (as `scripts/install.sh` does).
 async fn latest_tag() -> Result<String> {
     let url = format!("https://github.com/{REPO}/releases/latest");
-    let resp = http_client(reqwest::redirect::Policy::none())?
+    let client = http_client(reqwest::redirect::Policy::none())?;
+    let resp = client
         .get(&url)
         .send()
         .await
