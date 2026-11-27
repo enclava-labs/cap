@@ -12,6 +12,7 @@ Enclava CAP is the open-source control plane core for running OCI images as conf
 | `crates/enclava-engine` | Kubernetes manifest rendering, apply, watch, cleanup, and validation logic |
 | `crates/enclava-init` | In-TEE sidecar that verifies policy, unlocks storage, prepares TLS state, and signals workload readiness |
 | `crates/enclava-wait-exec` | Small wrapper that blocks app and ingress processes until `enclava-init` is ready |
+| `crates/enclava-vault` | Credential-substituting egress proxy; not yet wired into workloads ([README](crates/enclava-vault/README.md)) |
 | `crates/enclava-common` | Shared descriptor, image-reference, validation, encoding, and crypto helpers |
 | `crates/enclava-snp` | SNP-attested TLS channel to a TEE (evidence, AMD KDS, collateral policy), shared with the hosted PaaS |
 | `crates/enclava-verifier` | Deterministic, I/O-free verification of proof bundles against a trust policy |
