@@ -2225,6 +2225,28 @@ mod tests {
             removed, 1,
             "a fresh proof against the moved row retires the reused marker"
         );
+        // (d) A RECREATED marker (review: the reuse test never recreates
+        // one): the hostname retired in the scoped leg becomes outgoing
+        // AGAIN (a later swap away from it), and a fresh proof retires
+        // the recreated row — the retirement is keyed to the proof's row
+        // capture, never to the marker's history.
+        sqlx::query(
+            "INSERT INTO custom_domain_swaps (app_id, outgoing_domain)
+             VALUES ($1, 'outgoing.example.com')",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("recreate the retired hostname's marker");
+        let removed = retire_settled_swap_markers(
+            &pool,
+            app_id,
+            &["outgoing.example.com".to_string()],
+            &Some("moved-on.example.com".to_string()),
+        )
+        .await
+        .expect("recreated-marker retirement");
+        assert_eq!(removed, 1, "a fresh proof retires the recreated marker");
         let remaining: Option<Vec<String>> = sqlx::query_scalar(
             "SELECT array_agg(outgoing_domain ORDER BY outgoing_domain)
                FROM custom_domain_swaps WHERE app_id = $1",
@@ -2232,7 +2254,7 @@ mod tests {
         .bind(app_id)
         .fetch_one(&pool)
         .await
-        .expect("list markers after reuse retirement");
+        .expect("list markers after the recreated retirement");
         assert_eq!(remaining, None, "every marker is retired by a valid proof");
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
