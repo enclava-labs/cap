@@ -1188,6 +1188,22 @@ pub async fn verify_challenge(
     // long before the replacement's certificate exists: a zero-domain
     // window. Same transaction as the row swap, so the desired set flips
     // from {outgoing} to {outgoing, incoming} atomically.
+    // A flip-back re-activates the incoming domain: a marker left for it
+    // (it was outgoing in an earlier swap) is stale by definition — the
+    // domain is the row's current one, not outgoing. Drop it so the
+    // settler can never treat the live serving record as outgoing
+    // (review: reactivated domain loses its reservation).
+    if sqlx::query("DELETE FROM custom_domain_swaps WHERE app_id = $1 AND outgoing_domain = $2")
+        .bind(app.id)
+        .bind(&domain)
+        .execute(&mut *app_lane)
+        .await
+        .is_err()
+    {
+        release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
+        return Err(internal_error());
+    }
+
     if let Some(outgoing) = previous_custom.as_deref()
         && outgoing != domain.as_str()
         && sqlx::query(

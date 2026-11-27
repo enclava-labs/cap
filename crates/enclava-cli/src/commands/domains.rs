@@ -25,7 +25,8 @@ pub enum DomainsCommand {
     /// Verify a previously-added domain after publishing the TXT record.
     /// Verifying a domain that differs from the app's current one needs
     /// --replace (the explicit swap); verifying the current domain is the
-    /// repair flow and needs no flag.
+    /// repair flow and needs no flag. An app that was never deployed
+    /// settles its pending replacement (if any) with the first deploy.
     Verify {
         /// Domain name to verify
         domain: String,
@@ -121,7 +122,13 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             } else {
                 println!("Once the TXT record is published, run:");
             }
-            println!("  enclava domains verify {domain} --app {app_name}");
+            // A replacement's verify needs the same consent flag (review:
+            // the printed instruction must not lead into the slot refusal).
+            if replace {
+                println!("  enclava domains verify {domain} --app {app_name} --replace");
+            } else {
+                println!("  enclava domains verify {domain} --app {app_name}");
+            }
         }
 
         DomainsCommand::Verify {

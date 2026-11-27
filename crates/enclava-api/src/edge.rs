@@ -252,10 +252,15 @@ pub async fn reconcile_all_haproxy_routes_at_startup(
     }
 }
 
+/// The shared 30 s cadence of the edge background loops (the HAProxy
+/// reconciler and the custom-domain swap settler) — one const so they
+/// cannot drift apart (review suggestion).
+const EDGE_BACKGROUND_LOOP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn spawn_haproxy_reconciler(state: AppState, shutdown: tokio_util::sync::CancellationToken) {
     crate::reconciler::spawn_reconciler("haproxy-reconciler", shutdown, async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(EDGE_BACKGROUND_LOOP_INTERVAL).await;
             match haproxy_routes_need_reconciliation(&state).await {
                 Ok(false) => continue,
                 Ok(true) => {}
@@ -289,7 +294,7 @@ pub fn spawn_custom_domain_swap_settler(
 ) {
     crate::reconciler::spawn_reconciler("custom-domain-swap-settler", shutdown, async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(EDGE_BACKGROUND_LOOP_INTERVAL).await;
             if let Err(error) = settle_custom_domain_swaps(&state).await {
                 tracing::warn!(%error, "custom-domain swap settlement remains pending");
             }
@@ -303,8 +308,14 @@ pub fn spawn_custom_domain_swap_settler(
 const SWAP_SETTLEMENT_PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn settle_custom_domain_swaps(state: &AppState) -> Result<(), sqlx::Error> {
-    let apps: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT DISTINCT app.id, app.name, app.namespace
+    // The row's domain is captured WITH the probe: the settlement proof is
+    // only valid for that row state. A concurrent replacement flips the
+    // row and inserts fresh markers; the DELETE is scoped to the fetched
+    // list AND re-checks the row, so a stale proof can never retire a
+    // newer swap's markers (review: TOCTOU between the probe and the
+    // delete).
+    let apps: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT DISTINCT app.id, app.name, app.namespace, app.custom_domain
            FROM apps AS app
            JOIN custom_domain_swaps AS s ON s.app_id = app.id
           ORDER BY app.id",
@@ -315,7 +326,7 @@ async fn settle_custom_domain_swaps(state: &AppState) -> Result<(), sqlx::Error>
         state.kube_client.clone(),
         enclava_engine::apply::types::ApplyConfig::default(),
     );
-    for (app_id, name, namespace) in apps {
+    for (app_id, name, namespace, probed_row_domain) in apps {
         let probe = crate::deploy::workload_rollout_settled(&engine, &namespace, &name);
         let verdict = match tokio::time::timeout(SWAP_SETTLEMENT_PROBE_BOUND, probe).await {
             Ok(verdict) => verdict,
@@ -333,17 +344,28 @@ async fn settle_custom_domain_swaps(state: &AppState) -> Result<(), sqlx::Error>
         // The rollout has settled: the serving certificate carries the
         // row's domain. Retire the outgoing domains' DNS records first
         // (idempotent; a failure keeps the markers for the next pass) and
-        // then drop every marker for the app (a chained swap can leave
-        // more than one) so the reconciler stops serving the outgoing
-        // domains.
+        // then drop the fetched markers so the reconciler stops serving
+        // the outgoing domains.
         let outgoing: Vec<String> = sqlx::query_scalar(
             "SELECT outgoing_domain FROM custom_domain_swaps WHERE app_id = $1 ORDER BY outgoing_domain",
         )
         .bind(app_id)
         .fetch_all(&state.db)
         .await?;
+        // Re-read the row right before the destructive steps: a flip-back
+        // (`verify <outgoing> --replace`) re-activates that domain — its
+        // DNS record is the live serving record and must be kept, and the
+        // row guard must fail so the markers survive their own proof.
+        let row_domain: Option<String> =
+            sqlx::query_scalar("SELECT custom_domain FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&state.db)
+                .await?;
         let mut dns_failed = false;
         for domain in &outgoing {
+            if row_domain.as_deref() == Some(domain.as_str()) {
+                continue;
+            }
             if let Err(error) = crate::dns::delete_dns_record(
                 &state.db,
                 &state.http_client,
@@ -365,11 +387,8 @@ async fn settle_custom_domain_swaps(state: &AppState) -> Result<(), sqlx::Error>
         if dns_failed {
             continue;
         }
-        let removed = sqlx::query("DELETE FROM custom_domain_swaps WHERE app_id = $1")
-            .bind(app_id)
-            .execute(&state.db)
-            .await?
-            .rows_affected();
+        let removed =
+            retire_settled_swap_markers(&state.db, app_id, &outgoing, &probed_row_domain).await?;
         tracing::info!(
             app_id = %app_id,
             removed,
@@ -377,6 +396,32 @@ async fn settle_custom_domain_swaps(state: &AppState) -> Result<(), sqlx::Error>
         );
     }
     Ok(())
+}
+
+/// Retire the swap markers the settler proved settled. The DELETE is
+/// scoped to the fetched list (a marker inserted by a concurrent
+/// replacement after the fetch survives with its own proof) and guarded by
+/// the row state the proof was taken against (a row flip — replacement or
+/// flip-back — fails the guard, so a stale proof can never retire a newer
+/// swap's markers).
+pub(crate) async fn retire_settled_swap_markers(
+    pool: &PgPool,
+    app_id: Uuid,
+    outgoing: &[String],
+    probed_row_domain: &Option<String>,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM custom_domain_swaps
+          WHERE app_id = $1
+            AND outgoing_domain = ANY($2)
+            AND (SELECT custom_domain FROM apps WHERE id = $1) IS NOT DISTINCT FROM $3",
+    )
+    .bind(app_id)
+    .bind(outgoing)
+    .bind(probed_row_domain)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
 }
 
 /// Whether a rollout probe outcome authorizes deleting a swap marker: only
@@ -1997,6 +2042,123 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete edge swap fixture");
+    }
+
+    #[tokio::test]
+    async fn settled_marker_retirement_is_scoped_and_row_guarded() {
+        // cap F1 (review): the settler's DELETE must (a) retire only the
+        // markers it fetched — a marker inserted by a concurrent
+        // replacement after the fetch survives with its own proof — and
+        // (b) fail when the row moved since the proof was taken, so a
+        // stale rollout can never retire a newer swap's markers.
+        let pool = edge_database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let suffix = app_id.simple().to_string();
+        sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+            .bind(org_id)
+            .bind(format!("edge-{suffix}"))
+            .bind(&suffix[..8])
+            .execute(&pool)
+            .await
+            .expect("insert edge test organization");
+        sqlx::query(
+            "INSERT INTO apps (
+                 id, org_id, name, namespace, instance_id, tenant_id,
+                 service_account, bootstrap_owner_pubkey_hash,
+                 tenant_instance_identity_hash, domain, tee_domain,
+                 custom_domain, status
+             ) VALUES (
+                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'running'
+             )",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .bind(format!("edge-{}", &suffix[..12]))
+        .bind(format!("cap-edge-{}", &suffix[..12]))
+        .bind(format!("instance-{suffix}"))
+        .bind(&suffix[..8])
+        .bind(format!("cap-edge-{}-sa", &suffix[..12]))
+        .bind("11".repeat(32))
+        .bind("22".repeat(32))
+        .bind(format!("edge-{}.example.test", &suffix[..12]))
+        .bind(format!("edge-{}.tee.example.test", &suffix[..12]))
+        .bind("incoming.example.com")
+        .execute(&pool)
+        .await
+        .expect("insert edge test app");
+        sqlx::query(
+            "INSERT INTO custom_domain_swaps (app_id, outgoing_domain)
+             VALUES ($1, 'outgoing.example.com'), ($1, 'older.example.com')",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("insert swap markers");
+
+        // (a) A row flip after the proof (a concurrent replacement, or a
+        // flip-back) fails the guard: every marker survives.
+        let removed = retire_settled_swap_markers(
+            &pool,
+            app_id,
+            &[
+                "older.example.com".to_string(),
+                "outgoing.example.com".to_string(),
+            ],
+            &Some("moved-on.example.com".to_string()),
+        )
+        .await
+        .expect("guarded retirement");
+        assert_eq!(removed, 0, "a moved row must fail the retirement guard");
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM custom_domain_swaps WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count markers");
+        assert_eq!(remaining, 2);
+
+        // (b) A marker NOT in the fetched list (inserted after the fetch)
+        // survives even when the row matches the proof.
+        sqlx::query(
+            "INSERT INTO custom_domain_swaps (app_id, outgoing_domain)
+             VALUES ($1, 'concurrent.example.com')",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("insert concurrent marker");
+        let removed = retire_settled_swap_markers(
+            &pool,
+            app_id,
+            &[
+                "older.example.com".to_string(),
+                "outgoing.example.com".to_string(),
+            ],
+            &Some("incoming.example.com".to_string()),
+        )
+        .await
+        .expect("scoped retirement");
+        assert_eq!(removed, 2, "only the fetched markers retire");
+        let remaining: Option<Vec<String>> = sqlx::query_scalar(
+            "SELECT array_agg(outgoing_domain ORDER BY outgoing_domain)
+               FROM custom_domain_swaps WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("list remaining markers");
+        assert_eq!(
+            remaining,
+            Some(vec!["concurrent.example.com".to_string()]),
+            "the concurrent replacement's marker survives with its own proof"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete edge retirement fixture");
     }
 
     #[test]
