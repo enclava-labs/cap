@@ -1526,6 +1526,72 @@ pub(crate) const CUSTOM_DOMAIN_SET_OPERATION: &str = "custom_domain_set";
 /// This is also the repair for apps wedged by the old behavior: once this
 /// ships, their expired fences are bounded on the next reconciler tick
 /// without manual database action.
+/// The non-delete `dns_hostname` operation kinds whose stranded fences
+/// [`reconcile_stranded_non_delete_dns_fences`] repairs: the app-create arm
+/// (`routes/apps.rs`), the deployment-setup arm, and the deployment-cleanup
+/// arm. Shared by the loop and its tests so the closed list cannot drift.
+/// `app_delete` is deliberately absent: a delete fence resolves only through
+/// #440's provider-level re-issue sweep (a late destructive DNS delete must
+/// never time-reclaim into a new owner's records). A future operation kind
+/// that arms a `dns_hostname` fence outside app delete must opt in here
+/// deliberately — and only if its provider call is an idempotent ensure
+/// like `ensure_dns_pair`, never a destructive delete.
+pub(crate) const DNS_HOSTNAME_RECLAIMABLE_OPERATION_KINDS: &[&str] =
+    &["app_create_dns", "deployment_setup", "deployment_cleanup"];
+
+/// Bound non-delete `dns_hostname` fences whose owner is gone (cap#442).
+///
+/// Three sites arm `dns_hostname` fences to `reclaim_after = 'infinity'`
+/// outside app delete: the create flow's pre-provider arm, the setup job's
+/// arm, and the cleanup job's arm. A dropped request or a dead worker
+/// leaves the row at infinity, and each site's deliberate fail-closed
+/// error path RETAINS to infinity too — while `claim()` only reclaims
+/// rows whose `reclaim_after` has elapsed, so an infinite row wedges the
+/// hostname (and the job's own retry loop) until manual database action.
+/// `#440`'s sweep covers only `app_delete` rows, and every other repair
+/// loop selects `kubernetes_namespace`.
+///
+/// This loop is the sibling of [`reconcile_orphaned_custom_domain_fences`]
+/// for those three kinds: it selects rows whose fence clock has lapsed and
+/// whose owner lease is not live (the same NOT EXISTS guard), and bounds
+/// `reclaim_after` to the ordinary reclaim quarantine — never clears the
+/// row: owner token, generation, and operation stay, so the next `claim()`
+/// takes over the generation CAS. The statement's own WHERE is the
+/// compare-and-swap: a row is selected once. The bound is authoritative
+/// because all three kinds only ever issue `ensure_dns_pair` — an
+/// idempotent, non-destructive ensure — so after the lease expiry plus
+/// the quarantine window no provider request of the dead owner is pending
+/// (the same margin the crate's quarantine gives a cancelled Kubernetes
+/// call and #440's cancel guard gives a cancelled delete).
+///
+/// Pure database work: it shares the `"orphan-lease-repair"` tick with the
+/// other two loops and never needs its own task.
+pub async fn reconcile_stranded_non_delete_dns_fences(
+    pool: &PgPool,
+) -> Result<u64, MutationLeaseError> {
+    let resources = sqlx::query(
+        "UPDATE external_resource_mutation_leases AS resource
+            SET reclaim_after = GREATEST(resource.locked_until, clock_timestamp())
+                    + ($1::bigint * interval '1 second'),
+                updated_at = clock_timestamp()
+          WHERE resource.resource_scope = 'dns_hostname'
+            AND resource.operation_kind = ANY($2::text[])
+            AND resource.reclaim_after = 'infinity'::timestamptz
+            AND resource.locked_until <= clock_timestamp()
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM app_mutation_leases AS app
+                 WHERE app.owner_token = resource.owner_token
+                   AND app.locked_until > clock_timestamp()
+            )",
+    )
+    .bind(RECLAIM_QUARANTINE_SECONDS)
+    .bind(DNS_HOSTNAME_RECLAIMABLE_OPERATION_KINDS.to_vec())
+    .execute(pool)
+    .await?;
+    Ok(resources.rows_affected())
+}
+
 pub async fn reconcile_orphaned_custom_domain_fences(
     pool: &PgPool,
 ) -> Result<u64, MutationLeaseError> {
@@ -5499,6 +5565,404 @@ pub(crate) mod tests {
             other_still_infinite, 1,
             "the retained deployment marker kind is untouched by the custom-domain reconciler"
         );
+    }
+
+    // cap#442: the non-delete dns_hostname bounded-reclaim loop
+    // (reconcile_stranded_non_delete_dns_fences) — staged through the
+    // production claim + arm paths, asserted through the real claim().
+
+    #[tokio::test]
+    async fn stranded_create_dns_fence_bounded_only_after_expiry_and_reclaimable() {
+        // Decision 4a: a dead owner's app_create_dns fence stays infinite
+        // while its lease is live, is bounded on the first tick after
+        // expiry, and a second app's real claim() on the same hostname
+        // succeeds only after the quarantine elapses.
+        let pool = database_test_pool(2).await;
+        let hostname = format!(
+            "create-strand-{}.example.test",
+            uuid::Uuid::new_v4().simple()
+        );
+        let (_org_id, app_id) = insert_app(&pool, &hostname).await;
+        let state = std::sync::Arc::new(state_with_pool(pool.clone()));
+        let dead = claim(
+            &state,
+            app_id,
+            "app_create_dns",
+            app_id,
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("claim the create dns fence");
+        dead.arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .expect("arm the create dns fence");
+        let owner_token = dead.token;
+        drop(dead);
+
+        // While the owner lease is LIVE, the loop must not touch the fence.
+        let repaired = reconcile_stranded_non_delete_dns_fences(&pool)
+            .await
+            .expect("reconciler run with a live owner");
+        assert_eq!(repaired, 0, "a live owner's fence is never bounded");
+        assert!(
+            dns_fence_is_infinite(&pool, &hostname).await,
+            "precondition: the create fence is still infinite"
+        );
+
+        // The owner dies: both clocks lapse together (renew keeps the app
+        // lease and the fence in one transaction).
+        for table in ["app_mutation_leases", "external_resource_mutation_leases"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET locked_until = clock_timestamp() - interval '1 second' WHERE owner_token = $1"
+            ))
+            .bind(owner_token)
+            .execute(&pool)
+            .await
+            .expect("expire the dead owner's rows");
+        }
+        let repaired = reconcile_stranded_non_delete_dns_fences(&pool)
+            .await
+            .expect("reconciler run after expiry");
+        assert_eq!(repaired, 1, "the dead owner's create fence is bounded");
+        assert!(
+            !dns_fence_is_infinite(&pool, &hostname).await,
+            "the fence is no longer infinite"
+        );
+        // Bounded, never cleared: the owner token and operation stay, so
+        // the next claim takes over the generation CAS.
+        assert_eq!(
+            dns_fence_owner(&pool, &hostname).await,
+            Some(owner_token),
+            "the row keeps its owner token — the bound is a deadline, not a clear"
+        );
+
+        // A second app's REAL create claim on the same hostname: Busy until
+        // the quarantine elapses, then it succeeds.
+        let (_org_two, app_two) = insert_app(&pool, "create-strand-second.example.test").await;
+        let state_two = std::sync::Arc::new(state_with_pool(pool.clone()));
+        let busy = claim(
+            &state_two,
+            app_two,
+            "app_create_dns",
+            app_two,
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await;
+        assert!(
+            matches!(busy, Err(MutationLeaseError::Busy)),
+            "inside the quarantine window the hostname is still fenced: {busy:?}"
+        );
+        // Quarantine elapses (simulated time travel on the deadline only).
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("advance the quarantine deadline");
+        let replacement = claim(
+            &state_two,
+            app_two,
+            "app_create_dns",
+            app_two,
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("the replacement create claim succeeds after the quarantine");
+        replacement
+            .finish()
+            .await
+            .expect("finish the replacement claim");
+    }
+
+    #[tokio::test]
+    async fn stranded_worker_dns_fences_are_bounded_per_kind() {
+        // Decision 4b (the fence-level half): a dead setup job's and a dead
+        // cleanup job's dns_hostname fences — operation_id = deployment id,
+        // exactly as the job runners claim them — are both bounded by the
+        // one loop. The retry-consumer halves live in the
+        // deployment_jobs tests.
+        let pool = database_test_pool(2).await;
+        for (kind, label) in [
+            ("deployment_setup", "setup"),
+            ("deployment_cleanup", "cleanup"),
+        ] {
+            let hostname = format!(
+                "{label}-strand-{}.example.test",
+                uuid::Uuid::new_v4().simple()
+            );
+            let (_org_id, app_id) = insert_app(&pool, &hostname).await;
+            let state = std::sync::Arc::new(state_with_pool(pool.clone()));
+            let deployment_id = Uuid::new_v4();
+            let dead = claim(
+                &state,
+                app_id,
+                kind,
+                deployment_id,
+                false,
+                vec![ResourceFence::dns(&hostname)],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("claim the {kind} dns fence"));
+            dead.arm_resource_scope_until_reconciled("dns_hostname")
+                .await
+                .unwrap_or_else(|_| panic!("arm the {kind} dns fence"));
+            let owner_token = dead.token;
+            drop(dead);
+            for table in ["app_mutation_leases", "external_resource_mutation_leases"] {
+                sqlx::query(&format!(
+                    "UPDATE {table} SET locked_until = clock_timestamp() - interval '1 second' WHERE owner_token = $1"
+                ))
+                .bind(owner_token)
+                .execute(&pool)
+                .await
+                .expect("expire the dead worker's rows");
+            }
+            let repaired = reconcile_stranded_non_delete_dns_fences(&pool)
+                .await
+                .unwrap_or_else(|_| panic!("reconciler run for {kind}"));
+            assert_eq!(repaired, 1, "the dead {kind} fence is bounded");
+            assert!(
+                !dns_fence_is_infinite(&pool, &hostname).await,
+                "the {kind} fence is no longer infinite"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_error_path_dns_fence_is_bounded_and_the_retry_claim_proceeds() {
+        // Decision 4c: the fail-closed error path RETAINS the fence to
+        // infinity through the production retain call; once the owner's
+        // clocks lapse, the loop bounds it and the retried mutation's real
+        // claim() proceeds — the same DB shape at all three sites (the
+        // sites' code paths are deliberately unchanged).
+        let pool = database_test_pool(2).await;
+        let hostname = format!(
+            "retain-strand-{}.example.test",
+            uuid::Uuid::new_v4().simple()
+        );
+        let (_org_id, app_id) = insert_app(&pool, &hostname).await;
+        let state = std::sync::Arc::new(state_with_pool(pool.clone()));
+        let deployment_id = Uuid::new_v4();
+        let mut retained = claim(
+            &state,
+            app_id,
+            "deployment_setup",
+            deployment_id,
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("claim the setup dns fence");
+        retained
+            .arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .expect("arm the setup dns fence");
+        let owner_token = retained.token;
+        retained
+            .retain_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .expect("retain the fence (the fail-closed error path)");
+        drop(retained);
+        assert!(
+            dns_fence_is_infinite(&pool, &hostname).await,
+            "the retained fence is infinite"
+        );
+
+        // The heartbeat stopped with the retain; the clocks lapse. The
+        // app lease's finite reclaim window elapses with them (the fence
+        // row is the infinite one).
+        for table in ["app_mutation_leases", "external_resource_mutation_leases"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET locked_until = clock_timestamp() - interval '2 seconds',
+                        reclaim_after = clock_timestamp() - interval '1 second'
+                  WHERE owner_token = $1 AND reclaim_after <> 'infinity'::timestamptz"
+            ))
+            .bind(owner_token)
+            .execute(&pool)
+            .await
+            .expect("expire the retained owner's finite rows");
+        }
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '1 second'
+              WHERE owner_token = $1",
+        )
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire the retained fence's clock");
+        let repaired = reconcile_stranded_non_delete_dns_fences(&pool)
+            .await
+            .expect("reconciler run");
+        assert_eq!(repaired, 1, "the retained fence is bounded");
+        // Quarantine elapses; the retry's real claim (the same call shape
+        // the setup runner makes) proceeds.
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("advance the quarantine deadline");
+        let retry = claim(
+            &state,
+            app_id,
+            "deployment_setup",
+            deployment_id,
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("the retried setup claim proceeds");
+        retry.finish().await.expect("finish the retry claim");
+    }
+
+    #[tokio::test]
+    async fn app_delete_dns_fence_stays_infinite_under_the_non_delete_loop() {
+        // Decision 4d (boundary): a staged app_delete dns fence (an
+        // expired owner, exactly #438's stranded shape) stays infinite
+        // after THIS loop runs — the delete kind is #440's provider-level
+        // sweep's alone.
+        let pool = database_test_pool(2).await;
+        let hostname = format!(
+            "delete-boundary-{}.example.test",
+            uuid::Uuid::new_v4().simple()
+        );
+        let (_org_id, app_id) = insert_app(&pool, &hostname).await;
+        poison_app_delete_dns_fence(&pool, &hostname, app_id).await;
+
+        let repaired = reconcile_stranded_non_delete_dns_fences(&pool)
+            .await
+            .expect("the non-delete loop runs");
+        assert_eq!(repaired, 0, "the non-delete loop selects no app_delete row");
+        assert!(
+            dns_fence_is_infinite(&pool, &hostname).await,
+            "the app_delete fence stays infinite — #440's sweep owns it"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_apps_delete_refuses_a_hostname_reused_by_the_replacement() {
+        // cap#442 (Decision 4e): after the bound, a replacement app takes
+        // the hostname; the failed app's later delete must not remove the
+        // replacement's records — delete_managed_dns_record_by_hostname
+        // refuses with HostnameInUse while another app owns the name.
+        let pool = database_test_pool(2).await;
+        let hostname = format!("reuse-{}.example.test", uuid::Uuid::new_v4().simple());
+        let (_org_failed, app_failed) = insert_app(&pool, &hostname).await;
+        let (_org_replacement, app_replacement) =
+            insert_app(&pool, "reuse-replacement-base.example.test").await;
+        // The replacement's create claimed the hostname (Decision 4a's
+        // claim) and its ensure_dns_pair persisted record ownership.
+        sqlx::query(
+            "INSERT INTO dns_records (id, app_id, hostname, zone_id, record_id, record_type, target, is_custom)
+             VALUES ($1, $2, $3, NULL, NULL, 'A', 'managed-target', false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app_replacement)
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("persist the replacement's record ownership");
+
+        let config = crate::dns::DnsConfig {
+            cloudflare_api_token: "test-token".to_string(),
+            cloudflare_api_base_url: "http://127.0.0.1:9".to_string(),
+            cloudflare_zone_id: None,
+            cloudflare_zone_name: "example.test".to_string(),
+            target: "managed-target".to_string(),
+            required: true,
+        };
+        let client = reqwest::Client::new();
+        let error = crate::dns::delete_managed_dns_record_by_hostname(
+            &pool,
+            &client,
+            Some(&config),
+            app_failed,
+            &hostname,
+        )
+        .await;
+        assert!(
+            matches!(error, Err(crate::dns::DnsError::HostnameInUse { .. })),
+            "the failed app's delete must refuse the reused hostname: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn renewing_owner_fence_is_never_bounded() {
+        // Decision 4d (liveness): a fence whose owner is still renewing is
+        // never bounded. The discriminating shape: the FENCE row's clock
+        // has lapsed (stale) while the owner's app lease is still live —
+        // only the NOT EXISTS guard keeps the loop away.
+        let pool = database_test_pool(2).await;
+        let hostname = format!("live-owner-{}.example.test", uuid::Uuid::new_v4().simple());
+        let (_org_id, app_id) = insert_app(&pool, &hostname).await;
+        let state = std::sync::Arc::new(state_with_pool(pool.clone()));
+        let live = claim(
+            &state,
+            app_id,
+            "app_create_dns",
+            app_id,
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("claim the live owner's fence");
+        live.arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .expect("arm the live owner's fence");
+        let owner_token = live.token;
+        drop(live);
+        // The fence row's own clock goes stale; the app lease keeps
+        // renewing (locked_until in the future).
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '5 minutes'
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("stale the fence clock only");
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() + interval '5 minutes'
+              WHERE owner_token = $1",
+        )
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("keep the owner lease live");
+
+        let repaired = reconcile_stranded_non_delete_dns_fences(&pool)
+            .await
+            .expect("reconciler run");
+        assert_eq!(repaired, 0, "a renewing owner's fence is never bounded");
+        assert!(
+            dns_fence_is_infinite(&pool, &hostname).await,
+            "the live owner's fence stays armed to infinity"
+        );
+
+        // The staged fence is test-local state on a shared database: remove
+        // it (and its lease rows) so later runs' loop counts stay exact.
+        sqlx::query("DELETE FROM external_resource_mutation_leases WHERE owner_token = $1")
+            .bind(owner_token)
+            .execute(&pool)
+            .await
+            .expect("remove the liveness fence fixture");
+        sqlx::query("DELETE FROM app_mutation_leases WHERE owner_token = $1")
+            .bind(owner_token)
+            .execute(&pool)
+            .await
+            .expect("remove the liveness lease fixture");
     }
 
     #[tokio::test]
