@@ -1691,6 +1691,77 @@ hkdf-info = "tls-state-luks-key"
     }
 
     #[test]
+    fn retained_expired_certificate_renewal_200_invalid_body_fails_and_keeps_certificate() {
+        // QA S4 / review F-2: a 200 response whose body does not validate —
+        // here a chain that covers the configured set and anchors to the
+        // test root but was minted for a DIFFERENT key than the retained
+        // one — must be rejected BEFORE tls.crt is written. The retained
+        // certificate is expired, so the failed renewal stays terminal, and
+        // the retained file must be byte-identical afterwards (no partial
+        // or garbage write).
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (root, chain) = mint_test_chain(TEST_HOSTNAMES, |params| {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        });
+        let anchors = [root.anchor()];
+        let persistent = write_retained_state(
+            dir.path(),
+            &full_chain_pem(&[&chain.chain_pem, &root.cert.pem()]),
+            &chain.leaf_key_pem,
+        );
+        let cert_before = std::fs::read(cert_path(&persistent)).unwrap();
+        let key_before = std::fs::read(key_path(&persistent)).unwrap();
+        // The invalid success body: a well-formed, anchored, full-coverage
+        // replacement minted for the WRONG key. Only the leaf/key binding
+        // check distinguishes it from a legitimate response.
+        let wrong_key = KeyPair::generate().unwrap();
+        let wrong_leaf = mint_leaf_for_key(&root.params, &root.key, &wrong_key, TEST_HOSTNAMES);
+        let wrong_chain = full_chain_pem(&[&wrong_leaf, &root.cert.pem()]);
+        let success_body = json!({"certificate_chain_pem": wrong_chain}).to_string();
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), success_body)], events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (wait, _clock) = fake_wait(
+            dir.path().join("init-acme-cooldown"),
+            Utc::now(),
+            events.clone(),
+        );
+
+        let error = provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("validating TLS certificate broker response"),
+            "the response must be validated before any write: {rendered}"
+        );
+        assert!(
+            rendered.contains("leaf does not match the retained TLS private key"),
+            "the wrong-key body is what fails validation: {rendered}"
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["post"],
+            "the broker was called"
+        );
+        assert_eq!(
+            std::fs::read(cert_path(&persistent)).unwrap(),
+            cert_before,
+            "an invalid broker response must never write tls.crt"
+        );
+        assert_eq!(
+            std::fs::read(key_path(&persistent)).unwrap(),
+            key_before,
+            "the retained private key is never touched"
+        );
+    }
+
+    #[test]
     fn retained_due_but_valid_certificate_renews_with_retained_key() {
         // A retained certificate inside its last third of validity is due:
         // the renewal order goes out while the old certificate still
@@ -2825,6 +2896,24 @@ hkdf-info = "tls-state-luks-key"
         broker_script: Vec<(String, String)>,
         events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) -> (String, std::thread::JoinHandle<()>) {
+        let (base, handle, _bodies) =
+            spawn_scripted_broker_with_body_capture(broker_script, events, None);
+        (base, handle)
+    }
+
+    /// Scripted broker that ALSO captures every POSTed request body, so a
+    /// test can decode the re-order request (`csr_der_base64`) the way the
+    /// real broker sees it.
+    #[allow(clippy::type_complexity)]
+    fn spawn_scripted_broker_with_body_capture(
+        broker_script: Vec<(String, String)>,
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        bodies: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let script = std::sync::Arc::new(std::sync::Mutex::new(
@@ -2832,6 +2921,7 @@ hkdf-info = "tls-state-luks-key"
                 .into_iter()
                 .collect::<std::collections::VecDeque<_>>(),
         ));
+        let captured_bodies = bodies.clone();
         let handle = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
@@ -2864,6 +2954,12 @@ hkdf-info = "tls-state-luks-key"
                     )
                 } else {
                     events.lock().unwrap().push("post".to_string());
+                    if let Some(bodies) = &captured_bodies {
+                        bodies
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&request_body).into_owned());
+                    }
                     let mut script = script.lock().unwrap();
                     match script.len() {
                         0 => panic!("broker script exhausted"),
@@ -2879,7 +2975,7 @@ hkdf-info = "tls-state-luks-key"
                 stream.flush().ok();
             }
         });
-        (base, handle)
+        (base, handle, bodies)
     }
 
     /// Mint a leaf for an explicitly supplied key — needed when the broker
@@ -3616,8 +3712,12 @@ hkdf-info = "tls-state-luks-key"
         let renewed_pem = mint_leaf_for_key(&root.params, &root.key, &retained_key, &full_set);
         let renewed_chain = full_chain_pem(&[&renewed_pem, &root.cert.pem()]);
         let success_body = json!({"certificate_chain_pem": renewed_chain}).to_string();
-        let (base, _server) =
-            spawn_scripted_broker(vec![("200 OK".to_string(), success_body)], events.clone());
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (base, _server, _) = spawn_scripted_broker_with_body_capture(
+            vec![("200 OK".to_string(), success_body)],
+            events.clone(),
+            Some(bodies.clone()),
+        );
         let cfg = broker_config_with_endpoints(
             dir.path(),
             &full_set,
@@ -3641,6 +3741,48 @@ hkdf-info = "tls-state-luks-key"
             std::fs::read_to_string(key_path(&persistent)).unwrap(),
             chain.leaf_key_pem,
             "the retained private key is never replaced"
+        );
+        // QA S3 / review SHOULD-FIX: the re-order REQUEST must carry a CSR
+        // covering the FULL configured hostname set (issue_via_broker
+        // builds it from cfg.tls_certificate_hostnames). The scripted
+        // broker ignores the request body, so pin the protocol ask, not
+        // just the written end state.
+        let request_bodies = bodies.lock().unwrap().clone();
+        assert_eq!(request_bodies.len(), 1, "one re-order POST");
+        let request: serde_json::Value =
+            serde_json::from_str(&request_bodies[0]).expect("parsing re-order request JSON");
+        let csr_der = base64::engine::general_purpose::STANDARD
+            .decode(
+                request["csr_der_base64"]
+                    .as_str()
+                    .expect("re-order request carries csr_der_base64"),
+            )
+            .expect("base64-decoding csr_der_base64");
+        use x509_parser::certification_request::X509CertificationRequest;
+        use x509_parser::extensions::{GeneralName, ParsedExtension};
+        use x509_parser::prelude::FromDer;
+        let (_, csr) =
+            X509CertificationRequest::from_der(&csr_der).expect("parsing the re-order CSR");
+        let mut requested: Vec<String> = csr
+            .requested_extensions()
+            .into_iter()
+            .flatten()
+            .filter_map(|extension| match extension {
+                ParsedExtension::SubjectAlternativeName(san) => Some(san),
+                _ => None,
+            })
+            .flat_map(|san| san.general_names.iter())
+            .filter_map(|name| match name {
+                GeneralName::DNSName(dns) => Some(dns.to_string()),
+                _ => None,
+            })
+            .collect();
+        requested.sort();
+        let mut configured: Vec<String> = full_set.iter().map(|h| h.to_string()).collect();
+        configured.sort();
+        assert_eq!(
+            requested, configured,
+            "the re-order CSR must request the FULL configured hostname set"
         );
     }
 
