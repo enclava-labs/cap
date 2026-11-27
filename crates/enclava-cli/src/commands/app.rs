@@ -4296,5 +4296,5 @@ fn signer_deferred_hint_for(cause: Option<&str>) -> String {
 /// Pure so the exact wording stays pinned by unit tests before other
 /// surfaces match on it.
 fn signer_deferred_hint() -> String {
-    "the signer rotation IS COMMITTED and the signer change is live; the KBS policy publication is pending and completes on the next deploy or the next CAP restart (the startup KBS reconciliation clears the fence) - no action is needed for publication; running `signer rotate` again starts a NEW rotation (fresh confirmation token) and replaces the current signer, it does not only retry publication".to_string()
+    "the signer rotation IS COMMITTED and the new signer is authoritative (in signed-policy mode it takes effect at the next deploy, which must be signed by it); the KBS policy publication is pending and completes on the next deploy or the next CAP restart (the startup KBS reconciliation clears the fence) - no action is needed for publication; running `signer rotate` again starts a NEW rotation (fresh confirmation token) and replaces the current signer, it does not only retry publication".to_string()
 }

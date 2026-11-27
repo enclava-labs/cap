@@ -801,13 +801,17 @@ fn signer_deferred_hint_pins_the_committed_rotation_wording() {
     // A deferred 409 that survives the client's bounded same-key retries
     // means the identity change is already COMMITTED and only the KBS policy
     // publication is pending. The hint must carry the load-bearing facts:
-    // committed-and-live, publication completes WITHOUT user action (next
-    // deploy / next CAP restart), and a re-run is a NEW rotation, not a
-    // publication retry — it replaces the current signer (rework of the
-    // original wording: a re-run was presented as the remedy).
+    // committed-and-authoritative (in signed-policy mode the new signer
+    // takes effect at the next deploy, which must be signed by it),
+    // publication completes WITHOUT user action (next deploy / next CAP
+    // restart), and a re-run is a NEW rotation, not a publication retry — it
+    // replaces the current signer (rework of the original wording: a re-run
+    // was presented as the remedy).
     let hint = signer_deferred_hint_for(Some("signer_rotation_publication_pending"));
     assert!(hint.contains("IS COMMITTED"), "got: {hint}");
-    assert!(hint.contains("signer change is live"), "got: {hint}");
+    assert!(hint.contains("new signer is authoritative"), "got: {hint}");
+    assert!(hint.contains("must be signed by it"), "got: {hint}");
+    assert!(!hint.contains("is live"), "got: {hint}");
     assert!(hint.contains("KBS policy publication"), "got: {hint}");
     assert!(hint.contains("pending"), "got: {hint}");
     assert!(hint.contains("next deploy"), "got: {hint}");
