@@ -574,8 +574,13 @@ mod tests {
         // the past and asserting the returned wait already includes those
         // five seconds (round-2 review: the unit pins could not catch the
         // epoch being dropped).
+        // A twenty-second epoch (still under the 28 s deadline, so the loop
+        // is not capped): the discrimination margin between the two runs
+        // becomes nineteen seconds, and the entry run's two empty-mount
+        // global syncs would have to differ by that much for a regression
+        // to pass — while the deadline caps every run at 28 s anyway.
         let epoch =
-            signal_safe_monotonic_nanos().saturating_sub(Duration::from_secs(5).as_nanos() as u64);
+            signal_safe_monotonic_nanos().saturating_sub(Duration::from_secs(20).as_nanos() as u64);
         // Call BOTH production entry points with no mounts, no siblings,
         // and a zero initial wait: the epoch run must outrun the
         // monitor-entry run by the epoch's five-second offset, whatever
@@ -595,7 +600,7 @@ mod tests {
         let (_reports, from_epoch) =
             execute_teardown_since_epoch(&request, |_| Vec::new(), |_| {}, epoch);
         assert!(
-            from_epoch.waited >= from_entry.waited + Duration::from_secs(4),
+            from_epoch.waited >= from_entry.waited + Duration::from_secs(19),
             "the production clock must start at the handler epoch, not monitor entry:              epoch {:?} vs entry {:?}",
             from_epoch.waited,
             from_entry.waited
