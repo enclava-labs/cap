@@ -4240,11 +4240,16 @@ fn destroy_failure_hint(code: Option<&str>, message: &str, app_name: &str) -> Op
 }
 
 /// `signer set` and `signer rotate` share the PATCH; a deferred-409 that
-/// survives the client's same-key retries means the identity change is
-/// COMMITTED and only its KBS key publication is still settling. Explain
-/// that on stderr before the error propagates (the command still exits
-/// non-zero), the same pattern as `destroy_failure_hint`: without it the
-/// raw API code is the only signal an operator gets.
+/// survives the client's same-key retries means one of two server cases,
+/// told apart only by the in-band `cause` the deferral body carries (the
+/// same convention `destroy_failure_hint` matches on):
+/// `signer_rotation_publication_pending` (or a cause-less deferral from an
+/// older server) - the identity change is COMMITTED and only its KBS key
+/// publication is settling; `kbs_publication_not_configured` - the request
+/// was rejected by preflight and NOTHING was committed. Explain which on
+/// stderr before the error propagates (the command still exits non-zero),
+/// the same pattern as `destroy_failure_hint`: without it the raw API code
+/// is the only signal an operator gets.
 async fn set_signer_explaining(
     api: &ApiClient,
     app_name: &str,
@@ -4253,10 +4258,38 @@ async fn set_signer_explaining(
     match api.set_signer(app_name, req).await {
         Ok(value) => Ok(value),
         Err(error) if is_deferred_idempotency_in_progress(&error) => {
-            eprintln!("Hint: {}", signer_deferred_hint());
+            eprintln!(
+                "Hint: {}",
+                signer_deferred_hint_for(deferred_cause_of(&error))
+            );
             Err(error)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// The in-band `cause` a deferred signer 409 carries, if any (the composed
+/// message renders it as "(cause: <cause>)").
+fn deferred_cause_of(error: &ApiError) -> Option<&str> {
+    let ApiError::Api { message, .. } = error else {
+        return None;
+    };
+    message
+        .split("(cause: ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+}
+
+fn signer_deferred_hint_for(cause: Option<&str>) -> String {
+    match cause {
+        // Preflight rejection: CAP released the idempotency lease as
+        // known-not-applied -- the original signer stands and no token was
+        // consumed. Saying "COMMITTED" here would be a lie.
+        Some("kbs_publication_not_configured") =>
+            "the signer identity change was NOT applied: KBS key publication is not configured for this app, so CAP rejected the request before committing; configure KBS publication, then re-run (the app still has its previous signer and no confirmation token was consumed)".to_string(),
+        // The publication checkpoint case (and a cause-less deferral from
+        // an older server): committed, only publication settling.
+        _ => signer_deferred_hint(),
     }
 }
 

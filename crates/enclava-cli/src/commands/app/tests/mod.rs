@@ -803,12 +803,54 @@ fn signer_deferred_hint_pins_the_committed_rotation_wording() {
     // publication is settling. The hint must say all three load-bearing
     // facts (committed, settling publication, safe to re-run) because the
     // raw API code carries none of them.
-    let hint = signer_deferred_hint();
+    let hint = signer_deferred_hint_for(Some("signer_rotation_publication_pending"));
     assert!(hint.contains("COMMITTED"), "got: {hint}");
     assert!(hint.contains("KBS key publication"), "got: {hint}");
     assert!(hint.contains("still settling"), "got: {hint}");
     assert!(hint.contains("safe to re-run"), "got: {hint}");
     assert!(hint.contains("fresh confirmation token"), "got: {hint}");
+
+    // A cause-less deferral (an older server that does not stamp the
+    // cause) keeps the committed wording: the publication checkpoint case
+    // is the deferral this contract was designed around.
+    let causeless = signer_deferred_hint_for(None);
+    assert_eq!(causeless, signer_deferred_hint());
+
+    // The preflight rejection carries the same deferred 409 but releases
+    // the lease as known-not-applied: NOTHING was committed, and the
+    // committed wording would be a lie (review follow-up on PR #437).
+    let rejected = signer_deferred_hint_for(Some("kbs_publication_not_configured"));
+    assert!(rejected.contains("NOT applied"), "got: {rejected}");
+    assert!(rejected.contains("not configured"), "got: {rejected}");
+    assert!(rejected.contains("previous signer"), "got: {rejected}");
+    assert!(
+        rejected.contains("no confirmation token was consumed"),
+        "got: {rejected}"
+    );
+    assert!(!rejected.contains("COMMITTED"), "got: {rejected}");
+}
+
+#[test]
+fn deferred_cause_of_reads_the_in_band_cause_from_the_composed_message() {
+    let with_cause = ApiError::Api {
+        status: 409,
+        code: Some("idempotency_request_in_progress".to_string()),
+        message: "idempotency_request_in_progress (cause: kbs_publication_not_configured) (retry after ~5s)".to_string(),
+        idempotency_disposition: Some("deferred".to_string()),
+    };
+    assert_eq!(
+        deferred_cause_of(&with_cause),
+        Some("kbs_publication_not_configured")
+    );
+
+    let without_cause = ApiError::Api {
+        status: 409,
+        code: Some("idempotency_request_in_progress".to_string()),
+        message: "idempotency_request_in_progress (retry after ~5s)".to_string(),
+        idempotency_disposition: Some("deferred".to_string()),
+    };
+    assert_eq!(deferred_cause_of(&without_cause), None);
+    assert_eq!(deferred_cause_of(&ApiError::NotAuthenticated), None);
 }
 
 #[test]
