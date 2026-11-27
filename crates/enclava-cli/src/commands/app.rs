@@ -14,7 +14,7 @@ use crate::commands::{counted_progress, format_duration, timed_progress};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use clap::Subcommand;
-use enclava_cli::api_client::{ApiClient, ApiError};
+use enclava_cli::api_client::{ApiClient, ApiError, is_deferred_idempotency_in_progress};
 use enclava_cli::api_types::*;
 use enclava_cli::app_config::{AppConfig, AppConfigError};
 use enclava_cli::config::{self, CliPaths};
@@ -3909,7 +3909,7 @@ pub async fn signer(cmd: SignerCommand) -> Result<(), Box<dyn std::error::Error>
                 issuer: issuer.clone(),
                 email_confirmation_token: None,
             };
-            let _ = api.set_signer(&app_name, &req).await?;
+            let _ = set_signer_explaining(&api, &app_name, &req).await?;
             println!("Signer identity set for {app_name}.");
             println!("  Subject: {subject}");
             println!("  Issuer:  {issuer}");
@@ -3945,7 +3945,7 @@ pub async fn signer(cmd: SignerCommand) -> Result<(), Box<dyn std::error::Error>
                 issuer: issuer.clone(),
                 email_confirmation_token: Some(confirmation_token),
             };
-            let _ = api.set_signer(&app_name, &req).await?;
+            let _ = set_signer_explaining(&api, &app_name, &req).await?;
             println!("Signer identity rotated for {app_name}.");
             println!("  Subject: {subject}");
             println!("  Issuer:  {issuer}");
@@ -4237,4 +4237,31 @@ fn destroy_failure_hint(code: Option<&str>, message: &str, app_name: &str) -> Op
         ),
         _ => None,
     }
+}
+
+/// `signer set` and `signer rotate` share the PATCH; a deferred-409 that
+/// survives the client's same-key retries means the identity change is
+/// COMMITTED and only its KBS key publication is still settling. Explain
+/// that on stderr before the error propagates (the command still exits
+/// non-zero), the same pattern as `destroy_failure_hint`: without it the
+/// raw API code is the only signal an operator gets.
+async fn set_signer_explaining(
+    api: &ApiClient,
+    app_name: &str,
+    req: &SetSignerRequest,
+) -> Result<serde_json::Value, ApiError> {
+    match api.set_signer(app_name, req).await {
+        Ok(value) => Ok(value),
+        Err(error) if is_deferred_idempotency_in_progress(&error) => {
+            eprintln!("Hint: {}", signer_deferred_hint());
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Pure so the exact wording stays pinned by unit tests before other
+/// surfaces match on it.
+fn signer_deferred_hint() -> String {
+    "the signer identity change was COMMITTED; its KBS key publication is still settling and completes on the next deploy or on a re-run (a re-run of `signer rotate` issues a fresh confirmation token); it is safe to re-run".to_string()
 }

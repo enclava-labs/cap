@@ -128,29 +128,10 @@ impl ApiClient {
     }
 
     async fn check_response(&self, resp: reqwest::Response) -> Result<reqwest::Response, ApiError> {
-        let status = resp.status();
-        if status.is_success() {
+        if resp.status().is_success() {
             Ok(resp)
         } else {
-            let status_code = status.as_u16();
-            // Bound the error-body read too: a hostile API must not be able
-            // to stream an unbounded "error" body into CLI memory either.
-            let composed = match read_bounded_body(resp, MAX_API_ERROR_BODY_BYTES).await {
-                Ok(bytes) => match serde_json::from_slice::<ApiErrorBody>(&bytes) {
-                    Ok(body) => compose_api_error(status_code, body),
-                    Err(_) => ComposedApiError::plain(format!("HTTP {status_code}")),
-                },
-                Err(ApiError::ResponseTooLarge(cap)) => ComposedApiError::plain(format!(
-                    "HTTP {status_code} (error body exceeded {cap}-byte cap)"
-                )),
-                Err(_) => ComposedApiError::plain(format!("HTTP {status_code}")),
-            };
-            Err(ApiError::Api {
-                status: status_code,
-                code: composed.code,
-                message: composed.message,
-                idempotency_disposition: composed.idempotency_disposition,
-            })
+            Err(response_error(resp).await.0)
         }
     }
 
@@ -292,15 +273,44 @@ impl ApiClient {
         app_name: &str,
         req: &SetSignerRequest,
     ) -> Result<serde_json::Value, ApiError> {
-        let resp = self
-            .http
-            .patch(self.url(&format!("/apps/{app_name}/signer")))
-            .headers(self.auth_headers()?)
-            .json(req)
-            .send()
-            .await?;
-        let resp = self.check_response(resp).await?;
-        read_bounded_json(resp).await
+        // paas#447/cap#422: the signer PATCH (set and rotate share it) rides
+        // CAP's deferred-409 contract. One CLI-minted Idempotency-Key per
+        // invocation, reused by every retry, so the publication checkpoint
+        // is reclaimed by the same key instead of re-executing the commit;
+        // a later invocation mints a fresh key. A deferred 409 retries the
+        // SAME request after the server's retry_after hint, at most
+        // SIGNER_DEFERRED_MAX_RETRIES times; a still-deferred response and
+        // every terminal result (superseded conflict, 400/403, any
+        // non-deferred error) surface unchanged.
+        let idempotency_key = signer_idempotency_key();
+        let mut deferred_retries: u32 = 0;
+        loop {
+            let resp = self
+                .http
+                .patch(self.url(&format!("/apps/{app_name}/signer")))
+                .headers(self.auth_headers()?)
+                .header("Idempotency-Key", &idempotency_key)
+                .json(req)
+                .send()
+                .await?;
+            if resp.status().is_success() {
+                return read_bounded_json(resp).await;
+            }
+            let (error, retry_after) = response_error(resp).await;
+            if !is_deferred_idempotency_in_progress(&error)
+                || deferred_retries >= SIGNER_DEFERRED_MAX_RETRIES
+            {
+                return Err(error);
+            }
+            let seconds = retry_after
+                .unwrap_or(SIGNER_DEFERRED_RETRY_AFTER_DEFAULT_SECONDS)
+                .clamp(
+                    SIGNER_DEFERRED_RETRY_AFTER_MIN_SECONDS,
+                    SIGNER_DEFERRED_RETRY_AFTER_MAX_SECONDS,
+                );
+            tokio::time::sleep(std::time::Duration::from_secs(seconds as u64)).await;
+            deferred_retries += 1;
+        }
     }
 
     pub async fn issue_signer_rotation_token(
@@ -959,6 +969,81 @@ pub const MAX_API_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Error bodies carry a short code/message envelope; anything larger is not
 /// a legitimate error payload.
 const MAX_API_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Deferred-409 same-key retry bounds for the signer PATCH (set + rotate):
+/// at most two retries (~30 s total budget), each sleep clamped to the
+/// window around the server's `retry_after` hint (missing hint -> default).
+const SIGNER_DEFERRED_MAX_RETRIES: u32 = 2;
+const SIGNER_DEFERRED_RETRY_AFTER_MIN_SECONDS: i64 = 1;
+const SIGNER_DEFERRED_RETRY_AFTER_MAX_SECONDS: i64 = 15;
+const SIGNER_DEFERRED_RETRY_AFTER_DEFAULT_SECONDS: i64 = 5;
+
+/// One fresh `Idempotency-Key` per signer command invocation: CAP's
+/// idempotency lease binds the request to the key and the deferred
+/// publication checkpoint is reclaimed only by a SAME-key retry, so every
+/// retry of one invocation reuses it while a later invocation starts a new
+/// lease. Random, not derived from the body -- a deterministic key would
+/// let a later invocation replay an old lease.
+fn signer_idempotency_key() -> String {
+    format!("cli-signer:{}", uuid::Uuid::new_v4())
+}
+
+/// CAP's deferred-409 contract: the request is deferred under a live or
+/// reapplied idempotency lease and the caller must retry with the same key
+/// (`idempotency_disposition: "deferred"`; the legacy `disposition`
+/// field carries the same statement). The CLI acts on it only for the
+/// signer PATCH; everything else -- including a legacy in-progress 409
+/// without the deferred stamp -- passes through untouched.
+pub fn is_deferred_idempotency_in_progress(error: &ApiError) -> bool {
+    let ApiError::Api {
+        status,
+        code,
+        idempotency_disposition,
+        ..
+    } = error
+    else {
+        return false;
+    };
+    *status == 409
+        && code.as_deref() == Some("idempotency_request_in_progress")
+        && idempotency_disposition.as_deref() == Some("deferred")
+}
+
+/// Convert a non-success response into its `ApiError` and, separately, the
+/// raw `retry_after` seconds the body carried. The hint is already folded
+/// into the composed message; it is surfaced on its own so callers that
+/// ACT on the server's lease hint (the deferred-409 same-key retry) do not
+/// parse prose back out of the display string.
+async fn response_error(resp: reqwest::Response) -> (ApiError, Option<i64>) {
+    let status_code = resp.status().as_u16();
+    // Bound the error-body read too: a hostile API must not be able
+    // to stream an unbounded "error" body into CLI memory either.
+    let (composed, retry_after) = match read_bounded_body(resp, MAX_API_ERROR_BODY_BYTES).await {
+        Ok(bytes) => match serde_json::from_slice::<ApiErrorBody>(&bytes) {
+            Ok(body) => {
+                let retry_after = body.retry_after;
+                (compose_api_error(status_code, body), retry_after)
+            }
+            Err(_) => (ComposedApiError::plain(format!("HTTP {status_code}")), None),
+        },
+        Err(ApiError::ResponseTooLarge(cap)) => (
+            ComposedApiError::plain(format!(
+                "HTTP {status_code} (error body exceeded {cap}-byte cap)"
+            )),
+            None,
+        ),
+        Err(_) => (ComposedApiError::plain(format!("HTTP {status_code}")), None),
+    };
+    (
+        ApiError::Api {
+            status: status_code,
+            code: composed.code,
+            message: composed.message,
+            idempotency_disposition: composed.idempotency_disposition,
+        },
+        retry_after,
+    )
+}
 
 fn http_client_for(url: &str) -> reqwest::Client {
     http_client_builder_for(url)
@@ -1696,5 +1781,64 @@ mod loopback_tests {
         ] {
             assert!(validated_discovered_api_url(invalid).is_err(), "{invalid}");
         }
+    }
+}
+
+#[cfg(test)]
+mod signer_deferred_tests {
+    use super::*;
+
+    #[test]
+    fn signer_idempotency_key_is_fresh_per_invocation() {
+        let first = signer_idempotency_key();
+        let second = signer_idempotency_key();
+        assert!(first.starts_with("cli-signer:"), "got: {first}");
+        assert_ne!(
+            first, second,
+            "two invocations must not share an idempotency lease"
+        );
+    }
+
+    #[test]
+    fn deferred_409_predicate_discriminates_the_contract() {
+        let deferred = ApiError::Api {
+            status: 409,
+            code: Some("idempotency_request_in_progress".to_string()),
+            message: "idempotency_request_in_progress (retry after ~5s)".to_string(),
+            idempotency_disposition: Some("deferred".to_string()),
+        };
+        assert!(is_deferred_idempotency_in_progress(&deferred));
+
+        // A legacy in-progress 409 without the deferred stamp is not the
+        // same-key contract: no client-side retry, no committed-rotation
+        // hint.
+        let legacy = ApiError::Api {
+            status: 409,
+            code: Some("idempotency_request_in_progress".to_string()),
+            message: "idempotency_request_in_progress".to_string(),
+            idempotency_disposition: None,
+        };
+        assert!(!is_deferred_idempotency_in_progress(&legacy));
+
+        // Terminal results never match, even as a 409.
+        let superseded = ApiError::Api {
+            status: 409,
+            code: Some("signer_rotation_superseded".to_string()),
+            message: "signer_rotation_superseded".to_string(),
+            idempotency_disposition: None,
+        };
+        assert!(!is_deferred_idempotency_in_progress(&superseded));
+
+        let rejected = ApiError::Api {
+            status: 403,
+            code: Some("forbidden".to_string()),
+            message: "forbidden".to_string(),
+            idempotency_disposition: None,
+        };
+        assert!(!is_deferred_idempotency_in_progress(&rejected));
+
+        assert!(!is_deferred_idempotency_in_progress(
+            &ApiError::NotAuthenticated
+        ));
     }
 }

@@ -797,6 +797,21 @@ fn destroy_failure_hint_covers_lane_conflicts_and_teardown_failures() {
 }
 
 #[test]
+fn signer_deferred_hint_pins_the_committed_rotation_wording() {
+    // A deferred 409 that survives the client's bounded same-key retries
+    // means the identity change is already COMMITTED and only the KBS key
+    // publication is settling. The hint must say all three load-bearing
+    // facts (committed, settling publication, safe to re-run) because the
+    // raw API code carries none of them.
+    let hint = signer_deferred_hint();
+    assert!(hint.contains("COMMITTED"), "got: {hint}");
+    assert!(hint.contains("KBS key publication"), "got: {hint}");
+    assert!(hint.contains("still settling"), "got: {hint}");
+    assert!(hint.contains("safe to re-run"), "got: {hint}");
+    assert!(hint.contains("fresh confirmation token"), "got: {hint}");
+}
+
+#[test]
 fn destroy_removes_the_template_deploy_resume_file_for_that_name() {
     let dir = tempfile::tempdir().unwrap();
     let paths = CliPaths::from_root(dir.path().to_path_buf()).unwrap();
