@@ -1832,6 +1832,24 @@ pub fn spawn_deployment_dispatcher(state: AppState, shutdown: tokio_util::sync::
                     "failed to repair orphaned custom-domain namespace fences"
                 ),
             }
+            // Non-delete dns_hostname fences (cap#442): the create/setup/
+            // cleanup kinds only ever `ensure_dns_pair`, so once their
+            // owner is gone, expiry plus the ordinary quarantine is
+            // authority to bound the fence for retry — pure database work,
+            // so it shares this tick. The delete kind stays #440's
+            // provider-level sweep's alone.
+            match crate::mutation_leases::reconcile_stranded_non_delete_dns_fences(&repair_state.db)
+                .await
+            {
+                Ok(repaired) if repaired > 0 => {
+                    tracing::warn!(repaired, "bounded stranded non-delete dns_hostname fences")
+                }
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    error_code = "non_delete_dns_fence_repair_failed",
+                    "failed to bound stranded non-delete dns_hostname fences"
+                ),
+            }
             match expire_customer_config_holds(&repair_state.db).await {
                 Ok(expired) if expired > 0 => tracing::warn!(
                     expired,
@@ -12311,5 +12329,250 @@ pub(crate) mod tests {
         .expect("verify job cleanup");
         assert!(!app_exists);
         assert!(!job_exists);
+    }
+
+    // cap#442: the existing retry consumers complete once the new
+    // bounded-reclaim loop (reconcile_stranded_non_delete_dns_fences) has
+    // bounded a dead worker's dns_hostname fence — no manual database action.
+
+    #[tokio::test]
+    async fn stranded_setup_fence_requeues_then_reclaims_without_manual_action() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        // The app owns a custom domain, so the setup runner's real claim
+        // competes for its dns_hostname fence (the arm site).
+        let hostname = format!("setup-retry-{}.example.test", Uuid::new_v4().simple());
+        sqlx::query("UPDATE apps SET custom_domain = $1 WHERE id = $2")
+            .bind(&hostname)
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("pin the app's custom domain");
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+
+        // A previous setup attempt died right after the arm.
+        let dead = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_setup",
+            deployment_id,
+            false,
+            vec![crate::mutation_leases::ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("claim the dead attempt's fence");
+        dead.arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .expect("arm the dead attempt's fence");
+        drop(dead);
+        let owner_token: Uuid =
+            sqlx::query_scalar("SELECT owner_token FROM app_mutation_leases WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the dead owner's token");
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE owner_token = $1",
+        )
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire the dead owner's app lease");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '1 second'
+              WHERE owner_token = $1",
+        )
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire the dead owner's fence clock");
+
+        // The requeued job's REAL setup claim (the runner's call shape) is
+        // Busy behind the poisoned fence; the runner's own consumer
+        // requeues it.
+        let resources = vec![
+            crate::mutation_leases::ResourceFence::dns(&app.domain),
+            crate::mutation_leases::ResourceFence::dns(
+                app.tee_domain.as_deref().unwrap_or(&app.domain),
+            ),
+            crate::mutation_leases::ResourceFence::kbs_policy(),
+            crate::mutation_leases::ResourceFence::dns(&hostname),
+        ];
+        let busy = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_setup",
+            deployment_id,
+            false,
+            resources.clone(),
+        )
+        .await;
+        assert!(
+            matches!(busy, Err(crate::mutation_leases::MutationLeaseError::Busy)),
+            "the poisoned fence keeps the retry Busy: {busy:?}"
+        );
+        let job = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim the requeued setup job")
+            .expect("the requeued setup job exists");
+        requeue_setup_job(&pool, &job, "mutation_fence_busy")
+            .await
+            .expect("the existing retry consumer requeues the job");
+        let job_state: String =
+            sqlx::query_scalar("SELECT state FROM deployment_apply_jobs WHERE deployment_id = $1")
+                .bind(deployment_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the job state");
+        assert_eq!(job_state, "setup_pending", "the job is back on the queue");
+
+        // The new loop bounds the fence; the quarantine elapses; the SAME
+        // claim the runner makes now succeeds — no manual database action.
+        let repaired = crate::mutation_leases::reconcile_stranded_non_delete_dns_fences(&pool)
+            .await
+            .expect("the bounded-reclaim loop runs");
+        assert_eq!(repaired, 1, "the stranded setup fence is bounded");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("advance the quarantine deadline");
+        let retry = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_setup",
+            deployment_id,
+            false,
+            resources,
+        )
+        .await
+        .expect("the requeued job's claim succeeds after the bound");
+        retry.finish().await.expect("finish the retried claim");
+    }
+
+    #[tokio::test]
+    async fn stranded_cleanup_fence_requeues_then_reclaims_without_manual_action() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let hostname = format!("cleanup-retry-{}.example.test", Uuid::new_v4().simple());
+        sqlx::query("UPDATE apps SET custom_domain = $1 WHERE id = $2")
+            .bind(&hostname)
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("pin the app's custom domain");
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+
+        // A previous cleanup attempt died right after the arm.
+        let dead = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_cleanup",
+            deployment_id,
+            true,
+            vec![crate::mutation_leases::ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("claim the dead cleanup attempt's fence");
+        dead.arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .expect("arm the dead cleanup attempt's fence");
+        drop(dead);
+        let owner_token: Uuid =
+            sqlx::query_scalar("SELECT owner_token FROM app_mutation_leases WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the dead owner's token");
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE owner_token = $1",
+        )
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire the dead owner's app lease");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '1 second'
+              WHERE owner_token = $1",
+        )
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire the dead owner's fence clock");
+
+        // The requeued cleanup's REAL claim (the runner's call shape,
+        // allow_deleting = true) is Busy behind the poisoned fence; the
+        // runner's own consumer releases it for retry.
+        let busy = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_cleanup",
+            deployment_id,
+            true,
+            vec![crate::mutation_leases::ResourceFence::dns(&hostname)],
+        )
+        .await;
+        assert!(
+            matches!(busy, Err(crate::mutation_leases::MutationLeaseError::Busy)),
+            "the poisoned fence keeps the cleanup retry Busy: {busy:?}"
+        );
+        // The cleanup retry consumer (release_cleanup_for_retry) is the
+        // path the runner takes on a Busy claim.
+        let lock_token: Option<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT lock_token FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("read the job's lock token")
+        .flatten();
+        if let Some(lock_token) = lock_token {
+            release_cleanup_for_retry(&pool, deployment_id, lock_token)
+                .await
+                .expect("the existing cleanup retry consumer runs");
+        }
+
+        // The new loop bounds the fence; the quarantine elapses; the SAME
+        // claim the cleanup runner makes now succeeds.
+        let repaired = crate::mutation_leases::reconcile_stranded_non_delete_dns_fences(&pool)
+            .await
+            .expect("the bounded-reclaim loop runs");
+        assert_eq!(repaired, 1, "the stranded cleanup fence is bounded");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("advance the quarantine deadline");
+        let retry = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_cleanup",
+            deployment_id,
+            true,
+            vec![crate::mutation_leases::ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("the requeued cleanup's claim succeeds after the bound");
+        retry.finish().await.expect("finish the retried claim");
     }
 }

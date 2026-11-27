@@ -2363,6 +2363,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn newer_deployment_cannot_start_while_a_cleanup_job_is_pending() {
+        // cap#442 (Decision 4f): the admission guard that keeps a stale
+        // cleanup job — retried after the bounded-reclaim loop frees its
+        // dns fence — from undoing a newer deployment of the same app: a
+        // deployment in `cleanup_pending` blocks every new deployment
+        // (the 409 "an earlier deployment is still completing setup;
+        // retry after setup is reconciled" from the create route), so the
+        // cleanup terminalizes BEFORE any newer deployment can start.
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        let deployment_id = Uuid::new_v4();
+        // One transaction: the nonterminal-deployment constraint trigger is
+        // deferred to commit, by which time the durable apply job exists
+        // (the fixture pattern).
+        let mut tx = pool.begin().await.expect("begin the staging transaction");
+        sqlx::query(
+            "INSERT INTO deployments (
+                id, org_id, app_id, trigger, status, spec_snapshot, image_digest
+            ) VALUES ($1, $2, $3, 'api', 'failed'::deploy_status_enum, $4, $5)",
+        )
+        .bind(deployment_id)
+        .bind(app.org_id)
+        .bind(app.id)
+        .bind(serde_json::json!({"setup_state": "cleanup_pending"}))
+        .bind("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .execute(&mut *tx)
+        .await
+        .expect("insert the cleanup-pending deployment");
+        // The schema requires a durable apply job for a nonterminal
+        // deployment (the cleanup job the admission check speaks of).
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                deployment_id, app_id, org_id, source_deployment_id,
+                payload_version, payload, payload_sha256,
+                cleanup_app_on_setup_failure, signed_required,
+                state, next_attempt_at
+            ) VALUES ($1, $2, $3, $1, 2, '{\"version\": 2, \"log_encryption\": null}',
+                      decode(repeat('61', 32), 'hex'), true, false,
+                      'cleanup_pending', clock_timestamp())",
+        )
+        .bind(deployment_id)
+        .bind(app.id)
+        .bind(app.org_id)
+        .execute(&mut *tx)
+        .await
+        .expect("insert the pending cleanup job");
+        tx.commit().await.expect("commit the staging transaction");
+
+        let mut tx = pool.begin().await.expect("begin admission check");
+        assert!(
+            app_has_incomplete_deployment_setup(&mut tx, app.id)
+                .await
+                .expect("admission check runs"),
+            "a cleanup-pending deployment blocks newer deployments"
+        );
+        tx.rollback().await.expect("rollback");
+
+        // Once the cleanup terminalizes, a newer deployment may start —
+        // and it starts with the CURRENT hostnames, never with the stale
+        // cleanup's snapshot.
+        sqlx::query(
+            "UPDATE deployments
+                SET spec_snapshot = jsonb_set(spec_snapshot, '{setup_state}', '\"done\"')
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("terminalize the cleanup");
+        let mut tx = pool.begin().await.expect("begin admission check");
+        assert!(
+            !app_has_incomplete_deployment_setup(&mut tx, app.id)
+                .await
+                .expect("admission check runs"),
+            "a terminalized cleanup no longer blocks newer deployments"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    #[tokio::test]
     async fn stored_auto_deploys_are_rejected_before_validation_or_persistence() {
         let pool = database_test_pool().await;
         let mut app = insert_setup_test_app(&pool).await;
