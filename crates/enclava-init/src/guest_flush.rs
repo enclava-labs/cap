@@ -576,26 +576,29 @@ mod tests {
         // epoch being dropped).
         let epoch =
             signal_safe_monotonic_nanos().saturating_sub(Duration::from_secs(5).as_nanos() as u64);
-        // Call the PRODUCTION entry point (execute_teardown_since_epoch
-        // owns its clock) with no mounts, no siblings, and a zero initial
-        // wait: the two global syncs on an idle test runner are far below
-        // the bound, so a regression to monitor entry (waited ~ 0) fails
-        // while the honest epoch reports the full five seconds.
-        let (_reports, outcome) = execute_teardown_since_epoch(
-            &TeardownRequest {
-                mounts: &[],
-                siblings: &[],
-                initial_wait: Duration::ZERO,
-                deadline: TEARDOWN_DEADLINE,
-            },
-            |_| Vec::new(),
-            |_| {},
-            epoch,
-        );
+        // Call BOTH production entry points with no mounts, no siblings,
+        // and a zero initial wait: the epoch run must outrun the
+        // monitor-entry run by the epoch's five-second offset, whatever
+        // the writeback duration (round-4 review: a fixed upper bound
+        // depended on disk speed).
+        let request = TeardownRequest {
+            mounts: &[],
+            siblings: &[],
+            initial_wait: Duration::ZERO,
+            deadline: TEARDOWN_DEADLINE,
+        };
+        // Baseline: the same run measured from MONITOR ENTRY (the
+        // regression this pin guards against) on the same machine, so the
+        // two global syncs' duration appears in BOTH runs and cannot make
+        // either side of the comparison lie about the clock's origin.
+        let (_reports, from_entry) = execute_teardown(&request, |_| Vec::new(), |_| {});
+        let (_reports, from_epoch) =
+            execute_teardown_since_epoch(&request, |_| Vec::new(), |_| {}, epoch);
         assert!(
-            outcome.waited >= Duration::from_secs(5) && outcome.waited < Duration::from_secs(7),
-            "the epoch must be the production clock's origin: {:?}",
-            outcome.waited
+            from_epoch.waited >= from_entry.waited + Duration::from_secs(4),
+            "the production clock must start at the handler epoch, not monitor entry:              epoch {:?} vs entry {:?}",
+            from_epoch.waited,
+            from_entry.waited
         );
     }
 
