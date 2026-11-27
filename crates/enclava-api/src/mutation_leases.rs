@@ -5950,6 +5950,19 @@ pub(crate) mod tests {
             dns_fence_is_infinite(&pool, &hostname).await,
             "the live owner's fence stays armed to infinity"
         );
+
+        // The staged fence is test-local state on a shared database: remove
+        // it (and its lease rows) so later runs' loop counts stay exact.
+        sqlx::query("DELETE FROM external_resource_mutation_leases WHERE owner_token = $1")
+            .bind(owner_token)
+            .execute(&pool)
+            .await
+            .expect("remove the liveness fence fixture");
+        sqlx::query("DELETE FROM app_mutation_leases WHERE owner_token = $1")
+            .bind(owner_token)
+            .execute(&pool)
+            .await
+            .expect("remove the liveness lease fixture");
     }
 
     #[tokio::test]

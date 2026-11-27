@@ -12463,7 +12463,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn stranded_cleanup_fence_requeues_then_reclaims_without_manual_action() {
         let pool = database_test_pool().await;
-        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let (app, deployment_id, _setup_handle, mut payload) = insert_job_fixture(&pool).await;
         let hostname = format!("cleanup-retry-{}.example.test", Uuid::new_v4().simple());
         sqlx::query("UPDATE apps SET custom_domain = $1 WHERE id = $2")
             .bind(&hostname)
@@ -12471,6 +12471,30 @@ pub(crate) mod tests {
             .execute(&pool)
             .await
             .expect("pin the app's custom domain");
+        // Stage the job in cleanup_pending (the cleanup kind's real shape)
+        // and claim it, so the retry consumer below runs for a claimed
+        // job with a lock token — exactly the runner's Busy arm.
+        payload.delete_app_on_setup_failure = true;
+        replace_job_with_raw_payload(
+            &pool,
+            deployment_id,
+            serde_json::to_value(&payload).expect("serialize cleanup payload"),
+            JOB_PAYLOAD_VERSION,
+            true,
+            "setup_pending",
+        )
+        .await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim the setup job")
+            .expect("the setup job exists");
+        mark_setup_failed(&pool, &setup)
+            .await
+            .expect("persist the cleanup-pending failure");
+        let claimed = claim_job(&pool, "cleanup_pending", "cleaning_up", Some(deployment_id))
+            .await
+            .expect("claim the cleanup job")
+            .expect("the cleanup job exists");
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
         state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
@@ -12533,20 +12557,17 @@ pub(crate) mod tests {
             "the poisoned fence keeps the cleanup retry Busy: {busy:?}"
         );
         // The cleanup retry consumer (release_cleanup_for_retry) is the
-        // path the runner takes on a Busy claim.
-        let lock_token: Option<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>(
-            "SELECT lock_token FROM deployment_apply_jobs WHERE deployment_id = $1",
-        )
-        .bind(deployment_id)
-        .fetch_optional(&pool)
-        .await
-        .expect("read the job's lock token")
-        .flatten();
-        if let Some(lock_token) = lock_token {
-            release_cleanup_for_retry(&pool, deployment_id, lock_token)
+        // path the runner takes on a Busy claim — on the CLAIMED job.
+        release_cleanup_for_retry(&pool, deployment_id, claimed.lock_token)
+            .await
+            .expect("the existing cleanup retry consumer runs");
+        let job_state: String =
+            sqlx::query_scalar("SELECT state FROM deployment_apply_jobs WHERE deployment_id = $1")
+                .bind(deployment_id)
+                .fetch_one(&pool)
                 .await
-                .expect("the existing cleanup retry consumer runs");
-        }
+                .expect("read the job state");
+        assert_eq!(job_state, "cleanup_pending", "the job is back on the queue");
 
         // The new loop bounds the fence; the quarantine elapses; the SAME
         // claim the cleanup runner makes now succeeds.
