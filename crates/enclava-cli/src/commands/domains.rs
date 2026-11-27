@@ -7,21 +7,36 @@ use enclava_cli::config::{self, CliPaths};
 
 #[derive(Subcommand)]
 pub enum DomainsCommand {
-    /// Request a TXT verification challenge for a custom domain
+    /// Request a TXT verification challenge for a custom domain.
+    /// An app holds at most one custom domain: a second domain is
+    /// refused unless --replace is passed.
     Add {
         /// Domain name (e.g., app.example.com)
         domain: String,
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
         app: Option<String>,
+        /// Replace the app's current custom domain: the current one keeps
+        /// serving until the replacement's certificate arrives on the next
+        /// deploy, then its route is removed
+        #[arg(long)]
+        replace: bool,
     },
-    /// Verify a previously-added domain after publishing the TXT record
+    /// Verify a previously-added domain after publishing the TXT record.
+    /// Verifying a domain that differs from the app's current one needs
+    /// --replace (the explicit swap); verifying the current domain is the
+    /// repair flow and needs no flag.
     Verify {
         /// Domain name to verify
         domain: String,
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
         app: Option<String>,
+        /// Replace the app's current custom domain: the current one keeps
+        /// serving until the replacement's certificate arrives on the next
+        /// deploy, then its route is removed
+        #[arg(long)]
+        replace: bool,
     },
     /// List domains for an app
     List {
@@ -32,7 +47,8 @@ pub enum DomainsCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a custom domain
+    /// Remove a custom domain: the route goes at once; the certificate
+    /// drops the name on the next deploy
     Remove {
         /// Domain name to remove
         domain: String,
@@ -59,12 +75,17 @@ fn build_api_client() -> Result<ApiClient, Box<dyn std::error::Error>> {
 
 pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        DomainsCommand::Add { domain, app } => {
+        DomainsCommand::Add {
+            domain,
+            app,
+            replace,
+        } => {
             let app_name = resolve_app_name(&app)?;
             let api = build_api_client()?;
 
             let req = CreateChallengeRequest {
                 domain: domain.clone(),
+                replace,
             };
             let resp = api.create_domain_challenge(&app_name, &req).await?;
 
@@ -103,11 +124,15 @@ pub async fn run(cmd: DomainsCommand) -> Result<(), Box<dyn std::error::Error>> 
             println!("  enclava domains verify {domain} --app {app_name}");
         }
 
-        DomainsCommand::Verify { domain, app } => {
+        DomainsCommand::Verify {
+            domain,
+            app,
+            replace,
+        } => {
             let app_name = resolve_app_name(&app)?;
             let api = build_api_client()?;
 
-            let resp = match api.verify_domain(&app_name, &domain).await {
+            let resp = match api.verify_domain(&app_name, &domain, replace).await {
                 Ok(resp) => resp,
                 Err(error) => {
                     if let Some(hint) = verify_refusal_hint(&error, &domain) {
@@ -194,6 +219,97 @@ mod tests {
             message: "cap_operation_rejected".to_string(),
             idempotency_disposition: None,
         }
+    }
+
+    #[test]
+    fn domains_add_and_verify_parse_the_replace_flag() {
+        // cap F1 (C6 v): --replace is a real flag on both commands, and
+        // its absence is the refusing default.
+        use crate::commands::Cli;
+        use clap::Parser;
+        let parsed =
+            Cli::try_parse_from(["enclava", "domains", "add", "d2.example.com", "--replace"])
+                .expect("--replace parses on domains add");
+        let crate::commands::Command::Domains(DomainsCommand::Add {
+            domain, replace, ..
+        }) = parsed.command
+        else {
+            panic!("expected domains add");
+        };
+        assert_eq!(domain, "d2.example.com");
+        assert!(replace);
+
+        let parsed = Cli::try_parse_from([
+            "enclava",
+            "domains",
+            "verify",
+            "d2.example.com",
+            "--replace",
+        ])
+        .expect("--replace parses on domains verify");
+        let crate::commands::Command::Domains(DomainsCommand::Verify {
+            domain, replace, ..
+        }) = parsed.command
+        else {
+            panic!("expected domains verify");
+        };
+        assert_eq!(domain, "d2.example.com");
+        assert!(replace);
+
+        let parsed = Cli::try_parse_from(["enclava", "domains", "add", "d1.example.com"])
+            .expect("domains add parses without the flag");
+        let crate::commands::Command::Domains(DomainsCommand::Add { replace, .. }) = parsed.command
+        else {
+            panic!("expected domains add");
+        };
+        assert!(!replace);
+    }
+
+    #[test]
+    fn domains_help_documents_the_one_domain_per_app_contract() {
+        // cap F1 (C2/C5): the CLI help states the contract and the
+        // consequences — the swap semantics and remove's route/certificate
+        // timing.
+        use clap::CommandFactory;
+        let mut domains = crate::commands::Cli::command()
+            .find_subcommand_mut("domains")
+            .expect("domains subcommand exists")
+            .clone();
+        let mut buffer = Vec::new();
+        domains
+            .write_help(&mut buffer)
+            .expect("render domains help");
+        let help = String::from_utf8(buffer).expect("help is utf-8");
+        assert!(
+            help.contains("An app holds at most one custom domain"),
+            "add help states the contract: {help}"
+        );
+        let mut buffer = Vec::new();
+        domains
+            .find_subcommand_mut("add")
+            .expect("add subcommand exists")
+            .write_help(&mut buffer)
+            .expect("render add help");
+        let add_help = String::from_utf8(buffer).expect("help is utf-8");
+        assert!(
+            add_help.contains("certificate arrives on the next deploy"),
+            "add's --replace help states the certificate timing: {add_help}"
+        );
+        let mut buffer = Vec::new();
+        domains
+            .find_subcommand_mut("remove")
+            .expect("remove subcommand exists")
+            .write_help(&mut buffer)
+            .expect("render remove help");
+        let remove_help = String::from_utf8(buffer).expect("help is utf-8");
+        assert!(
+            remove_help.contains("the route goes at once"),
+            "remove help states the route consequence: {remove_help}"
+        );
+        assert!(
+            remove_help.contains("certificate drops the name on the next deploy"),
+            "remove help states the certificate consequence"
+        );
     }
 
     #[test]

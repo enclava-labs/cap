@@ -738,10 +738,20 @@ impl ApiClient {
         &self,
         app_name: &str,
         domain: &str,
+        replace: bool,
     ) -> Result<VerifyResponse, ApiError> {
+        // cap F1: `?replace=true` only when passed — the parameter is
+        // additive, so the pre-F1 wire shape is byte-identical.
+        let url = if replace {
+            self.url(&format!(
+                "/apps/{app_name}/domains/{domain}/verify?replace=true"
+            ))
+        } else {
+            self.url(&format!("/apps/{app_name}/domains/{domain}/verify"))
+        };
         let resp = self
             .http
-            .post(self.url(&format!("/apps/{app_name}/domains/{domain}/verify")))
+            .post(url)
             .headers(self.auth_headers()?)
             .send()
             .await?;

@@ -5230,10 +5230,18 @@ pub async fn verify_paas_domain_challenge(
         IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
     };
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
+        // cap F1: the relay body may carry the explicit replacement
+        // consent (`"replace": true`); absent means false, so pre-F1
+        // relay callers keep the refusing behavior.
+        let replace = body
+            .get("replace")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let Json(response) = crate::routes::domains::verify_challenge(
             auth,
             State(state.clone()),
             Path((app_name, domain)),
+            Query(crate::routes::domains::VerifyParams { replace }),
         )
         .await?;
         Ok((StatusCode::OK, to_value(response)?))

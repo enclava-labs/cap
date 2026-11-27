@@ -4909,7 +4909,7 @@ pub(crate) mod tests {
         pool
     }
 
-    fn test_app(org_id: Uuid, app_id: Uuid) -> App {
+    pub(crate) fn test_app(org_id: Uuid, app_id: Uuid) -> App {
         let now = chrono::Utc::now();
         let suffix = app_id.simple().to_string();
         App {

@@ -16,7 +16,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use base64::Engine;
@@ -309,6 +309,54 @@ fn mint_challenge_token() -> String {
 #[derive(Debug, Deserialize)]
 pub struct CreateChallengeRequest {
     pub domain: String,
+    /// cap F1: the explicit replacement consent (the CLI's `--replace`).
+    /// Absent means `false`, so older clients (and the hosted relay)
+    /// keep the refusing behavior.
+    #[serde(default)]
+    pub replace: bool,
+}
+
+/// Query parameters for POST .../domains/<domain>/verify. Additive: no
+/// parameters is the pre-F1 wire shape (`replace = false`).
+#[derive(Debug, Default, Deserialize)]
+pub struct VerifyParams {
+    #[serde(default)]
+    pub replace: bool,
+}
+
+/// cap F1: the one-custom-domain-per-app slot is occupied. Typed, stable,
+/// and shaped like the file's refusals (409 + `error` code + `message`):
+/// it names the current domain and the two honest ways forward. The
+/// app row is never touched on this refusal.
+fn custom_domain_slot_occupied(current_domain: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "custom_domain_slot_occupied",
+            "current_domain": current_domain,
+            "message": format!(
+                "this app already serves {current_domain}; remove it first, or pass --replace; the replacement's certificate arrives on the next deploy"
+            ),
+        })),
+    )
+}
+
+/// Whether a custom-domain action may proceed given the app's occupied
+/// slot: `None` = proceed; `Some(refusal)` = refuse. The same rule guards
+/// `domains add` (C1) and `domains verify` (C4): a domain that is not the
+/// app's current one is refused unless `replace` was explicitly passed;
+/// the current domain and a first domain always proceed.
+fn custom_domain_slot_refusal(
+    app: &App,
+    requested_domain: &str,
+    replace: bool,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    match app.custom_domain.as_deref() {
+        Some(current) if current != requested_domain && !replace => {
+            Some(custom_domain_slot_occupied(current))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -399,6 +447,13 @@ pub async fn create_challenge(
             Json(serde_json::json!({"error": e.to_string()})),
         )
     })?;
+
+    // cap F1 (C1): the per-app slot is singular. A second domain is
+    // refused before anything is minted (the app row is never touched);
+    // `--replace` is the explicit swap.
+    if let Some(refusal) = custom_domain_slot_refusal(&app, &domain, body.replace) {
+        return Err(refusal);
+    }
 
     let token = mint_challenge_token();
     let expires_at = Utc::now() + Duration::hours(CHALLENGE_LIFETIME_HOURS);
@@ -516,6 +571,7 @@ pub async fn verify_challenge(
     auth: AuthContext,
     State(state): State<AppState>,
     Path((app_name, domain)): Path<(String, String)>,
+    Query(params): Query<VerifyParams>,
 ) -> Result<Json<VerifyResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
@@ -538,6 +594,15 @@ pub async fn verify_challenge(
                 Json(serde_json::json!({"error": e.to_string()})),
             )
         })?;
+
+    // cap F1 (C4): verify must never silently re-bind the app row to a
+    // domain that is not the app's current one — the same rule as the add
+    // path. Refused before the mutation lease is claimed, so nothing
+    // persists and the row is untouched. Verifying the CURRENT domain
+    // (the repair flow) proceeds unchanged.
+    if let Some(refusal) = custom_domain_slot_refusal(&app, &domain, params.replace) {
+        return Err(refusal);
+    }
 
     type ChallengeRow = (
         Uuid,
@@ -1070,12 +1135,17 @@ pub async fn verify_challenge(
             ));
         }
     };
-    let app_backend = if ingress_scheduled {
+    if ingress_scheduled {
         // The restart is scheduled: the edge route publishes now (the
         // backend exists and serves once the rollout converges), while the
         // response's ingress_ready stays false so the client knows serving
         // is converging rather than established.
-        match mutation
+        //
+        // cap F1 (C3): only the INCOMING domain's route is published here.
+        // The outgoing domain's route stays in the desired set via the
+        // swap marker below until the rollout settles — never at verify
+        // time.
+        let route_publish = match mutation
             .guard_provider(ensure_custom_domain_haproxy_route(
                 &state,
                 auth.org_id,
@@ -1085,43 +1155,19 @@ pub async fn verify_challenge(
             ))
             .await
         {
-            Ok(Ok(backend)) => backend,
-            Ok(Err(response)) => {
-                release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
-                return Err(response);
-            }
+            Ok(result) => result,
             Err(_) => {
                 // Renewal lost mid-publish: the write may still land, so
                 // the fences stay quarantined (cap#422).
                 quarantine_mutation_and_rollback_lane(&mutation, app_lane).await?;
                 return Err(internal_error());
             }
+        };
+        if let Err(response) = route_publish {
+            release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
+            return Err(response);
         }
-    } else {
-        let org_slug: String =
-            match sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
-                .bind(auth.org_id)
-                .fetch_one(&state.db)
-                .await
-            {
-                Ok(slug) => slug,
-                Err(_) => {
-                    release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane)
-                        .await?;
-                    return Err(internal_error());
-                }
-            };
-        match crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App) {
-            Ok(backend) => backend,
-            Err(e) => {
-                release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("invalid app name: {e}")})),
-                ));
-            }
-        }
-    };
+    }
 
     if sqlx::query("UPDATE apps SET custom_domain = $1, updated_at = now() WHERE id = $2")
         .bind(&domain)
@@ -1134,60 +1180,28 @@ pub async fn verify_challenge(
         return Err(internal_error());
     }
 
-    if let Some(old) = previous_custom.as_deref()
-        && old != domain
+    // cap F1 (C3): a replacement keeps the OUTGOING domain served until
+    // the workload rollout settles with the new certificate — the swap
+    // settler deletes this marker then, and the HAProxy reconciler removes
+    // the outgoing route on its next pass. Without the marker the
+    // reconciler would drop the outgoing route within one pass (30 s),
+    // long before the replacement's certificate exists: a zero-domain
+    // window. Same transaction as the row swap, so the desired set flips
+    // from {outgoing} to {outgoing, incoming} atomically.
+    if let Some(outgoing) = previous_custom.as_deref()
+        && outgoing != domain.as_str()
+        && sqlx::query(
+            "INSERT INTO custom_domain_swaps (app_id, outgoing_domain)
+             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(app.id)
+        .bind(outgoing)
+        .execute(&mut *app_lane)
+        .await
+        .is_err()
     {
-        let dns_delete = match mutation
-            .guard_provider(crate::dns::delete_dns_record(
-                &state.db,
-                &state.http_client,
-                state.dns.as_ref(),
-                app.id,
-                old,
-            ))
-            .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                // Renewal lost mid-delete: the Cloudflare deletion may
-                // still land, so the app's fences stay quarantined
-                // (cap#422). No edge request was issued on this arm, so
-                // the cross-app edge_config fence is released instead of
-                // idling through the reclaim quarantine.
-                quarantine_mutation_and_rollback_lane_releasing_edge_config(&mutation, app_lane)
-                    .await?;
-                return Err(internal_error());
-            }
-        };
-        if let Err(dns_error) = dns_delete {
-            release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
-            return Err(dns_error_response(dns_error));
-        }
-        let edge_removal = match mutation
-            .guard_provider(crate::edge::remove_haproxy_routes(
-                &state.kube_client,
-                &state.db,
-                &crate::edge::EdgeRouteConfig::from_env(),
-                Some(edge_config_generation),
-                &[(app_backend.clone(), old.to_string())],
-            ))
-            .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                // Renewal lost mid-removal: the route removal may still
-                // land, so the fences stay quarantined (cap#422).
-                quarantine_mutation_and_rollback_lane(&mutation, app_lane).await?;
-                return Err(internal_error());
-            }
-        };
-        if edge_removal.is_err() {
-            release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": "previous edge route reconciliation failed"})),
-            ));
-        }
+        release_mutation_and_rollback_lane(&state, &mut mutation, app.id, app_lane).await?;
+        return Err(internal_error());
     }
 
     mutation
@@ -1303,6 +1317,22 @@ pub async fn remove_custom_domain(
         ));
     }
 
+    // cap F1: a pending swap keeps the OUTGOING domain served. Removing
+    // the app's (current) domain is an explicit user action that ends the
+    // swap too: the outgoing markers go, their routes go with the removed
+    // domain's, and their DNS records are cleaned like the current one's.
+    // An outgoing-only domain cannot be removed directly — it is not the
+    // app's domain (the `custom_domain = $3` authority check above refuses
+    // it); removing the current domain or waiting for the swap to settle
+    // ends its service.
+    let swap_outgoing: Vec<String> = sqlx::query_scalar(
+        "SELECT outgoing_domain FROM custom_domain_swaps WHERE app_id = $1 ORDER BY outgoing_domain",
+    )
+    .bind(app.id)
+    .fetch_all(&mut *app_lane)
+    .await
+    .map_err(|_| internal_error())?;
+
     mutation
         .guard_provider(crate::dns::delete_dns_record(
             &state.db,
@@ -1314,6 +1344,20 @@ pub async fn remove_custom_domain(
         .await
         .map_err(|_| internal_error())?
         .map_err(dns_error_response)?;
+
+    for outgoing in &swap_outgoing {
+        mutation
+            .guard_provider(crate::dns::delete_dns_record(
+                &state.db,
+                &state.http_client,
+                state.dns.as_ref(),
+                app.id,
+                outgoing,
+            ))
+            .await
+            .map_err(|_| internal_error())?
+            .map_err(dns_error_response)?;
+    }
 
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
         .bind(auth.org_id)
@@ -1330,13 +1374,17 @@ pub async fn remove_custom_domain(
             },
         )?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
+    let mut route_pairs = vec![(app_backend.clone(), domain.clone())];
+    for outgoing in &swap_outgoing {
+        route_pairs.push((app_backend.clone(), outgoing.clone()));
+    }
     if mutation
         .guard_provider(crate::edge::remove_haproxy_routes(
             &state.kube_client,
             &state.db,
             &edge_config,
             Some(edge_config_generation),
-            &[(app_backend, domain.clone())],
+            &route_pairs,
         ))
         .await
         .map_err(|_| internal_error())?
@@ -1351,6 +1399,13 @@ pub async fn remove_custom_domain(
     sqlx::query("UPDATE apps SET custom_domain = NULL, updated_at = now() WHERE id = $1 AND custom_domain = $2")
         .bind(app.id)
         .bind(&domain)
+        .execute(&mut *app_lane)
+        .await
+        .map_err(|_| internal_error())?;
+
+    // The swap markers die with the slot they were keeping warm.
+    sqlx::query("DELETE FROM custom_domain_swaps WHERE app_id = $1")
+        .bind(app.id)
         .execute(&mut *app_lane)
         .await
         .map_err(|_| internal_error())?;
@@ -1502,6 +1557,73 @@ mod tests {
             validate_custom_domain("enclava.dev", "enclava.dev", "tee.enclava.dev"),
             Err(DomainError::InsidePlatformZone(_))
         ));
+    }
+
+    fn test_app(custom_domain: Option<&str>) -> App {
+        let app_id = Uuid::new_v4();
+        let mut app = crate::deployment_jobs::tests::test_app(Uuid::new_v4(), app_id);
+        app.custom_domain = custom_domain.map(str::to_string);
+        app
+    }
+
+    #[test]
+    fn second_domain_is_refused_with_the_slot_occupied_shape() {
+        // cap F1 (C6 i): the fixed-shape refusal — typed code, names the
+        // current domain, says both honest ways forward and when the
+        // replacement's certificate arrives. The app row is never touched:
+        // the decision is made from the row alone, before any write.
+        let app = test_app(Some("d1.example.com"));
+        let refusal =
+            custom_domain_slot_refusal(&app, "d2.example.com", false).expect("must refuse");
+        let (status, body) = refusal;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let body = body.0;
+        assert_eq!(body["error"], "custom_domain_slot_occupied");
+        assert_eq!(body["current_domain"], "d1.example.com");
+        let message = body["message"].as_str().expect("message is a string");
+        assert!(
+            message.contains("d1.example.com"),
+            "names the current domain: {message}"
+        );
+        assert!(message.contains("remove it first"), "{message}");
+        assert!(message.contains("--replace"), "{message}");
+        assert!(
+            message.contains("the replacement's certificate arrives on the next deploy"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn slot_refusal_allows_the_current_domain_a_first_domain_and_replace() {
+        // cap F1 (C4/C2): the current domain is the repair flow (no flag);
+        // an empty slot always proceeds; --replace is the explicit swap.
+        let occupied = test_app(Some("d1.example.com"));
+        assert!(custom_domain_slot_refusal(&occupied, "d1.example.com", false).is_none());
+        assert!(custom_domain_slot_refusal(&occupied, "d2.example.com", true).is_none());
+        let empty = test_app(None);
+        assert!(custom_domain_slot_refusal(&empty, "d2.example.com", false).is_none());
+        assert!(custom_domain_slot_refusal(&empty, "d2.example.com", true).is_none());
+    }
+
+    #[test]
+    fn verify_params_default_to_no_replace() {
+        // The query parameter is additive: the pre-F1 wire shape (no
+        // parameters) deserializes to the refusing behavior.
+        assert!(
+            !serde_json::from_str::<VerifyParams>("{}")
+                .expect("empty object deserializes")
+                .replace
+        );
+        assert!(
+            serde_json::from_str::<VerifyParams>(r#"{"replace":true}"#)
+                .expect("replace deserializes")
+                .replace
+        );
+        assert!(
+            !serde_json::from_str::<VerifyParams>(r#"{"replace":false}"#)
+                .expect("explicit false deserializes")
+                .replace
+        );
     }
 
     #[test]
@@ -2060,6 +2182,10 @@ mod tests {
                 auth,
                 State(task_state),
                 Path((app_name, domain.to_string())),
+                // cap F1: the app already serves a different custom domain,
+                // so the domain change rides the explicit replacement
+                // consent — the silent replace this row removed.
+                axum::extract::Query(crate::routes::domains::VerifyParams { replace: true }),
             )
             .await
         });
@@ -2276,6 +2402,7 @@ mod tests {
                 auth,
                 State(task_state),
                 Path((app_name, domain.to_string())),
+                axum::extract::Query(Default::default()),
             )
             .await
         });
@@ -2706,6 +2833,7 @@ mod tests {
                 auth,
                 State(task_state),
                 Path((app_name, domain.to_string())),
+                axum::extract::Query(Default::default()),
             )
             .await
         });
