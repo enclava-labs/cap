@@ -40,6 +40,16 @@ pub enum ApiError {
     NotAuthenticated,
 }
 
+/// How long `deploy` keeps replaying an accepted-but-unsettled hosted
+/// operation before handing the still-unsettled response to the command
+/// layer. The settle window is the platform's CAP observation, not the
+/// deployment job itself, so this stays far below the deploy health
+/// timeout.
+const DEPLOY_SETTLE_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+/// Poll spacing between settle replays; each replay is an idempotent
+/// hosted-operation lookup, not a new deployment.
+const DEPLOY_SETTLE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl ApiClient {
     /// Create a new API client.
     pub fn new(base_url: &str, auth_token: Option<String>) -> Self {
@@ -344,15 +354,33 @@ impl ApiClient {
         app_name: &str,
         req: &DeployRequest,
     ) -> Result<DeployResponse, ApiError> {
-        let resp = self
-            .http
-            .post(self.url(&format!("/apps/{app_name}/deploy")))
-            .headers(self.auth_headers()?)
-            .json(req)
-            .send()
-            .await?;
-        let resp = self.check_response(resp).await?;
-        read_bounded_json(resp).await
+        // A hosted platform answers a deploy whose CAP observation is still
+        // settling with HTTP 202 and an accepted body that has no
+        // `deployment_id` (it carries `operation_id` instead). The operation
+        // is durable and the identical request replays the settled outcome,
+        // so re-POST the same body until it settles or the retry window
+        // expires, then return the (possibly still-unsettled) response for
+        // the command layer to handle.
+        let deadline = std::time::Instant::now() + DEPLOY_SETTLE_RETRY_WINDOW;
+        loop {
+            let resp = self
+                .http
+                .post(self.url(&format!("/apps/{app_name}/deploy")))
+                .headers(self.auth_headers()?)
+                .json(req)
+                .send()
+                .await?;
+            let accepted = resp.status() == reqwest::StatusCode::ACCEPTED;
+            let resp = self.check_response(resp).await?;
+            let decoded: DeployResponse = read_bounded_json(resp).await?;
+            if !accepted || decoded.deployment_id.is_some() {
+                return Ok(decoded);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(decoded);
+            }
+            tokio::time::sleep(DEPLOY_SETTLE_RETRY_INTERVAL).await;
+        }
     }
 
     pub async fn list_deployments(&self, app_name: &str) -> Result<Vec<DeploymentEntry>, ApiError> {

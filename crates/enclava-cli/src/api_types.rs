@@ -234,8 +234,15 @@ pub struct DeployResourcesSpec {
 
 #[derive(Debug, Deserialize)]
 pub struct DeployResponse {
-    pub deployment_id: String,
+    /// The CAP deployment the platform observed for this deploy. Absent in
+    /// the HTTP 202 accepted body the hosted platform answers while the
+    /// deploy operation is still settling: that body carries `operation_id`
+    /// instead, and the identical request replays the settled outcome once
+    /// it lands (see `ApiClient::deploy`).
+    pub deployment_id: Option<String>,
     pub status: String,
+    /// Empty in the accepted body, which reports `app_name` instead.
+    #[serde(default)]
     pub app_domain: String,
 }
 
