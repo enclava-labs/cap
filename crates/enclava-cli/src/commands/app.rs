@@ -569,8 +569,9 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         println!();
         println!("  App:    {app_name}");
         println!("  Status: accepted (the platform is still settling the deployment)");
-        println!("  Next:   `enclava status --app {app_name}` reports live state; re-running");
-        println!("          this deploy replays the settled outcome and resumes this flow.");
+        println!("  Next:   `enclava status --app {app_name}` reports live state. Do not");
+        println!("          re-run this deploy until it settles: the signed request is");
+        println!("          per-invocation, so a re-run starts a second deployment.");
         return Ok(());
     };
     pb.set_position(1);

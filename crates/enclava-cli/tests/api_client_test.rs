@@ -703,7 +703,7 @@ async fn deploy_replays_the_accepted_202_body_until_it_settles() {
     let settled_body = concat!(
         r#"{"deployment_id":"a2b1ce2b-f2a8-4f1e-9e44-c1f7fb4f529f","#,
         r#""status":"pending","#,
-        r#""app_domain":"cd-test13.enclava.app"}"#
+        r#""app_domain":"deploy-fixture.invalid"}"#
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -712,9 +712,31 @@ async fn deploy_replays_the_accepted_202_body_until_it_settles() {
         let mut requests = Vec::new();
         for (index, body) in [(0, accepted_body), (1, settled_body)] {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 8192];
-            let n = stream.read(&mut buf).unwrap();
-            requests.push(String::from_utf8_lossy(&buf[..n]).to_string());
+            // Read the COMPLETE request (headers plus Content-Length body):
+            // one `read` may return a partial request, and the replay
+            // equality below only means anything for whole requests.
+            let mut request = Vec::new();
+            let expected_body_len = loop {
+                let mut chunk = [0u8; 8192];
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0, "connection closed mid-request");
+                request.extend_from_slice(&chunk[..n]);
+                let headers_end = request.windows(4).position(|window| window == b"\r\n\r\n");
+                if let Some(headers_end) = headers_end {
+                    let headers = String::from_utf8_lossy(&request[..headers_end]).to_string();
+                    let content_length = headers.lines().find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap())
+                    });
+                    if content_length.is_some_and(|len| request.len() >= headers_end + 4 + len) {
+                        break content_length.expect("complete implies parsed");
+                    }
+                }
+            };
+            // `expected_body_len` ensured the read above is the whole request;
+            // the full text (headers + body) is compared below.
+            let _ = expected_body_len;
+            requests.push(String::from_utf8_lossy(&request).to_string());
             let status = if index == 0 {
                 "HTTP/1.1 202 Accepted"
             } else {
@@ -758,5 +780,5 @@ async fn deploy_replays_the_accepted_202_body_until_it_settles() {
         Some("a2b1ce2b-f2a8-4f1e-9e44-c1f7fb4f529f")
     );
     assert_eq!(resp.status, "pending");
-    assert_eq!(resp.app_domain, "cd-test13.enclava.app");
+    assert_eq!(resp.app_domain, "deploy-fixture.invalid");
 }

@@ -42,10 +42,13 @@ pub enum ApiError {
 
 /// How long `deploy` keeps replaying an accepted-but-unsettled hosted
 /// operation before handing the still-unsettled response to the command
-/// layer. The settle window is the platform's CAP observation, not the
-/// deployment job itself, so this stays far below the deploy health
-/// timeout.
-const DEPLOY_SETTLE_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+/// layer, always within one command invocation: the signed request is
+/// built once per invocation (a fresh deploy id and timestamp), so a
+/// RE-run is a new deployment, not a replay. The settle window is the
+/// platform's CAP observation (observed live to exceed a 60-second span
+/// on the dev custom-domain certificate redeploy), not the deployment
+/// job itself, so this stays far below the deploy health timeout.
+const DEPLOY_SETTLE_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 /// Poll spacing between settle replays; each replay is an idempotent
 /// hosted-operation lookup, not a new deployment.
 const DEPLOY_SETTLE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
@@ -376,10 +379,17 @@ impl ApiClient {
             if !accepted || decoded.deployment_id.is_some() {
                 return Ok(decoded);
             }
+            // The last accepted response is already in hand: never sleep
+            // or start another replay once the window has passed, and
+            // re-check after sleeping so a slow sleep cannot launch a
+            // late replay either.
             if std::time::Instant::now() >= deadline {
                 return Ok(decoded);
             }
             tokio::time::sleep(DEPLOY_SETTLE_RETRY_INTERVAL).await;
+            if std::time::Instant::now() >= deadline {
+                return Ok(decoded);
+            }
         }
     }
 
