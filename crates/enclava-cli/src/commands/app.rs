@@ -560,6 +560,20 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     // Phase 1: Deploy
     pb.set_message("Submitting deployment...");
     let resp = api.deploy(&app_name, &req).await?;
+    // The platform may still be settling the deploy operation past the
+    // client's settle-replay window (HTTP 202 accepted, no deployment id).
+    // The operation is durable: nothing can be tracked from here without
+    // the deployment id, so end the command cleanly instead of failing.
+    let Some(deployment_id) = resp.deployment_id.as_deref() else {
+        pb.finish_with_message("Deployment accepted, still settling");
+        println!();
+        println!("  App:    {app_name}");
+        println!("  Status: accepted (the platform is still settling the deployment)");
+        println!("  Next:   `enclava status --app {app_name}` reports live state. Do not");
+        println!("          re-run this deploy until it settles: the signed request is");
+        println!("          per-invocation, so a re-run starts a second deployment.");
+        return Ok(());
+    };
     pb.set_position(1);
     pb.set_message("Manifests applied");
 
@@ -569,15 +583,8 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let max_wait = Duration::from_secs(DEPLOY_HEALTH_TIMEOUT_SECONDS);
     let poll_interval = Duration::from_secs(3);
-    wait_for_deployment_apply_start(
-        &api,
-        &app_name,
-        &resp.deployment_id,
-        max_wait,
-        poll_interval,
-        &pb,
-    )
-    .await?;
+    wait_for_deployment_apply_start(&api, &app_name, deployment_id, max_wait, poll_interval, &pb)
+        .await?;
 
     // Phase 3: First ownership claim for password-mode apps.
     //
@@ -598,7 +605,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         if wait_for_bootstrap_endpoint(
             &api,
             &app_name,
-            DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+            DeploymentWait::trusted(deployment_id, Some(&trusted_deployment)),
             max_wait,
             poll_interval,
             &pb,
@@ -609,7 +616,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
                 &api,
                 &paths,
                 &app_name,
-                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+                DeploymentWait::trusted(deployment_id, Some(&trusted_deployment)),
                 &storage_password,
                 capture,
                 None,
@@ -629,7 +636,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             wait_for_deploy_runtime(
                 &api,
                 &app_name,
-                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+                DeploymentWait::trusted(deployment_id, Some(&trusted_deployment)),
                 max_wait,
                 poll_interval,
                 &pb,
@@ -641,7 +648,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
                 ensure_password_storage_unlocked_for_config(
                     &api,
                     &app_name,
-                    DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+                    DeploymentWait::trusted(deployment_id, Some(&trusted_deployment)),
                     &pb,
                     &storage_password,
                 )
@@ -661,7 +668,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         wait_for_deploy_runtime(
             &api,
             &app_name,
-            DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+            DeploymentWait::trusted(deployment_id, Some(&trusted_deployment)),
             max_wait,
             poll_interval,
             &pb,
@@ -672,7 +679,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             ensure_password_storage_unlocked_for_config(
                 &api,
                 &app_name,
-                DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+                DeploymentWait::trusted(deployment_id, Some(&trusted_deployment)),
                 &pb,
                 &storage_password,
             )
@@ -685,7 +692,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         &api,
         &resp.app_domain,
         &app_name,
-        DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+        DeploymentWait::trusted(deployment_id, Some(&trusted_deployment)),
         &config_pairs,
         &pb,
     )
@@ -699,7 +706,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     wait_for_deployment_completion(
         &api,
         &app_name,
-        DeploymentWait::trusted(&resp.deployment_id, Some(&trusted_deployment)),
+        DeploymentWait::trusted(deployment_id, Some(&trusted_deployment)),
         health_timeout,
         Duration::from_secs(2),
         &pb,
@@ -713,7 +720,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     println!();
     println!("  App:    {app_name}");
     println!("  URL:    https://{}", resp.app_domain);
-    println!("  Deploy: {}", resp.deployment_id);
+    println!("  Deploy: {deployment_id}");
     println!("  Duration: {}", format_duration(deploy_started.elapsed()));
     if !config_pairs.is_empty() {
         println!("  Config: {} key(s) set", config_pairs.len());

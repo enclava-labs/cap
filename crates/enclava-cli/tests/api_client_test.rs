@@ -678,3 +678,107 @@ async fn api_client_rejects_oversized_streamed_success_body_without_content_leng
         ApiError::ResponseTooLarge(cap) if cap == 16 * 1024 * 1024
     ));
 }
+
+#[tokio::test]
+async fn deploy_replays_the_accepted_202_body_until_it_settles() {
+    use enclava_cli::api_types::{DeployRequest, DeployResourcesSpec};
+
+    // The exact accepted body the hosted platform answers a deploy whose CAP
+    // observation is still settling (HTTP 202; paas cap_proxy.rs
+    // `hosted_operation_accepted_response`, in this shape since #433/#434,
+    // before the dev proof): no `deployment_id`, `operation_id` instead. This
+    // is the body that made the CLI fail with
+    // `response body decode failed: missing field `deployment_id`` on the
+    // custom-domain certificate redeploy (devproof-cd-edges-20261126,
+    // scenario B) while the deploy itself landed.
+    let accepted_body = concat!(
+        r#"{"status":"accepted","#,
+        r#""operation_id":"7ba1f5c2-9b3e-4f2c-8f5c-4a0d7b9c4e7a","#,
+        r#""operation_kind":"app_deploy","#,
+        r#""app_name":"cd-test13","#,
+        r#""message":"Hosted operation accepted and is still settling; "#,
+        r#"the app's status read reports its progress, and retrying the same "#,
+        r#"request after it settles replays the settled outcome"}"#
+    );
+    let settled_body = concat!(
+        r#"{"deployment_id":"a2b1ce2b-f2a8-4f1e-9e44-c1f7fb4f529f","#,
+        r#""status":"pending","#,
+        r#""app_domain":"deploy-fixture.invalid"}"#
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for (index, body) in [(0, accepted_body), (1, settled_body)] {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the COMPLETE request (headers plus Content-Length body):
+            // one `read` may return a partial request, and the replay
+            // equality below only means anything for whole requests.
+            let mut request = Vec::new();
+            let expected_body_len = loop {
+                let mut chunk = [0u8; 8192];
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0, "connection closed mid-request");
+                request.extend_from_slice(&chunk[..n]);
+                let headers_end = request.windows(4).position(|window| window == b"\r\n\r\n");
+                if let Some(headers_end) = headers_end {
+                    let headers = String::from_utf8_lossy(&request[..headers_end]).to_string();
+                    let content_length = headers.lines().find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap())
+                    });
+                    if content_length.is_some_and(|len| request.len() >= headers_end + 4 + len) {
+                        break content_length.expect("complete implies parsed");
+                    }
+                }
+            };
+            // `expected_body_len` ensured the read above is the whole request;
+            // the full text (headers + body) is compared below.
+            let _ = expected_body_len;
+            requests.push(String::from_utf8_lossy(&request).to_string());
+            let status = if index == 0 {
+                "HTTP/1.1 202 Accepted"
+            } else {
+                "HTTP/1.1 200 OK"
+            };
+            let response = format!(
+                "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        requests
+    });
+
+    let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let req = DeployRequest {
+        image: Some("ghcr.io/enclava-labs/cd-fixture:latest".to_string()),
+        resources: DeployResourcesSpec {
+            cpu: "1".to_string(),
+            memory: "512Mi".to_string(),
+            storage: "1Gi".to_string(),
+            tls_storage: "128Mi".to_string(),
+        },
+        customer_descriptor_blob: None,
+        org_keyring_blob: None,
+        signed_policy_artifact: None,
+    };
+    let resp = client.deploy("cd-test13", &req).await.unwrap();
+
+    let requests = handle.join().unwrap();
+    assert_eq!(requests.len(), 2, "the accepted body must be replayed once");
+    for request in &requests {
+        assert!(request.starts_with("POST /apps/cd-test13/deploy "));
+    }
+    // The replay must be the identical request: the platform's operation key
+    // derives from the request body, so a changed body would create a new
+    // deployment instead of replaying the settling one.
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(
+        resp.deployment_id.as_deref(),
+        Some("a2b1ce2b-f2a8-4f1e-9e44-c1f7fb4f529f")
+    );
+    assert_eq!(resp.status, "pending");
+    assert_eq!(resp.app_domain, "deploy-fixture.invalid");
+}
